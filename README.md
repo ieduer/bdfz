@@ -1,15 +1,35 @@
-基於 https://github.com/c-jeremy/sue/blob/main/pseudo-auth.php     
-更新為 API 版，放出暴力舊版。   
+ # SAA
 
-新版本無視時間，不好直接放出。  
-使用 sue 框架，稍作抓包即可實現自動考勤任務。 
+> 基於 <a href="https://github.com/c-jeremy/sue/blob/main/pseudo-auth.php" target="_blank" rel="noopener noreferrer">pseudo-auth.php</a> ，通過最小抓包實現；提供 API 化版本。**該版本無視時間限制**；此倉庫附帶「暴力」舊版供研究與自用。
 
-當然，你可以試著在 MAC 運行如下：
 
-    bash <(wget -qO- https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)  
-或  
 
-    bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)
+---
 
-開發原因： https://bdfz.net/posts/imgseiue/    
-無意義之事，以無意義待之；技術的價值就是這個了吧。   
+## macOS / Homebrew
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)
+# 或
+bash <(wget -qO- https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)
+```
+
+> 若 `curl` / `wget` 均不可用，請手動下載 `saa.sh` 後執行：`bash saa.sh`。
+
+---
+
+
+## 背景與記錄
+
+- 最不值：<a href="https://bdfz.net/posts/imgseiue/" target="_blank" rel="noopener noreferrer">noatt</a>
+- 點不點名：<a href="https://bdfz.net/posts/attendance/" target="_blank" rel="noopener noreferrer">attendance</a>
+
+> 無意義之事，以無意義待之；技術的價值，大概也在於此。
+
+---
+
+## 免責聲明
+
+- 本項目僅供學術研究與個人學習之用，請勿用於任何違規行為。
+- 使用產生的風險由使用者自行承擔。
+- 直接都考了，不太好吧。😜
