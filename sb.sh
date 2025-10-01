@@ -153,15 +153,15 @@ v4v6(){
 }
 
 v6_setup(){
-    if [ -z "$(curl -s4m5 icanhazip.com -k)" ]; then
+    if ! curl -fsS4m5 --retry 2 icanhazip.com >/dev/null 2>&1; then
         yellow "檢測到 純IPV6 VPS，添加NAT64"
         echo -e "nameserver 2a00:1098:2b::1\nnameserver 2a00:1098:2c::1" > /etc/resolv.conf
         ipv="prefer_ipv6"
     else
         ipv="prefer_ipv4"
     fi
-    
-    if [ -n "$(curl -s6m5 icanhazip.com -k)" ]; then
+
+    if curl -fsS6m5 --retry 2 icanhazip.com >/dev/null 2>&1; then
         endip="2606:4700:d0::a29f:c001"
     else
         endip="162.159.192.1"
@@ -494,6 +494,7 @@ generate_reality_materials() {
     ensure_dirs
     local out="/etc/s-box/reality.out"
     local pubfile="/etc/s-box/public.key"
+    local jsonfile="/etc/s-box/reality.json"
     local rk pub
 
     # Only (re)generate if we don't have a public key file or the private_key var is empty
@@ -530,6 +531,12 @@ generate_reality_materials() {
 
     # short_id is an 8-16 hex string
     : "${short_id:=$(head -c 8 /dev/urandom | hexdump -e '1/1 \"%02x\"')}"
+
+    # Always export a compatible JSON for legacy code paths
+    if [[ -n "${private_key:-}" && -s "$pubfile" ]]; then
+        pub=$(cat "$pubfile")
+        printf '{ "private_key": "%s", "public_key": "%s" }\n' "$private_key" "$pub" > "$jsonfile"
+    fi
 }
 
 # Sane defaults if證書部分未配置
@@ -662,6 +669,92 @@ else red "Sing-box服务未运行" && exit; fi
 }
 
 wgcfgo(){ ipuuid; }
+
+# 綜合輸出分享與訂閱
+clash_sb_share(){
+    ipuuid
+    result_vl_vm_hy_tu
+    resvless
+    resvmess
+    reshy2
+    restu5
+    gen_clash_sub
+    green "Clash/Mihomo 訂閱已生成：/etc/s-box/clash_sub.json"
+}
+
+# 兼容別名
+sbshare(){ clash_sb_share; }
+
+# 啟停/重啟
+stclre(){
+    echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"
+    readp "選擇【0-3】:" act
+    if [[ x"${release}" == x"alpine" ]]; then
+        case "$act" in
+            1) rc-service sing-box restart;;
+            2) rc-service sing-box stop;;
+            3) rc-service sing-box start;;
+            *) return;;
+        esac
+    else
+        case "$act" in
+            1) systemctl restart sing-box;;
+            2) systemctl stop sing-box;;
+            3) systemctl start sing-box;;
+            *) return;;
+        esac
+    fi
+}
+
+# 切換/更新內核（簡化：走安裝流程）
+upsbcroe(){ inssb; }
+
+# 查看運行日誌
+sblog(){
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-service sing-box status || true
+        tail -n 200 /var/log/messages 2>/dev/null || true
+    else
+        journalctl -u sing-box -e --no-pager
+    fi
+}
+
+# 腳本更新（暫不實作）
+upsbyg(){ yellow "暫未實作：更新腳本。請使用最新 sb.sh 覆蓋當前版本。"; }
+
+# 使用說明（簡版）
+sbsm(){
+    blue "安裝內核 → 自動生成默認配置 → 開機自啟。"
+    blue "可用功能：變更證書/端口、生成訂閱、查看日誌、開啟BBR。"
+    blue "分享/訂閱輸出：選 7 或 11（雙棧選 IP）。產物在 /etc/s-box/"
+}
+
+# 卸載
+unins(){
+    remove_firewall_rules
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-service sing-box stop 2>/dev/null || true
+        rc-update del sing-box 2>/dev/null || true
+        rm -f /etc/init.d/sing-box
+    else
+        systemctl stop sing-box 2>/dev/null || true
+        systemctl disable sing-box 2>/dev/null || true
+        rm -f /etc/systemd/system/sing-box.service
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    readp "是否刪除 /etc/s-box 目錄與所有配置？(y/n, 默認n): " rmconf
+    if [[ "$rmconf" == "y" || "$rmconf" == "Y" ]]; then
+        rm -rf /etc/s-box
+        green "已刪除 /etc/s-box。"
+    fi
+    readp "是否移除快捷命令 sb？(y/n, 默認n): " rmsb
+    if [[ "$rmsb" == "y" || "$rmsb" == "Y" ]]; then
+        rm -f /usr/local/bin/sb
+        hash -r 2>/dev/null || true
+        green "已移除 sb 命令。"
+    fi
+    green "Sing-box 已卸載完成。"
+}
 
 result_vl_vm_hy_tu(){
 if [[ -f /root/ieduerca/cert.crt && -f /root/ieduerca/private.key && -s /root/ieduerca/cert.crt && -s /root/ieduerca/private.key ]]; then ym=$(bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'); echo "$ym" > /root/ieduerca/ca.log; fi
