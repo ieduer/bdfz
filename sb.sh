@@ -372,6 +372,9 @@ inssb(){
     fi
 }
 
+# Backward-compat wrapper for older menu typo
+instsllsingbox(){ inssb; }
+
 insport(){
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green "三、設置各協議端口"
@@ -830,7 +833,7 @@ main_menu() {
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     readp "請輸入數字【0-13】:" Input
     case "$Input" in  
-     1 ) instsllsingbox;;
+     1 ) inssb;;
      2 ) unins;;
      3 ) changeserv;;
      4 ) stclre;;
