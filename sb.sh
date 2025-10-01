@@ -394,9 +394,59 @@ inssb(){
         else
             red "內核安裝校驗可能失敗，請檢查 /etc/s-box/sing-box 是否存在。"
         fi
+        # 首次安裝後自動生成默認配置並啟動
+        if [[ ! -f /etc/s-box/sb.json ]]; then
+            blue "首次安裝：正在自動生成默認配置並啟動服務..."
+            auto_config_and_start
+        fi
     else
         red "解壓或移動 Sing-box 內核失敗，安裝終止。" && exit 1
     fi
+}
+
+# --- 自動默認配置安裝與啟動 ---
+auto_config_and_start(){
+    # 1) 自簽默認證書與變量（無交互）
+    ensure_dirs
+    openssl ecparam -genkey -name prime256v1 -out /etc/s-box/private.key >/dev/null 2>&1 || true
+    openssl req -new -x509 -days 36500 -key /etc/s-box/private.key -out /etc/s-box/cert.pem -subj "/CN=www.bing.com" >/dev/null 2>&1 || true
+    tlsyn=false
+    ym_vl_re=apple.com
+    ym_vm_ws=www.bing.com
+    certificatec_vmess_ws='/etc/s-box/cert.pem'; certificatep_vmess_ws='/etc/s-box/private.key'
+    certificatec_hy2='/etc/s-box/cert.pem';    certificatep_hy2='/etc/s-box/private.key'
+    certificatec_tuic='/etc/s-box/cert.pem';   certificatep_tuic='/etc/s-box/private.key'
+
+    # 2) 端口（隨機且避占用，無交互）
+    ports=()
+    for i in {1..4}; do
+        while true; do
+            p_temp=$(shuf -i 10000-65535 -n 1)
+            if ! [[ " ${ports[@]} " =~ " $p_temp " ]] && ! check_port_in_use "$p_temp"; then
+                ports+=("$p_temp")
+                break
+            fi
+        done
+    done
+    port_vl_re=${ports[0]}; port_vm_ws=${ports[1]}; port_hy2=${ports[2]}; port_tu=${ports[3]}
+
+    # 3) UUID、Reality材料、網絡策略
+    uuid=$(/etc/s-box/sing-box generate uuid)
+    generate_reality_materials
+    v6_setup
+
+    # 4) 生成配置、開放防火牆、啟動服務
+    inssbjsonser
+    configure_firewall "$port_vl_re" "$port_vm_ws" "$port_hy2" "$port_tu"
+    sbservice
+
+    # 5) 生成出站/訂閱輔助信息
+    ipuuid
+    result_vl_vm_hy_tu
+    gen_clash_sub
+
+    green "默認配置已生成並啟動。配置文件：/etc/s-box/sb.json"
+    yellow "節點與訂閱：/etc/s-box/{vl_reality.txt,vm_ws*.txt,hy2.txt,tuic5.txt,clash_sub.json}"
 }
 
 # Backward-compat wrapper for older menu typo
@@ -777,7 +827,42 @@ resvless(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 resvmess(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; if [[ "$tls" = "false" ]]; then red "🚀【 vmess-ws 】节点信息如下："; vmess_json="{\"add\":\"$server_ipcl\",\"aid\":\"0\",\"host\":\"$vm_name\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$ws_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-$hostname\",\"tls\":\"\",\"type\":\"none\",\"v\":\"2\"}"; vmess_link="vmess://$(echo "$vmess_json" | base64_n0)"; echo "$vmess_link" > /etc/s-box/vm_ws.txt; else red "🚀【 vmess-ws-tls 】节点信息如下："; vmess_json="{\"add\":\"$vm_name\",\"aid\":\"0\",\"host\":\"$vm_name\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$ws_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-tls-$hostname\",\"tls\":\"tls\",\"sni\":\"$vm_name\",\"type\":\"none\",\"v\":\"2\"}"; vmess_link="vmess://$(echo "$vmess_json" | base64_n0)"; echo "$vmess_link" > /etc/s-box/vm_ws_tls.txt; fi; echo; echo "分享链接："; echo -e "${yellow}$vmess_link${plain}"; echo; echo "二维码："; qrencode -o - -t ANSIUTF8 "$vmess_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; echo; }
 reshy2(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; hy2_link="hysteria2://$uuid@$cl_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=$hy2_ins&sni=$hy2_name#hy2-$hostname"; echo "$hy2_link" > /etc/s-box/hy2.txt; red "🚀【 Hysteria-2 】节点信息如下："; echo; echo "分享链接："; echo -e "${yellow}$hy2_link${plain}"; echo; echo "二维码："; qrencode -o - -t ANSIUTF8 "$hy2_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; echo; }
 restu5(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; tuic5_link="tuic://$uuid:$uuid@$cl_tu5_ip:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&allow_insecure=$ins&allowInsecure=$ins#tu5-$hostname"; echo "$tuic5_link" > /etc/s-box/tuic5.txt; red "🚀【 Tuic-v5 】节点信息如下："; echo; echo "分享链接："; echo -e "${yellow}$tuic5_link${plain}"; echo; echo "二维码："; qrencode -o - -t ANSIUTF8 "$tuic5_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; echo; }
-# ... other functions here ...
+
+# --- 交互變更配置流程 ---
+changeserv(){
+    red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    green "變更配置流程開始：將引導你選擇證書/端口/IPv4/IPv6優先等參數"
+    # 證書（交互：ACME 或自簽）
+    inscertificate
+    # 端口（交互或隨機）
+    insport
+    # 網絡偏好（自動探測v4/v6）
+    v6_setup
+    # 生成配置
+    inssbjsonser
+    # 保存防火牆並啟動/重啟服務
+    configure_firewall "$port_vl_re" "$port_vm_ws" "$port_hy2" "$port_tu"
+    sbservice
+    # 生成節點與訂閱
+    ipuuid
+    result_vl_vm_hy_tu
+    gen_clash_sub
+    green "配置已更新並啟動。可在 /etc/s-box 查看相關文件。"
+}
+
+# --- 協議端口狀態摘要 ---
+showprotocol(){
+    if [[ ! -f /etc/s-box/sb.json ]]; then return; fi
+    local vl_port vm_port hy2_port tu_port
+    vl_port=$(jq -r '.inbounds[] | select(.type=="vless")     .listen_port' /etc/s-box/sb.json 2>/dev/null)
+    vm_port=$(jq -r '.inbounds[] | select(.type=="vmess")     .listen_port' /etc/s-box/sb.json 2>/dev/null)
+    hy2_port=$(jq -r '.inbounds[] | select(.type=="hysteria2") .listen_port' /etc/s-box/sb.json 2>/dev/null)
+    tu_port=$(jq -r '.inbounds[] | select(.type=="tuic")      .listen_port' /etc/s-box/sb.json 2>/dev/null)
+    [[ -n "$vl_port"  ]] && blue "VLESS-REALITY  端口：$vl_port"
+    [[ -n "$vm_port"  ]] && blue "VMESS-WS       端口：$vm_port"
+    [[ -n "$hy2_port" ]] && blue "HY2            端口：$hy2_port"
+    [[ -n "$tu_port"  ]] && blue "TUIC v5        端口：$tu_port"
+}
 
 # --- BBR 安裝模塊 (內置, 無重啟) ---
 install_bbr_local() {
