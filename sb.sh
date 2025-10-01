@@ -126,6 +126,26 @@ ensure_dirs() {
     chmod 700 /etc/s-box
 }
 
+# --- 安裝全局快捷方式 ---
+install_shortcut(){
+    local target="/usr/local/bin/sb"
+    local self
+    self="$(realpath "${BASH_SOURCE[0]:-$0}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")"
+    [[ "$self" != /* ]] && self="$(pwd)/$self"
+    if [[ ! -x "$target" ]] || ! grep -q "$self" "$target" 2>/dev/null; then
+        cat >"$target" <<'EOX'
+#!/usr/bin/env bash
+# cursor shortcut wrapper for sb
+exec "__SB_SCRIPT__" "$@"
+EOX
+        # replace placeholder with absolute script path
+        sed -i "s|__SB_SCRIPT__|$self|g" "$target"
+        chmod +x "$target"
+        green "已安裝快捷命令：sb  （現在可直接輸入 sb 呼出腳本）"
+    fi
+    hash -r 2>/dev/null || true
+}
+
 # --- 網絡與防火牆 ---
 v4v6(){
     v4=$(curl -fsS4m5 --retry 2 icanhazip.com || true)
@@ -367,6 +387,13 @@ inssb(){
     if [[ -f '/etc/s-box/sing-box' ]]; then
         chmod +x /etc/s-box/sing-box
         blue "成功安裝 Sing-box 內核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')"
+        install_shortcut
+        yellow "提示：現在可以在任意目錄執行 ${bblue}sb${plain} 喚起腳本。"
+        if /etc/s-box/sing-box version >/dev/null 2>&1; then
+            green "內核安裝校驗通過。"
+        else
+            red "內核安裝校驗可能失敗，請檢查 /etc/s-box/sing-box 是否存在。"
+        fi
     else
         red "解壓或移動 Sing-box 內核失敗，安裝終止。" && exit 1
     fi
@@ -825,10 +852,16 @@ main_menu() {
     green " 0. 退出腳本"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     
+    if [[ -x '/etc/s-box/sing-box' ]]; then
+        corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}')
+        green "Sing-box 核心已安裝：$corev"
+    else
+        yellow "Sing-box 核心未安裝"
+    fi
     if [[ -f '/etc/s-box/sb.json' ]]; then 
         showprotocol
     else
-        yellow "Sing-box未安裝"
+        yellow "尚未生成運行配置（/etc/s-box/sb.json）。選擇【3】生成/調整配置，或按【1】安裝內核/依賴。"
     fi
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     readp "請輸入數字【0-13】:" Input
@@ -854,4 +887,5 @@ main_menu() {
 check_os
 check_dependencies
 ensure_dirs
+install_shortcut
 main_menu
