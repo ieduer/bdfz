@@ -529,8 +529,8 @@ generate_reality_materials() {
         fi
     fi
 
-    # short_id is an 8-16 hex string
-    : "${short_id:=$(head -c 8 /dev/urandom | hexdump -e '1/1 \"%02x\"')}"
+    # short_id is an 8-16 hex string (robust, correct format, OpenSSL fallback)
+    : "${short_id:=$(head -c 8 /dev/urandom | hexdump -e '1/1 "%02x"' 2>/dev/null || openssl rand -hex 8)}"
 
     # Always export a compatible JSON for legacy code paths
     if [[ -n "${private_key:-}" && -s "$pubfile" ]]; then
@@ -553,7 +553,7 @@ generate_reality_materials() {
 inssbjsonser(){
     ensure_dirs
     generate_reality_materials
-cat > /etc/s-box/sb10.json <<EOF
+    cat > /etc/s-box/sb10.json <<EOF
 {
 "log": { "disabled": false, "level": "info", "timestamp": true },
 "inbounds": [
@@ -579,11 +579,17 @@ cat > /etc/s-box/sb10.json <<EOF
     { "type": "direct", "tag": "direct", "domain_strategy": "$ipv" },
     { "type": "block", "tag": "block" }
 ],
-"route": { "rules": [ { "protocol": ["quic", "stun"], "outbound": "block" }, { "outbound": "direct", "network": "udp,tcp" } ] }
+"route": {
+  "rules": [
+    { "protocol": "stun", "outbound": "block" },
+    { "protocol": "quic", "outbound": "block" }
+  ],
+  "final": "direct"
+}
 }
 EOF
 
-cat > /etc/s-box/sb11.json <<EOF
+    cat > /etc/s-box/sb11.json <<EOF
 {
 "log": { "disabled": false, "level": "info", "timestamp": true },
 "inbounds": [
@@ -610,7 +616,13 @@ cat > /etc/s-box/sb11.json <<EOF
     { "type": "direct", "tag": "vps-outbound-v4", "domain_strategy": "prefer_ipv4" },
     { "type": "direct", "tag": "vps-outbound-v6", "domain_strategy": "prefer_ipv6" }
 ],
-"route": { "rules": [ { "action": "sniff" }, { "outbound": "direct", "network": "udp,tcp" } ] }
+"route": {
+  "rules": [
+    { "protocol": "stun", "outbound": "block" },
+    { "protocol": "quic", "outbound": "block" }
+  ],
+  "final": "direct"
+}
 }
 EOF
 sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' | cut -d '.' -f 1,2)
@@ -628,6 +640,9 @@ command_background=true
 pidfile="/var/run/sing-box.pid"' > /etc/init.d/sing-box
 chmod +x /etc/init.d/sing-box
 rc-update add sing-box default
+# 配置校驗
+if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json; then
+    red "配置校驗失敗，未啟動服務。請檢查 /etc/s-box/sb.json"; return 1; fi
 rc-service sing-box start
 else
 cat > /etc/systemd/system/sing-box.service <<EOF
@@ -648,8 +663,16 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable sing-box >/dev/null 2>&1
+# 配置校驗
+if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json; then
+    red "配置校驗失敗，未啟動服務。請檢查 /etc/s-box/sb.json"; return 1; fi
 systemctl start sing-box
 systemctl restart sing-box
+# 健康檢查
+if ! systemctl -q is-active sing-box; then
+    red "Sing-box 服務未運行。最近的錯誤："
+    journalctl -u sing-box -n 50 --no-pager || true
+fi
 fi
 }
 
@@ -971,10 +994,10 @@ changeserv(){
 showprotocol(){
     if [[ ! -f /etc/s-box/sb.json ]]; then return; fi
     local vl_port vm_port hy2_port tu_port
-    vl_port=$(jq -r '.inbounds[] | select(.type=="vless")     .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    vm_port=$(jq -r '.inbounds[] | select(.type=="vmess")     .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    hy2_port=$(jq -r '.inbounds[] | select(.type=="hysteria2") .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    tu_port=$(jq -r '.inbounds[] | select(.type=="tuic")      .listen_port' /etc/s-box/sb.json 2>/dev/null)
+    vl_port=$(jq -r '.inbounds[] | select(.type=="vless")    | .listen_port'    /etc/s-box/sb.json 2>/dev/null)
+    vm_port=$(jq -r '.inbounds[] | select(.type=="vmess")    | .listen_port'    /etc/s-box/sb.json 2>/dev/null)
+    hy2_port=$(jq -r '.inbounds[] | select(.type=="hysteria2")| .listen_port'    /etc/s-box/sb.json 2>/dev/null)
+    tu_port=$(jq -r '.inbounds[] | select(.type=="tuic")     | .listen_port'    /etc/s-box/sb.json 2>/dev/null)
     [[ -n "$vl_port"  ]] && blue "VLESS-REALITY  端口：$vl_port"
     [[ -n "$vm_port"  ]] && blue "VMESS-WS       端口：$vm_port"
     [[ -n "$hy2_port" ]] && blue "HY2            端口：$hy2_port"
