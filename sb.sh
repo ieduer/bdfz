@@ -492,20 +492,44 @@ insport(){
  # --- Reality materials (generate if missing) ---
 generate_reality_materials() {
     ensure_dirs
-    # Generate Reality keypair once (sing-box >=1.9 outputs JSON)
-    if [[ ! -s /etc/s-box/public.key || -z "${private_key:-}" ]]; then
-        if /etc/s-box/sing-box generate reality-keypair >/etc/s-box/reality.json 2>/dev/null; then
-            private_key=$(jq -r '.private_key' /etc/s-box/reality.json)
-            jq -r '.public_key' /etc/s-box/reality.json > /etc/s-box/public.key
+    local out="/etc/s-box/reality.out"
+    local pubfile="/etc/s-box/public.key"
+    local rk pub
+
+    # Only (re)generate if we don't have a public key file or the private_key var is empty
+    if [[ ! -s "$pubfile" || -z "${private_key:-}" ]]; then
+        # Capture generator output (some versions print JSON, others plain text)
+        /etc/s-box/sing-box generate reality-keypair >"$out" 2>/dev/null || true
+
+        # Try JSON first
+        if jq -e -r '.private_key,.public_key' "$out" >/dev/null 2>&1; then
+            private_key=$(jq -r '.private_key' "$out")
+            jq -r '.public_key' "$out" > "$pubfile"
         else
-            # Older versions print as "PrivateKey: ...", "PublicKey: ..."
-            rk=$(/etc/s-box/sing-box generate reality-keypair 2>/dev/null || true)
-            private_key=$(echo "$rk" | awk -F': ' '/Private/{print $2}')
-            echo "$rk" | awk -F': ' '/Public/{print $2}' > /etc/s-box/public.key
+            # Fallback: parse textual formats like:
+            #   PrivateKey: xxxxx
+            #   PublicKey:  yyyyy
+            private_key=$(awk -F'[: ]+' 'BEGIN{IGNORECASE=1} /Private[ _-]*Key/{print $NF; exit}' "$out")
+            pub=$(awk -F'[: ]+' 'BEGIN{IGNORECASE=1} /Public[ _-]*Key/{print $NF; exit}' "$out")
+
+            # If still empty, try capturing to a variable (some builds write to stderr)
+            if [[ -z "$private_key" || -z "$pub" ]]; then
+                rk=$(/etc/s-box/sing-box generate reality-keypair 2>/dev/null || true)
+                private_key=${private_key:-$(echo "$rk" | awk -F'[: ]+' 'BEGIN{IGNORECASE=1} /Private[ _-]*Key/{print $NF; exit}')}
+                pub=${pub:-$(echo "$rk" | awk -F'[: ]+' 'BEGIN{IGNORECASE=1} /Public[ _-]*Key/{print $NF; exit}')}
+            fi
+
+            if [[ -n "$private_key" && -n "$pub" ]]; then
+                printf '%s\n' "$pub" > "$pubfile"
+            else
+                red "生成 Reality 密鑰失敗，請確認 /etc/s-box/sing-box 是否可執行與兼容。"
+                exit 1
+            fi
         fi
     fi
+
     # short_id is an 8-16 hex string
-    : "${short_id:=$(head -c 8 /dev/urandom | hexdump -e '1/1 "%02x"')}"
+    : "${short_id:=$(head -c 8 /dev/urandom | hexdump -e '1/1 \"%02x\"')}"
 }
 
 # Sane defaults if證書部分未配置
