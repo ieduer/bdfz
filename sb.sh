@@ -111,7 +111,7 @@ install_shortcut(){
     local target="/usr/local/bin/sb"
     local self_path
     self_path="$(realpath "${BASH_SOURCE[0]:-$0}")"
-    if [[ ! -x "$target" ]] || ! grep -q "$self_path" "$target" 2>/dev/null; then
+    if [[ ! -f "$target" ]] || ! grep -qF "$self_path" "$target" 2>/dev/null; then
         echo "#!/usr/bin/env bash" > "$target"
         echo "exec \"$self_path\" \"\$@\"" >> "$target"
         chmod +x "$target"
@@ -129,15 +129,11 @@ v6_setup(){
     if ! curl -fsS4m5 --retry 2 icanhazip.com >/dev/null 2>&1; then
         yellow "檢測到 純IPV6 VPS，添加NAT64"
         echo -e "nameserver 2a00:1098:2b::1\nnameserver 2a00:1098:2c::1" > /etc/resolv.conf
-        ipv="prefer_ipv6"
+        ipv4_strategy="ipv6_only"
+        ipv6_strategy="ipv6_only"
     else
-        ipv="prefer_ipv4"
-    fi
-
-    if curl -fsS6m5 --retry 2 icanhazip.com >/dev/null 2>&1; then
-        endip="2606:4700:d0::a29f:c001"
-    else
-        endip="162.159.192.1"
+        ipv4_strategy="prefer_ipv4"
+        ipv6_strategy="prefer_ipv6"
     fi
 }
 
@@ -301,7 +297,7 @@ rebuild_config_and_start(){
     readp "是否使用ACME證書? (y/n, 默認n使用自簽): " use_acme
     if [[ "${use_acme,,}" == "y" ]]; then
         if [[ ! -f /root/ieduerca/cert.crt || ! -s /root/ieduerca/cert.crt ]]; then
-            yellow "未找到有效的ACME證書，請先使用菜單10申請。"
+            yellow "未找到有效的ACME證書，將嘗試為您申請。"
             apply_acme_cert
         fi
         if [[ -f /root/ieduerca/cert.crt && -s /root/ieduerca/cert.crt ]]; then
@@ -344,10 +340,13 @@ rebuild_config_and_start(){
     # 4) 生成配置、防火牆、服務
     inssbjsonser
     configure_firewall "$port_vl_re" "$port_vm_ws" "$port_hy2" "$port_tu"
-    sbservice
+    if ! sbservice; then return 1; fi
 
     # 5) 生成輔助信息
-    ipuuid || true
+    if ! ipuuid; then 
+        red "IP UUID 信息生成失敗，請檢查服務狀態。"
+        return 1
+    fi
     gen_clash_sub || true
     green "配置已更新並啟動。"
 }
@@ -394,10 +393,10 @@ inssbjsonser(){
     
     ensure_dirs
     generate_reality_materials
-    cat > /etc/s-box/sb10.json <<EOF
+    cat > /etc/s-box/sb.json <<EOF
 {
-"log": { "disabled": false, "level": "info", "timestamp": true },
-"inbounds": [
+  "log": { "disabled": false, "level": "info", "timestamp": true },
+  "inbounds": [
     { "type": "vless", "sniff": true, "sniff_override_destination": true, "tag": "vless-sb", "listen": "::", "listen_port": ${port_vl_re},
       "users": [ { "uuid": "${uuid}", "flow": "xtls-rprx-vision" } ],
       "tls": { "enabled": true, "server_name": "${ym_vl_re}", "reality": { "enabled": true, "handshake": { "server": "${ym_vl_re}", "server_port": 443 }, "private_key": "$private_key", "short_id": ["$short_id"] } }
@@ -415,46 +414,15 @@ inssbjsonser(){
       "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr",
       "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" }
     }
-],
-"outbounds": [
-    { "type": "direct", "tag": "direct", "domain_strategy": "${ipv:-prefer_ipv4}" },
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct", "network": "tcp,udp", "override_address": "1.1.1.1", "domain_strategy": "${ipv4_strategy:-prefer_ipv4}" },
+    { "type": "direct", "tag": "direct-v6", "network": "tcp,udp", "override_address": "2606:4700:4700::1111", "domain_strategy": "${ipv6_strategy:-prefer_ipv6}" },
     { "type": "block", "tag": "block" }
-],
-"route": { "rules": [ { "protocol": ["quic", "stun"], "outbound": "block" }, { "outbound": "direct" } ] }
+  ],
+  "route": { "rules": [ { "protocol": ["quic", "stun"], "outbound": "block" }, { "outbound": "direct" } ] }
 }
 EOF
-
-    cat > /etc/s-box/sb11.json <<EOF
-{
-"log": { "disabled": false, "level": "info", "timestamp": true },
-"inbounds": [
-    { "type": "vless", "tag": "vless-sb", "listen": "::", "listen_port": ${port_vl_re},
-      "users": [ { "uuid": "${uuid}", "flow": "xtls-rprx-vision" } ],
-      "tls": { "enabled": true, "server_name": "${ym_vl_re}", "reality": { "enabled": true, "handshake": { "server": "${ym_vl_re}", "server_port": 443 }, "private_key": "$private_key", "short_id": ["$short_id"] } }
-    },
-    { "type": "vmess", "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws},
-      "users": [ { "uuid": "${uuid}", "alterId": 0 } ],
-      "transport": { "type": "ws", "path": "/${uuid}-vm", "max_early_data": 2048, "early_data_header_name": "Sec-WebSocket-Protocol" },
-      "tls":{ "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" }
-    }, 
-    { "type": "hysteria2", "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2},
-      "users": [ { "password": "${uuid}" } ], "ignore_client_bandwidth": false,
-      "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" }
-    },
-    { "type": "tuic", "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu},
-      "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr",
-      "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" }
-    }
-],
-"outbounds": [
-    { "type": "direct", "tag": "direct", "domain_strategy": "${ipv:-prefer_ipv4}" }
-],
-"route": { "rules": [ { "outbound": "direct" } ] }
-}
-EOF
-    local sbnh; sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' | cut -d '.' -f 1,2)
-    local num; [[ "$sbnh" == "1.10" ]] && num=10 || num=11
-    cp "/etc/s-box/sb${num}.json" /etc/s-box/sb.json
 }
 
 sbservice(){
@@ -495,9 +463,11 @@ EOF
             red "配置校驗失敗，未啟動服務。請檢查 /etc/s-box/sb.json"; return 1; 
         fi
         systemctl restart sing-box
+        sleep 2
         if ! systemctl -q is-active sing-box; then
             red "Sing-box 服務啟動失敗。最近的日誌："
             journalctl -u sing-box -n 20 --no-pager || true
+            return 1
         else
             green "Sing-box 服務已成功啟動。"
         fi
@@ -506,22 +476,20 @@ EOF
 
 ipuuid(){
     if [[ x"${release}" == x"alpine" ]]; then status_cmd="rc-service sing-box status"; status_pattern="started"; else status_cmd="systemctl status sing-box"; status_pattern="active"; fi
-    if [[ -n $($status_cmd 2>/dev/null | grep -w "$status_pattern") && -f '/etc/s-box/sb.json' ]]; then
-        v4v6
-        if [[ -n $v6 ]]; then
-            sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"
-        elif [[ -n $v4 ]]; then
-            sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$v4"; server_ipcl="$v4"
-        else
-            red "无法获取公網 IP 地址。" && return 1
-        fi
-        echo "$sbdnsip" > /etc/s-box/sbdnsip.log; echo "$server_ip" > /etc/s-box/server_ip.log; echo "$server_ipcl" > /etc/s-box/server_ipcl.log
-    else 
-        red "Sing-box服務未運行"; return 1; 
+    if [[ -z $($status_cmd 2>/dev/null | grep -w "$status_pattern") || ! -f '/etc/s-box/sb.json' ]]; then
+        red "Sing-box服務未運行或配置不存在。"
+        return 1
     fi
+    v4v6
+    if [[ -n $v6 ]]; then
+        sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"
+    elif [[ -n $v4 ]]; then
+        sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$v4"; server_ipcl="$v4"
+    else
+        red "无法获取公網 IP 地址。" && return 1
+    fi
+    echo "$sbdnsip" > /etc/s-box/sbdnsip.log; echo "$server_ip" > /etc/s-box/server_ip.log; echo "$server_ipcl" > /etc/s-box/server_ipcl.log
 }
-
-wgcfgo(){ ipuuid; }
 
 result_vl_vm_hy_tu(){
     if [[ -f /root/ieduerca/cert.crt && -s /root/ieduerca/cert.crt ]]; then 
@@ -547,8 +515,8 @@ resvless(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 resvmess(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; if [[ "$tls" = "false" ]]; then red "🚀【 vmess-ws 】"; vmess_json="{\"add\":\"$server_ipcl\",\"aid\":\"0\",\"host\":\"$vm_name\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$ws_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-$hostname\",\"tls\":\"\",\"type\":\"none\",\"v\":\"2\"}"; vmess_link="vmess://$(echo "$vmess_json" | base64_n0)"; echo "$vmess_link" > /etc/s-box/vm_ws.txt; else red "🚀【 vmess-ws-tls 】"; vmess_json="{\"add\":\"$vm_name\",\"aid\":\"0\",\"host\":\"$vm_name\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$ws_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-tls-$hostname\",\"tls\":\"tls\",\"sni\":\"$vm_name\",\"type\":\"none\",\"v\":\"2\"}"; vmess_link="vmess://$(echo "$vmess_json" | base64_n0)"; echo "$vmess_link" > /etc/s-box/vm_ws_tls.txt; fi; echo "分享链接："; echo -e "${yellow}$vmess_link${plain}"; echo "二维码："; qrencode -o - -t ANSIUTF8 "$vmess_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; }
 reshy2(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; hy2_link="hysteria2://$uuid@$cl_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=$hy2_ins&sni=$hy2_name#hy2-$hostname"; echo "$hy2_link" > /etc/s-box/hy2.txt; red "🚀【 Hysteria-2 】"; echo "分享链接："; echo -e "${yellow}$hy2_link${plain}"; echo "二维码："; qrencode -o - -t ANSIUTF8 "$hy2_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; }
 restu5(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; tuic5_link="tuic://$uuid:$uuid@$cl_tu5_ip:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&allow_insecure=$tu5_ins&allowInsecure=$tu5_ins#tu5-$hostname"; echo "$tuic5_link" > /etc/s-box/tuic5.txt; red "🚀【 Tuic-v5 】"; echo "分享链接："; echo -e "${yellow}$tuic5_link${plain}"; echo "二维码："; qrencode -o - -t ANSIUTF8 "$tuic5_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; }
+
 gen_clash_sub(){
-    # This function is unchanged, just including for completeness
     result_vl_vm_hy_tu
     local ws_path_client; ws_path_client=$(echo "$ws_path" | sed 's#^/##')
     local public_key; public_key=$(cat /etc/s-box/public.key 2>/dev/null)
@@ -573,6 +541,7 @@ gen_clash_sub(){
 }
 EOF
 }
+
 clash_sb_share(){
     if ! ipuuid; then
         red "Sing-box 服務未運行，無法生成分享鏈接。"
@@ -583,6 +552,7 @@ clash_sb_share(){
     if [[ "$gen_sub" == "y" ]]; then gen_clash_sub; fi
 }
 sbshare(){ clash_sb_share; }
+
 stclre(){
     echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"
     readp "選擇【0-3】：" act
@@ -592,7 +562,7 @@ stclre(){
         case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; *) return;; esac
     fi
 }
-upsbcroe(){ inssb; }
+
 sblog(){
     if [[ x"${release}" == x"alpine" ]]; then
         rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true
@@ -621,13 +591,14 @@ showprotocol(){
     [[ -n "$hy2_port" ]] && blue "HY2            端口：$hy2_port"
     [[ -n "$tu_port" ]] && blue "TUIC v5        端口：$tu_port"
 }
+
 install_bbr_local() {
     if [[ $vi =~ lxc|openvz ]]; then
         yellow "當前VPS的架構為 $vi，不支持安裝原版BBR。"
         return
     fi
     local kernel_version; kernel_version=$(uname -r | cut -d- -f1)
-    if dpkg --compare-versions "$kernel_version" "ge" "4.9" 2>/dev/null || (ver1=${kernel_version//./}; ver2=${"4.9"//./}; [ "$ver1" -ge "$ver2" ]); then
+    if (echo "$kernel_version" "4.9" | awk '{exit !($1 >= $2)}'); then
         green "當前內核版本 ($kernel_version) 已支持BBR。"
     else
         red "當前內核版本 ($kernel_version) 過低，不支持BBR。"
@@ -651,6 +622,7 @@ install_bbr_local() {
         red "BBR開啟可能未成功，請檢查：sysctl net.ipv4.tcp_available_congestion_control"
     fi
 }
+
 # --- 主菜單 ---
 main_menu() {
     clear
@@ -675,7 +647,7 @@ main_menu() {
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     
     if [[ -x '/etc/s-box/sing-box' ]]; then
-        corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}')
+        local corev; corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}')
         green "Sing-box 核心已安裝：$corev"
         showprotocol
     else
@@ -689,7 +661,7 @@ main_menu() {
      3 ) rebuild_config_and_start;;
      4 ) stclre;;
      5 ) upsbyg;; 
-     6 ) inssb;;
+     6 ) inssb;; # 更新內核即重裝
      7 ) clash_sb_share;;
      8 ) sblog;;
      9 ) install_bbr_local;;
