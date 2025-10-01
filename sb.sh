@@ -88,14 +88,8 @@ check_dependencies() {
     done
 
     if [ ${#missing_pkgs[@]} -gt 0 ]; then
-        yellow "檢測到缺少以下核心依賴: ${missing_pkgs[*]}"
-        readp "是否立即安裝? (y/n) " confirm
-        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-            install_dependencies
-        else
-            red "依賴不完整，腳本無法繼續。"
-            exit 1
-        fi
+        yellow "檢測到缺少以下核心依賴: ${missing_pkgs[*]}，將自動安裝。"
+        install_dependencies
     fi
 }
 
@@ -215,7 +209,7 @@ remove_firewall_rules() {
     green "防火牆規則已更新。"
 }
 
-# --- 證書管理 ---
+# --- 證書管理（保留ACME，默認自簽在 inscertificate） ---
 apply_acme_cert() {
     if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
         green "首次運行，正在安裝acme.sh證書申請客戶端..."
@@ -269,57 +263,20 @@ apply_acme_cert() {
     fi
 }
 
+# 默認自簽，無交互
 inscertificate(){
-    ymzs(){
-        ym_vl_re=apple.com
-        blue "Vless-reality的SNI域名默認為 apple.com"
-        blue "Vmess-ws, Hysteria-2, Tuic-v5 將使用 $(cat /root/ieduerca/ca.log 2>/dev/null) 證書並開啟SNI驗證"
-        tlsyn=true
-        ym_vm_ws=$(cat /root/ieduerca/ca.log 2>/dev/null)
-        certificatec_vmess_ws='/root/ieduerca/cert.crt'; certificatep_vmess_ws='/root/ieduerca/private.key'
-        certificatec_hy2='/root/ieduerca/cert.crt'; certificatep_hy2='/root/ieduerca/private.key'
-        certificatec_tuic='/root/ieduerca/cert.crt'; certificatep_tuic='/root/ieduerca/private.key'
-    }
-
-    zqzs(){
-        ym_vl_re=apple.com
-        blue "Vless-reality的SNI域名默認為 apple.com"
-        blue "Vmess-ws將關閉TLS，Hysteria-2、Tuic-v5將使用bing自簽證書並關閉SNI驗證"
-        tlsyn=false
-        ym_vm_ws=www.bing.com
-        certificatec_vmess_ws='/etc/s-box/cert.pem'; certificatep_vmess_ws='/etc/s-box/private.key'
-        certificatec_hy2='/etc/s-box/cert.pem'; certificatep_hy2='/etc/s-box/private.key'
-        certificatec_tuic='/etc/s-box/cert.pem'; certificatep_tuic='/etc/s-box/private.key'
-    }
-
-    red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green "二、生成並設置相關證書"
-    openssl ecparam -genkey -name prime256v1 -out /etc/s-box/private.key
-    openssl req -new -x509 -days 36500 -key /etc/s-box/private.key -out /etc/s-box/cert.pem -subj "/CN=www.bing.com"
-    green "bing.com 自簽證書生成成功。"
-
-    if [[ -f /root/ieduerca/cert.crt && -s /root/ieduerca/cert.crt ]]; then
-        yellow "檢測到已存在的Acme域名證書：$(cat /root/ieduerca/ca.log)"
-        readp "是否使用此證書? (y/n, 默認n使用自簽證書): " use_acme
-        if [[ "$use_acme" == "y" || "$use_acme" == "Y" ]]; then
-            ymzs
-        else
-            zqzs
-        fi
-    else
-        readp "是否現在申請一個免費的Acme域名證書? (y/n, 默認n使用自簽證書): " want_acme
-        if [[ "$want_acme" == "y" || "$want_acme" == "Y" ]]; then
-            apply_acme_cert
-            if [[ -f /root/ieduerca/cert.crt && -s /root/ieduerca/cert.crt ]]; then
-                ymzs
-            else
-                red "Acme證書申請失敗，將繼續使用自簽證書。"
-                zqzs
-            fi
-        else
-            zqzs
-        fi
-    fi
+    # 默認使用自簽；如需 ACME，請用菜單 10 申請後再執行「變更配置」
+    ym_vl_re=apple.com
+    tlsyn=false
+    ym_vm_ws=www.bing.com
+    ensure_dirs
+    openssl ecparam -genkey -name prime256v1 -out /etc/s-box/private.key >/dev/null 2>&1 || true
+    openssl req -new -x509 -days 36500 -key /etc/s-box/private.key -out /etc/s-box/cert.pem -subj "/CN=www.bing.com" >/dev/null 2>&1 || true
+    certificatec_vmess_ws='/etc/s-box/cert.pem'; certificatep_vmess_ws='/etc/s-box/private.key'
+    certificatec_hy2='/etc/s-box/cert.pem';    certificatep_hy2='/etc/s-box/private.key'
+    certificatec_tuic='/etc/s-box/cert.pem';   certificatep_tuic='/etc/s-box/private.key'
+    blue "Vless-reality 的 SNI 默認：apple.com"
+    blue "Vmess-ws 默認關閉 TLS；Hysteria-2 / Tuic-v5 使用自簽，關閉嚴格驗證"
 }
 
 # --- 端口管理 ---
@@ -332,42 +289,30 @@ check_port_in_use() {
     fi
 }
 
-chooseport(){
-    local port=""
-    local user_input_port=$1
-    while true; do
-        if [[ -n "$user_input_port" ]]; then
-            port=$user_input_port
-            user_input_port="" # 只使用一次用戶輸入
-        else
-            port=$(shuf -i 10000-65535 -n 1)
-        fi
-
-        if ! check_port_in_use "$port"; then
-            blue "確認的端口：$port"
-            break
-        else
-            yellow "端口 $port 被占用，請重新輸入或留空以隨機生成。"
-            readp "自定義端口: " port
-        fi
+# 非常用端口自動選擇
+pick_uncommon_ports(){
+    local exclude_ports="22 53 80 123 443 587 110 143 993 995 3306 5432 6379 8080 8443 25 21 3389 1521 27017 5000 8888 27015 25565"
+    local chosen=()
+    while [ ${#chosen[@]} -lt 4 ]; do
+        local p; p=$(shuf -i 20000-65000 -n 1)
+        if echo " $exclude_ports " | grep -q " $p "; then continue; fi
+        if check_port_in_use "$p"; then continue; fi
+        local dup=0; for c in "${chosen[@]}"; do [[ "$c" == "$p" ]] && dup=1 && break; done
+        [[ $dup -eq 1 ]] && continue
+        chosen+=("$p")
     done
+    port_vl_re=${chosen[0]}
+    port_vm_ws=${chosen[1]}
+    port_hy2=${chosen[2]}
+    port_tu=${chosen[3]}
 }
 
 # --- sing-box核心安裝與配置 ---
 inssb(){
     ensure_dirs
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green "選擇內核版本 (1.10系列支持geosite分流, 之後版本不支持)"
-    yellow "1：最新正式版 (回車默認)"
-    yellow "2：1.10.x 最新版"
-    readp "請選擇【1-2】：" menu
-    
-    if [ -z "$menu" ] || [ "$menu" = "1" ] ; then
-        sbcore=$(curl -Ls https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | grep -Eo '"[0-9.]+",' | sed -n 1p | tr -d '",')
-    else
-        sbcore=$(curl -Ls https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | grep -Eo '"1\.10[0-9\.]*",'  | sed -n 1p | tr -d '",')
-    fi
-    
+    green "自動選擇並安裝 Sing-box 最新正式版（默認）"
+    sbcore=$(curl -Ls https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | grep -Eo '"[0-9.]+"' | sed -n 1p | tr -d '",')
     if [ -z "$sbcore" ]; then
         red "獲取Sing-box版本號失敗，請檢查網絡。" && exit 1
     fi
@@ -417,18 +362,8 @@ auto_config_and_start(){
     certificatec_hy2='/etc/s-box/cert.pem';    certificatep_hy2='/etc/s-box/private.key'
     certificatec_tuic='/etc/s-box/cert.pem';   certificatep_tuic='/etc/s-box/private.key'
 
-    # 2) 端口（隨機且避占用，無交互）
-    ports=()
-    for i in {1..4}; do
-        while true; do
-            p_temp=$(shuf -i 10000-65535 -n 1)
-            if ! [[ " ${ports[@]} " =~ " $p_temp " ]] && ! check_port_in_use "$p_temp"; then
-                ports+=("$p_temp")
-                break
-            fi
-        done
-    done
-    port_vl_re=${ports[0]}; port_vm_ws=${ports[1]}; port_hy2=${ports[2]}; port_tu=${ports[3]}
+    # 2) 端口（自動選擇非常用端口，無交互）
+    pick_uncommon_ports
 
     # 3) UUID、Reality材料、網絡策略
     uuid=$(/etc/s-box/sing-box generate uuid)
@@ -441,9 +376,9 @@ auto_config_and_start(){
     sbservice
 
     # 5) 生成出站/訂閱輔助信息
-    ipuuid
-    result_vl_vm_hy_tu
-    gen_clash_sub
+    ipuuid || true
+    result_vl_vm_hy_tu || true
+    gen_clash_sub || true
 
     green "默認配置已生成並啟動。配置文件：/etc/s-box/sb.json"
     yellow "節點與訂閱：/etc/s-box/{vl_reality.txt,vm_ws*.txt,hy2.txt,tuic5.txt,clash_sub.json}"
@@ -452,44 +387,22 @@ auto_config_and_start(){
 # Backward-compat wrapper for older menu typo
 instsllsingbox(){ inssb; }
 
+# 端口與 UUID（無交互）
 insport(){
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green "三、設置各協議端口"
-    readp "是否自定義每個協議端口? (y/n, 默認n隨機生成): " custom_port
-    if [[ "$custom_port" == "y" || "$custom_port" == "Y" ]]; then
-        readp "設置Vless-reality端口 [1-65535] (留空隨機): " p_in; chooseport "$p_in"; port_vl_re=$port
-        readp "設置Vmess-ws端口 [1-65535] (留空隨機): " p_in; chooseport "$p_in"; port_vm_ws=$port
-        readp "設置Hysteria2端口 [1-65535] (留空隨機): " p_in; chooseport "$p_in"; port_hy2=$port
-        readp "設置Tuic5端口 [1-65535] (留空隨機): " p_in; chooseport "$p_in"; port_tu=$port
-    else
-        ports=()
-        for i in {1..4}; do
-            local p_temp
-            while true; do
-                p_temp=$(shuf -i 10000-65535 -n 1)
-                if ! [[ " ${ports[@]} " =~ " $p_temp " ]] && ! check_port_in_use "$p_temp"; then
-                    ports+=("$p_temp")
-                    break
-                fi
-            done
-        done
-        port_vl_re=${ports[0]}; port_vm_ws=${ports[1]}; port_hy2=${ports[2]}; port_tu=${ports[3]}
-    fi
-
-    echo
-    blue "各協議端口確認如下"
+    green "三、設置各協議端口（自動選擇非常用端口，避免佔用）"
+    pick_uncommon_ports
     blue "Vless-reality端口：$port_vl_re"
     blue "Vmess-ws端口：$port_vm_ws"
     blue "Hysteria-2端口：$port_hy2"
     blue "Tuic-v5端口：$port_tu"
-    
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green "四、生成統一UUID"
     uuid=$(/etc/s-box/sing-box generate uuid)
     blue "已確認uuid (密碼)：${uuid}"
 }
 
- # --- Reality materials (generate if missing) ---
+# --- Reality materials (generate if missing) ---
 generate_reality_materials() {
     ensure_dirs
     local out="/etc/s-box/reality.out"
@@ -539,7 +452,7 @@ generate_reality_materials() {
     fi
 }
 
-# Sane defaults if證書部分未配置
+# Sane defaults if 證書部分未配置
 : "${ym_vl_re:=apple.com}"
 : "${tlsyn:=false}"
 : "${ym_vm_ws:=www.bing.com}"
@@ -654,7 +567,7 @@ WorkingDirectory=/root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=/etc/s-box/sing-box run -c /etc/s-box/sb.json
-ExecReload=/bin/kill -HUP \$MAINPID
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=infinity
@@ -680,22 +593,30 @@ ipuuid(){
 if [[ x"${release}" == x"alpine" ]]; then status_cmd="rc-service sing-box status"; status_pattern="started"; else status_cmd="systemctl status sing-box"; status_pattern="active"; fi
 if [[ -n $($status_cmd 2>/dev/null | grep -w "$status_pattern") && -f '/etc/s-box/sb.json' ]]; then
 v4v6
-if [[ -n $v4 && -n $v6 ]]; then
-green "双栈VPS需要选择IP配置输出，一般情况下nat vps建议选择IPV6"; yellow "1：使用IPV4配置输出 (回车默认) "; yellow "2：使用IPV6配置输出"; readp "请选择【1-2】：" menu
-if [ -z "$menu" ] || [ "$menu" = "1" ]; then sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$v4"; server_ipcl="$v4"; else sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"; fi
+if [[ -n $v6 ]]; then
+    sbdnsip='tls://[2001:4860:4860::8888]/dns-query'
+    server_ip="[$v6]"; server_ipcl="$v6"
+elif [[ -n $v4 ]]; then
+    sbdnsip='tls://8.8.8.8/dns-query'
+    server_ip="$v4"; server_ipcl="$v4"
 else
-serip=$(curl -s4m5 icanhazip.com -k || curl -s6m5 icanhazip.com -k)
-if [[ "$serip" =~ : ]]; then sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$serip]"; server_ipcl="$serip"; else sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$serip"; server_ipcl="$serip"; fi
+    serip=$(curl -s4m5 icanhazip.com -k || curl -s6m5 icanhazip.com -k)
+    if [[ "$serip" =~ : ]]; then sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$serip]"; server_ipcl="$serip"; else sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$serip"; server_ipcl="$serip"; fi
 fi
+
+# 保存
 echo "$sbdnsip" > /etc/s-box/sbdnsip.log; echo "$server_ip" > /etc/s-box/server_ip.log; echo "$server_ipcl" > /etc/s-box/server_ipcl.log
-else red "Sing-box服务未运行" && exit; fi
+else red "Sing-box服務未運行"; return 1; fi
 }
 
 wgcfgo(){ ipuuid; }
 
 # 綜合輸出分享與訂閱
 clash_sb_share(){
-    ipuuid
+    if ! ipuuid; then
+        red "Sing-box 服務未運行，請先選 1 安裝或 3 變更配置後啟動。"
+        return
+    fi
     result_vl_vm_hy_tu
     resvless
     resvmess
@@ -711,7 +632,7 @@ sbshare(){ clash_sb_share; }
 # 啟停/重啟
 stclre(){
     echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"
-    readp "選擇【0-3】:" act
+    readp "選擇【0-3】：" act
     if [[ x"${release}" == x"alpine" ]]; then
         case "$act" in
             1) rc-service sing-box restart;;
@@ -781,7 +702,7 @@ unins(){
 
 result_vl_vm_hy_tu(){
 if [[ -f /root/ieduerca/cert.crt && -f /root/ieduerca/private.key && -s /root/ieduerca/cert.crt && -s /root/ieduerca/private.key ]]; then ym=$(bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'); echo "$ym" > /root/ieduerca/ca.log; fi
-rm -rf /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt; sbdnsip=$(cat /etc/s-box/sbdnsip.log); server_ip=$(cat /etc/s-box/server_ip.log); server_ipcl=$(cat /etc/s-box/server_ipcl.log); uuid=$(jq -r '.inbounds[0].users[0].uuid' /etc/s-box/sb.json); vl_port=$(jq -r '.inbounds[0].listen_port' /etc/s-box/sb.json); vl_name=$(jq -r '.inbounds[0].tls.server_name' /etc/s-box/sb.json); public_key=$(cat /etc/s-box/public.key); short_id=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/s-box/sb.json); ws_path=$(jq -r '.inbounds[1].transport.path' /etc/s-box/sb.json); vm_port=$(jq -r '.inbounds[1].listen_port' /etc/s-box/sb.json); tls=$(jq -r '.inbounds[1].tls.enabled' /etc/s-box/sb.json); vm_name=$(jq -r '.inbounds[1].tls.server_name' /etc/s-box/sb.json)
+rm -rf /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt; sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null || echo 'tls://8.8.8.8/dns-query'); server_ip=$(cat /etc/s-box/server_ip.log 2>/dev/null || true); server_ipcl=$(cat /etc/s-box/server_ipcl.log 2>/dev/null || true); uuid=$(jq -r '.inbounds[0].users[0].uuid' /etc/s-box/sb.json); vl_port=$(jq -r '.inbounds[0].listen_port' /etc/s-box/sb.json); vl_name=$(jq -r '.inbounds[0].tls.server_name' /etc/s-box/sb.json); public_key=$(cat /etc/s-box/public.key); short_id=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/s-box/sb.json); ws_path=$(jq -r '.inbounds[1].transport.path' /etc/s-box/sb.json); vm_port=$(jq -r '.inbounds[1].listen_port' /etc/s-box/sb.json); tls=$(jq -r '.inbounds[1].tls.enabled' /etc/s-box/sb.json); vm_name=$(jq -r '.inbounds[1].tls.server_name' /etc/s-box/sb.json)
 if [[ "$tls" = "false" ]]; then vmadd_local=$server_ipcl; vmadd_are_local=$server_ip; else vmadd_local=$vm_name; vmadd_are_local=$vm_name; fi
 hy2_port=$(jq -r '.inbounds[2].listen_port' /etc/s-box/sb.json); ym=$(cat /root/ieduerca/ca.log 2>/dev/null); hy2_sniname=$(jq -r '.inbounds[2].tls.key_path' /etc/s-box/sb.json); if [[ "$hy2_sniname" = '/etc/s-box/private.key' ]]; then hy2_name=www.bing.com; sb_hy2_ip=$server_ip; cl_hy2_ip=$server_ipcl; ins_hy2=1; hy2_ins=true; else hy2_name=$ym; sb_hy2_ip=$ym; cl_hy2_ip=$ym; ins_hy2=0; hy2_ins=false; fi
 tu5_port=$(jq -r '.inbounds[3].listen_port' /etc/s-box/sb.json); tu5_sniname=$(jq -r '.inbounds[3].tls.key_path' /etc/s-box/sb.json); if [[ "$tu5_sniname" = '/etc/s-box/private.key' ]]; then tu5_name=www.bing.com; sb_tu5_ip=$server_ip; cl_tu5_ip=$server_ipcl; ins=1; tu5_ins=true; else tu5_name=$ym; sb_tu5_ip=$ym; cl_tu5_ip=$ym; ins=0; tu5_ins=false; fi
@@ -968,36 +889,33 @@ resvmess(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 reshy2(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; hy2_link="hysteria2://$uuid@$cl_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=$hy2_ins&sni=$hy2_name#hy2-$hostname"; echo "$hy2_link" > /etc/s-box/hy2.txt; red "🚀【 Hysteria-2 】节点信息如下："; echo; echo "分享链接："; echo -e "${yellow}$hy2_link${plain}"; echo; echo "二维码："; qrencode -o - -t ANSIUTF8 "$hy2_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; echo; }
 restu5(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; tuic5_link="tuic://$uuid:$uuid@$cl_tu5_ip:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&allow_insecure=$ins&allowInsecure=$ins#tu5-$hostname"; echo "$tuic5_link" > /etc/s-box/tuic5.txt; red "🚀【 Tuic-v5 】节点信息如下："; echo; echo "分享链接："; echo -e "${yellow}$tuic5_link${plain}"; echo; echo "二维码："; qrencode -o - -t ANSIUTF8 "$tuic5_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; echo; }
 
-# --- 交互變更配置流程 ---
+# --- 交互變更配置流程（已盡可能默認） ---
 changeserv(){
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green "變更配置流程開始：將引導你選擇證書/端口/IPv4/IPv6優先等參數"
-    # 證書（交互：ACME 或自簽）
+    green "變更配置流程開始：默認自簽證書 / 自動端口 / 自動IP優先"
     inscertificate
-    # 端口（交互或隨機）
     insport
-    # 網絡偏好（自動探測v4/v6）
     v6_setup
-    # 生成配置
     inssbjsonser
-    # 保存防火牆並啟動/重啟服務
     configure_firewall "$port_vl_re" "$port_vm_ws" "$port_hy2" "$port_tu"
     sbservice
-    # 生成節點與訂閱
-    ipuuid
-    result_vl_vm_hy_tu
-    gen_clash_sub
+    ipuuid || true
+    result_vl_vm_hy_tu || true
+    gen_clash_sub || true
     green "配置已更新並啟動。可在 /etc/s-box 查看相關文件。"
 }
 
 # --- 協議端口狀態摘要 ---
 showprotocol(){
-    if [[ ! -f /etc/s-box/sb.json ]]; then return; fi
+    if [[ ! -s /etc/s-box/sb.json ]] || ! jq -e . /etc/s-box/sb.json >/dev/null 2>&1; then
+        yellow "尚未生成運行配置（/etc/s-box/sb.json）。選擇【3】生成/調整配置，或按【1】安裝內核/依賴。"
+        return 0
+    fi
     local vl_port vm_port hy2_port tu_port
-    vl_port=$(jq -r '.inbounds[] | select(.type=="vless")    | .listen_port'    /etc/s-box/sb.json 2>/dev/null)
-    vm_port=$(jq -r '.inbounds[] | select(.type=="vmess")    | .listen_port'    /etc/s-box/sb.json 2>/dev/null)
-    hy2_port=$(jq -r '.inbounds[] | select(.type=="hysteria2")| .listen_port'    /etc/s-box/sb.json 2>/dev/null)
-    tu_port=$(jq -r '.inbounds[] | select(.type=="tuic")     | .listen_port'    /etc/s-box/sb.json 2>/dev/null)
+    vl_port=$(jq -r '.inbounds[]? | select(.type=="vless")      | .listen_port // empty' /etc/s-box/sb.json 2>/dev/null || true)
+    vm_port=$(jq -r '.inbounds[]? | select(.type=="vmess")      | .listen_port // empty' /etc/s-box/sb.json 2>/dev/null || true)
+    hy2_port=$(jq -r '.inbounds[]? | select(.type=="hysteria2")  | .listen_port // empty' /etc/s-box/sb.json 2>/dev/null || true)
+    tu_port=$(jq -r '.inbounds[]? | select(.type=="tuic")       | .listen_port // empty' /etc/s-box/sb.json 2>/dev/null || true)
     [[ -n "$vl_port"  ]] && blue "VLESS-REALITY  端口：$vl_port"
     [[ -n "$vm_port"  ]] && blue "VMESS-WS       端口：$vm_port"
     [[ -n "$hy2_port" ]] && blue "HY2            端口：$hy2_port"
@@ -1051,7 +969,6 @@ install_bbr_local() {
     fi
 }
 
-
 main_menu() {
     clear
     white "Vless-reality-vision、Vmess-ws(tls)、Hysteria-2、Tuic-v5 四協議共存腳本"
@@ -1089,7 +1006,7 @@ main_menu() {
         yellow "尚未生成運行配置（/etc/s-box/sb.json）。選擇【3】生成/調整配置，或按【1】安裝內核/依賴。"
     fi
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    readp "請輸入數字【0-13】:" Input
+    readp "請輸入數字【0-13】：" Input
     case "$Input" in  
      1 ) inssb;;
      2 ) unins;;
