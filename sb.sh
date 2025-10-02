@@ -3,12 +3,15 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-# --- 错误处理 ---
 trap 'code=$?; echo -e "\033[31m\033[01m[ERROR]\033[0m at line $LINENO while running: ${BASH_COMMAND} (exit $code)"; exit $code' ERR
+export LANG=en_US.UTF_8
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+blue='\033[0;36m'
+bblue='\033[0;34m'
+plain='\033[0m'
 
-# --- 颜色定义 ---
-export LANG=en_US.UTF-8
-red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; plain='\033[0m'
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
 yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
@@ -22,7 +25,6 @@ base64_n0() { if base64 --help 2>/dev/null | grep -q -- '--wrap'; then base64 --
 export sbfiles="/etc/s-box/sb.json"
 hostname=$(hostname)
 
-# --- 自我安装与引导 ---
 bootstrap_and_exec() {
     local permanent_path="/usr/local/lib/ieduer-sb.sh"
     local shortcut_path="/usr/local/bin/sb"
@@ -74,7 +76,7 @@ configure_firewall() {
 }
 
 remove_firewall_rules() {
-    if [[ ! -f /etc/s-box/sb.json ]]; then return; fi; green "正在移除防火牆規則..."; local ports_to_close=(); ports_to_close+=($(jq -r '.inbounds[].listen_port' /etc/s-box/sb.json 2>/dev/null))
+    if [[ ! -f /etc/s-box/sb.json ]]; then return; fi; green "正在移除防火牆規則..."; local ports_to_close=(); ports_to_close+=($(jq -r '.inbounds[].listen_port' /etc/s-box/sb.json 2>/dev/null || true))
     for port in "${ports_to_close[@]}"; do if [[ -n "$port" ]]; then iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true; iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true; fi; done
     if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; elif command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; elif [[ -d /etc/iptables ]]; then iptables-save >/etc/iptables/rules.v4 2>/dev/null || true; fi
     green "防火牆規則已更新。"
@@ -97,8 +99,22 @@ pick_uncommon_ports(){
 }
 
 inssb(){
-    ensure_dirs; red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; green "自動選擇並安裝 Sing-box 最新正式版"
-    sbcore=$(curl -Ls https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | grep -Eo '"[0-9.]+"' | head -n 1 | tr -d '"'); if [ -z "$sbcore" ]; then red "獲取版本號失敗"; exit 1; fi
+    ensure_dirs; red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; 
+    green "選擇內核版本安裝模式:"
+    yellow "1：最新正式版 (推薦，回車默認)"
+    yellow "2：最新 1.10.x 版 (兼容 geosite)"
+    yellow "3：手動輸入指定版本號"
+    readp "請選擇【1-3】：" menu
+    
+    local sbcore=""
+    case "$menu" in
+        2) sbcore=$(curl -Ls https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | grep -Eo '"1\.10[0-9\.]*"' | head -n 1 | tr -d '"') ;;
+        3) readp "請輸入版本號 (例如: 1.11.5): " sbcore ;;
+        *) sbcore=$(curl -Ls https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | grep -Eo '"[0-9.]+"' | head -n 1 | tr -d '"') ;;
+    esac
+
+    if [ -z "$sbcore" ]; then red "獲取或輸入的版本號無效"; exit 1; fi
+    
     green "正在下載 Sing-box v$sbcore ..."; local sbname="sing-box-$sbcore-linux-$cpu"
     curl -L -o /etc/s-box/sing-box.tar.gz -# --retry 2 "https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz"
     if [[ ! -s '/etc/s-box/sing-box.tar.gz' ]]; then red "下載內核失敗"; exit 1; fi
@@ -134,13 +150,13 @@ rebuild_config_and_start(){
     inssbjsonser; configure_firewall "$port_vl_re" "$port_vm_ws" "$port_hy2" "$port_tu"
     if ! sbservice; then return 1; fi
     if ! ipuuid; then red "IP UUID 信息生成失敗，請檢查服務狀態。"; return 1; fi
-    gen_clash_sub || true; green "配置已更新並啟動。"
+    gen_clash_sub || true; green "配置已更新並啟動。"; enable_bbr_autonomously
 }
 
 generate_reality_materials() {
     ensure_dirs; local pubfile="/etc/s-box/public.key"; local jsonfile="/etc/s-box/reality.json"; local rk pub; local private_key
     if [[ ! -s "$pubfile" ]]; then
-        local out; out=$(mktemp)
+        local out; out=$(mktemp);
         /etc/s-box/sing-box generate reality-keypair >"$out" 2>/dev/null || true
         if jq -e -r '.private_key,.public_key' "$out" >/dev/null 2>&1; then
             private_key=$(jq -r '.private_key' "$out"); jq -r '.public_key' "$out" > "$pubfile"
@@ -160,7 +176,28 @@ inssbjsonser(){
     : "${certificatec_vmess_ws:=/etc/s-box/cert.pem}"; : "${certificatep_vmess_ws:=/etc/s-box/private.key}"
     : "${certificatec_hy2:=/etc/s-box/cert.pem}"; : "${certificatep_hy2:=/etc/s-box/private.key}"
     : "${certificatec_tuic:=/etc/s-box/cert.pem}"; : "${certificatep_tuic:=/etc/s-box/private.key}"
-    cat > /etc/s-box/sb.json <<EOF
+    local sbnh; sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' | cut -d '.' -f 1,2)
+    local config_content=""
+    if [[ "$sbnh" == "1.10" ]]; then
+        config_content=$(cat <<EOF
+{
+  "log": { "disabled": false, "level": "info", "timestamp": true },
+  "inbounds": [
+    { "type": "vless", "sniff": true, "sniff_override_destination": true, "tag": "vless-sb", "listen": "::", "listen_port": ${port_vl_re}, "users": [ { "uuid": "${uuid}", "flow": "xtls-rprx-vision" } ], "tls": { "enabled": true, "server_name": "${ym_vl_re}", "reality": { "enabled": true, "handshake": { "server": "${ym_vl_re}", "server_port": 443 }, "private_key": "$private_key", "short_id": ["$short_id"] } } },
+    { "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws}, "users": [ { "uuid": "${uuid}", "alterId": 0 } ], "transport": { "type": "ws", "path": "/${uuid}-vm" }, "tls":{ "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" } }, 
+    { "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2}, "users": [ { "password": "${uuid}" } ], "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" } },
+    { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct", "domain_strategy": "${dns_strategy:-prefer_ipv4}" },
+    { "type": "block", "tag": "block" }
+  ],
+  "route": { "rules": [ { "geosite": ["cn"], "outbound": "direct"}, { "protocol": ["quic", "stun"], "outbound": "block" } ], "final": "direct" }
+}
+EOF
+)
+    else
+        config_content=$(cat <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
   "dns": { "strategy": "${dns_strategy:-prefer_ipv4}" },
@@ -174,6 +211,9 @@ inssbjsonser(){
   "route": { "rules": [ { "protocol": ["quic", "stun"], "outbound": "block" }, { "outbound": "direct" } ], "final": "direct" }
 }
 EOF
+)
+    fi
+    echo "$config_content" > /etc/s-box/sb.json
 }
 
 sbservice(){
@@ -256,6 +296,9 @@ gen_clash_sub(){
     result_vl_vm_hy_tu; local ws_path_client; ws_path_client=$(echo "$ws_path" | sed 's#^/##'); local public_key; public_key=$(cat /etc/s-box/public.key 2>/dev/null || true); local tag_vless="vless-${hostname}"; local tag_vmess="vmess-${hostname}"; local tag_hy2="hy2-${hostname}"; local tag_tuic="tuic5-${hostname}"; local sbdnsip; sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null); : "${sbdnsip:=tls://8.8.8.8/dns-query}"; cat > /etc/s-box/clash_sub.json <<EOF
 { "dns": { "servers": [ { "tag": "proxydns", "address": "${sbdnsip}", "detour": "select" }, { "tag": "localdns", "address": "h3://223.5.5.5/dns-query", "detour": "direct" } ] }, "outbounds": [ { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"] }, { "type": "vless", "tag": "${tag_vless}", "server": "${server_ipcl}", "server_port": ${vl_port}, "uuid": "${uuid}", "flow": "xtls-rprx-vision", "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" }, "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } }, { "type": "vmess", "tag": "${tag_vmess}", "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "transport": { "type": "ws", "path": "${ws_path_client}", "headers": { "Host": ["${vm_name}"] } }, "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "utls": { "enabled": true, "fingerprint": "chrome" } } }, { "type": "hysteria2", "tag": "${tag_hy2}", "server": "${cl_hy2_ip}", "server_port": ${hy2_port}, "password": "${uuid}", "tls": { "enabled": true, "server_name": "${hy2_name}", "insecure": ${hy2_ins}, "alpn": ["h3"] } }, { "type": "tuic", "tag": "${tag_tuic}", "server": "${cl_tu5_ip}", "server_port": ${tu5_port}, "uuid": "${uuid}", "password": "${uuid}", "congestion_control": "bbr", "tls": { "enabled": true, "server_name": "${tu5_name}", "insecure": ${tu5_ins}, "alpn": ["h3"] } }, { "tag": "direct", "type": "direct" }, { "tag": "auto", "type": "urltest", "outbounds": ["${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"], "url": "https://www.gstatic.com/generate_204", "interval": "1m" } ] }
 EOF
+    green "Clash/Mihomo 訂閱模板已生成：/etc/s-box/clash_sub.json"
+    echo; yellow "文件內容如下:"; echo
+    cat /etc/s-box/clash_sub.json
 }
 
 clash_sb_share(){ if ! ipuuid; then red "Sing-box 服務未運行，無法生成分享鏈接。"; return; fi; result_vl_vm_hy_tu; resvless; resvmess; reshy2; restu5; readp "是否生成/更新訂閱文件 (for Clash/Mihomo)? (y/n): " gen_sub; if [[ "${gen_sub,,}" == "y" ]]; then gen_clash_sub; fi; }
@@ -270,14 +313,15 @@ showprotocol(){
     [[ -n "$vl_port" ]] && blue "VLESS-REALITY  端口：$vl_port"; [[ -n "$vm_port" ]] && blue "VMESS-WS       端口：$vm_port"; [[ -n "$hy2_port" ]] && blue "HY2            端口：$hy2_port"; [[ -n "$tu_port" ]] && blue "TUIC v5        端口：$tu_port"
 }
 
-install_bbr_local() {
-    if [[ $vi =~ lxc|openvz ]]; then yellow "當前VPS的架構為 $vi，不支持安裝原版BBR。"; return; fi
-    local kernel_version; kernel_version=$(uname -r | cut -d- -f1); if (echo "$kernel_version" "4.9" | awk '{exit !($1 >= $2)}'); then green "當前內核版本 ($kernel_version) 已支持BBR。"; else red "當前內核版本 ($kernel_version) 過低，不支持BBR。"; yellow "請手動升級內核到 4.9 或更高版本。"; return; fi
-    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then green "BBR 已開啟，無需重複操作。"; return; fi
-    green "正在開啟BBR..."; sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf; sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+enable_bbr_autonomously() {
+    if [[ $vi =~ lxc|openvz ]]; then return 0; fi
+    local kernel_version; kernel_version=$(uname -r | cut -d- -f1); if ! (echo "$kernel_version" "4.9" | awk '{exit !($1 >= $2)}'); then return 0; fi
+    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then return 0; fi
+    green "檢測到支持BBR，正在自動開啟..."
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf; sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
     echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
     sysctl -p >/dev/null 2>&1; modprobe tcp_bbr 2>/dev/null || true
-    if sysctl net.ipv4.tcp_congestion_control | grep -qw "bbr" && sysctl net.ipv4.tcp_available_congestion_control | grep -qw "bbr"; then green "BBR已成功開啟並立即生效，無需重啟！"; else red "BBR開啟可能未成功，請檢查。"; fi
+    if sysctl net.ipv4.tcp_congestion_control | grep -qw "bbr"; then green "BBR已成功開啟並立即生效，無需重啟！"; else red "BBR開啟可能未成功。"; fi
 }
 
 unins(){
@@ -294,51 +338,44 @@ main_menu() {
     white "Vless-reality, Vmess-ws, Hysteria-2, Tuic-v5 四協議共存腳本"
     white "快捷命令：sb"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green " 1. 安裝/重裝 Sing-box" 
+    green " 1. 安裝/重裝 Sing-box (交互式)" 
     green " 2. 卸載 Sing-box"
     white "----------------------------------------------------------------------------------"
-    green " 3. 重置/變更配置 (交互式)"
-    green " 4. 服務管理 (啟/停/重啟)"
-    green " 5. 更新 Sing-box 腳本"
-    green " 6. 更新 Sing-box 內核"
+    green " 3. 服務管理 (啟/停/重啟)"
+    green " 4. 更新 Sing-box 腳本"
+    green " 5. 更新 Sing-box 內核"
     white "----------------------------------------------------------------------------------"
-    green " 7. 刷新並查看節點與配置"
-    green " 8. 查看 Sing-box 運行日誌"
-    green " 9. 一鍵開啟BBR (無重啟)"
-    green "10. 申請 Acme 域名證書"
-    green "11. 雙棧VPS切換IP配置輸出"
+    green " 6. 刷新並查看節點與配置"
+    green " 7. 查看 Sing-box 運行日誌"
+    green " 8. 申請 Acme 域名證書"
+    green " 9. 雙棧VPS切換IP配置輸出"
     white "----------------------------------------------------------------------------------"
     green " 0. 退出腳本"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     
     if [[ -x '/etc/s-box/sing-box' ]]; then local corev; corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}'); green "Sing-box 核心已安裝：$corev"; showprotocol; else yellow "Sing-box 核心未安裝，請先選 1 。"; fi
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    readp "請輸入數字【0-11】：" Input
+    readp "請輸入數字【0-9】：" Input
     case "$Input" in  
      1 ) inssb;;
      2 ) unins;;
-     3 ) rebuild_config_and_start;;
-     4 ) stclre;;
-     5 ) upsbyg;; 
-     6 ) inssb;;
-     7 ) clash_sb_share;;
-     8 ) sblog;;
-     9 ) install_bbr_local;;
-    10 ) apply_acme_cert;;
-    11 ) ipuuid && clash_sb_share;;
+     3 ) stclre;;
+     4 ) upsbyg;; 
+     5 ) inssb;;
+     6 ) clash_sb_share;;
+     7 ) sblog;;
+     8 ) apply_acme_cert;;
+     9 ) ipuuid && clash_sb_share;;
      * ) exit 
     esac
 }
 
 # --- 腳本入口 ---
 SELF_PATH=""
-# shellcheck disable=SC2128
 if [[ -n "${BASH_SOURCE[0]}" && -f "${BASH_SOURCE[0]}" ]]; then
     SELF_PATH="$(realpath "${BASH_SOURCE[0]}")"
 fi
-
 PERMANENT_PATH="/usr/local/lib/ieduer-sb.sh"
-
 if [[ -z "$SELF_PATH" ]] || [[ "$SELF_PATH" != "$PERMANENT_PATH" ]]; then
     bootstrap_and_exec "$@"
     exit 0
