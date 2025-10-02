@@ -27,24 +27,15 @@ base64_n0() {
 export sbfiles="/etc/s-box/sb.json"
 hostname=$(hostname)
 
-# --- 自我複製與快捷方式安裝 ---
-self_install() {
-    local self_path; self_path="$(realpath "${BASH_SOURCE[0]:-$0}")"
+install_and_exec() {
     local permanent_path="/usr/local/lib/ieduer-sb.sh"
     local shortcut_path="/usr/local/bin/sb"
-
-    if [[ "$self_path" != "$permanent_path" ]]; then
-        green "首次運行，正在將腳本安裝到 $permanent_path"
-        cp "$self_path" "$permanent_path"
-        chmod +x "$permanent_path"
-        # 重新執行永久位置的腳本
-        exec "$permanent_path" "$@"
-    fi
-    
-    if [[ ! -L "$shortcut_path" ]] || [[ "$(readlink -f "$shortcut_path")" != "$permanent_path" ]]; then
-        ln -sf "$permanent_path" "$shortcut_path"
-        green "已安裝快捷命令：sb"
-    fi
+    local script_url="https://raw.githubusercontent.com/ieduer/bdfz/main/sb.sh"
+    if ! command -v wget &>/dev/null && ! command -v curl &>/dev/null; then red "wget 和 curl 都不可用，无法下载脚本。"; exit 1; fi
+    green "正在下载最新脚本到 $permanent_path ..."
+    if command -v curl &>/dev/null; then curl -fsSL "$script_url" -o "$permanent_path"; else wget -qO "$permanent_path" "$script_url"; fi
+    if [[ ! -s "$permanent_path" ]]; then red "脚本下载失败，请检查网络或链接。"; exit 1; fi
+    chmod +x "$permanent_path"; ln -sf "$permanent_path" "$shortcut_path"; green "已安装/更新快捷命令：sb"; exec "$shortcut_path" "$@"
 }
 
 check_os() {
@@ -67,7 +58,6 @@ install_dependencies() {
 }
 
 ensure_dirs() { mkdir -p /etc/s-box /root/ieduerca; chmod 700 /etc/s-box; }
-
 v4v6(){ v4=$(curl -fsS4m5 --retry 2 icanhazip.com || true); v6=$(curl -fsS6m5 --retry 2 icanhazip.com || true); }
 
 v6_setup(){
@@ -151,8 +141,8 @@ rebuild_config_and_start(){
 }
 
 generate_reality_materials() {
-    ensure_dirs; local pubfile="/etc/s-box/public.key"; local jsonfile="/etc/s-box/reality.json"; local rk pub
-    if [[ ! -s "$pubfile" || -z "${private_key:-}" ]]; then
+    ensure_dirs; local pubfile="/etc/s-box/public.key"; local jsonfile="/etc/s-box/reality.json"; local rk pub; local private_key
+    if [[ ! -s "$pubfile" ]]; then
         local out; out=$(mktemp)
         /etc/s-box/sing-box generate reality-keypair >"$out" 2>/dev/null || true
         if jq -e -r '.private_key,.public_key' "$out" >/dev/null 2>&1; then
@@ -164,6 +154,7 @@ generate_reality_materials() {
         fi; rm -f "$out"
     fi
     : "${short_id:=$(head -c 8 /dev/urandom | hexdump -e '1/1 "%02x"' 2>/dev/null || openssl rand -hex 8)}"
+    if [[ -z "${private_key:-}" ]]; then private_key=$(jq -r .private_key "$jsonfile" 2>/dev/null || true); fi 
     if [[ -n "${private_key:-}" && -s "$pubfile" ]]; then pub=$(cat "$pubfile"); printf '{ "private_key": "%s", "public_key": "%s" }\n' "$private_key" "$pub" > "$jsonfile"; fi
 }
 
@@ -180,10 +171,7 @@ inssbjsonser(){
     { "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2}, "users": [ { "password": "${uuid}" } ], "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" } },
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
-  "outbounds": [
-    { "type": "direct", "tag": "direct" },
-    { "type": "block", "tag": "block" }
-  ],
+  "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ],
   "route": { "rules": [ { "protocol": ["quic", "stun"], "outbound": "block" }, { "outbound": "direct" } ], "final": "direct" }
 }
 EOF
@@ -266,35 +254,15 @@ reshy2(){ echo; white "~~~~~~~~~~~~~~~~~"; hy2_link="hysteria2://$uuid@$cl_hy2_i
 restu5(){ echo; white "~~~~~~~~~~~~~~~~~"; tuic5_link="tuic://$uuid:$uuid@$cl_tu5_ip:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&allow_insecure=$tu5_ins&allowInsecure=$tu5_ins#tuic5-$hostname"; echo "$tuic5_link" > /etc/s-box/tuic5.txt; red "🚀 TUIC-v5"; echo "链接:"; echo -e "${yellow}$tuic5_link${plain}"; echo "二维码:"; qrencode -o - -t ANSIUTF8 "$tuic5_link"; }
 
 gen_clash_sub(){
-    result_vl_vm_hy_tu
-    local ws_path_client; ws_path_client=$(echo "$ws_path" | sed 's#^/##')
-    local public_key; public_key=$(cat /etc/s-box/public.key 2>/dev/null || true)
-    local tag_vless="vless-${hostname}"; local tag_vmess="vmess-${hostname}"; local tag_hy2="hy2-${hostname}"; local tag_tuic="tuic5-${hostname}"
-    local sbdnsip; sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null); : "${sbdnsip:=tls://8.8.8.8/dns-query}"
-    cat > /etc/s-box/clash_sub.json <<EOF
+    result_vl_vm_hy_tu; local ws_path_client; ws_path_client=$(echo "$ws_path" | sed 's#^/##'); local public_key; public_key=$(cat /etc/s-box/public.key 2>/dev/null || true); local tag_vless="vless-${hostname}"; local tag_vmess="vmess-${hostname}"; local tag_hy2="hy2-${hostname}"; local tag_tuic="tuic5-${hostname}"; local sbdnsip; sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null); : "${sbdnsip:=tls://8.8.8.8/dns-query}"; cat > /etc/s-box/clash_sub.json <<EOF
 { "dns": { "servers": [ { "tag": "proxydns", "address": "${sbdnsip}", "detour": "select" }, { "tag": "localdns", "address": "h3://223.5.5.5/dns-query", "detour": "direct" } ] }, "outbounds": [ { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"] }, { "type": "vless", "tag": "${tag_vless}", "server": "${server_ipcl}", "server_port": ${vl_port}, "uuid": "${uuid}", "flow": "xtls-rprx-vision", "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" }, "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } }, { "type": "vmess", "tag": "${tag_vmess}", "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "transport": { "type": "ws", "path": "${ws_path_client}", "headers": { "Host": ["${vm_name}"] } }, "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "utls": { "enabled": true, "fingerprint": "chrome" } } }, { "type": "hysteria2", "tag": "${tag_hy2}", "server": "${cl_hy2_ip}", "server_port": ${hy2_port}, "password": "${uuid}", "tls": { "enabled": true, "server_name": "${hy2_name}", "insecure": ${hy2_ins}, "alpn": ["h3"] } }, { "type": "tuic", "tag": "${tag_tuic}", "server": "${cl_tu5_ip}", "server_port": ${tu5_port}, "uuid": "${uuid}", "password": "${uuid}", "congestion_control": "bbr", "tls": { "enabled": true, "server_name": "${tu5_name}", "insecure": ${tu5_ins}, "alpn": ["h3"] } }, { "tag": "direct", "type": "direct" }, { "tag": "auto", "type": "urltest", "outbounds": ["${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"], "url": "https://www.gstatic.com/generate_204", "interval": "1m" } ] }
 EOF
 }
 
-clash_sb_share(){
-    if ! ipuuid; then red "Sing-box 服務未運行，無法生成分享鏈接。"; return; fi
-    result_vl_vm_hy_tu; resvless; resvmess; reshy2; restu5
-    readp "是否生成/更新訂閱文件 (for Clash/Mihomo)? (y/n): " gen_sub
-    if [[ "${gen_sub,,}" == "y" ]]; then gen_clash_sub; fi
-}
-sbshare(){ clash_sb_share; }
-
-stclre(){
-    echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"; readp "選擇【0-3】：" act
-    if [[ x"${release}" == x"alpine" ]]; then
-        case "$act" in 1) rc-service sing-box restart;; 2) rc-service sing-box stop;; 3) rc-service sing-box start;; *) return;; esac
-    else
-        case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; *) return;; esac
-    fi
-}
-
+clash_sb_share(){ if ! ipuuid; then red "Sing-box 服務未運行，無法生成分享鏈接。"; return; fi; result_vl_vm_hy_tu; resvless; resvmess; reshy2; restu5; readp "是否生成/更新訂閱文件 (for Clash/Mihomo)? (y/n): " gen_sub; if [[ "${gen_sub,,}" == "y" ]]; then gen_clash_sub; fi; }
+stclre(){ echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"; readp "選擇【0-3】：" act; if [[ x"${release}" == x"alpine" ]]; then case "$act" in 1) rc-service sing-box restart;; 2) rc-service sing-box stop;; 3) rc-service sing-box start;; *) return;; esac; else case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; *) return;; esac; fi; }
 sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; }
-upsbyg(){ yellow "請從源地址獲取最新腳本覆蓋當前文件。"; }
+upsbyg(){ yellow "正在嘗試更新..."; install_and_exec; }
 sbsm(){ blue "安裝內核 → 自動生成默認配置 → 開機自啟。"; blue "可用功能：變更證書/端口、生成訂閱、查看日誌、開啟BBR。"; blue "分享/訂閱輸出：選 7 或 11。產物在 /etc/s-box/"; }
 
 showprotocol(){
@@ -332,7 +300,7 @@ main_menu() {
     white "----------------------------------------------------------------------------------"
     green " 3. 重置/變更配置 (交互式)"
     green " 4. 服務管理 (啟/停/重啟)"
-    green " 5. 更新 Sing-box 腳本 (手動)"
+    green " 5. 更新 Sing-box 腳本"
     green " 6. 更新 Sing-box 內核"
     white "----------------------------------------------------------------------------------"
     green " 7. 刷新並查看節點與配置"
@@ -344,11 +312,7 @@ main_menu() {
     green " 0. 退出腳本"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     
-    if [[ -x '/etc/s-box/sing-box' ]]; then
-        local corev; corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}'); green "Sing-box 核心已安裝：$corev"; showprotocol
-    else
-        yellow "Sing-box 核心未安裝，請先選 1 。"
-    fi
+    if [[ -x '/etc/s-box/sing-box' ]]; then local corev; corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}'); green "Sing-box 核心已安裝：$corev"; showprotocol; else yellow "Sing-box 核心未安裝，請先選 1 。"; fi
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     readp "請輸入數字【0-11】：" Input
     case "$Input" in  
@@ -367,8 +331,12 @@ main_menu() {
     esac
 }
 
-check_os
-check_dependencies
-ensure_dirs
-self_install
-main_menu
+# --- 腳本入口 ---
+if [[ "${BASH_SOURCE[0]}" == "/usr/local/lib/ieduer-sb.sh" || -z "${BASH_SOURCE[0]}" ]]; then
+    check_os
+    check_dependencies
+    ensure_dirs
+    main_menu
+else
+    install_and_exec "$@"
+fi
