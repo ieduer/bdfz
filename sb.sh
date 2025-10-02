@@ -24,77 +24,64 @@ base64_n0() {
 }
 
 [[ $EUID -ne 0 ]] && yellow "請以root模式運行腳本" && exit
-export sbfiles="/etc/s-box/sb10.json /etc/s-box/sb11.json /etc/s-box/sb.json"
+export sbfiles="/etc/s-box/sb.json"
 hostname=$(hostname)
 
-check_os() {
-    if [[ -r /etc/os-release ]]; then
-        . /etc/os-release
-        case "${ID,,}" in
-            ubuntu|debian) release="Debian" ;;
-            centos|rhel|rocky|almalinux) release="Centos" ;;
-            alpine) release="alpine" ;;
-            *) red "腳本不支持當前的系統 (${PRETTY_NAME:-unknown})。" && exit 1 ;;
-        esac
-        op="${PRETTY_NAME:-$ID}"
-    else
-        if [[ -f /etc/redhat-release ]]; then release="Centos"; op=$(cat /etc/redhat-release); elif grep -qi alpine /etc/issue 2>/dev/null; then release="alpine"; op="Alpine"; else red "无法识别的操作系统。" && exit 1; fi
+# --- 自我複製與快捷方式安裝 ---
+self_install() {
+    local self_path; self_path="$(realpath "${BASH_SOURCE[0]:-$0}")"
+    local permanent_path="/usr/local/lib/ieduer-sb.sh"
+    local shortcut_path="/usr/local/bin/sb"
+
+    if [[ "$self_path" != "$permanent_path" ]]; then
+        green "首次運行，正在將腳本安裝到 $permanent_path"
+        cp "$self_path" "$permanent_path"
+        chmod +x "$permanent_path"
+        # 重新執行永久位置的腳本
+        exec "$permanent_path" "$@"
     fi
-    case "$(uname -m)" in
-        armv7l) cpu=armv7 ;; aarch64) cpu=arm64 ;; x86_64) cpu=amd64 ;; *) red "目前腳本不支持 $(uname -m) 架構" && exit 1 ;;
-    esac
+    
+    if [[ ! -L "$shortcut_path" ]] || [[ "$(readlink -f "$shortcut_path")" != "$permanent_path" ]]; then
+        ln -sf "$permanent_path" "$shortcut_path"
+        green "已安裝快捷命令：sb"
+    fi
+}
+
+check_os() {
+    if [[ -r /etc/os-release ]]; then . /etc/os-release; case "${ID,,}" in ubuntu|debian) release="Debian" ;; centos|rhel|rocky|almalinux) release="Centos" ;; alpine) release="alpine" ;; *) red "不支持的系統 (${PRETTY_NAME:-unknown})。" && exit 1 ;; esac; op="${PRETTY_NAME:-$ID}"; else red "无法识别的操作系统。" && exit 1; fi
+    case "$(uname -m)" in armv7l) cpu=armv7 ;; aarch64) cpu=arm64 ;; x86_64) cpu=amd64 ;; *) red "不支持的架構 $(uname -m)" && exit 1 ;; esac
     vi=$(command -v systemd-detect-virt &>/dev/null && systemd-detect-virt || command -v virt-what &>/dev/null && virt-what || echo "unknown")
 }
 
 check_dependencies() {
-    local pkgs=("curl" "openssl" "iptables" "tar" "wget" "jq" "socat" "qrencode" "git" "ss" "lsof" "virt-what")
-    local missing_pkgs=()
+    local pkgs=("curl" "openssl" "iptables" "tar" "wget" "jq" "socat" "qrencode" "git" "ss" "lsof" "virt-what"); local missing_pkgs=()
     for pkg in "${pkgs[@]}"; do if ! command -v "$pkg" &> /dev/null; then missing_pkgs+=("$pkg"); fi; done
-    if [ ${#missing_pkgs[@]} -gt 0 ]; then
-        yellow "檢測到缺少以下核心依賴: ${missing_pkgs[*]}，將自動安裝。"
-        install_dependencies
-    fi
+    if [ ${#missing_pkgs[@]} -gt 0 ]; then yellow "檢測到缺少依賴: ${missing_pkgs[*]}，將自動安裝。"; install_dependencies; fi
 }
 
 install_dependencies() {
-    green "開始安裝必要的依賴……"
-    if [[ x"${release}" == x"alpine" ]]; then
-        apk update && apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what
-    else
-        if [ -x "$(command -v apt-get)" ]; then
-            apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what
-        elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then
-            local PKG_MANAGER; PKG_MANAGER=$(command -v yum || command -v dnf)
-            $PKG_MANAGER install -y epel-release || true
-            $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what
-            systemctl enable --now cronie 2>/dev/null || true; systemctl enable --now iptables 2>/dev/null || true
-        fi
-    fi; green "依賴安裝完成。"
+    green "開始安裝必要的依賴……"; if [[ x"${release}" == x"alpine" ]]; then apk update && apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what
+    else if [ -x "$(command -v apt-get)" ]; then apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what
+    elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then local PKG_MANAGER; PKG_MANAGER=$(command -v yum || command -v dnf); $PKG_MANAGER install -y epel-release || true; $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what; systemctl enable --now cronie 2>/dev/null || true; systemctl enable --now iptables 2>/dev/null || true; fi; fi
+    green "依賴安裝完成。"
 }
 
 ensure_dirs() { mkdir -p /etc/s-box /root/ieduerca; chmod 700 /etc/s-box; }
-
-install_shortcut(){
-    local target="/usr/local/bin/sb"; local self_path; self_path="$(realpath "${BASH_SOURCE[0]:-$0}")"
-    if [[ ! -f "$target" ]] || ! grep -qF "$self_path" "$target" 2>/dev/null; then
-        echo "#!/usr/bin/env bash" > "$target"; echo "exec \"$self_path\" \"\$@\"" >> "$target"; chmod +x "$target"; green "已安裝快捷命令：sb"
-    fi
-}
 
 v4v6(){ v4=$(curl -fsS4m5 --retry 2 icanhazip.com || true); v6=$(curl -fsS6m5 --retry 2 icanhazip.com || true); }
 
 v6_setup(){
     if ! curl -fsS4m5 --retry 2 icanhazip.com >/dev/null 2>&1; then
         yellow "檢測到 純IPV6 VPS，添加NAT64"; echo -e "nameserver 2a00:1098:2b::1\nnameserver 2a00:1098:2c::1" > /etc/resolv.conf
-        ipv4_strategy="ipv6_only"; ipv6_strategy="ipv6_only"
+        dns_strategy="ipv6_only"
     else
-        ipv4_strategy="prefer_ipv4"; ipv6_strategy="prefer_ipv6"
+        dns_strategy="prefer_ipv4"
     fi
 }
 
 configure_firewall() {
     green "正在配置防火牆..."; local ports_to_open=("$@")
-    for port in "${ports_to_open[@]}"; do if [[ -n "$port" ]]; then iptables -I INPUT -p tcp --dport "$port" -j ACCEPT; iptables -I INPUT -p udp --dport "$port" -j ACCEPT; green "已開放端口: $port (TCP/UDP)"; fi; done
+    for port in "${ports_to_open[@]}"; do if [[ -n "$port" ]]; then iptables -I INPUT -p tcp --dport "$port" -j ACCEPT; iptables -I INPUT -p udp --dport "$port" -j ACCEPT; fi; done
     if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; elif command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; elif [[ -d /etc/iptables ]]; then iptables-save >/etc/iptables/rules.v4 2>/dev/null || true; fi
     green "防火牆規則已保存。"
 }
@@ -186,6 +173,7 @@ inssbjsonser(){
     cat > /etc/s-box/sb.json <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
+  "dns": { "strategy": "${dns_strategy:-prefer_ipv4}" },
   "inbounds": [
     { "type": "vless", "sniff": true, "sniff_override_destination": true, "tag": "vless-sb", "listen": "::", "listen_port": ${port_vl_re}, "users": [ { "uuid": "${uuid}", "flow": "xtls-rprx-vision" } ], "tls": { "enabled": true, "server_name": "${ym_vl_re}", "reality": { "enabled": true, "handshake": { "server": "${ym_vl_re}", "server_port": 443 }, "private_key": "$private_key", "short_id": ["$short_id"] } } },
     { "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws}, "users": [ { "uuid": "${uuid}", "alterId": 0 } ], "transport": { "type": "ws", "path": "/${uuid}-vm" }, "tls":{ "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" } }, 
@@ -193,8 +181,7 @@ inssbjsonser(){
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
   "outbounds": [
-    { "type": "direct", "tag": "direct", "domain_strategy": "${ipv4_strategy:-prefer_ipv4}" },
-    { "type": "direct", "tag": "direct-v6", "domain_strategy": "${ipv6_strategy:-prefer_ipv6}" },
+    { "type": "direct", "tag": "direct" },
     { "type": "block", "tag": "block" }
   ],
   "route": { "rules": [ { "protocol": ["quic", "stun"], "outbound": "block" }, { "outbound": "direct" } ], "final": "direct" }
@@ -233,43 +220,30 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload; systemctl enable sing-box >/dev/null 2>&1
         if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json; then red "配置校驗失敗"; return 1; fi
-        systemctl restart sing-box; sleep 2
-        if ! systemctl -q is-active sing-box; then red "服務啟動失敗"; journalctl -u sing-box -n 20 --no-pager || true; return 1; else green "服務已成功啟動。"; fi
+        systemctl restart sing-box
+        for i in {1..5}; do if systemctl -q is-active sing-box; then green "服務已成功啟動。"; return 0; fi; sleep 1; done
+        red "服務啟動失敗"; journalctl -u sing-box -n 20 --no-pager || true; return 1;
     fi
 }
 
 ipuuid(){
     for i in {1..3}; do
-        if [[ x"${release}" == x"alpine" ]]; then
-            if rc-service sing-box status 2>/dev/null | grep -q 'started'; then break; fi
-        else
-            if systemctl -q is-active sing-box; then break; fi
-        fi
-        if [ $i -eq 3 ]; then red "Sing-box服務未運行或啟動失敗。"; return 1; fi
-        sleep 1
+        if [[ x"${release}" == x"alpine" ]]; then if rc-service sing-box status 2>/dev/null | grep -q 'started'; then break; fi
+        else if systemctl -q is-active sing-box; then break; fi; fi
+        if [ $i -eq 3 ]; then red "Sing-box服務未運行或啟動失敗。"; return 1; fi; sleep 1
     done
     v4v6; local menu
     if [[ -n "$v4" && -n "$v6" ]]; then
         readp "雙棧VPS，請選擇IP配置輸出 (1: IPv4, 2: IPv6, 默認2): " menu
-        if [[ "$menu" == "1" ]]; then
-            sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$v4"; server_ipcl="$v4"
-        else
-            sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"
-        fi
-    elif [[ -n "$v6" ]]; then
-        sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"
-    elif [[ -n "$v4" ]]; then
-        sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$v4"; server_ipcl="$v4"
-    else
-        red "无法获取公網 IP 地址。" && return 1
-    fi
+        if [[ "$menu" == "1" ]]; then sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$v4"; server_ipcl="$v4"; else sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"; fi
+    elif [[ -n "$v6" ]]; then sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"
+    elif [[ -n "$v4" ]]; then sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$v4"; server_ipcl="$v4"
+    else red "无法获取公網 IP 地址。" && return 1; fi
     echo "$sbdnsip" > /etc/s-box/sbdnsip.log; echo "$server_ip" > /etc/s-box/server_ip.log; echo "$server_ipcl" > /etc/s-box/server_ipcl.log
 }
 
 result_vl_vm_hy_tu(){
-    if [[ -f /root/ieduerca/cert.crt && -s /root/ieduerca/cert.crt ]]; then 
-        local ym; ym=$(~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}' || true); echo "$ym" > /root/ieduerca/ca.log; 
-    fi
+    if [[ -f /root/ieduerca/cert.crt && -s /root/ieduerca/cert.crt ]]; then local ym; ym=$(~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}' || true); echo "$ym" > /root/ieduerca/ca.log; fi
     rm -rf /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt; 
     sbdnsip=$(cat /etc/s-box/sbdnsip.log); server_ip=$(cat /etc/s-box/server_ip.log); server_ipcl=$(cat /etc/s-box/server_ipcl.log); 
     uuid=$(jq -r '.inbounds[0].users[0].uuid' /etc/s-box/sb.json); 
@@ -286,10 +260,10 @@ result_vl_vm_hy_tu(){
     if [[ "$tu5_sniname" = '/etc/s-box/private.key' ]]; then tu5_name=www.bing.com; cl_tu5_ip=$server_ipcl; tu5_ins=true; else tu5_name=$ym; cl_tu5_ip=$ym; tu5_ins=false; fi
 }
 
-resvless(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; vl_link="vless://$uuid@$server_ipcl:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_name&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#vl-reality-$hostname"; echo "$vl_link" > /etc/s-box/vl_reality.txt; red "🚀【 vless-reality-vision 】"; echo "分享链接："; echo -e "${yellow}$vl_link${plain}"; echo "二维码："; qrencode -o - -t ANSIUTF8 "$vl_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; }
-resvmess(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; if [[ "$tls" = "false" ]]; then red "🚀【 vmess-ws 】"; vmess_json="{\"add\":\"$server_ipcl\",\"aid\":\"0\",\"host\":\"$vm_name\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$ws_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-$hostname\",\"tls\":\"\",\"type\":\"none\",\"v\":\"2\"}"; vmess_link="vmess://$(echo "$vmess_json" | base64_n0)"; echo "$vmess_link" > /etc/s-box/vm_ws.txt; else red "🚀【 vmess-ws-tls 】"; vmess_json="{\"add\":\"$vm_name\",\"aid\":\"0\",\"host\":\"$vm_name\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$ws_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-tls-$hostname\",\"tls\":\"tls\",\"sni\":\"$vm_name\",\"type\":\"none\",\"v\":\"2\"}"; vmess_link="vmess://$(echo "$vmess_json" | base64_n0)"; echo "$vmess_link" > /etc/s-box/vm_ws_tls.txt; fi; echo "分享链接："; echo -e "${yellow}$vmess_link${plain}"; echo "二维码："; qrencode -o - -t ANSIUTF8 "$vmess_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; }
-reshy2(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; hy2_link="hysteria2://$uuid@$cl_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=$hy2_ins&sni=$hy2_name#hy2-$hostname"; echo "$hy2_link" > /etc/s-box/hy2.txt; red "🚀【 Hysteria-2 】"; echo "分享链接："; echo -e "${yellow}$hy2_link${plain}"; echo "二维码："; qrencode -o - -t ANSIUTF8 "$hy2_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; }
-restu5(){ echo; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; tuic5_link="tuic://$uuid:$uuid@$cl_tu5_ip:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&allow_insecure=$tu5_ins&allowInsecure=$tu5_ins#tu5-$hostname"; echo "$tuic5_link" > /etc/s-box/tuic5.txt; red "🚀【 Tuic-v5 】"; echo "分享链接："; echo -e "${yellow}$tuic5_link${plain}"; echo "二维码："; qrencode -o - -t ANSIUTF8 "$tuic5_link"; white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"; }
+resvless(){ echo; white "~~~~~~~~~~~~~~~~~"; vl_link="vless://$uuid@$server_ipcl:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_name&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#vl-reality-$hostname"; echo "$vl_link" > /etc/s-box/vl_reality.txt; red "🚀 VLESS-Reality"; echo "链接:"; echo -e "${yellow}$vl_link${plain}"; echo "二维码:"; qrencode -o - -t ANSIUTF8 "$vl_link"; }
+resvmess(){ echo; white "~~~~~~~~~~~~~~~~~"; if [[ "$tls" = "false" ]]; then red "🚀 VMess-WS"; vmess_json="{\"add\":\"$server_ipcl\",\"aid\":\"0\",\"host\":\"$vm_name\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$ws_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-$hostname\",\"tls\":\"\",\"type\":\"none\",\"v\":\"2\"}"; vmess_link="vmess://$(echo "$vmess_json" | base64_n0)"; echo "$vmess_link" > /etc/s-box/vm_ws.txt; else red "🚀 VMess-WS-TLS"; vmess_json="{\"add\":\"$vm_name\",\"aid\":\"0\",\"host\":\"$vm_name\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$ws_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-tls-$hostname\",\"tls\":\"tls\",\"sni\":\"$vm_name\",\"type\":\"none\",\"v\":\"2\"}"; vmess_link="vmess://$(echo "$vmess_json" | base64_n0)"; echo "$vmess_link" > /etc/s-box/vm_ws_tls.txt; fi; echo "链接:"; echo -e "${yellow}$vmess_link${plain}"; echo "二维码:"; qrencode -o - -t ANSIUTF8 "$vmess_link"; }
+reshy2(){ echo; white "~~~~~~~~~~~~~~~~~"; hy2_link="hysteria2://$uuid@$cl_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=$hy2_ins&sni=$hy2_name#hy2-$hostname"; echo "$hy2_link" > /etc/s-box/hy2.txt; red "🚀 Hysteria-2"; echo "链接:"; echo -e "${yellow}$hy2_link${plain}"; echo "二维码:"; qrencode -o - -t ANSIUTF8 "$hy2_link"; }
+restu5(){ echo; white "~~~~~~~~~~~~~~~~~"; tuic5_link="tuic://$uuid:$uuid@$cl_tu5_ip:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&allow_insecure=$tu5_ins&allowInsecure=$tu5_ins#tuic5-$hostname"; echo "$tuic5_link" > /etc/s-box/tuic5.txt; red "🚀 TUIC-v5"; echo "链接:"; echo -e "${yellow}$tuic5_link${plain}"; echo "二维码:"; qrencode -o - -t ANSIUTF8 "$tuic5_link"; }
 
 gen_clash_sub(){
     result_vl_vm_hy_tu
@@ -396,5 +370,5 @@ main_menu() {
 check_os
 check_dependencies
 ensure_dirs
-install_shortcut
+self_install
 main_menu
