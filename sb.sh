@@ -4,13 +4,8 @@ IFS=$'\n\t'
 umask 077
 
 trap 'code=$?; echo -e "\033[31m\033[01m[ERROR]\033[0m at line $LINENO while running: ${BASH_COMMAND} (exit $code)"; exit $code' ERR
-export LANG=en_US.UTF_8
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-blue='\033[0;36m'
-bblue='\033[0;34m'
-plain='\033[0m'
+export LANG=en_US.UTF-8
+red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; plain='\033[0m'
 
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
@@ -293,16 +288,79 @@ reshy2(){ echo; white "~~~~~~~~~~~~~~~~~"; hy2_link="hysteria2://$uuid@$cl_hy2_i
 restu5(){ echo; white "~~~~~~~~~~~~~~~~~"; tuic5_link="tuic://$uuid:$uuid@$cl_tu5_ip:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&allow_insecure=$tu5_ins&allowInsecure=$tu5_ins#tuic5-$hostname"; echo "$tuic5_link" > /etc/s-box/tuic5.txt; red "🚀 TUIC-v5"; echo "链接:"; echo -e "${yellow}$tuic5_link${plain}"; echo "二维码:"; qrencode -o - -t ANSIUTF8 "$tuic5_link"; }
 
 gen_clash_sub(){
-    result_vl_vm_hy_tu; local ws_path_client; ws_path_client=$(echo "$ws_path" | sed 's#^/##'); local public_key; public_key=$(cat /etc/s-box/public.key 2>/dev/null || true); local tag_vless="vless-${hostname}"; local tag_vmess="vmess-${hostname}"; local tag_hy2="hy2-${hostname}"; local tag_tuic="tuic5-${hostname}"; local sbdnsip; sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null); : "${sbdnsip:=tls://8.8.8.8/dns-query}"; cat > /etc/s-box/clash_sub.json <<EOF
-{ "dns": { "servers": [ { "tag": "proxydns", "address": "${sbdnsip}", "detour": "select" }, { "tag": "localdns", "address": "h3://223.5.5.5/dns-query", "detour": "direct" } ] }, "outbounds": [ { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"] }, { "type": "vless", "tag": "${tag_vless}", "server": "${server_ipcl}", "server_port": ${vl_port}, "uuid": "${uuid}", "flow": "xtls-rprx-vision", "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" }, "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } }, { "type": "vmess", "tag": "${tag_vmess}", "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "transport": { "type": "ws", "path": "${ws_path_client}", "headers": { "Host": ["${vm_name}"] } }, "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "utls": { "enabled": true, "fingerprint": "chrome" } } }, { "type": "hysteria2", "tag": "${tag_hy2}", "server": "${cl_hy2_ip}", "server_port": ${hy2_port}, "password": "${uuid}", "tls": { "enabled": true, "server_name": "${hy2_name}", "insecure": ${hy2_ins}, "alpn": ["h3"] } }, { "type": "tuic", "tag": "${tag_tuic}", "server": "${cl_tu5_ip}", "server_port": ${tu5_port}, "uuid": "${uuid}", "password": "${uuid}", "congestion_control": "bbr", "tls": { "enabled": true, "server_name": "${tu5_name}", "insecure": ${tu5_ins}, "alpn": ["h3"] } }, { "tag": "direct", "type": "direct" }, { "tag": "auto", "type": "urltest", "outbounds": ["${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"], "url": "https://www.gstatic.com/generate_204", "interval": "1m" } ] }
+    result_vl_vm_hy_tu
+    local ws_path_client; ws_path_client=$(echo "$ws_path" | sed 's#^/##')
+    local public_key; public_key=$(cat /etc/s-box/public.key 2>/dev/null || true)
+    local tag_vless="vless-${hostname}"; local tag_vmess="vmess-${hostname}"; local tag_hy2="hy2-${hostname}"; local tag_tuic="tuic5-${hostname}"
+    local sbdnsip; sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null); : "${sbdnsip:=tls://8.8.8.8/dns-query}"
+    cat > /etc/s-box/clash_sub.json <<EOF
+{
+  "log": { "disabled": false, "level": "info", "timestamp": true },
+  "experimental": { "clash_api": { "external_controller": "127.0.0.1:9090", "external_ui": "ui", "secret": "", "default_mode": "Rule" }, "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true } },
+  "dns": {
+    "servers": [
+      { "tag": "proxydns", "address": "${sbdnsip}", "detour": "select" },
+      { "tag": "localdns", "address": "h3://223.5.5.5/dns-query", "detour": "direct" },
+      { "tag": "dns_fakeip", "address": "fakeip" }
+    ],
+    "rules": [
+      { "outbound": "any", "server": "localdns", "disable_cache": true },
+      { "clash_mode": "Global", "server": "proxydns" },
+      { "clash_mode": "Direct", "server": "localdns" },
+      { "rule_set": "geosite-cn", "server": "localdns" },
+      { "rule_set": "geosite-geolocation-!cn", "server": "proxydns" },
+      { "rule_set": "geosite-geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" }
+    ],
+    "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" }, "independent_cache": true, "final": "proxydns"
+  },
+  "inbounds": [ { "type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30", "fd00::1/126"], "auto_route": true, "strict_route": true, "sniff": true, "sniff_override_destination": true, "domain_strategy": "prefer_ipv4" } ],
+  "outbounds": [
+    { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"] },
+    { "type": "vless", "tag": "${tag_vless}", "server": "${server_ipcl}", "server_port": ${vl_port}, "uuid": "${uuid}", "flow": "xtls-rprx-vision", "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" }, "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } },
+    { "type": "vmess", "tag": "${tag_vmess}", "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "packet_encoding": "packetaddr", "transport": { "type": "ws", "path": "${ws_path}", "headers": { "Host": ["${vm_name}"] } }, "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "insecure": false, "utls": { "enabled": true, "fingerprint": "chrome" } } },
+    { "type": "hysteria2", "tag": "${tag_hy2}", "server": "${cl_hy2_ip}", "server_port": ${hy2_port}, "password": "${uuid}", "tls": { "enabled": true, "server_name": "${hy2_name}", "insecure": ${hy2_ins}, "alpn": ["h3"] } },
+    { "type": "tuic", "tag": "${tag_tuic}", "server": "${cl_tu5_ip}", "server_port": ${tu5_port}, "uuid": "${uuid}", "password": "${uuid}", "congestion_control": "bbr", "udp_relay_mode": "native", "tls": { "enabled": true, "server_name": "${tu5_name}", "insecure": ${tu5_ins}, "alpn": ["h3"] } },
+    { "tag": "direct", "type": "direct" },
+    { "tag": "auto", "type": "urltest", "outbounds": ["${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"], "url": "https://www.gstatic.com/generate_204", "interval": "1m", "tolerance": 50, "interrupt_exist_connections": false }
+  ],
+  "route": {
+    "rule_set": [
+      { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geoip-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs", "download_detour": "select", "update_interval": "1d" }
+    ],
+    "auto_detect_interface": true, "final": "select",
+    "rules": [
+      { "inbound": "tun-in", "action": "sniff" }, { "protocol": "dns", "action": "hijack-dns" }, { "port": 443, "network": "udp", "action": "reject" },
+      { "clash_mode": "Direct", "outbound": "direct" }, { "clash_mode": "Global", "outbound": "select" },
+      { "rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct" }, { "ip_is_private": true, "outbound": "direct" },
+      { "rule_set": "geosite-geolocation-!cn", "outbound": "select" }
+    ]
+  },
+  "ntp": { "enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m", "detour": "direct" }
+}
 EOF
     green "Clash/Mihomo 訂閱模板已生成：/etc/s-box/clash_sub.json"
     echo; yellow "文件內容如下:"; echo
     cat /etc/s-box/clash_sub.json
 }
 
-clash_sb_share(){ if ! ipuuid; then red "Sing-box 服務未運行，無法生成分享鏈接。"; return; fi; result_vl_vm_hy_tu; resvless; resvmess; reshy2; restu5; readp "是否生成/更新訂閱文件 (for Clash/Mihomo)? (y/n): " gen_sub; if [[ "${gen_sub,,}" == "y" ]]; then gen_clash_sub; fi; }
-stclre(){ echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"; readp "選擇【0-3】：" act; if [[ x"${release}" == x"alpine" ]]; then case "$act" in 1) rc-service sing-box restart;; 2) rc-service sing-box stop;; 3) rc-service sing-box start;; *) return;; esac; else case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; *) return;; esac; fi; }
+clash_sb_share(){ 
+    if ! ipuuid; then red "Sing-box 服務未運行，無法生成分享鏈接。"; return; fi
+    result_vl_vm_hy_tu; resvless; resvmess; reshy2; restu5
+    readp "是否生成/更新訂閱文件 (for Clash/Mihomo)? (y/n): " gen_sub
+    if [[ "${gen_sub,,}" == "y" ]]; then gen_clash_sub; fi
+}
+
+stclre(){ 
+    echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"; readp "選擇【0-3】：" act
+    if [[ x"${release}" == x"alpine" ]]; then 
+        case "$act" in 1) rc-service sing-box restart;; 2) rc-service sing-box stop;; 3) rc-service sing-box start;; *) return;; esac
+    else 
+        case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; *) return;; esac
+    fi
+}
+
 sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; }
 upsbyg(){ yellow "正在嘗試更新..."; bootstrap_and_exec; }
 sbsm(){ blue "安裝內核 → 自動生成默認配置 → 開機自啟。"; blue "可用功能：變更證書/端口、生成訂閱、查看日誌、開啟BBR。"; blue "分享/訂閱輸出：選 7 或 11。產物在 /etc/s-box/"; }
@@ -315,13 +373,12 @@ showprotocol(){
 
 enable_bbr_autonomously() {
     if [[ $vi =~ lxc|openvz ]]; then return 0; fi
-    local kernel_version; kernel_version=$(uname -r | cut -d- -f1); if ! (echo "$kernel_version" "4.9" | awk '{exit !($1 >= $2)}'); then return 0; fi
+    local kernel_version; kernel_version=$(uname -r | cut -d- -f1); if (echo "$kernel_version" "4.9" | awk '{exit !($1 >= $2)}'); then green "檢測到內核支持BBR。"; else return 0; fi
     if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then return 0; fi
-    green "檢測到支持BBR，正在自動開啟..."
-    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf; sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    green "正在自動開啟BBR..."; sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf; sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
     echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
     sysctl -p >/dev/null 2>&1; modprobe tcp_bbr 2>/dev/null || true
-    if sysctl net.ipv4.tcp_congestion_control | grep -qw "bbr"; then green "BBR已成功開啟並立即生效，無需重啟！"; else red "BBR開啟可能未成功。"; fi
+    if sysctl net.ipv4.tcp_congestion_control | grep -qw "bbr"; then green "BBR已成功開啟並立即生效！"; else red "BBR開啟可能未成功。"; fi
 }
 
 unins(){
@@ -338,34 +395,36 @@ main_menu() {
     white "Vless-reality, Vmess-ws, Hysteria-2, Tuic-v5 四協議共存腳本"
     white "快捷命令：sb"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green " 1. 安裝/重裝 Sing-box (交互式)" 
+    green " 1. 安裝/重裝 Sing-box" 
     green " 2. 卸載 Sing-box"
     white "----------------------------------------------------------------------------------"
-    green " 3. 服務管理 (啟/停/重啟)"
-    green " 4. 更新 Sing-box 腳本"
-    green " 5. 更新 Sing-box 內核"
+    green " 3. 重置/變更配置 (交互式)"
+    green " 4. 服務管理 (啟/停/重啟)"
+    green " 5. 更新 Sing-box 腳本"
+    green " 6. 更新 Sing-box 內核"
     white "----------------------------------------------------------------------------------"
-    green " 6. 刷新並查看節點與配置"
-    green " 7. 查看 Sing-box 運行日誌"
-    green " 8. 申請 Acme 域名證書"
-    green " 9. 雙棧VPS切換IP配置輸出"
+    green " 7. 刷新並查看節點與配置"
+    green " 8. 查看 Sing-box 運行日誌"
+    green " 9. 申請 Acme 域名證書"
+    green "10. 雙棧VPS切換IP配置輸出"
     white "----------------------------------------------------------------------------------"
     green " 0. 退出腳本"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     
     if [[ -x '/etc/s-box/sing-box' ]]; then local corev; corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}'); green "Sing-box 核心已安裝：$corev"; showprotocol; else yellow "Sing-box 核心未安裝，請先選 1 。"; fi
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    readp "請輸入數字【0-9】：" Input
+    readp "請輸入數字【0-10】：" Input
     case "$Input" in  
      1 ) inssb;;
      2 ) unins;;
-     3 ) stclre;;
-     4 ) upsbyg;; 
-     5 ) inssb;;
-     6 ) clash_sb_share;;
-     7 ) sblog;;
-     8 ) apply_acme_cert;;
-     9 ) ipuuid && clash_sb_share;;
+     3 ) rebuild_config_and_start;;
+     4 ) stclre;;
+     5 ) upsbyg;; 
+     6 ) inssb;;
+     7 ) clash_sb_share;;
+     8 ) sblog;;
+     9 ) apply_acme_cert;;
+    10 ) ipuuid && clash_sb_share;;
      * ) exit 
     esac
 }
