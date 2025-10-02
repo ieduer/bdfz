@@ -3,15 +3,12 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
+# --- 错误处理 ---
 trap 'code=$?; echo -e "\033[31m\033[01m[ERROR]\033[0m at line $LINENO while running: ${BASH_COMMAND} (exit $code)"; exit $code' ERR
-export LANG=en_US.UTF-8
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-blue='\033[0;36m'
-bblue='\033[0;34m'
-plain='\033[0m'
 
+# --- 颜色定义 ---
+export LANG=en_US.UTF-8
+red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; plain='\033[0m'
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
 yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
@@ -19,9 +16,7 @@ blue(){ echo -e "\033[36m\033[01m$1\033[0m";}
 white(){ echo -e "\033[37m\033[01m$1\033[0m";}
 readp(){ read -p "$(yellow "$1")" "$2";}
 
-base64_n0() {
-    if base64 --help 2>/dev/null | grep -q -- '--wrap'; then base64 --wrap=0; elif base64 --help 2>/dev/null | grep -q -- '-w'; then base64 -w 0; else base64; fi
-}
+base64_n0() { if base64 --help 2>/dev/null | grep -q -- '--wrap'; then base64 --wrap=0; elif base64 --help 2>/dev/null | grep -q -- '-w'; then base64 -w 0; else base64; fi; }
 
 [[ $EUID -ne 0 ]] && yellow "請以root模式運行腳本" && exit
 export sbfiles="/etc/s-box/sb.json"
@@ -32,29 +27,11 @@ bootstrap_and_exec() {
     local permanent_path="/usr/local/lib/ieduer-sb.sh"
     local shortcut_path="/usr/local/bin/sb"
     local script_url="https://raw.githubusercontent.com/ieduer/bdfz/main/sb.sh"
-
-    if ! command -v wget &>/dev/null && ! command -v curl &>/dev/null; then
-        red "wget 和 curl 都不可用，无法下载脚本。请先安装其中一个。"
-        exit 1
-    fi
-    
+    if ! command -v wget &>/dev/null && ! command -v curl &>/dev/null; then red "wget 和 curl 都不可用，无法下载脚本。"; exit 1; fi
     green "正在下载最新脚本到 $permanent_path ..."
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$script_url" -o "$permanent_path"
-    else
-        wget -qO "$permanent_path" "$script_url"
-    fi
-    
-    if [[ ! -s "$permanent_path" ]]; then
-        red "脚本下载失败，请检查网络或链接。"
-        exit 1
-    fi
-
-    chmod +x "$permanent_path"
-    ln -sf "$permanent_path" "$shortcut_path"
-    green "已安装/更新快捷命令：sb"
-    
-    # 重新执行脚本
+    if command -v curl &>/dev/null; then curl -fsSL "$script_url" -o "$permanent_path"; else wget -qO "$permanent_path" "$script_url"; fi
+    if [[ ! -s "$permanent_path" ]]; then red "脚本下载失败，请检查网络或链接。"; exit 1; fi
+    chmod +x "$permanent_path"; ln -sf "$permanent_path" "$shortcut_path"; green "已安装/更新快捷命令：sb"
     exec "$shortcut_path" "$@"
 }
 
@@ -161,9 +138,9 @@ rebuild_config_and_start(){
 }
 
 generate_reality_materials() {
-    ensure_dirs; local pubfile="/etc/s-box/public.key"; local jsonfile="/etc/s-box/reality.json"; local rk pub;
+    ensure_dirs; local pubfile="/etc/s-box/public.key"; local jsonfile="/etc/s-box/reality.json"; local rk pub; local private_key
     if [[ ! -s "$pubfile" ]]; then
-        local out; out=$(mktemp); local private_key
+        local out; out=$(mktemp)
         /etc/s-box/sing-box generate reality-keypair >"$out" 2>/dev/null || true
         if jq -e -r '.private_key,.public_key' "$out" >/dev/null 2>&1; then
             private_key=$(jq -r '.private_key' "$out"); jq -r '.public_key' "$out" > "$pubfile"
@@ -354,9 +331,15 @@ main_menu() {
 }
 
 # --- 腳本入口 ---
-SELF_PATH="$(realpath "${BASH_SOURCE[0]:-$0}")"
+SELF_PATH=""
+# shellcheck disable=SC2128
+if [[ -n "${BASH_SOURCE[0]}" && -f "${BASH_SOURCE[0]}" ]]; then
+    SELF_PATH="$(realpath "${BASH_SOURCE[0]}")"
+fi
+
 PERMANENT_PATH="/usr/local/lib/ieduer-sb.sh"
-if [[ ! -f "$SELF_PATH" ]] || [[ "$SELF_PATH" != "$PERMANENT_PATH" ]]; then
+
+if [[ -z "$SELF_PATH" ]] || [[ "$SELF_PATH" != "$PERMANENT_PATH" ]]; then
     bootstrap_and_exec "$@"
     exit 0
 fi
