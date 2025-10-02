@@ -27,15 +27,35 @@ base64_n0() {
 export sbfiles="/etc/s-box/sb.json"
 hostname=$(hostname)
 
-install_and_exec() {
+# --- 自我安装与引导 ---
+bootstrap_and_exec() {
     local permanent_path="/usr/local/lib/ieduer-sb.sh"
     local shortcut_path="/usr/local/bin/sb"
     local script_url="https://raw.githubusercontent.com/ieduer/bdfz/main/sb.sh"
-    if ! command -v wget &>/dev/null && ! command -v curl &>/dev/null; then red "wget 和 curl 都不可用，无法下载脚本。"; exit 1; fi
+
+    if ! command -v wget &>/dev/null && ! command -v curl &>/dev/null; then
+        red "wget 和 curl 都不可用，无法下载脚本。请先安装其中一个。"
+        exit 1
+    fi
+    
     green "正在下载最新脚本到 $permanent_path ..."
-    if command -v curl &>/dev/null; then curl -fsSL "$script_url" -o "$permanent_path"; else wget -qO "$permanent_path" "$script_url"; fi
-    if [[ ! -s "$permanent_path" ]]; then red "脚本下载失败，请检查网络或链接。"; exit 1; fi
-    chmod +x "$permanent_path"; ln -sf "$permanent_path" "$shortcut_path"; green "已安装/更新快捷命令：sb"; exec "$shortcut_path" "$@"
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$script_url" -o "$permanent_path"
+    else
+        wget -qO "$permanent_path" "$script_url"
+    fi
+    
+    if [[ ! -s "$permanent_path" ]]; then
+        red "脚本下载失败，请检查网络或链接。"
+        exit 1
+    fi
+
+    chmod +x "$permanent_path"
+    ln -sf "$permanent_path" "$shortcut_path"
+    green "已安装/更新快捷命令：sb"
+    
+    # 重新执行脚本
+    exec "$shortcut_path" "$@"
 }
 
 check_os() {
@@ -141,9 +161,9 @@ rebuild_config_and_start(){
 }
 
 generate_reality_materials() {
-    ensure_dirs; local pubfile="/etc/s-box/public.key"; local jsonfile="/etc/s-box/reality.json"; local rk pub; local private_key
+    ensure_dirs; local pubfile="/etc/s-box/public.key"; local jsonfile="/etc/s-box/reality.json"; local rk pub;
     if [[ ! -s "$pubfile" ]]; then
-        local out; out=$(mktemp)
+        local out; out=$(mktemp); local private_key
         /etc/s-box/sing-box generate reality-keypair >"$out" 2>/dev/null || true
         if jq -e -r '.private_key,.public_key' "$out" >/dev/null 2>&1; then
             private_key=$(jq -r '.private_key' "$out"); jq -r '.public_key' "$out" > "$pubfile"
@@ -152,15 +172,17 @@ generate_reality_materials() {
             pub=$(awk -F'[: ]+' 'BEGIN{IGNORECASE=1} /Public[ _-]*Key/{print $NF; exit}' "$out")
             if [[ -n "$private_key" && -n "$pub" ]]; then printf '%s\n' "$pub" > "$pubfile"; else red "生成 Reality 密鑰失敗。"; exit 1; fi
         fi; rm -f "$out"
+        if [[ -n "$private_key" && -s "$pubfile" ]]; then pub=$(cat "$pubfile"); printf '{ "private_key": "%s", "public_key": "%s" }\n' "$private_key" "$pub" > "$jsonfile"; fi
     fi
     : "${short_id:=$(head -c 8 /dev/urandom | hexdump -e '1/1 "%02x"' 2>/dev/null || openssl rand -hex 8)}"
-    if [[ -z "${private_key:-}" ]]; then private_key=$(jq -r .private_key "$jsonfile" 2>/dev/null || true); fi 
-    if [[ -n "${private_key:-}" && -s "$pubfile" ]]; then pub=$(cat "$pubfile"); printf '{ "private_key": "%s", "public_key": "%s" }\n' "$private_key" "$pub" > "$jsonfile"; fi
 }
 
 inssbjsonser(){
-    : "${ym_vl_re:=apple.com}"; : "${tlsyn:=false}"; : "${ym_vm_ws:=www.bing.com}"; : "${certificatec_vmess_ws:=/etc/s-box/cert.pem}"; : "${certificatep_vmess_ws:=/etc/s-box/private.key}"; : "${certificatec_hy2:=/etc/s-box/cert.pem}"; : "${certificatep_hy2:=/etc/s-box/private.key}"; : "${certificatec_tuic:=/etc/s-box/cert.pem}"; : "${certificatep_tuic:=/etc/s-box/private.key}"; : "${uuid:=$(/etc/s-box/sing-box generate uuid)}"
-    ensure_dirs; generate_reality_materials
+    local private_key; private_key=$(jq -r .private_key /etc/s-box/reality.json)
+    : "${ym_vl_re:=apple.com}"; : "${tlsyn:=false}"; : "${ym_vm_ws:=www.bing.com}"; : "${uuid:=$(/etc/s-box/sing-box generate uuid)}"
+    : "${certificatec_vmess_ws:=/etc/s-box/cert.pem}"; : "${certificatep_vmess_ws:=/etc/s-box/private.key}"
+    : "${certificatec_hy2:=/etc/s-box/cert.pem}"; : "${certificatep_hy2:=/etc/s-box/private.key}"
+    : "${certificatec_tuic:=/etc/s-box/cert.pem}"; : "${certificatep_tuic:=/etc/s-box/private.key}"
     cat > /etc/s-box/sb.json <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
@@ -262,7 +284,7 @@ EOF
 clash_sb_share(){ if ! ipuuid; then red "Sing-box 服務未運行，無法生成分享鏈接。"; return; fi; result_vl_vm_hy_tu; resvless; resvmess; reshy2; restu5; readp "是否生成/更新訂閱文件 (for Clash/Mihomo)? (y/n): " gen_sub; if [[ "${gen_sub,,}" == "y" ]]; then gen_clash_sub; fi; }
 stclre(){ echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"; readp "選擇【0-3】：" act; if [[ x"${release}" == x"alpine" ]]; then case "$act" in 1) rc-service sing-box restart;; 2) rc-service sing-box stop;; 3) rc-service sing-box start;; *) return;; esac; else case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; *) return;; esac; fi; }
 sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; }
-upsbyg(){ yellow "正在嘗試更新..."; install_and_exec; }
+upsbyg(){ yellow "正在嘗試更新..."; bootstrap_and_exec; }
 sbsm(){ blue "安裝內核 → 自動生成默認配置 → 開機自啟。"; blue "可用功能：變更證書/端口、生成訂閱、查看日誌、開啟BBR。"; blue "分享/訂閱輸出：選 7 或 11。產物在 /etc/s-box/"; }
 
 showprotocol(){
@@ -286,7 +308,7 @@ unins(){
     remove_firewall_rules
     if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box stop 2>/dev/null || true; rc-update del sing-box 2>/dev/null || true; rm -f /etc/init.d/sing-box; else systemctl stop sing-box 2>/dev/null || true; systemctl disable sing-box 2>/dev/null || true; rm -f /etc/systemd/system/sing-box.service; systemctl daemon-reload 2>/dev/null || true; fi
     readp "是否刪除 /etc/s-box 目錄與所有配置？(y/n, 默認n): " rmconf; if [[ "${rmconf,,}" == "y" ]]; then rm -rf /etc/s-box; green "已刪除 /etc/s-box。"; fi
-    readp "是否移除快捷命令 sb？(y/n, 默認n): " rmsb; if [[ "${rmsb,,}" == "y" ]]; then rm -f /usr/local/bin/sb; green "已移除 sb 命令。"; fi
+    readp "是否移除快捷命令 sb？(y/n, 默認n): " rmsb; if [[ "${rmsb,,}" == "y" ]]; then rm -f /usr/local/bin/sb /usr/local/lib/ieduer-sb.sh; green "已移除 sb 命令和腳本文件。"; fi
     green "Sing-box 已卸載完成。"
 }
 
@@ -332,11 +354,14 @@ main_menu() {
 }
 
 # --- 腳本入口 ---
-if [[ "${BASH_SOURCE[0]}" == "/usr/local/lib/ieduer-sb.sh" || -z "${BASH_SOURCE[0]}" ]]; then
-    check_os
-    check_dependencies
-    ensure_dirs
-    main_menu
-else
-    install_and_exec "$@"
+SELF_PATH="$(realpath "${BASH_SOURCE[0]:-$0}")"
+PERMANENT_PATH="/usr/local/lib/ieduer-sb.sh"
+if [[ ! -f "$SELF_PATH" ]] || [[ "$SELF_PATH" != "$PERMANENT_PATH" ]]; then
+    bootstrap_and_exec "$@"
+    exit 0
 fi
+
+check_os
+check_dependencies
+ensure_dirs
+main_menu
