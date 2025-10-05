@@ -36,7 +36,22 @@ bash <(wget -qO- https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)
 
 ---
 
- # IPMENU
+# IP Menu
+
+A tiny macOS **menubar** utility that shows your public IP (with country + ASN/ISP) and reacts quickly to VPN/proxy node changes (e.g., **sing-box**). Runs without a Dock icon and auto-starts via LaunchAgent. Single-file installer.
+
+- **Menubar-only** (no Dock icon), built with `rumps` + `pyobjc`
+- **Public IP** with fast refresh; falls back to local IP
+- **ASN/ISP** via online (ipinfo/ip-api) or offline (sapics ip-location-db)
+- **Country** display: off / **code** / name
+- **IPv4 formatting**: full / first 2 / first + last / last 2
+- **Change notifications** for public/local IP; optional sound
+- **LaunchAgent** autostart; one-click **Reload** from the menu
+
+---
+
+## Install (one-liner)
+
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
 # 或
