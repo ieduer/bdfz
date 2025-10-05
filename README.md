@@ -33,3 +33,12 @@ bash <(wget -qO- https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)
 - 本項目僅供學術研究與個人學習之用，請勿用於任何違規行為。
 - 使用產生的風險由使用者自行承擔。
 - 直接都考了，不太好吧。😜
+
+---
+
+ # IPMENU
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
+# 或
+bash <(wget -qO- https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
+```
