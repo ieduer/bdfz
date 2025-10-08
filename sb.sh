@@ -45,24 +45,20 @@ bootstrap_and_exec() {
     fi
     if [[ ! -s "$permanent_path" ]]; then red "腳本下載失敗，請檢查網絡或链接。"; exit 1; fi
     chmod +x "$permanent_path"; ln -sf "$permanent_path" "$shortcut_path"; green "已安裝/更新快捷命令：sb"
-    # 使用 exec 替換當前進程，確保新腳本立即生效
     exec "$permanent_path" "$@"
 }
 
-# 腳本自我更新函數
 upsbyg(){
     yellow "正在嘗試更新腳本..."
     bootstrap_and_exec
 }
 
-# 只有當腳本不是從永久路徑執行時，才運行引導程序
-# realpath 可能不存在於極簡系統，用 readlink -f 替代
 SELF_PATH=""
 if command -v realpath >/dev/null; then SELF_PATH=$(realpath "$0"); else SELF_PATH=$(readlink -f "$0"); fi
 PERMANENT_PATH="/usr/local/lib/ieduer-sb.sh"
 if [[ "$SELF_PATH" != "$PERMANENT_PATH" ]]; then
     bootstrap_and_exec "$@"
-    exit 0 # 確保引導程序執行後，舊的臨時進程乾淨退出
+    exit 0
 fi
 # --- 引導結束 ---
 
@@ -125,7 +121,7 @@ ensure_dirs() { mkdir -p /etc/s-box /root/ieduerca; chmod 700 /etc/s-box /root/i
 v4v6(){ v4=$(curl -s4m5 icanhazip.com -k); v6=$(curl -s6m5 icanhazip.com -k); }
 
 configure_firewall(){
-    green "正在配置防火牆... (將清除所有現有iptables規則，並設置默認允許)"
+    green "正在配置防火牆... (將清除所有現有iptables規則，並設置默認允许)"
     systemctl stop firewalld.service >/dev/null 2>&1 || true; systemctl disable firewalld.service >/dev/null 2>&1 || true
     setenforce 0 >/dev/null 2>&1 || true
     ufw disable >/dev/null 2>&1 || true
@@ -135,7 +131,7 @@ configure_firewall(){
     ip6tables -F; ip6tables -X; ip6tables -t nat -F; ip6tables -t nat -X; ip6tables -t mangle -F; ip6tables -t mangle -X
     if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; fi
     if command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; fi
-    green "防火牆規則已清除，並設置為默認允許。"
+    green "防火牆規則已清除，並設置為默認允许。"
 }
 
 setup_certificates(){
@@ -301,7 +297,7 @@ description="sing-box service"
 command="/etc/s-box/sing-box"
 command_args="run -c /etc/s-box/sb.json"
 command_background=true
-pidfile="/var/run/sing-box.pid"' > /etc/init.d/sing-box
+pidfile="/var/run/sing-box.pid"' > /etc/init/sing-box
         chmod +x /etc/init.d/sing-box; rc-update add sing-box default
         rc-service sing-box restart
     else
@@ -376,6 +372,10 @@ ipuuid(){
     elif [[ -n "$v4" ]]; then
         server_ip="$v4"; server_ipcl="$v4"
     else red "无法获取公網 IP 地址。" && return 1; fi
+    
+    if [[ -z "$server_ip" || -z "$server_ipcl" ]]; then
+        red "获取 IP 地址失败。"; return 1;
+    fi
 }
 
 display_sharing_info() {
@@ -385,43 +385,23 @@ display_sharing_info() {
     local uuid=$(echo "$config" | jq -r '.inbounds[0].users[0].uuid')
     local public_key=$(cat /etc/s-box/public.key 2>/dev/null || true)
     
-    # VLESS
-    local vl_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .listen_port')
-    local vl_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.server_name')
-    local vl_short_id=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.reality.short_id[0]')
-    local vl_link="vless://$uuid@$server_ipcl:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_sni&fp=chrome&pbk=$public_key&sid=$vl_short_id&type=tcp&headerType=none#vl-reality-$hostname"
-    echo "$vl_link" > /etc/s-box/vl_reality.txt
+    local vl_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .listen_port'); local vl_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.server_name'); local vl_short_id=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.reality.short_id[0]')
+    local vl_link="vless://$uuid@$server_ipcl:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_sni&fp=chrome&pbk=$public_key&sid=$vl_short_id&type=tcp&headerType=none#vl-reality-$hostname"; echo "$vl_link" > /etc/s-box/vl_reality.txt
     
-    # VMESS
-    local vm_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .listen_port')
-    local vm_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .transport.path')
-    local vm_tls=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.enabled')
-    local vm_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.server_name')
+    local vm_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .listen_port'); local vm_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .transport.path'); local vm_tls=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.enabled'); local vm_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.server_name')
     if [[ "$vm_tls" == "true" ]]; then
-        local vm_json="{\"add\":\"$vm_sni\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-tls-$hostname\",\"tls\":\"tls\",\"sni\":\"$vm_sni\",\"type\":\"none\",\"v\":\"2\"}"
-        echo "vmess://$(echo "$vm_json" | base64_n0)" > /etc/s-box/vm_ws_tls.txt
+        local vm_json="{\"add\":\"$vm_sni\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-tls-$hostname\",\"tls\":\"tls\",\"sni\":\"$vm_sni\",\"type\":\"none\",\"v\":\"2\"}"; echo "vmess://$(echo "$vm_json" | base64_n0)" > /etc/s-box/vm_ws_tls.txt
     else
-        local vm_json="{\"add\":\"$server_ipcl\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-$hostname\",\"tls\":\"\",\"type\":\"none\",\"v\":\"2\"}"
-        echo "vmess://$(echo "$vm_json" | base64_n0)" > /etc/s-box/vm_ws.txt
+        local vm_json="{\"add\":\"$server_ipcl\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-$hostname\",\"tls\":\"\",\"type\":\"none\",\"v\":\"2\"}"; echo "vmess://$(echo "$vm_json" | base64_n0)" > /etc/s-box/vm_ws.txt
     fi
     
-    # HYSTERIA2
-    local hy2_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .listen_port')
-    local hy2_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.server_name')
-    local hy2_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.certificate_path')
-    local hy2_insecure hy2_server
+    local hy2_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .listen_port'); local hy2_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.server_name'); local hy2_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.certificate_path'); local hy2_insecure hy2_server
     if [[ "$hy2_cert_path" == "/etc/s-box/cert.pem" ]]; then hy2_insecure=true; hy2_server=$server_ipcl; else hy2_insecure=false; hy2_server=$hy2_sni; fi
-    local hy2_link="hysteria2://$uuid@$hy2_server:$hy2_port?security=tls&alpn=h3&insecure=$hy2_insecure&sni=$hy2_sni#hy2-$hostname"
-    echo "$hy2_link" > /etc/s-box/hy2.txt
+    local hy2_link="hysteria2://$uuid@$hy2_server:$hy2_port?security=tls&alpn=h3&insecure=$hy2_insecure&sni=$hy2_sni#hy2-$hostname"; echo "$hy2_link" > /etc/s-box/hy2.txt
     
-    # TUIC
-    local tu_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .listen_port')
-    local tu_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.server_name')
-    local tu_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.certificate_path')
-    local tu_insecure tu_server
+    local tu_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .listen_port'); local tu_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.server_name'); local tu_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.certificate_path'); local tu_insecure tu_server
     if [[ "$tu_cert_path" == "/etc/s-box/cert.pem" ]]; then tu_insecure=true; tu_server=$server_ipcl; else tu_insecure=false; tu_server=$tu_sni; fi
-    local tu_link="tuic://$uuid:$uuid@$tu_server:$tu_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu_sni&allow_insecure=$tu_insecure#tuic5-$hostname"
-    echo "$tu_link" > /etc/s-box/tuic5.txt
+    local tu_link="tuic://$uuid:$uuid@$tu_server:$tu_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu_sni&allow_insecure=$tu_insecure#tuic5-$hostname"; echo "$tu_link" > /etc/s-box/tuic5.txt
     
     for f in /etc/s-box/vl_reality.txt /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt /etc/s-box/hy2.txt /etc/s-box/tuic5.txt; do
         if [[ -s "$f" ]]; then
@@ -436,7 +416,31 @@ display_sharing_info() {
     fi
 }
 
-install_process() {
+inssb() {
+    red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    green "安裝最新正式版 Sing-box 內核..."
+    local versions_json=$(curl -fsSL --retry 3 "https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box")
+    local sbcore=$(echo "$versions_json" | jq -r '.versions[] | sort -rV | grep -E -m 1 "^[0-9]+\.[0-9]+\.[0-9]+$"')
+    if [[ -z "$sbcore" ]]; then red "從 jsdelivr 獲取最新版本號失敗。"; exit 1; fi
+    
+    green "正在下載 Sing-box v$sbcore ..."
+    local sbname="sing-box-$sbcore-linux-$cpu"
+    curl -L -o /etc/s-box/sing-box.tar.gz -# --retry 3 --fail "https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz"
+    
+    if [[ ! -s '/etc/s-box/sing-box.tar.gz' ]]; then red "下載內核失敗"; exit 1; fi
+    tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
+    mv "/etc/s-box/$sbname/sing-box" /etc/s-box
+    rm -rf "/etc/s-box/sing-box.tar.gz" "/etc/s-box/$sbname"
+    
+    if [[ -x '/etc/s-box/sing-box' ]]; then
+        chmod +x /etc/s-box/sing-box
+        blue "成功安裝內核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')"
+    else 
+        red "解壓內核失敗"; exit 1; 
+    fi
+}
+
+install_or_reinstall() {
     configure_firewall
     inssb
     setup_certificates
@@ -546,9 +550,9 @@ main_menu() {
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     readp "請輸入數字【0-10】：" Input
     case "$Input" in  
-     1 ) install_process;;
+     1 ) install_or_reinstall;;
      2 ) unins;;
-     3 ) install_process;;
+     3 ) install_or_reinstall;;
      4 ) stclre;;
      5 ) upsbyg;; 
      6 ) inssb && sbservice && post_install_check && display_sharing_info;;
@@ -560,7 +564,7 @@ main_menu() {
     esac
 }
 
-# --- 腳本入口 ---
+# --- 腳本主體執行 ---
 check_os
 check_dependencies
 ensure_dirs
