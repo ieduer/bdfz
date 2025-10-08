@@ -14,13 +14,13 @@ trap_error(){
   local code=$?
   local line="$1"
   local cmd="$2"
-  echo -e "\033[31m\033[01m[ERROR]\033[0m at line $line while running: $cmd (exit $code)"
+  echo -e "\033[31m\033[01m[ERROR]\033[0m at line $line while running: '$cmd' (exit code: $code)"
   logger -t "sb.sh" "[ERROR] line $line cmd: $cmd exit: $code"
   exit $code
 }
 trap 'trap_error $LINENO "$BASH_COMMAND"' ERR
 
-export LANG=en_US.UTF-8
+export LANG=en_US.UTF_8
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; plain='\033[0m'
 
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
@@ -41,14 +41,27 @@ hostname=$(hostname)
 bootstrap_and_exec() {
     local permanent_path="/usr/local/lib/ieduer-sb.sh"
     local shortcut_path="/usr/local/bin/sb"
+    # 使用 Github Raw 作為源，更穩定
     local script_url="https://raw.githubusercontent.com/ieduer/bdfz/main/sb.sh"
     if ! command -v wget &>/dev/null && ! command -v curl &>/dev/null; then red "wget 和 curl 都不可用，无法下载脚本。"; exit 1; fi
     green "正在下載最新腳本到 $permanent_path ..."
-    if command -v curl &>/dev/null; then curl -fsSL "$script_url" -o "$permanent_path"; else wget -qO "$permanent_path" "$script_url"; fi
-    if [[ ! -s "$permanent_path" ]]; then red "腳本下載失敗，請檢查網絡或鏈接。"; exit 1; fi
+    if command -v curl &>/dev/null; then 
+        curl -fsSL --retry 3 "$script_url" -o "$permanent_path"
+    else 
+        wget -qO "$permanent_path" --tries=3 "$script_url"
+    fi
+    if [[ ! -s "$permanent_path" ]]; then red "腳本下載失敗，請檢查網絡或链接。"; exit 1; fi
     chmod +x "$permanent_path"; ln -sf "$permanent_path" "$shortcut_path"; green "已安裝/更新快捷命令：sb"
+    # 使用 exec 替換當前進程，確保新腳本立即生效
     exec "$shortcut_path" "$@"
 }
+
+# 恢復 upsbyg 函數
+upsbyg(){
+    yellow "正在嘗試更新腳本..."
+    bootstrap_and_exec
+}
+
 
 check_os() {
     if [[ -r /etc/os-release ]]; then . /etc/os-release; case "${ID,,}" in ubuntu|debian) release="Debian" ;; centos|rhel|rocky|almalinux) release="Centos" ;; alpine) release="alpine" ;; *) red "不支持的系統 (${PRETTY_NAME:-unknown})。" && exit 1 ;; esac; op="${PRETTY_NAME:-$ID}"; else red "無法識別的作業系統。" && exit 1; fi
@@ -119,7 +132,6 @@ setup_certificates() {
 
     if $use_acme; then
         local ym_acme=$(cat /root/ieduerca/ca.log)
-        # 將證書信息存儲到臨時文件，供後續 jq 使用
         jq -n --arg vl_re "apple.com" \
               --arg vm_ws "$ym_acme" \
               --arg hy2 "$ym_acme" \
@@ -189,7 +201,6 @@ setup_uuid_and_reality() {
     blue "Reality 公鑰和 short_id 已生成。"
 }
 
-# 使用 JQ 健壯地生成 JSON
 inssbjsonser(){
     green "正在使用 jq 生成服務端配置文件..."
     local cert_conf="/tmp/cert_config.json"
@@ -239,16 +250,18 @@ inssbjsonser(){
     local hy2_inbound=$(jq -n \
         --argjson port "$(jq -r .hy2 $port_conf)" \
         --arg pass "$(jq -r .uuid $user_conf)" \
+        --arg sni "$(jq -r .hy2 $cert_conf)" \
         --arg cert "$(jq -r .cert $cert_conf)" \
         --arg key "$(jq -r .key $cert_conf)" \
-        '{type: "hysteria2", tag: "hy2-sb", listen: "::", listen_port: $port, sniff: true, sniff_override_destination: true, users: [{password: $pass}], tls: {enabled: true, alpn: ["h3"], certificate_path: $cert, key_path: $key}}')
+        '{type: "hysteria2", tag: "hy2-sb", listen: "::", listen_port: $port, sniff: true, sniff_override_destination: true, users: [{password: $pass}], tls: {enabled: true, server_name: $sni, alpn: ["h3"], certificate_path: $cert, key_path: $key}}')
         
     local tuic_inbound=$(jq -n \
         --argjson port "$(jq -r .tuic $port_conf)" \
         --arg uuid "$(jq -r .uuid $user_conf)" \
+        --arg sni "$(jq -r .tuic $cert_conf)" \
         --arg cert "$(jq -r .cert $cert_conf)" \
         --arg key "$(jq -r .key $cert_conf)" \
-        '{type: "tuic", tag: "tuic5-sb", listen: "::", listen_port: $port, sniff: true, sniff_override_destination: true, users: [{uuid: $uuid, password: $uuid}], congestion_control: "bbr", tls: {enabled: true, alpn: ["h3"], certificate_path: $cert, key_path: $key}}')
+        '{type: "tuic", tag: "tuic5-sb", listen: "::", listen_port: $port, sniff: true, sniff_override_destination: true, users: [{uuid: $uuid, password: $uuid}], congestion_control: "bbr", tls: {enabled: true, server_name: $sni, alpn: ["h3"], certificate_path: $cert, key_path: $key}}')
 
     # 使用 jq 將 inbound 添加到基礎 json 中
     echo "$base_json" | jq ".inbounds += [$vless_inbound, $vmess_inbound, $hy2_inbound, $tuic_inbound]" > "$sbfiles"
@@ -354,63 +367,60 @@ ipuuid(){
 
 # 分享鏈接和客戶端配置生成函數
 result_vl_vm_hy_tu() {
-    # 確保獲取到最新數據
     if [[ ! -s "$sbfiles" ]]; then red "配置文件 sb.json 不存在或為空。"; return 1; fi
     ipuuid # 獲取IP
     
     local config; config=$(cat "$sbfiles")
     local uuid=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .users[0].uuid')
     local public_key=$(cat /etc/s-box/public.key 2>/dev/null || true)
-    
-    # 遍歷 inbounds 提取信息
-    local vl_port vm_port hy2_port tu_port
-    local vl_sni vm_sni hy2_sni tu_sni
-    local vm_path vm_tls
-    local hy2_cert_path tu_cert_path
-    
-    vl_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .listen_port')
-    vl_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.server_name')
-    vl_short_id=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.reality.short_id[0]')
-    
-    vm_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .listen_port')
-    vm_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .transport.path')
-    vm_tls=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.enabled')
-    vm_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.server_name')
-    
-    hy2_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .listen_port')
-    hy2_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.certificate_path' | xargs basename | sed 's/\.pem//;s/\.crt//')
-    hy2_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.certificate_path')
-    
-    tu_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .listen_port')
-    tu_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.certificate_path' | xargs basename | sed 's/\.pem//;s/\.crt//')
-    tu_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.certificate_path')
+    if [[ -z "$public_key" ]]; then
+      # 如果公鑰文件不存在，從配置中重新生成一次（雖然正常流程不該發生）
+      setup_uuid_and_reality >/dev/null
+      public_key=$(jq -r .public_key /tmp/user_config.json)
+    fi
 
-    # VLESS
+    # 提取所有節點信息
+    local vl_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .listen_port')
+    local vl_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.server_name')
+    local vl_short_id=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.reality.short_id[0]')
+    
+    local vm_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .listen_port')
+    local vm_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .transport.path')
+    local vm_tls=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.enabled')
+    local vm_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.server_name')
+    
+    local hy2_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .listen_port')
+    local hy2_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.server_name')
+    local hy2_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.certificate_path')
+    
+    local tu_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .listen_port')
+    local tu_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.server_name')
+    local tu_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.certificate_path')
+
+    # 生成 VLESS 鏈接
     local vl_link="vless://$uuid@$server_ipcl:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_sni&fp=chrome&pbk=$public_key&sid=$vl_short_id&type=tcp&headerType=none#vl-reality-$hostname"
     echo "$vl_link" > /etc/s-box/vl_reality.txt
     
-    # VMESS
+    # 生成 VMESS 鏈接
     local vm_link vm_json
     if [[ "$vm_tls" == "true" ]]; then
         vm_json="{\"add\":\"$vm_sni\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-tls-$hostname\",\"tls\":\"tls\",\"sni\":\"$vm_sni\",\"type\":\"none\",\"v\":\"2\"}"
-        vm_link="vmess://$(echo "$vm_json" | base64_n0)"
-        echo "$vm_link" > /etc/s-box/vm_ws_tls.txt
+        echo "vmess://$(echo "$vm_json" | base64_n0)" > /etc/s-box/vm_ws_tls.txt
     else
         vm_json="{\"add\":\"$server_ipcl\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-$hostname\",\"tls\":\"\",\"type\":\"none\",\"v\":\"2\"}"
-        vm_link="vmess://$(echo "$vm_json" | base64_n0)"
-        echo "$vm_link" > /etc/s-box/vm_ws.txt
+        echo "vmess://$(echo "$vm_json" | base64_n0)" > /etc/s-box/vm_ws.txt
     fi
     
-    # HYSTERIA2
+    # 生成 HYSTERIA2 鏈接
     local hy2_insecure hy2_server
-    if [[ "$hy2_cert_path" == "/etc/s-box/cert.pem" ]]; then hy2_insecure=true; hy2_server=$server_ipcl; else hy2_insecure=false; hy2_server=$vm_sni; fi
-    local hy2_link="hysteria2://$uuid@$hy2_server:$hy2_port?security=tls&alpn=h3&insecure=$hy2_insecure&sni=$vm_sni#hy2-$hostname"
+    if [[ "$hy2_cert_path" == "/etc/s-box/cert.pem" ]]; then hy2_insecure=true; hy2_server=$server_ipcl; else hy2_insecure=false; hy2_server=$hy2_sni; fi
+    local hy2_link="hysteria2://$uuid@$hy2_server:$hy2_port?security=tls&alpn=h3&insecure=$hy2_insecure&sni=$hy2_sni#hy2-$hostname"
     echo "$hy2_link" > /etc/s-box/hy2.txt
     
-    # TUIC
+    # 生成 TUIC 鏈接
     local tu_insecure tu_server
-    if [[ "$tu_cert_path" == "/etc/s-box/cert.pem" ]]; then tu_insecure=true; tu_server=$server_ipcl; else tu_insecure=false; tu_server=$vm_sni; fi
-    local tu_link="tuic://$uuid:$uuid@$tu_server:$tu_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$vm_sni&allow_insecure=$tu_insecure#tuic5-$hostname"
+    if [[ "$tu_cert_path" == "/etc/s-box/cert.pem" ]]; then tu_insecure=true; tu_server=$server_ipcl; else tu_insecure=false; tu_server=$tu_sni; fi
+    local tu_link="tuic://$uuid:$uuid@$tu_server:$tu_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu_sni&allow_insecure=$tu_insecure#tuic5-$hostname"
     echo "$tu_link" > /etc/s-box/tuic5.txt
 }
 
@@ -418,7 +428,7 @@ display_sharing_info() {
     rm -f /etc/s-box/*.txt
     result_vl_vm_hy_tu
 
-    for f in /etc/s-box/*.txt; do
+    for f in /etc/s-box/vl_reality.txt /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt /etc/s-box/hy2.txt /etc/s-box/tuic5.txt; do
         if [[ -s "$f" ]]; then
             local protocol_name=$(basename "$f" .txt | tr '_' '-')
             echo; white "~~~~~~~~~~~~~~~~~";
@@ -445,18 +455,22 @@ clash_sb_share(){
     display_sharing_info
 }
 
-# 核心安裝流程
 install_or_reinstall_sb() {
     ensure_dirs
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green "安裝最新正式版 Sing-box 內核..."
     
-    local sbcore=$(curl -Ls https://data.jsdelivr.net/v1/package/gh/SagerNet/sing-box | grep -Eo '"[0-9.]+"' | sort -rV | head -n 1 | tr -d '"')
-    if [ -z "$sbcore" ]; then red "獲取版本號失敗"; exit 1; fi
+    # 修復版本號獲取邏輯
+    local versions_json=$(curl -fsSL --retry 3 "https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box")
+    local sbcore=$(echo "$versions_json" | jq -r '.versions[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -n 1)
+
+    if [[ -z "$sbcore" || ! "$sbcore" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then 
+        red "從 jsdelivr 獲取最新版本號失敗。"; exit 1; 
+    fi
     
     green "正在下載 Sing-box v$sbcore ..."
     local sbname="sing-box-$sbcore-linux-$cpu"
-    curl -L -o /etc/s-box/sing-box.tar.gz -# --retry 2 "https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz"
+    curl -L -o /etc/s-box/sing-box.tar.gz -# --retry 3 --fail "https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz"
     
     if [[ ! -s '/etc/s-box/sing-box.tar.gz' ]]; then red "下載內核失敗"; exit 1; fi
     tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
@@ -531,17 +545,25 @@ apply_acme_cert() {
 }
 
 enable_bbr_autonomously() {
-    if [[ $vi =~ lxc|openvz ]]; then return 0; fi
-    local kernel_version=$(uname -r | cut -d- -f1)
-    if awk -v ver="$kernel_version" 'BEGIN{if(ver < 4.9) exit 1}'; then
-        if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then green "BBR 已啟用。"; return 0; fi
-        green "檢測到內核支持BBR，正在自動開啟..."; 
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-        sysctl -p >/dev/null 2>&1
-        if sysctl net.ipv4.tcp_congestion_control | grep -qw "bbr"; then green "BBR已成功開啟並立即生效！"; else red "BBR開啟可能未成功。"; fi
+    if [[ $(sysctl -n net.ipv4.tcp_congestion_control) == "bbr" ]]; then green "BBR 已啟用。"; return 0; fi
+    if [[ $(uname -r | cut -d. -f1) -lt 5 && $(uname -r | cut -d. -f2) -lt 9 && $(uname -r | cut -d. -f1) -eq 4 ]]; then return 0; fi
+    green "正在嘗試啟用 BBR..."
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1
+    if [[ $(sysctl -n net.ipv4.tcp_congestion_control) == "bbr" ]]; then green "BBR 已成功啟用！"; else red "BBR 啟用失敗。"; fi
+}
+
+stclre(){ 
+    echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"; readp "選擇【0-3】：" act
+    if [[ x"${release}" == x"alpine" ]]; then 
+        case "$act" in 1) rc-service sing-box restart;; 2) rc-service sing-box stop;; 3) rc-service sing-box start;; *) return;; esac
+    else 
+        case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; *) return;; esac
     fi
 }
+
+sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager -n 100; fi; echo -e "\n[Log saved to $LOG_FILE]"; }
 
 main_menu() {
     clear
@@ -566,6 +588,11 @@ main_menu() {
     if [[ -x '/etc/s-box/sing-box' ]]; then 
         local corev; corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}'); 
         green "Sing-box 核心已安裝：$corev"
+        if systemctl is-active --quiet sing-box || ( [[ x"${release}" == x"alpine" ]] && rc-service sing-box status | grep -q 'started' ); then
+            green "服務狀態：$(green '運行中')"
+        else
+            yellow "服務狀態：$(yellow '未運行')"
+        fi
     else 
         yellow "Sing-box 核心未安裝，請先選 1 。"
     fi
