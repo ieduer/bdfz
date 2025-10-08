@@ -107,15 +107,24 @@ configure_firewall() {
     for port in "${ports_to_open[@]}"; do if [[ -n "$port" ]]; then 
         iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
         iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+        ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        ip6tables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT
     fi; done
-    if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; elif command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; elif [[ -d /etc/iptables ]]; then iptables-save >/etc/iptables/rules.v4 2>/dev/null || true; fi
+    if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; elif command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; elif [[ -d /etc/iptables ]]; then iptables-save >/etc/iptables/rules.v4 2>/dev/null || true; ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true; fi
     green "防火牆規則已保存。"
 }
 
 remove_firewall_rules() {
     if [[ ! -f /etc/s-box/sb.json ]]; then return; fi; green "正在移除防火牆規則..."; local ports_to_close=(); ports_to_close+=($(jq -r '.inbounds[].listen_port' /etc/s-box/sb.json 2>/dev/null || true))
-    for port in "${ports_to_close[@]}"; do if [[ -n "$port" ]]; then iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true; iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true; fi; done
-    if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; elif command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; elif [[ -d /etc/iptables ]]; then iptables-save >/etc/iptables/rules.v4 2>/dev/null || true; fi
+    for port in "${ports_to_close[@]}"; do
+        if [[ -n "$port" ]]; then
+            iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+            iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+            ip6tables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+            ip6tables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        fi
+    done
+    if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; elif command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; elif [[ -d /etc/iptables ]]; then iptables-save >/etc/iptables/rules.v4 2>/dev/null || true; ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true; fi
     green "防火牆規則已更新。"
 }
 
@@ -480,44 +489,83 @@ gen_clash_sub(){
     cat > /etc/s-box/clash_sub.json <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
-  "experimental": { "clash_api": { "external_controller": "127.0.0.1:9090", "external_ui": "ui", "secret": "", "default_mode": "Rule" }, "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true } },
+  "experimental": {
+    "clash_api": { "external_controller": "127.0.0.1:9090", "external_ui": "ui", "secret": "", "default_mode": "Rule" },
+    "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true }
+  },
   "dns": {
     "servers": [
-      { "tag": "proxydns", "address": "${sbdnsip}", "detour": "select" },
-      { "tag": "localdns", "address": "h3://223.5.5.5/dns-query", "detour": "direct" },
+      { "tag": "proxydns", "address": "${sbdnsip}", "detour": "direct", "address_resolver": "localdns" },
+      { "tag": "localdns", "address": "https://223.5.5.5/dns-query", "detour": "direct" },
       { "tag": "dns_fakeip", "address": "fakeip" }
     ],
     "rules": [
-      { "action": "route", "server": "localdns", "disable_cache": true },
-      { "clash_mode": "Global", "server": "proxydns" },
       { "clash_mode": "Direct", "server": "localdns" },
       { "rule_set": "geosite-cn", "server": "localdns" },
-      { "rule_set": "geosite-geolocation-!cn", "server": "proxydns" },
-      { "rule_set": "geosite-geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" }
+      { "rule_set": "geosite-geolocation-!cn", "query_type": ["A","AAAA"], "server": "dns_fakeip" },
+      { "rule_set": "geosite-geolocation-!cn", "server": "proxydns" }
     ],
-    "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" }, "independent_cache": true, "final": "proxydns"
+    "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" },
+    "independent_cache": true,
+    "final": "proxydns"
   },
-  "inbounds": [ { "type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30", "fd00::1/126"], "auto_route": true, "strict_route": true, "sniff": true, "sniff_override_destination": true, "domain_strategy": "prefer_ipv4" } ],
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.19.0.1/30","fd00::1/126"],
+      "auto_route": true,
+      "strict_route": true,
+      "sniff": true,
+      "sniff_override_destination": true,
+      "domain_strategy": "prefer_ipv4"
+    }
+  ],
   "outbounds": [
     { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"] },
-    { "type": "vless", "tag": "${tag_vless}", "server": "${server_ipcl}", "server_port": ${vl_port}, "uuid": "${uuid}", "flow": "xtls-rprx-vision", "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" }, "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } },
-    { "type": "vmess", "tag": "${tag_vmess}", "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "packet_encoding": "packetaddr", "transport": { "type": "ws", "path": "${ws_path}", "headers": { "Host": ["${vm_name}"] } }, "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "insecure": false, "utls": { "enabled": true, "fingerprint": "chrome" } } },
-    { "type": "hysteria2", "tag": "${tag_hy2}", "server": "${cl_hy2_ip}", "server_port": ${hy2_port}, "password": "${uuid}", "tls": { "enabled": true, "server_name": "${hy2_name}", "insecure": ${hy2_ins}, "alpn": ["h3"] } },
-    { "type": "tuic", "tag": "${tag_tuic}", "server": "${cl_tu5_ip}", "server_port": ${tu5_port}, "uuid": "${uuid}", "password": "${uuid}", "congestion_control": "bbr", "udp_relay_mode": "native", "tls": { "enabled": true, "server_name": "${tu5_name}", "insecure": ${tu5_ins}, "alpn": ["h3"] } },
+    { "type": "vless", "tag": "${tag_vless}",
+      "server": "${server_ipcl}", "server_port": ${vl_port}, "uuid": "${uuid}", "flow": "xtls-rprx-vision",
+      "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" },
+               "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } },
+    { "type": "vmess", "tag": "${tag_vmess}",
+      "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "packet_encoding": "packetaddr",
+      "transport": { "type": "ws", "path": "${ws_path}", "headers": { "Host": ["${vm_name}"] } },
+      "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "insecure": false, "utls": { "enabled": true, "fingerprint": "chrome" } } },
+    { "type": "hysteria2", "tag": "${tag_hy2}",
+      "server": "${cl_hy2_ip}", "server_port": ${hy2_port}, "password": "${uuid}",
+      "tls": { "enabled": true, "server_name": "${hy2_name}", "insecure": ${hy2_ins}, "alpn": ["h3"] } },
+    { "type": "tuic", "tag": "${tag_tuic}",
+      "server": "${cl_tu5_ip}", "server_port": ${tu5_port}, "uuid": "${uuid}", "password": "${uuid}",
+      "congestion_control": "bbr", "udp_relay_mode": "native",
+      "tls": { "enabled": true, "server_name": "${tu5_name}", "insecure": ${tu5_ins}, "alpn": ["h3"] } },
     { "tag": "direct", "type": "direct" },
-    { "tag": "auto", "type": "urltest", "outbounds": ["${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"], "url": "https://www.gstatic.com/generate_204", "interval": "1m", "tolerance": 50, "interrupt_exist_connections": false }
+    { "tag": "auto", "type": "urltest",
+      "outbounds": ["${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "1m",
+      "tolerance": 50 }
   ],
   "route": {
     "rule_set": [
-      { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs", "download_detour": "select", "update_interval": "1d" },
-      { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs", "download_detour": "select", "update_interval": "1d" },
-      { "tag": "geoip-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs", "download_detour": "select", "update_interval": "1d" }
+      { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
+        "download_detour": "direct", "update_interval": "1d" },
+      { "tag": "geosite-cn", "type": "remote", "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs",
+        "download_detour": "direct", "update_interval": "1d" },
+      { "tag": "geoip-cn", "type": "remote", "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+        "download_detour": "direct", "update_interval": "1d" }
     ],
-    "auto_detect_interface": true, "final": "select",
+    "auto_detect_interface": true,
+    "final": "select",
     "rules": [
-      { "inbound": "tun-in", "action": "sniff" }, { "protocol": "dns", "action": "hijack-dns" },
-      { "clash_mode": "Direct", "outbound": "direct" }, { "clash_mode": "Global", "outbound": "select" },
-      { "rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct" }, { "ip_is_private": true, "outbound": "direct" },
+      { "inbound": "tun-in", "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "clash_mode": "Direct", "outbound": "direct" },
+      { "clash_mode": "Global", "outbound": "select" },
+      { "rule_set": ["geoip-cn","geosite-cn"], "outbound": "direct" },
+      { "ip_is_private": true, "outbound": "direct" },
       { "rule_set": "geosite-geolocation-!cn", "outbound": "select" }
     ]
   },
