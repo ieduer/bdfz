@@ -1,13 +1,13 @@
 #!/bin/bash
 export LANG=en_US.UTF-8
 
+# --- 增強健壯性 ---
+set -e
+trap 'echo -e "\033[31m\033[01m[ERROR] An error occurred at line $LINENO\033[0m"; exit 1' ERR
+# --- 結束 ---
+
 # --- 腳本1的顏色和基礎函數 ---
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-blue='\033[0;36m'
-bblue='\033[0;34m'
-plain='\033[0m'
+red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; bblue='\033[0;34m'; plain='\033[0m'
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
 yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
@@ -16,87 +16,14 @@ white(){ echo -e "\033[37m\033[01m$1\033[0m";}
 readp(){ read -p "$(yellow "$1")" "$2";}
 base64_n0() { if base64 --help 2>/dev/null | grep -q -- '--wrap'; then base64 --wrap=0; elif base64 --help 2>/dev/null | grep -q -- '-w'; then base64 -w 0; else base64; fi; }
 
-# --- 來自腳本2的健壯性增強 ---
-set -Eeuo pipefail
-trap_error(){
-  local code=$?
-  local line="$1"
-  local cmd="$2"
-  red "[ERROR] at line $line while running: '$cmd' (exit code: $code)"
-  exit $code
-}
-trap 'trap_error $LINENO "$BASH_COMMAND"' ERR
-# --- 結束 ---
-
-[[ $EUID -ne 0 ]] && yellow "请以root模式运行脚本" && exit
-
-# --- 腳本1的系統檢測和變量設置 ---
-if [[ -f /etc/redhat-release ]]; then
-    release="Centos"
-elif cat /etc/issue | grep -q -E -i "alpine"; then
-    release="alpine"
-elif cat /etc/issue | grep -q -E -i "debian"; then
-    release="Debian"
-elif cat /etc/issue | grep -q -E -i "ubuntu"; then
-    release="Ubuntu"
-elif cat /etc/issue | grep -q -E -i "centos|red hat|redhat"; then
-    release="Centos"
-elif cat /proc/version | grep -q -E -i "debian"; then
-    release="Debian"
-elif cat /proc/version | grep -q -E -i "ubuntu"; then
-    release="Ubuntu"
-elif cat /proc/version | grep -q -E -i "centos|red hat|redhat"; then
-    release="Centos"
-else 
-    red "脚本不支持当前的系统，请选择使用Ubuntu,Debian,Centos系统。" && exit
-fi
-
-op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
-if [[ $(echo "$op" | grep -i -E "arch") ]]; then
-    red "脚本不支持当前的 $op 系统，请选择使用Ubuntu,Debian,Centos系统。" && exit
-fi
-
-case $(uname -m) in
-    armv7l) cpu=armv7;;
-    aarch64) cpu=arm64;;
-    x86_64) cpu=amd64;;
-    *) red "目前脚本不支持$(uname -m)架构" && exit;;
-esac
-
-hostname=$(hostname)
-# --- 結束 ---
-
-# --- 腳本1的依賴安裝 ---
-install_dependencies(){
-    if [ ! -f /tmp/sbyg_update_lock ]; then
-        green "首次運行，開始安裝必要的依賴……"
-        if [[ x"${release}" == x"alpine" ]]; then
-            apk update
-            apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what bind-tools xxd
-        else
-            if [ -x "$(command -v apt-get)" ]; then
-                apt-get update -y
-                apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what dnsutils xxd
-            elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then
-                local PKG_MANAGER=$(command -v yum || command -v dnf)
-                $PKG_MANAGER install -y epel-release || true
-                $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what bind-utils xxd
-                systemctl enable --now cronie 2>/dev/null || true
-                systemctl enable --now iptables 2>/dev/null || true
-            fi
-        fi
-        touch /tmp/sbyg_update_lock
-        green "依賴安裝完成。"
-    fi
-}
-# --- 結束 ---
+# --- 所有函數定義 ---
 
 v4v6(){
     v4=$(curl -s4m5 icanhazip.com -k)
     v6=$(curl -s6m5 icanhazip.com -k)
 }
 
-# --- 新的防火牆邏輯 ---
+# 新的防火牆邏輯
 configure_firewall(){
     green "正在配置防火牆..."
     systemctl stop firewalld.service >/dev/null 2>&1 || true
@@ -108,22 +35,18 @@ configure_firewall(){
     iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
     ip6tables -P INPUT DROP; ip6tables -P FORWARD DROP; ip6tables -P OUTPUT ACCEPT
     
-    iptables -A INPUT -i lo -j ACCEPT
-    ip6tables -A INPUT -i lo -j ACCEPT
+    iptables -A INPUT -i lo -j ACCEPT; ip6tables -A INPUT -i lo -j ACCEPT
     iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
     ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
 
     green "開放 SSH 端口 22"
-    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-    ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT
+    iptables -A INPUT -p tcp --dport 22 -j ACCEPT; ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT
 
     for port in "$@"; do
         if [[ -n "$port" ]]; then
             green "開放協議端口 $port (TCP/UDP)"
-            iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
-            iptables -A INPUT -p udp --dport "$port" -j ACCEPT
-            ip6tables -A INPUT -p tcp --dport "$port" -j ACCEPT
-            ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT
+            iptables -A INPUT -p tcp --dport "$port" -j ACCEPT; iptables -A INPUT -p udp --dport "$port" -j ACCEPT
+            ip6tables -A INPUT -p tcp --dport "$port" -j ACCEPT; ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT
         fi
     done
 
@@ -132,7 +55,6 @@ configure_firewall(){
     green "防火牆配置完成。"
 }
 
-# 來自腳本1的安裝內核邏輯 (簡化後)
 inssb(){
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green "安裝最新正式版 Sing-box 內核..."
@@ -158,7 +80,37 @@ inssb(){
     fi
 }
 
-# 來自腳本1的證書邏輯，但調用腳本2的ACME函數
+# 替換為腳本2的 ACME 函數
+apply_acme_cert() {
+    if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
+        green "首次運行，正在安裝acme.sh..."; curl https://get.acme.sh | sh
+        if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then red "acme.sh 安裝失敗"; return 1; fi
+    fi
+    local prev_domain=""; [[ -s "/root/ieduerca/ca.log" ]] && prev_domain=$(cat /root/ieduerca/ca.log 2>/dev/null || true)
+    readp "請輸入您解析到本機的域名 (默認: ${prev_domain:-无}): " domain
+    [[ -z "$domain" ]] && domain="$prev_domain"
+    if [[ -z "$domain" ]]; then red "域名不能為空。"; return 1; fi
+
+    v4v6; local a aaaa; a=$(dig +short A "$domain" 2>/dev/null | head -n1 || true); aaaa=$(dig +short AAAA "$domain" 2>/dev/null | head -n1 || true)
+    if [[ (-n "$a" && -n "$v4" && "$a" != "$v4") || (-n "$aaaa" && -n "$v6" && "$aaaa" != "$v6") ]]; then
+        yellow "警告: $domain 的 A/AAAA 記錄可能未指向本機 (A=$a AAAA=$aaaa，本機 v4=$v4 v6=$v6)，ACME 可能失敗。"
+    fi
+    local stopped_services=();
+    for svc in nginx apache2 httpd sing-box; do if systemctl is-active --quiet "$svc"; then systemctl stop "$svc" || true; stopped_services+=("$svc"); fi; done
+
+    green "嘗試使用 HTTP-01 模式申請/續期證書..."
+    if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone --httpport 80 -k ec-256; then
+        red "證書申請失敗。"; for svc in "${stopped_services[@]}"; do systemctl start "$svc" || true; done; return 1;
+    fi
+    local cert_path="/root/ieduerca";
+    ~/.acme.sh/acme.sh --install-cert -d "${domain}" --ecc --key-file "${cert_path}/private.key" --fullchain-file "${cert_path}/cert.crt" --reloadcmd "systemctl restart sing-box"
+    echo "${domain}" > "${cert_path}/ca.log"
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade 1>/dev/null 2>&1 || true; ~/.acme.sh/acme.sh --install-cronjob 1>/dev/null 2>&1 || true
+    for svc in "${stopped_services[@]}"; do if [[ "$svc" != "sing-box" ]]; then systemctl start "$svc" || true; fi; done
+    green "證書申請與安裝成功：${domain}"; return 0
+}
+
+
 inscertificate(){
     green "二、生成並設置相關證書"
     blue "自動生成bing自簽證書中……" && sleep 1
@@ -173,28 +125,23 @@ inscertificate(){
     else
         readp "如果你有解析完成的域名，是否申請一個Acme域名證書？(y/n, 默認n使用自簽): " choice
         if [[ "${choice,,}" == "y" ]]; then
+            # 使用新的 ACME 函數
             if apply_acme_cert; then use_acme=true; else red "Acme證書申請失敗，回退到自簽證書。"; use_acme=false; fi
         fi
     fi
 
     if $use_acme; then
-        ym_vl_re="apple.com"
-        ym_vm_ws=$(cat /root/ieduerca/ca.log)
-        tlsyn=true
+        ym_vl_re="apple.com"; ym_vm_ws=$(cat /root/ieduerca/ca.log); tlsyn=true
         certificatec_vmess_ws='/root/ieduerca/cert.crt'; certificatep_vmess_ws='/root/ieduerca/private.key'
         certificatec_hy2='/root/ieduerca/cert.crt'; certificatep_hy2='/root/ieduerca/private.key'
         certificatec_tuic='/root/ieduerca/cert.crt'; certificatep_tuic='/root/ieduerca/private.key'
-        blue "Vless-reality SNI: apple.com"
-        blue "Vmess-ws, Hysteria-2, Tuic-v5 將使用 $ym_vm_ws 證書並開啟TLS。"
+        blue "Vless-reality SNI: apple.com"; blue "Vmess-ws, Hysteria-2, Tuic-v5 將使用 $ym_vm_ws 證書並開啟TLS。"
     else
-        ym_vl_re="apple.com"
-        ym_vm_ws="www.bing.com"
-        tlsyn=false
+        ym_vl_re="apple.com"; ym_vm_ws="www.bing.com"; tlsyn=false
         certificatec_vmess_ws='/etc/s-box/cert.pem'; certificatep_vmess_ws='/etc/s-box/private.key'
         certificatec_hy2='/etc/s-box/cert.pem'; certificatep_hy2='/etc/s-box/private.key'
         certificatec_tuic='/etc/s-box/cert.pem'; certificatep_tuic='/etc/s-box/private.key'
-        blue "Vless-reality SNI: apple.com"
-        blue "Vmess-ws 將關閉TLS，Hysteria-2, Tuic-v5 將使用bing自簽證書。"
+        blue "Vless-reality SNI: apple.com"; blue "Vmess-ws 將關閉TLS，Hysteria-2, Tuic-v5 將使用bing自簽證書。"
     fi
 }
 
@@ -224,11 +171,9 @@ insport() {
 inssbjsonser(){
     local dns_strategy="prefer_ipv4"
     if [[ -z "$(curl -s4m5 icanhazip.com -k)" ]]; then dns_strategy="prefer_ipv6"; fi
-    
     local vmess_tls_alpn=""
     if [[ "${tlsyn}" == "true" ]]; then vmess_tls_alpn=', "alpn": ["http/1.1"]'; fi
-    
-    # 使用來自腳本1的 cat EOF 方式，確保穩定性
+
     cat > /etc/s-box/sb.json <<EOF
 {
 "log": { "disabled": false, "level": "info", "timestamp": true },
@@ -303,8 +248,7 @@ post_install_check() {
     sleep 3
     if systemctl is-active --quiet sing-box || ( [[ x"${release}" == x"alpine" ]] && rc-service sing-box status 2>/dev/null | grep -q 'started' ); then green "✅ Sing-box 服務正在運行。"; else red "❌ Sing-box 服務啟動失敗！"; return 1; fi
     
-    blue "檢查端口監聽狀態:"
-    local all_ports_listening=true
+    blue "檢查端口監聽狀態:"; local all_ports_listening=true
     for port in "$port_vl_re" "$port_vm_ws" "$port_hy2" "$port_tu"; do
         if ss -H -tunlp "sport = :$port" | grep -q "sing-box"; then green "  ✅ 端口 $port 正在被 sing-box 監聽。"; else red "  ❌ 端口 $port 未被監聽！"; all_ports_listening=false; fi
     done
@@ -316,12 +260,13 @@ ipuuid(){
     if [[ -n "$v4" && -n "$v6" ]]; then
         readp "雙棧VPS，請選擇IP配置輸出 (1: IPv4, 2: IPv6, 默認2): " menu
         if [[ "$menu" == "1" ]]; then server_ip="$v4"; server_ipcl="$v4"; else server_ip="[$v6]"; server_ipcl="$v6"; fi
-    elif [[ -n "$v6" ]]; then server_ip="[$v6]"; server_ipcl="$v6"
-    elif [[ -n "$v4" ]]; then server_ip="$v4"; server_ipcl="$v4"
+    elif [[ -n "$v6" ]]; then server_ip="[$v6]"; server_ipcl="$v6";
+    elif [[ -n "$v4" ]]; then server_ip="$v4"; server_ipcl="$v4";
     else red "无法获取公網 IP 地址。" && return 1; fi
     if [[ -z "$server_ip" || -z "$server_ipcl" ]]; then red "获取 IP 地址失败。"; return 1; fi
 }
 
+# 替換為腳本2的分享信息方案
 display_sharing_info() {
     if ! ipuuid; then red "無法獲取IP信息，跳過分享。"; return 1; fi
     rm -f /etc/s-box/*.txt
@@ -344,10 +289,10 @@ display_sharing_info() {
 }
 
 install_or_reinstall() {
+    mkdir -p /etc/s-box
     inssb
     inscertificate
     insport
-    # 生成 UUID 和 Reality 密鑰
     green "四、自動生成 UUID 和 Reality 密鑰"
     uuid=$(/etc/s-box/sing-box generate uuid)
     key_pair=$(/etc/s-box/sing-box generate reality-keypair)
@@ -356,7 +301,7 @@ install_or_reinstall() {
     echo "$public_key" > /etc/s-box/public.key
     short_id=$(/etc/s-box/sing-box generate rand --hex 4)
     blue "已確認uuid (密碼)：${uuid}"; blue "Vmess Path：/${uuid}-vm"
-
+    
     configure_firewall "$port_vl_re" "$port_vm_ws" "$port_hy2" "$port_tu"
     inssbjsonser
     sbservice
@@ -372,35 +317,6 @@ unins(){
     green "Sing-box 已卸載完成。"
 }
 
-apply_acme_cert() {
-    if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
-        green "首次運行，正在安裝acme.sh..."; curl https://get.acme.sh | sh
-        if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then red "acme.sh 安裝失敗"; return 1; fi
-    fi
-    local prev_domain=""; [[ -s "/root/ieduerca/ca.log" ]] && prev_domain=$(cat /root/ieduerca/ca.log 2>/dev/null || true)
-    readp "請輸入您解析到本機的域名 (默認: ${prev_domain:-无}): " domain
-    [[ -z "$domain" ]] && domain="$prev_domain"
-    if [[ -z "$domain" ]]; then red "域名不能為空。"; return 1; fi
-
-    v4v6; local a aaaa; a=$(dig +short A "$domain" 2>/dev/null | head -n1 || true); aaaa=$(dig +short AAAA "$domain" 2>/dev/null | head -n1 || true)
-    if [[ (-n "$a" && -n "$v4" && "$a" != "$v4") || (-n "$aaaa" && -n "$v6" && "$aaaa" != "$v6") ]]; then
-        yellow "警告: $domain 的 A/AAAA 記錄可能未指向本機 (A=$a AAAA=$aaaa，本機 v4=$v4 v6=$v6)，ACME 可能失敗。"
-    fi
-    local stopped_services=();
-    for svc in nginx apache2 httpd sing-box; do if systemctl is-active --quiet "$svc"; then systemctl stop "$svc" || true; stopped_services+=("$svc"); fi; done
-
-    green "嘗試使用 HTTP-01 模式申請/續期證書..."
-    if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone --httpport 80 -k ec-256; then
-        red "證書申請失敗。"; for svc in "${stopped_services[@]}"; do systemctl start "$svc" || true; done; return 1;
-    fi
-    local cert_path="/root/ieduerca";
-    ~/.acme.sh/acme.sh --install-cert -d "${domain}" --ecc --key-file "${cert_path}/private.key" --fullchain-file "${cert_path}/cert.crt" --reloadcmd "systemctl restart sing-box"
-    echo "${domain}" > "${cert_path}/ca.log"
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade 1>/dev/null 2>&1 || true; ~/.acme.sh/acme.sh --install-cronjob 1>/dev/null 2>&1 || true
-    for svc in "${stopped_services[@]}"; do if [[ "$svc" != "sing-box" ]]; then systemctl start "$svc" || true; fi; done
-    green "證書申請與安裝成功：${domain}"; return 0
-}
-
 stclre(){ 
     echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"; readp "選擇【0-3】：" act
     if [[ x"${release}" == x"alpine" ]]; then 
@@ -410,8 +326,9 @@ stclre(){
     fi
 }
 
-sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager -n 100; fi; echo -e "\n日誌已保存到 $LOG_FILE"; }
+sblog(){ if [[ x"${release}" == x"alpine" ]]; then tail -n 100 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager -n 100; fi; echo -e "\n日誌已保存到 $LOG_FILE"; }
 
+# --- 主菜單 (來自腳本2) ---
 main_menu() {
     clear
     white "Vless-reality, Vmess-ws, Hysteria-2, Tuic-v5 四協議共存腳本 (基於腳本1)"
@@ -461,11 +378,6 @@ main_menu() {
 }
 
 # --- 腳本主體執行 ---
-main() {
-    check_os
-    install_dependencies
-    ensure_dirs
-    main_menu
-}
-
-main "$@"
+check_os
+install_dependencies
+main_menu
