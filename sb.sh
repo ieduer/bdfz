@@ -359,7 +359,11 @@ inssbjsonser(){
   "log": { "disabled": false, "level": "info", "timestamp": true },
   "inbounds": [
     { "type": "vless", "sniff": true, "sniff_override_destination": true, "tag": "vless-sb", "listen": "::", "listen_port": ${port_vl_re}, "users": [ { "uuid": "${uuid}", "flow": "xtls-rprx-vision" } ], "tls": { "enabled": true, "server_name": "${ym_vl_re}", "reality": { "enabled": true, "handshake": { "server": "${ym_vl_re}", "server_port": 443 }, "private_key": "$private_key", "short_id": ["$short_id"] } } },
-    { "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws}, "users": [ { "uuid": "${uuid}", "alterId": 0 } ], "transport": { "type": "ws", "path": "/${uuid}-vm" }, "tls":{ "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" } }, 
+    { "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws},
+      "users": [ { "uuid": "${uuid}", "alterId": 0 } ],
+      "packet_encoding": "packetaddr",
+      "transport": { "type": "ws", "path": "/${uuid}-vm" },
+      "tls": { "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" } },
     { "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2}, "users": [ { "password": "${uuid}" } ], "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" } },
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
@@ -377,7 +381,11 @@ EOF
   "log": { "disabled": false, "level": "info", "timestamp": true },
   "inbounds": [
     { "type": "vless", "sniff": true, "sniff_override_destination": true, "tag": "vless-sb", "listen": "::", "listen_port": ${port_vl_re}, "users": [ { "uuid": "${uuid}", "flow": "xtls-rprx-vision" } ], "tls": { "enabled": true, "server_name": "${ym_vl_re}", "reality": { "enabled": true, "handshake": { "server": "${ym_vl_re}", "server_port": 443 }, "private_key": "$private_key", "short_id": ["$short_id"] } } },
-    { "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws}, "users": [ { "uuid": "${uuid}", "alterId": 0 } ], "transport": { "type": "ws", "path": "/${uuid}-vm" }, "tls":{ "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" } }, 
+    { "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws},
+      "users": [ { "uuid": "${uuid}", "alterId": 0 } ],
+      "packet_encoding": "packetaddr",
+      "transport": { "type": "ws", "path": "/${uuid}-vm" },
+      "tls": { "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" } },
     { "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2}, "users": [ { "password": "${uuid}" } ], "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" } },
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
@@ -444,14 +452,14 @@ ipuuid(){
     if [[ -n "$v4" && -n "$v6" ]]; then
         readp "雙棧VPS，請選擇IP配置輸出 (1: IPv4, 2: IPv6, 默認2): " menu
         if [[ "$menu" == "1" ]]; then
-            sbdnsip='tls://dns.google'; server_ip="$v4"; server_ipcl="$v4"
+            sbdnsip='https://dns.google/dns-query'; server_ip="$v4"; server_ipcl="$v4"
         else
-            sbdnsip='tls://[2001:4860:4860::8888]'; server_ip="[$v6]"; server_ipcl="$v6"
+            sbdnsip='https://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"
         fi
     elif [[ -n "$v6" ]]; then
-        sbdnsip='tls://[2001:4860:4860::8888]'; server_ip="[$v6]"; server_ipcl="$v6"
+        sbdnsip='https://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"
     elif [[ -n "$v4" ]]; then
-        sbdnsip='tls://dns.google'; server_ip="$v4"; server_ipcl="$v4"
+        sbdnsip='https://dns.google/dns-query'; server_ip="$v4"; server_ipcl="$v4"
     else
         red "无法获取公網 IP 地址。" && return 1
     fi
@@ -497,7 +505,7 @@ gen_clash_sub(){
   },
   "dns": {
     "servers": [
-      { "tag": "proxydns", "address": "https://8.8.8.8/dns-query", "detour": "select", "address_resolver": "localdns" },
+      { "tag": "proxydns", "address": "https://dns.google/dns-query", "detour": "select", "address_resolver": "localdns" },
       { "tag": "localdns", "address": "https://223.5.5.5/dns-query", "detour": "direct" },
       { "tag": "dns_fakeip", "address": "fakeip" }
     ],
@@ -531,8 +539,8 @@ gen_clash_sub(){
       "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" },
                "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } },
     { "type": "vmess", "tag": "${tag_vmess}",
-      "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "packet_encoding": "packetaddr",
-      "transport": { "type": "ws", "path": "${ws_path}", "headers": { "Host": ["${vm_name}"] } },
+      "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto",
+      "transport": { "type": "ws", "path": "${ws_path}", "headers": { "Host": "${vm_name}" } },
       "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "insecure": false, "utls": { "enabled": true, "fingerprint": "chrome" } } },
     { "type": "hysteria2", "tag": "${tag_hy2}",
       "server": "${cl_hy2_ip}", "server_port": ${hy2_port}, "password": "${uuid}",
