@@ -497,11 +497,12 @@ gen_clash_sub(){
   },
   "dns": {
     "servers": [
-      { "tag": "proxydns", "address": "${sbdnsip}", "detour": "direct", "address_resolver": "localdns" },
+      { "tag": "proxydns", "address": "https://8.8.8.8/dns-query", "detour": "select", "address_resolver": "localdns" },
       { "tag": "localdns", "address": "https://223.5.5.5/dns-query", "detour": "direct" },
       { "tag": "dns_fakeip", "address": "fakeip" }
     ],
     "rules": [
+      { "outbound": "any", "server": "localdns", "disable_cache": true },
       { "clash_mode": "Direct", "server": "localdns" },
       { "rule_set": "geosite-cn", "server": "localdns" },
       { "rule_set": "geosite-geolocation-!cn", "query_type": ["A","AAAA"], "server": "dns_fakeip" },
@@ -551,19 +552,20 @@ gen_clash_sub(){
     "rule_set": [
       { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary",
         "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-        "download_detour": "direct", "update_interval": "1d" },
+        "download_detour": "select", "update_interval": "1d" },
       { "tag": "geosite-cn", "type": "remote", "format": "binary",
         "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs",
-        "download_detour": "direct", "update_interval": "1d" },
+        "download_detour": "select", "update_interval": "1d" },
       { "tag": "geoip-cn", "type": "remote", "format": "binary",
         "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "download_detour": "direct", "update_interval": "1d" }
+        "download_detour": "select", "update_interval": "1d" }
     ],
     "auto_detect_interface": true,
     "final": "select",
     "rules": [
       { "inbound": "tun-in", "action": "sniff" },
       { "protocol": "dns", "action": "hijack-dns" },
+      { "port": 443, "network": "udp", "action": "reject" },
       { "clash_mode": "Direct", "outbound": "direct" },
       { "clash_mode": "Global", "outbound": "select" },
       { "rule_set": ["geoip-cn","geosite-cn"], "outbound": "direct" },
