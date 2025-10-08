@@ -362,7 +362,7 @@ inssbjsonser(){
     { "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws},
       "users": [ { "uuid": "${uuid}", "alterId": 0 } ],
       "transport": { "type": "ws", "path": "/${uuid}-vm" },
-      "tls": { "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" } },
+      "tls": { "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws", "alpn": ["http/1.1"] } },
     { "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2}, "users": [ { "password": "${uuid}" } ], "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" } },
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
@@ -383,7 +383,7 @@ EOF
     { "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws},
       "users": [ { "uuid": "${uuid}", "alterId": 0 } ],
       "transport": { "type": "ws", "path": "/${uuid}-vm" },
-      "tls": { "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" } },
+      "tls": { "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws", "alpn": ["http/1.1"] } },
     { "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2}, "users": [ { "password": "${uuid}" } ], "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" } },
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
@@ -537,9 +537,9 @@ gen_clash_sub(){
       "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" },
                "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } },
     { "type": "vmess", "tag": "${tag_vmess}",
-      "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto",
-      "transport": { "type": "ws", "path": "${ws_path}", "headers": { "Host": "${vm_name}" } },
-      "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "insecure": false, "utls": { "enabled": true, "fingerprint": "chrome" } } },
+      "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "packet_encoding": "packetaddr",
+      "transport": { "type": "ws", "path": "${ws_path}", "headers": { "Host": ["${vm_name}"] } },
+      "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "insecure": false, "utls": { "enabled": true, "fingerprint": "chrome" }, "alpn": ["http/1.1"] } },
     { "type": "hysteria2", "tag": "${tag_hy2}",
       "server": "${cl_hy2_ip}", "server_port": ${hy2_port}, "password": "${uuid}",
       "tls": { "enabled": true, "server_name": "${hy2_name}", "insecure": ${hy2_ins}, "alpn": ["h3"] } },
@@ -558,13 +558,13 @@ gen_clash_sub(){
     "rule_set": [
       { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary",
         "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-        "download_detour": "select", "update_interval": "1d" },
+        "download_detour": "${tag_vless}", "update_interval": "1d" },
       { "tag": "geosite-cn", "type": "remote", "format": "binary",
         "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs",
-        "download_detour": "select", "update_interval": "1d" },
+        "download_detour": "${tag_vless}", "update_interval": "1d" },
       { "tag": "geoip-cn", "type": "remote", "format": "binary",
         "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "download_detour": "select", "update_interval": "1d" }
+        "download_detour": "${tag_vless}", "update_interval": "1d" }
     ],
     "auto_detect_interface": true,
     "final": "select",
