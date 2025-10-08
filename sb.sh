@@ -398,11 +398,3 @@ case $(uname -m) in
     armv7l) cpu=armv7;; aarch64) cpu=arm64;; x86_64) cpu=amd64;;
     *) red "目前脚本不支持$(uname -m)架构" && exit;;
 esac
-hostname=$(hostname)
-
-# 首次運行時安裝依賴
-if [ ! -f /tmp/sbyg_update_lock ]; then
-    install_dependencies
-fi
-
-main_menu
