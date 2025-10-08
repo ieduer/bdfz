@@ -31,16 +31,13 @@ base64_n0() { if base64 --help 2>/dev/null | grep -q -- '--wrap'; then base64 --
 
 [[ $EUID -ne 0 ]] && yellow "請以root模式運行腳本" && exit
 
-# 全局變量
-export sbfiles="/etc/s-box/sb.json"
-hostname=$(hostname)
-
+# --- 引導程序 (Bootstrapper) ---
 bootstrap_and_exec() {
     local permanent_path="/usr/local/lib/ieduer-sb.sh"
     local shortcut_path="/usr/local/bin/sb"
     local script_url="https://raw.githubusercontent.com/ieduer/bdfz/main/sb.sh"
     if ! command -v wget &>/dev/null && ! command -v curl &>/dev/null; then red "wget 和 curl 都不可用，无法下载脚本。"; exit 1; fi
-    green "正在下載最新腳本到 $permanent_path ..."
+    green "首次運行，正在下載腳本到 $permanent_path ..."
     if command -v curl &>/dev/null; then 
         curl -fsSL --retry 3 "$script_url" -o "$permanent_path"
     else 
@@ -48,13 +45,30 @@ bootstrap_and_exec() {
     fi
     if [[ ! -s "$permanent_path" ]]; then red "腳本下載失敗，請檢查網絡或链接。"; exit 1; fi
     chmod +x "$permanent_path"; ln -sf "$permanent_path" "$shortcut_path"; green "已安裝/更新快捷命令：sb"
-    exec "$shortcut_path" "$@"
+    # 使用 exec 替換當前進程，確保新腳本立即生效
+    exec "$permanent_path" "$@"
 }
 
+# 腳本自我更新函數
 upsbyg(){
     yellow "正在嘗試更新腳本..."
     bootstrap_and_exec
 }
+
+# 只有當腳本不是從永久路徑執行時，才運行引導程序
+# realpath 可能不存在於極簡系統，用 readlink -f 替代
+SELF_PATH=""
+if command -v realpath >/dev/null; then SELF_PATH=$(realpath "$0"); else SELF_PATH=$(readlink -f "$0"); fi
+PERMANENT_PATH="/usr/local/lib/ieduer-sb.sh"
+if [[ "$SELF_PATH" != "$PERMANENT_PATH" ]]; then
+    bootstrap_and_exec "$@"
+    exit 0 # 確保引導程序執行後，舊的臨時進程乾淨退出
+fi
+# --- 引導結束 ---
+
+# --- 主腳本邏輯開始 ---
+
+hostname=$(hostname)
 
 check_os() {
     if [[ -r /etc/os-release ]]; then 
@@ -71,9 +85,7 @@ check_os() {
     fi
     
     case "$(uname -m)" in 
-        armv7l) cpu=armv7 ;; 
-        aarch64) cpu=arm64 ;; 
-        x86_64) cpu=amd64 ;; 
+        armv7l) cpu=armv7 ;; aarch64) cpu=arm64 ;; x86_64) cpu=amd64 ;; 
         *) red "不支持的架構 $(uname -m)" && exit 1 ;; 
     esac
 }
@@ -81,11 +93,7 @@ check_os() {
 check_dependencies() {
     local pkgs=("curl" "openssl" "iptables" "tar" "wget" "jq" "socat" "qrencode" "git" "ss" "lsof" "virt-what" "dig" "xxd")
     local missing_pkgs=()
-    for pkg in "${pkgs[@]}"; do 
-        if ! command -v "$pkg" &> /dev/null; then 
-            missing_pkgs+=("$pkg")
-        fi
-    done
+    for pkg in "${pkgs[@]}"; do if ! command -v "$pkg" &> /dev/null; then missing_pkgs+=("$pkg"); fi; done
     if [ ${#missing_pkgs[@]} -gt 0 ]; then 
         yellow "檢測到缺少依賴: ${missing_pkgs[*]}，將自動安裝。"
         install_dependencies
@@ -238,7 +246,6 @@ inssbjsonser(){
         "route":{ "rules":[ { "protocol": ["quic", "stun"], "outbound": "block" } ], "final": "direct" }
     }'
     
-    # 逐個構建 inbound
     local vless_inbound=$(jq -n \
         --argjson port "$(jq -r .vl $port_conf)" \
         --arg uuid "$(jq -r .uuid $user_conf)" \
@@ -281,7 +288,6 @@ inssbjsonser(){
         --arg key "$(jq -r .key $cert_conf)" \
         '{type: "tuic", tag: "tuic5-sb", listen: "::", listen_port: $port, sniff: true, sniff_override_destination: true, users: [{uuid: $uuid, password: $uuid}], congestion_control: "bbr", tls: {enabled: true, server_name: $sni, alpn: ["h3"], certificate_path: $cert, key_path: $key}}')
 
-    # 使用 jq 將 inbound 添加到基礎 json 中
     echo "$base_json" | jq ".inbounds += [$vless_inbound, $vmess_inbound, $hy2_inbound, $tuic_inbound]" > "$sbfiles"
     
     rm -f /tmp/cert_config.json /tmp/port_config.json /tmp/user_config.json
@@ -361,14 +367,14 @@ ipuuid(){
     if [[ -n "$v4" && -n "$v6" ]]; then
         readp "雙棧VPS，請選擇IP配置輸出 (1: IPv4, 2: IPv6, 默認2): " menu
         if [[ "$menu" == "1" ]]; then
-            server_ip="$v4"; server_ipcl="$v4"; sbdnsip='https://dns.google/dns-query'
+            server_ip="$v4"; server_ipcl="$v4"
         else
-            server_ip="[$v6]"; server_ipcl="$v6"; sbdnsip='https://[2001:4860:4860::8888]/dns-query'
+            server_ip="[$v6]"; server_ipcl="$v6"
         fi
     elif [[ -n "$v6" ]]; then
-        server_ip="[$v6]"; server_ipcl="$v6"; sbdnsip='https://[2001:4860:4860::8888]/dns-query'
+        server_ip="[$v6]"; server_ipcl="$v6"
     elif [[ -n "$v4" ]]; then
-        server_ip="$v4"; server_ipcl="$v4"; sbdnsip='https://dns.google/dns-query'
+        server_ip="$v4"; server_ipcl="$v4"
     else red "无法获取公網 IP 地址。" && return 1; fi
 }
 
@@ -376,7 +382,7 @@ display_sharing_info() {
     if ! ipuuid; then red "無法獲取IP信息，跳過分享。"; return 1; fi
     rm -f /etc/s-box/*.txt
     local config=$(cat "$sbfiles")
-    local uuid=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .users[0].uuid')
+    local uuid=$(echo "$config" | jq -r '.inbounds[0].users[0].uuid')
     local public_key=$(cat /etc/s-box/public.key 2>/dev/null || true)
     
     # VLESS
@@ -417,27 +423,21 @@ display_sharing_info() {
     local tu_link="tuic://$uuid:$uuid@$tu_server:$tu_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu_sni&allow_insecure=$tu_insecure#tuic5-$hostname"
     echo "$tu_link" > /etc/s-box/tuic5.txt
     
-    # 顯示
     for f in /etc/s-box/vl_reality.txt /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt /etc/s-box/hy2.txt /etc/s-box/tuic5.txt; do
         if [[ -s "$f" ]]; then
-            local protocol_name=$(basename "$f" .txt | tr '_' '-')
-            echo; white "~~~~~~~~~~~~~~~~~"; red "🚀 ${protocol_name^^}"
-            local link=$(cat "$f")
-            echo "鏈接:"; echo -e "${yellow}$link${plain}"
-            echo "二維碼:"; qrencode -o - -t ANSIUTF8 "$link"
+            local protocol_name=$(basename "$f" .txt | tr '_' '-'); echo; white "~~~~~~~~~~~~~~~~~"; red "🚀 ${protocol_name^^}"
+            local link=$(cat "$f"); echo "鏈接:"; echo -e "${yellow}$link${plain}"; echo "二維碼:"; qrencode -o - -t ANSIUTF8 "$link"
         fi
     done
     cat /etc/s-box/*.txt > /tmp/all_links.txt 2>/dev/null
     if [[ -s /tmp/all_links.txt ]]; then
         local sub_link=$(base64_n0 < /tmp/all_links.txt)
-        echo; white "~~~~~~~~~~~~~~~~~"; red "🚀 四合一聚合訂閱"
-        echo "鏈接:"; echo -e "${yellow}$sub_link${plain}"
+        echo; white "~~~~~~~~~~~~~~~~~"; red "🚀 四合一聚合訂閱"; echo "鏈接:"; echo -e "${yellow}$sub_link${plain}"
     fi
 }
 
 install_process() {
-    mkdir -p /etc/s-box
-    close_firewall
+    configure_firewall
     inssb
     setup_certificates
     setup_ports
@@ -512,7 +512,6 @@ stclre(){
 
 sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager -n 100; fi; echo -e "\n[Log saved to $LOG_FILE]"; }
 
-# 主菜單
 main_menu() {
     clear
     white "Vless-reality, Vmess-ws, Hysteria-2, Tuic-v5 四協議共存腳本 (融合版)"
@@ -549,10 +548,10 @@ main_menu() {
     case "$Input" in  
      1 ) install_process;;
      2 ) unins;;
-     3 ) install_process;; # 重置配置和安裝是同一個流程
+     3 ) install_process;;
      4 ) stclre;;
      5 ) upsbyg;; 
-     6 ) inssb && sbservice && post_install_check && display_sharing_info;; # 僅更新內核
+     6 ) inssb && sbservice && post_install_check && display_sharing_info;;
      7 ) display_sharing_info;;
      8 ) sblog;;
      9 ) apply_acme_cert;;
