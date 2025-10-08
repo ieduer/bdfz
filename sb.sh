@@ -24,21 +24,30 @@ v4v6(){
 
 configure_firewall(){
     green "正在配置防火牆..."
-    systemctl stop firewalld.service >/dev/null 2>&1 || true; systemctl disable firewalld.service >/dev/null 2>&1 || true
+    systemctl stop firewalld.service >/dev/null 2>&1 || true
+    systemctl disable firewalld.service >/dev/null 2>&1 || true
     setenforce 0 >/dev/null 2>&1 || true
     ufw disable >/dev/null 2>&1 || true
+
     iptables -F; iptables -X; ip6tables -F; ip6tables -X
     iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
     ip6tables -P INPUT DROP; ip6tables -P FORWARD DROP; ip6tables -P OUTPUT ACCEPT
+    
     iptables -A INPUT -i lo -j ACCEPT; ip6tables -A INPUT -i lo -j ACCEPT
-    iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT; ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
-    green "开放 SSH 端口 22"; iptables -A INPUT -p tcp --dport 22 -j ACCEPT; ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT
+    iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+    ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+    green "开放 SSH 端口 22"
+    iptables -A INPUT -p tcp --dport 22 -j ACCEPT; ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT
+
     for port in "$@"; do
         if [[ -n "$port" ]]; then
-            green "开放協議端口 $port (TCP/UDP)"; iptables -A INPUT -p tcp --dport "$port" -j ACCEPT; iptables -A INPUT -p udp --dport "$port" -j ACCEPT
+            green "开放協議端口 $port (TCP/UDP)"
+            iptables -A INPUT -p tcp --dport "$port" -j ACCEPT; iptables -A INPUT -p udp --dport "$port" -j ACCEPT
             ip6tables -A INPUT -p tcp --dport "$port" -j ACCEPT; ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT
         fi
     done
+
     if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; fi
     if command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; fi
     green "防火牆配置完成。"
@@ -47,21 +56,30 @@ configure_firewall(){
 inssb(){
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green "安装最新正式版 Sing-box 内核..."
-    local versions_json=$(curl -fsSL --retry 3 "https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box")
-    local sbcore=$(echo "$versions_json" | jq -r '.versions[] | sort -rV | grep -E -m 1 "^[0-9]+\.[0-9]+\.[0-9]+$"')
-    if [[ -z "$sbcore" ]]; then red "从 jsdelivr 獲取最新版本號失敗。"; exit 1; fi
+    
+    # --- 恢复脚本1的版本号获取方式 ---
+    sbcore=$(curl -Ls https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | grep -Eo '"[0-9.]+",' | sed -n 1p | tr -d '",')
+    if [[ -z "$sbcore" ]]; then red "获取最新版本号失败。"; exit 1; fi
+    
     green "正在下載 Sing-box v$sbcore ..."
     local sbname="sing-box-$sbcore-linux-$cpu"
     curl -L -o /etc/s-box/sing-box.tar.gz -# --retry 3 --fail "https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz"
+    
     if [[ ! -f '/etc/s-box/sing-box.tar.gz' || ! -s '/etc/s-box/sing-box.tar.gz' ]]; then red "下載內核失敗"; exit 1; fi
     tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
     mv -f "/etc/s-box/$sbname/sing-box" /etc/s-box/
     rm -rf "/etc/s-box/sing-box.tar.gz" "/etc/s-box/$sbname"
-    if [[ -f '/etc/s-box/sing-box' ]]; then chmod +x /etc/s-box/sing-box; blue "成功安裝內核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')"; else red "解壓內核失敗"; exit 1; fi
+    
+    if [[ -f '/etc/s-box/sing-box' ]]; then
+        chmod +x /etc/s-box/sing-box
+        blue "成功安裝內核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')"
+    else 
+        red "解壓內核失敗"; exit 1; 
+    fi
 }
 
 apply_acme_cert() {
-    mkdir -p /root/ieduerca /root/ygkkkca # 兼容脚本1的路径
+    mkdir -p /root/ieduerca /root/ygkkkca
     if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
         green "首次運行，正在安裝acme.sh..."; curl https://get.acme.sh | sh
         if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then red "acme.sh 安裝失敗"; return 1; fi
@@ -71,10 +89,14 @@ apply_acme_cert() {
     readp "請輸入您解析到本機的域名 (默認: ${prev_domain:-无}): " domain
     [[ -z "$domain" ]] && domain="$prev_domain"
     if [[ -z "$domain" ]]; then red "域名不能為空。"; return 1; fi
+
     v4v6; local a aaaa; a=$(dig +short A "$domain" 2>/dev/null | head -n1 || true); aaaa=$(dig +short AAAA "$domain" 2>/dev/null | head -n1 || true)
-    if [[ (-n "$a" && -n "$v4" && "$a" != "$v4") || (-n "$aaaa" && -n "$v6" && "$aaaa" != "$v6") ]]; then yellow "警告: $domain 的 A/AAAA 記錄可能未指向本機，ACME 可能失敗。"; fi
+    if [[ (-n "$a" && -n "$v4" && "$a" != "$v4") || (-n "$aaaa" && -n "$v6" && "$aaaa" != "$v6") ]]; then
+        yellow "警告: $domain 的 A/AAAA 記錄可能未指向本機 (A=$a AAAA=$aaaa，本機 v4=$v4 v6=$v6)，ACME 可能失敗。"
+    fi
     local stopped_services=();
     for svc in nginx apache2 httpd sing-box; do if systemctl is-active --quiet "$svc"; then systemctl stop "$svc" || true; stopped_services+=("$svc"); fi; done
+
     green "嘗試使用 HTTP-01 模式申請/續期證書..."
     if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone --httpport 80 -k ec-256; then
         red "證書申請失敗。"; for svc in "${stopped_services[@]}"; do systemctl start "$svc" || true; done; return 1;
@@ -89,8 +111,8 @@ apply_acme_cert() {
 
 inscertificate(){
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green "二、生成並設置相關證書"
-    blue "自動生成bing自簽證書中……" && sleep 1
+    green "二、生成并设置相关证书"
+    blue "自动生成bing自签证书中……" && sleep 1
     openssl ecparam -genkey -name prime256v1 -out /etc/s-box/private.key >/dev/null 2>&1
     openssl req -new -x509 -days 36500 -key /etc/s-box/private.key -out /etc/s-box/cert.pem -subj "/CN=www.bing.com" >/dev/null 2>&1
     local use_acme=false
@@ -195,8 +217,8 @@ ipuuid(){
     if [[ -n "$v4" && -n "$v6" ]]; then
         readp "雙棧VPS，請選擇IP配置輸出 (1: IPv4, 2: IPv6, 默認2): " menu
         if [[ "$menu" == "1" ]]; then server_ip="$v4"; server_ipcl="$v4"; else server_ip="[$v6]"; server_ipcl="$v6"; fi
-    elif [[ -n "$v6" ]]; then server_ip="[$v6]"; server_ipcl="$v6"
-    elif [[ -n "$v4" ]]; then server_ip="$v4"; server_ipcl="$v4"
+    elif [[ -n "$v6" ]]; then server_ip="[$v6]"; server_ipcl="$v6";
+    elif [[ -n "$v4" ]]; then server_ip="$v4"; server_ipcl="$v4";
     else red "无法获取公網 IP 地址。" && return 1; fi
     if [[ -z "$server_ip" || -z "$server_ipcl" ]]; then red "获取 IP 地址失败。"; return 1; fi
 }
@@ -231,7 +253,7 @@ install_or_reinstall() {
 unins(){
     readp "確認卸載Sing-box嗎? [y/n]: " confirm; [[ "${confirm,,}" != "y" ]] && yellow "卸載已取消" && return
     if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box stop 2>/dev/null || true; rc-update del sing-box 2>/dev/null || true; rm -f /etc/init.d/sing-box; else systemctl stop sing-box 2>/dev/null || true; systemctl disable sing-box 2>/dev/null || true; rm -f /etc/systemd/system/sing-box.service; systemctl daemon-reload 2>/dev/null || true; fi
-    readp "是否刪除 /etc/s-box 和 /root/ieduerca, /root/ygkkkca 目錄與所有配置？(y/n, 默認n): " rmconf; if [[ "${rmconf,,}" == "y" ]]; then rm -rf /etc/s-box /root/ieduerca /root/ygkkkca; green "已刪除配置目錄。"; fi
+    readp "是否刪除 /etc/s-box, /root/ieduerca, /root/ygkkkca 目錄與所有配置？(y/n, 默認n): " rmconf; if [[ "${rmconf,,}" == "y" ]]; then rm -rf /etc/s-box /root/ieduerca /root/ygkkkca; green "已刪除配置目錄。"; fi
     green "Sing-box 已卸載完成。"
 }
 
@@ -265,8 +287,14 @@ main_menu() {
     if [[ -f '/etc/s-box/sing-box' ]]; then 
         local corev; corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}'); 
         green "Sing-box 核心已安裝：$corev"
-        if systemctl is-active --quiet sing-box || ( [[ x"${release}" == x"alpine" ]] && rc-service sing-box status 2>/dev/null | grep -q 'started' ); then green "服務狀態：$(green '運行中')"; else yellow "服務狀態：$(yellow '未運行')"; fi
-    else yellow "Sing-box 核心未安裝，請先選 1 。"; fi
+        if systemctl is-active --quiet sing-box || ( [[ x"${release}" == x"alpine" ]] && rc-service sing-box status 2>/dev/null | grep -q 'started' ); then
+            green "服務狀態：$(green '運行中')"
+        else
+            yellow "服務狀態：$(yellow '未運行')"
+        fi
+    else 
+        yellow "Sing-box 核心未安裝，請先選 1 。"
+    fi
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     readp "請輸入數字【0-9】：" Input
     case "$Input" in  
@@ -281,22 +309,19 @@ main_menu() {
 
 [[ $EUID -ne 0 ]] && yellow "请以root模式运行脚本" && exit
 
-# 系統檢測
 if [[ -f /etc/redhat-release ]]; then release="Centos"; elif cat /etc/issue | grep -q -E -i "alpine"; then release="alpine"; elif cat /etc/issue | grep -q -E -i "debian"; then release="Debian"; elif cat /etc/issue | grep -q -E -i "ubuntu"; then release="Ubuntu"; else red "脚本不支持当前的系统。" && exit; fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
 case $(uname -m) in armv7l) cpu=armv7;; aarch64) cpu=arm64;; x86_64) cpu=amd64;; *) red "目前脚本不支持$(uname -m)架构" && exit;; esac
 hostname=$(hostname)
 
-# 首次運行時安裝依賴
 if [ ! -f /tmp/sbyg_update_lock ]; then
     green "首次運行，開始安裝必要的依賴……"
     if [[ x"${release}" == x"alpine" ]]; then
-        apk update
-        apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what bind-tools xxd
+        apk update; apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what bind-tools xxd
     else
         if [ -x "$(command -v apt-get)" ]; then
             apt-get update -y
-            apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what dnsutils xxd
+            DEBIAN_FRONTEND=noninteractive apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what dnsutils xxd
         elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then
             local PKG_MANAGER=$(command -v yum || command -v dnf)
             $PKG_MANAGER install -y epel-release || true
