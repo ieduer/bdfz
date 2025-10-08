@@ -325,7 +325,7 @@ rebuild_config_and_start(){
     inssbjsonser; configure_firewall "$port_vl_re" "$port_vm_ws" "$port_hy2" "$port_tu"
     if ! sbservice; then return 1; fi
     if ! ipuuid; then red "IP UUID 信息生成失敗，請檢查服務狀態。"; return 1; fi
-    gen_clash_sub || true; green "配置已更新並啟動。"; enable_bbr_autonomously
+    gen_sb_client || true; green "配置已更新並啟動。"; enable_bbr_autonomously
 }
 
 generate_reality_materials() {
@@ -510,19 +510,17 @@ resvmess(){ echo; white "~~~~~~~~~~~~~~~~~"; if [[ "$tls" = "false" ]]; then red
 reshy2(){ echo; white "~~~~~~~~~~~~~~~~~"; hy2_link="hysteria2://$uuid@$cl_hy2_svr:$hy2_port?security=tls&alpn=h3&insecure=$hy2_ins&sni=$hy2_name#hy2-$hostname"; echo "$hy2_link" > /etc/s-box/hy2.txt; red "🚀 Hysteria-2"; echo "链接:"; echo -e "${yellow}$hy2_link${plain}"; echo "二维码:"; qrencode -o - -t ANSIUTF8 "$hy2_link"; }
 restu5(){ echo; white "~~~~~~~~~~~~~~~~~"; tuic5_link="tuic://$uuid:$uuid@$cl_tu5_svr:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&allow_insecure=$tu5_ins&allowInsecure=$tu5_ins#tuic5-$hostname"; echo "$tuic5_link" > /etc/s-box/tuic5.txt; red "🚀 TUIC-v5"; echo "链接:"; echo -e "${yellow}$tuic5_link${plain}"; echo "二维码:"; qrencode -o - -t ANSIUTF8 "$tuic5_link"; }
 
-gen_clash_sub(){
+gen_sb_client(){
+    # 只生成 Sing-Box 客戶端四協議；不生成 Clash/Mihomo
     result_vl_vm_hy_tu
-    local ws_path_client; ws_path_client=$(echo "$ws_path" | sed 's#^/##')
-    local public_key; public_key=$(cat /etc/s-box/public.key 2>/dev/null || true)
-    local tag_vless="vless-${hostname}"; local tag_vmess="vmess-${hostname}"; local tag_hy2="hy2-${hostname}"; local tag_tuic="tuic5-${hostname}"
-    local sbdnsip; sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null); : "${sbdnsip:=tls://dns.google}"
-  cat > /etc/s-box/clash_sub.json <<EOF
+    local sbdnsip
+    sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null)
+    : "${sbdnsip:=https://dns.google/dns-query}"
+
+    cat > /etc/s-box/sb_client.json <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
-  "experimental": {
-    "clash_api": { "external_controller": "127.0.0.1:9090", "external_ui": "ui", "secret": "", "default_mode": "Rule" },
-    "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true }
-  },
+
   "dns": {
     "servers": [
       { "tag": "proxydns", "address": "${sbdnsip}", "detour": "select", "address_resolver": "localdns" },
@@ -540,6 +538,7 @@ gen_clash_sub(){
     "independent_cache": true,
     "final": "proxydns"
   },
+
   "inbounds": [
     {
       "type": "tun",
@@ -552,30 +551,42 @@ gen_clash_sub(){
       "domain_strategy": "prefer_ipv4"
     }
   ],
+
   "outbounds": [
-    { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"] },
-    { "type": "vless", "tag": "${tag_vless}",
+    { "tag": "select", "type": "selector", "default": "auto",
+      "outbounds": ["auto", "vless-${hostname}", "vmess-${hostname}", "hy2-${hostname}", "tuic5-${hostname}"] },
+
+    { "type": "vless", "tag": "vless-${hostname}",
       "server": "${server_ipcl}", "server_port": ${vl_port}, "uuid": "${uuid}", "flow": "xtls-rprx-vision",
-      "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" },
+      "tls": { "enabled": true, "server_name": "${vl_name}",
+               "utls": { "enabled": true, "fingerprint": "chrome" },
                "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } },
-    { "type": "vmess", "tag": "${tag_vmess}",
+
+    { "type": "vmess", "tag": "vmess-${hostname}",
       "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto",
       "transport": { "type": "ws", "path": "${ws_path}", "headers": { "Host": ["${vm_name}"] } },
-      "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "insecure": false, "utls": { "enabled": true, "fingerprint": "chrome" }, "alpn": ["http/1.1"] } },
-    { "type": "hysteria2", "tag": "${tag_hy2}",
+      "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "insecure": false,
+               "utls": { "enabled": true, "fingerprint": "chrome" }, "alpn": ["http/1.1"] } },
+
+    { "type": "hysteria2", "tag": "hy2-${hostname}",
       "server": "${cl_hy2_svr}", "server_port": ${hy2_port}, "password": "${uuid}",
       "tls": { "enabled": true, "server_name": "${hy2_name}", "insecure": ${hy2_ins}, "alpn": ["h3"] } },
-    { "type": "tuic", "tag": "${tag_tuic}",
+
+    { "type": "tuic", "tag": "tuic5-${hostname}",
       "server": "${cl_tu5_svr}", "server_port": ${tu5_port}, "uuid": "${uuid}", "password": "${uuid}",
       "congestion_control": "bbr", "udp_relay_mode": "native",
       "tls": { "enabled": true, "server_name": "${tu5_name}", "insecure": ${tu5_ins}, "alpn": ["h3"] } },
+
     { "tag": "direct", "type": "direct" },
+
     { "tag": "auto", "type": "urltest",
-      "outbounds": ["${tag_vless}", "${tag_vmess}", "${tag_hy2}", "${tag_tuic}"],
+      "outbounds": ["vless-${hostname}", "vmess-${hostname}", "hy2-${hostname}", "tuic5-${hostname}"],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "1m",
-      "tolerance": 50 }
+      "tolerance": 50,
+      "interrupt_exist_connections": false }
   ],
+
   "route": {
     "rule_set": [
       { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary",
@@ -601,19 +612,23 @@ gen_clash_sub(){
       { "rule_set": "geosite-geolocation-!cn", "outbound": "select" }
     ]
   },
+
   "ntp": { "enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m", "detour": "direct" }
 }
 EOF
-    green "Clash/Mihomo 訂閱模板已生成：/etc/s-box/clash_sub.json"
-    echo; yellow "文件內容如下:"; echo
-    cat /etc/s-box/clash_sub.json
+    rm -f /etc/s-box/clash_sub.json 2>/dev/null || true
+    green "Sing-Box 客戶端四協議配置已生成：/etc/s-box/sb_client.json"
 }
 
-clash_sb_share(){ 
+clash_sb_share(){
     if ! ipuuid; then red "Sing-box 服務未運行，無法生成分享鏈接。"; return; fi
-    result_vl_vm_hy_tu; resvless; resvmess; reshy2; restu5
-    readp "是否生成/更新訂閱文件 (for Clash/Mihomo)? (y/n): " gen_sub
-    if [[ "${gen_sub,,}" == "y" ]]; then gen_clash_sub; fi
+    result_vl_vm_hy_tu
+    resvless
+    resvmess
+    reshy2
+    restu5
+    gen_sb_client
+    yellow "已生成/更新 Sing-Box 客戶端四協議文件：/etc/s-box/sb_client.json"
 }
 
 stclre(){ 
@@ -627,7 +642,7 @@ stclre(){
 
 sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; echo -e "\n[Log saved to $LOG_FILE]"; }
 upsbyg(){ yellow "正在嘗試更新..."; bootstrap_and_exec; }
-sbsm(){ blue "安裝內核 → 自動生成默認配置 → 開機自啟。"; blue "可用功能：變更證書/端口、生成訂閱、查看日誌、開啟BBR。"; blue "分享/訂閱輸出：選 7 或 11。產物在 /etc/s-box/"; }
+sbsm(){ blue "安裝內核 → 自動生成默認配置 → 開機自啟。"; blue "可用功能：變更證書/端口、生成訂閱、查看日誌、開啟BBR。"; blue "分享/客戶端配置輸出：選 7 。產物在 /etc/s-box/"; }
 
 showprotocol(){
     if [[ ! -s /etc/s-box/sb.json ]] || ! jq -e . /etc/s-box/sb.json >/dev/null 2>&1; then yellow "尚未生成運行配置。"; return 0; fi
