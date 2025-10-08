@@ -3,7 +3,23 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-trap 'code=$?; echo -e "\033[31m\033[01m[ERROR]\033[0m at line $LINENO while running: ${BASH_COMMAND} (exit $code)"; exit $code' ERR
+# --- Logging ---
+LOG_FILE="/var/log/sb.sh.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+: >"$LOG_FILE" 2>/dev/null || true
+# tee all stdout/stderr to log file
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+trap_error(){
+  local code=$?
+  local line="$1"
+  local cmd="$2"
+  echo -e "\033[31m\033[01m[ERROR]\033[0m at line $line while running: $cmd (exit $code)"
+  logger -t "sb.sh" "[ERROR] line $line cmd: $cmd exit: $code"
+  return $code
+}
+trap 'trap_error $LINENO "$BASH_COMMAND"' ERR
+
 export LANG=en_US.UTF-8
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; plain='\033[0m'
 
@@ -62,15 +78,15 @@ check_os() {
 }
 
 check_dependencies() {
-    local pkgs=("curl" "openssl" "iptables" "tar" "wget" "jq" "socat" "qrencode" "git" "ss" "lsof" "virt-what"); local missing_pkgs=()
+    local pkgs=("curl" "openssl" "iptables" "tar" "wget" "jq" "socat" "qrencode" "git" "ss" "lsof" "virt-what" "dig"); local missing_pkgs=()
     for pkg in "${pkgs[@]}"; do if ! command -v "$pkg" &> /dev/null; then missing_pkgs+=("$pkg"); fi; done
     if [ ${#missing_pkgs[@]} -gt 0 ]; then yellow "檢測到缺少依賴: ${missing_pkgs[*]}，將自動安裝。"; install_dependencies; fi
 }
 
 install_dependencies() {
-    green "開始安裝必要的依賴……"; if [[ x"${release}" == x"alpine" ]]; then apk update && apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what
-    else if [ -x "$(command -v apt-get)" ]; then apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what
-    elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then local PKG_MANAGER; PKG_MANAGER=$(command -v yum || command -v dnf); $PKG_MANAGER install -y epel-release || true; $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what; systemctl enable --now cronie 2>/dev/null || true; systemctl enable --now iptables 2>/dev/null || true; fi; fi
+    green "開始安裝必要的依賴……"; if [[ x"${release}" == x"alpine" ]]; then apk update && apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what bind-tools
+    else if [ -x "$(command -v apt-get)" ]; then apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what dnsutils
+    elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then local PKG_MANAGER; PKG_MANAGER=$(command -v yum || command -v dnf); $PKG_MANAGER install -y epel-release || true; $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what bind-utils; systemctl enable --now cronie 2>/dev/null || true; systemctl enable --now iptables 2>/dev/null || true; fi; fi
     green "依賴安裝完成。"
 }
 
@@ -88,7 +104,10 @@ v6_setup(){
 
 configure_firewall() {
     green "正在配置防火牆..."; local ports_to_open=("$@")
-    for port in "${ports_to_open[@]}"; do if [[ -n "$port" ]]; then iptables -I INPUT -p tcp --dport "$port" -j ACCEPT; iptables -I INPUT -p udp --dport "$port" -j ACCEPT; fi; done
+    for port in "${ports_to_open[@]}"; do if [[ -n "$port" ]]; then 
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+    fi; done
     if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; elif command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; elif [[ -d /etc/iptables ]]; then iptables-save >/etc/iptables/rules.v4 2>/dev/null || true; fi
     green "防火牆規則已保存。"
 }
@@ -116,6 +135,13 @@ apply_acme_cert() {
         readp "請輸入您解析到本機的域名: " domain
     fi
     if [[ -z "$domain" ]]; then red "域名不能為空。"; return 1; fi
+
+    # DNS sanity (best-effort) — warn if A/AAAA not pointing here
+    v4v6
+    local a="" aaaa=""; a=$(dig +short A "$domain" 2>/dev/null | head -n1 || true); aaaa=$(dig +short AAAA "$domain" 2>/dev/null | head -n1 || true)
+    if [[ -n "$a" && -n "$v4" && "$a" != "$v4" ]] && [[ -n "$aaaa" && -n "$v6" && "$aaaa" != "$v6" ]]; then
+        yellow "警告: $domain 的 A/AAAA 記錄可能未指向本機 (A=$a AAAA=$aaaa，本機 v4=$v4 v6=$v6)，ACME 可能失敗。"
+    fi
 
     # Decide CA & email
     local ca_server email
@@ -332,7 +358,7 @@ inssbjsonser(){
     { "type": "direct", "tag": "direct", "domain_strategy": "${dns_strategy:-prefer_ipv4}" },
     { "type": "block", "tag": "block" }
   ],
-  "route": { "rules": [ { "geosite": ["cn"], "outbound": "direct"}, { "protocol": ["quic", "stun"], "outbound": "block" } ], "final": "direct" }
+  "route": { "rules": [ { "geosite": ["cn"], "outbound": "direct"}, { "protocol": ["stun"], "outbound": "block" } ], "final": "direct" }
 }
 EOF
 )
@@ -348,7 +374,7 @@ EOF
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
   "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ],
-  "route": { "rules": [ { "protocol": ["quic", "stun"], "outbound": "block" }, { "outbound": "direct" } ], "final": "direct" }
+  "route": { "rules": [ { "protocol": ["stun"], "outbound": "block" }, { "outbound": "direct" } ], "final": "direct" }
 }
 EOF
 )
@@ -424,7 +450,6 @@ ipuuid(){
 }
 
 result_vl_vm_hy_tu(){
-    if [[ -f /root/ieduerca/cert.crt && -s /root/ieduerca/cert.crt ]]; then local ym; ym=$(~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}' || true); echo "$ym" > /root/ieduerca/ca.log; fi
     rm -rf /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt; 
     sbdnsip=$(cat /etc/s-box/sbdnsip.log); server_ip=$(cat /etc/s-box/server_ip.log); server_ipcl=$(cat /etc/s-box/server_ipcl.log); 
     uuid=$(jq -r '.inbounds[0].users[0].uuid' /etc/s-box/sb.json); 
@@ -451,7 +476,7 @@ gen_clash_sub(){
     local ws_path_client; ws_path_client=$(echo "$ws_path" | sed 's#^/##')
     local public_key; public_key=$(cat /etc/s-box/public.key 2>/dev/null || true)
     local tag_vless="vless-${hostname}"; local tag_vmess="vmess-${hostname}"; local tag_hy2="hy2-${hostname}"; local tag_tuic="tuic5-${hostname}"
-    local sbdnsip; sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null); : "${sbdnsip:=tls://8.8.8.8/dns-query}"
+    local sbdnsip; sbdnsip=$(cat /etc/s-box/sbdnsip.log 2>/dev/null); : "${sbdnsip:=tls://dns.google}"
     cat > /etc/s-box/clash_sub.json <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
@@ -463,7 +488,7 @@ gen_clash_sub(){
       { "tag": "dns_fakeip", "address": "fakeip" }
     ],
     "rules": [
-      { "outbound": "any", "server": "localdns", "disable_cache": true },
+      { "action": "route", "server": "localdns", "disable_cache": true },
       { "clash_mode": "Global", "server": "proxydns" },
       { "clash_mode": "Direct", "server": "localdns" },
       { "rule_set": "geosite-cn", "server": "localdns" },
@@ -490,7 +515,7 @@ gen_clash_sub(){
     ],
     "auto_detect_interface": true, "final": "select",
     "rules": [
-      { "inbound": "tun-in", "action": "sniff" }, { "protocol": "dns", "action": "hijack-dns" }, { "port": 443, "network": "udp", "action": "reject" },
+      { "inbound": "tun-in", "action": "sniff" }, { "protocol": "dns", "action": "hijack-dns" },
       { "clash_mode": "Direct", "outbound": "direct" }, { "clash_mode": "Global", "outbound": "select" },
       { "rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct" }, { "ip_is_private": true, "outbound": "direct" },
       { "rule_set": "geosite-geolocation-!cn", "outbound": "select" }
@@ -520,7 +545,7 @@ stclre(){
     fi
 }
 
-sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; }
+sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; echo -e "\n[Log saved to $LOG_FILE]"; }
 upsbyg(){ yellow "正在嘗試更新..."; bootstrap_and_exec; }
 sbsm(){ blue "安裝內核 → 自動生成默認配置 → 開機自啟。"; blue "可用功能：變更證書/端口、生成訂閱、查看日誌、開啟BBR。"; blue "分享/訂閱輸出：選 7 或 11。產物在 /etc/s-box/"; }
 
