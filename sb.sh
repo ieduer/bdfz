@@ -364,10 +364,10 @@ inssbjsonser(){
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
   "outbounds": [
-    { "type": "direct", "tag": "direct", "domain_strategy": "${dns_strategy:-prefer_ipv4}" },
+    { "type": "direct", "tag": "direct" },
     { "type": "block", "tag": "block" }
   ],
-  "route": { "rules": [ { "geosite": ["cn"], "outbound": "direct"}, { "protocol": ["stun"], "outbound": "block" } ], "final": "direct" }
+  "route": { "rules": [ { "protocol": ["stun"], "outbound": "block" } ], "final": "direct" }
 }
 EOF
 )
@@ -375,15 +375,17 @@ EOF
         config_content=$(cat <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
-  "dns": { "strategy": "${dns_strategy:-prefer_ipv4}" },
   "inbounds": [
     { "type": "vless", "sniff": true, "sniff_override_destination": true, "tag": "vless-sb", "listen": "::", "listen_port": ${port_vl_re}, "users": [ { "uuid": "${uuid}", "flow": "xtls-rprx-vision" } ], "tls": { "enabled": true, "server_name": "${ym_vl_re}", "reality": { "enabled": true, "handshake": { "server": "${ym_vl_re}", "server_port": 443 }, "private_key": "$private_key", "short_id": ["$short_id"] } } },
     { "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws}, "users": [ { "uuid": "${uuid}", "alterId": 0 } ], "transport": { "type": "ws", "path": "/${uuid}-vm" }, "tls":{ "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws" } }, 
     { "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2}, "users": [ { "password": "${uuid}" } ], "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" } },
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
-  "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ],
-  "route": { "rules": [ { "protocol": ["stun"], "outbound": "block" }, { "outbound": "direct" } ], "final": "direct" }
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" }
+  ],
+  "route": { "rules": [ { "protocol": ["stun"], "outbound": "block" } ], "final": "direct" }
 }
 EOF
 )
