@@ -1,12 +1,12 @@
 #!/bin/bash
 export LANG=en_US.UTF-8
 
-# --- 增強健壯性 ---
+# --- 增强健壮性 ---
 set -e
 trap 'echo -e "\033[31m\033[01m[ERROR] An error occurred at line $LINENO\033[0m"; exit 1' ERR
-# --- 結束 ---
+# --- 结束 ---
 
-# --- 腳本1的顏色和基礎函數 ---
+# --- 脚本1的颜色和基础函数 ---
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; bblue='\033[0;34m'; plain='\033[0m'
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
@@ -16,14 +16,14 @@ white(){ echo -e "\033[37m\033[01m$1\033[0m";}
 readp(){ read -p "$(yellow "$1")" "$2";}
 base64_n0() { if base64 --help 2>/dev/null | grep -q -- '--wrap'; then base64 --wrap=0; elif base64 --help 2>/dev/null | grep -q -- '-w'; then base64 -w 0; else base64; fi; }
 
-# --- 所有函數定義 ---
+# --- 所有函数定义 ---
 
 v4v6(){
     v4=$(curl -s4m5 icanhazip.com -k)
     v6=$(curl -s6m5 icanhazip.com -k)
 }
 
-# 新的防火牆邏輯
+# 新的防火墙逻辑
 configure_firewall(){
     green "正在配置防火牆..."
     systemctl stop firewalld.service >/dev/null 2>&1 || true
@@ -39,12 +39,12 @@ configure_firewall(){
     iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
     ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
 
-    green "開放 SSH 端口 22"
+    green "开放 SSH 端口 22"
     iptables -A INPUT -p tcp --dport 22 -j ACCEPT; ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT
 
     for port in "$@"; do
         if [[ -n "$port" ]]; then
-            green "開放協議端口 $port (TCP/UDP)"
+            green "开放協議端口 $port (TCP/UDP)"
             iptables -A INPUT -p tcp --dport "$port" -j ACCEPT; iptables -A INPUT -p udp --dport "$port" -j ACCEPT
             ip6tables -A INPUT -p tcp --dport "$port" -j ACCEPT; ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT
         fi
@@ -57,11 +57,11 @@ configure_firewall(){
 
 inssb(){
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green "安裝最新正式版 Sing-box 內核..."
+    green "安装最新正式版 Sing-box 内核..."
     
     local versions_json=$(curl -fsSL --retry 3 "https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box")
     local sbcore=$(echo "$versions_json" | jq -r '.versions[] | sort -rV | grep -E -m 1 "^[0-9]+\.[0-9]+\.[0-9]+$"')
-    if [[ -z "$sbcore" ]]; then red "從 jsdelivr 獲取最新版本號失敗。"; exit 1; fi
+    if [[ -z "$sbcore" ]]; then red "从 jsdelivr 獲取最新版本號失敗。"; exit 1; fi
     
     green "正在下載 Sing-box v$sbcore ..."
     local sbname="sing-box-$sbcore-linux-$cpu"
@@ -80,7 +80,6 @@ inssb(){
     fi
 }
 
-# 替換為腳本2的 ACME 函數
 apply_acme_cert() {
     if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
         green "首次運行，正在安裝acme.sh..."; curl https://get.acme.sh | sh
@@ -110,8 +109,8 @@ apply_acme_cert() {
     green "證書申請與安裝成功：${domain}"; return 0
 }
 
-
 inscertificate(){
+    red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green "二、生成並設置相關證書"
     blue "自動生成bing自簽證書中……" && sleep 1
     openssl ecparam -genkey -name prime256v1 -out /etc/s-box/private.key >/dev/null 2>&1
@@ -119,14 +118,13 @@ inscertificate(){
     
     local use_acme=false
     if [[ -f /root/ieduerca/cert.crt && -s /root/ieduerca/cert.crt ]]; then
-        yellow "經檢測，之前已申請過Acme域名證書：$(cat /root/ieduerca/ca.log)"
-        readp "是否使用 $(cat /root/ieduerca/ca.log) 域名證書？(y/n, 默認n使用自簽): " choice
-        [[ "${choice,,}" == "y" ]] && use_acme=true
+        yellow "經檢測，之前已申請過Acme域名證書：$(cat /root/ieduerca/ca.log 2>/dev/null)"
+        readp "是否使用 $(cat /root/ieduerca/ca.log 2>/dev/null) 域名證書？(y/n, 默認n使用自簽): " choice
+        if [[ "${choice,,}" == "y" ]]; then use_acme=true; fi
     else
-        readp "如果你有解析完成的域名，是否申請一個Acme域名證書？(y/n, 默認n使用自簽): " choice
+        readp "如果你有解析完成的域名，是否申请一个Acme域名证书？(y/n, 默认n使用自签): " choice
         if [[ "${choice,,}" == "y" ]]; then
-            # 使用新的 ACME 函數
-            if apply_acme_cert; then use_acme=true; else red "Acme證書申請失敗，回退到自簽證書。"; use_acme=false; fi
+            if apply_acme_cert; then use_acme=true; else red "Acme证书申请失败，继续使用自签证书"; use_acme=false; fi
         fi
     fi
 
@@ -135,18 +133,19 @@ inscertificate(){
         certificatec_vmess_ws='/root/ieduerca/cert.crt'; certificatep_vmess_ws='/root/ieduerca/private.key'
         certificatec_hy2='/root/ieduerca/cert.crt'; certificatep_hy2='/root/ieduerca/private.key'
         certificatec_tuic='/root/ieduerca/cert.crt'; certificatep_tuic='/root/ieduerca/private.key'
-        blue "Vless-reality SNI: apple.com"; blue "Vmess-ws, Hysteria-2, Tuic-v5 將使用 $ym_vm_ws 證書並開啟TLS。"
+        blue "Vless-reality SNI: apple.com"; blue "Vmess-ws, Hysteria-2, Tuic-v5 将使用 $ym_vm_ws 证书并开启TLS。"
     else
         ym_vl_re="apple.com"; ym_vm_ws="www.bing.com"; tlsyn=false
         certificatec_vmess_ws='/etc/s-box/cert.pem'; certificatep_vmess_ws='/etc/s-box/private.key'
         certificatec_hy2='/etc/s-box/cert.pem'; certificatep_hy2='/etc/s-box/private.key'
         certificatec_tuic='/etc/s-box/cert.pem'; certificatep_tuic='/etc/s-box/private.key'
-        blue "Vless-reality SNI: apple.com"; blue "Vmess-ws 將關閉TLS，Hysteria-2, Tuic-v5 將使用bing自簽證書。"
+        blue "Vless-reality SNI: apple.com"; blue "Vmess-ws 将关闭TLS，Hysteria-2, Tuic-v5 将使用bing自签证书。"
     fi
 }
 
 insport() {
-    green "三、設置各個協議端口"
+    red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    green "三、设置各个协议端口"
     ports=()
     for i in {1..4}; do
         while true; do
@@ -266,7 +265,6 @@ ipuuid(){
     if [[ -z "$server_ip" || -z "$server_ipcl" ]]; then red "获取 IP 地址失败。"; return 1; fi
 }
 
-# 替換為腳本2的分享信息方案
 display_sharing_info() {
     if ! ipuuid; then red "無法獲取IP信息，跳過分享。"; return 1; fi
     rm -f /etc/s-box/*.txt
@@ -289,10 +287,12 @@ display_sharing_info() {
 }
 
 install_or_reinstall() {
-    mkdir -p /etc/s-box
+    mkdir -p /etc/s-box /root/ieduerca
     inssb
     inscertificate
     insport
+    
+    red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green "四、自動生成 UUID 和 Reality 密鑰"
     uuid=$(/etc/s-box/sing-box generate uuid)
     key_pair=$(/etc/s-box/sing-box generate reality-keypair)
@@ -313,7 +313,6 @@ unins(){
     readp "確認卸載Sing-box嗎? [y/n]: " confirm; [[ "${confirm,,}" != "y" ]] && yellow "卸載已取消" && return
     if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box stop 2>/dev/null || true; rc-update del sing-box 2>/dev/null || true; rm -f /etc/init.d/sing-box; else systemctl stop sing-box 2>/dev/null || true; systemctl disable sing-box 2>/dev/null || true; rm -f /etc/systemd/system/sing-box.service; systemctl daemon-reload 2>/dev/null || true; fi
     readp "是否刪除 /etc/s-box 和 /root/ieduerca 目錄與所有配置？(y/n, 默認n): " rmconf; if [[ "${rmconf,,}" == "y" ]]; then rm -rf /etc/s-box /root/ieduerca; green "已刪除配置目錄。"; fi
-    readp "是否移除快捷命令 sb？(y/n, 默認n): " rmsb; if [[ "${rmsb,,}" == "y" ]]; then rm -f /usr/local/bin/sb /usr/local/lib/ieduer-sb.sh; green "已移除 sb 命令和腳本文件。"; fi
     green "Sing-box 已卸載完成。"
 }
 
@@ -324,11 +323,12 @@ stclre(){
     else 
         case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; *) return;; esac
     fi
+    green "操作完成"
 }
 
-sblog(){ if [[ x"${release}" == x"alpine" ]]; then tail -n 100 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager -n 100; fi; echo -e "\n日誌已保存到 $LOG_FILE"; }
+sblog(){ if [[ x"${release}" == x"alpine" ]]; then tail -n 100 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager -n 100; fi; }
 
-# --- 主菜單 (來自腳本2) ---
+# 主菜單 (來自腳本2)
 main_menu() {
     clear
     white "Vless-reality, Vmess-ws, Hysteria-2, Tuic-v5 四協議共存腳本 (基於腳本1)"
@@ -367,7 +367,7 @@ main_menu() {
      2 ) unins;;
      3 ) install_or_reinstall;;
      4 ) stclre;;
-     5 ) upsbyg;; 
+     5 ) yellow "暫不支持此功能，請重新運行 curl 命令更新。";;
      6 ) inssb && sbservice && post_install_check && display_sharing_info;;
      7 ) display_sharing_info;;
      8 ) sblog;;
@@ -378,6 +378,31 @@ main_menu() {
 }
 
 # --- 腳本主體執行 ---
-check_os
-install_dependencies
+
+[[ $EUID -ne 0 ]] && yellow "请以root模式运行脚本" && exit
+
+if [[ -f /etc/redhat-release ]]; then
+    release="Centos"
+elif cat /etc/issue | grep -q -E -i "alpine"; then
+    release="alpine"
+elif cat /etc/issue | grep -q -E -i "debian"; then
+    release="Debian"
+elif cat /etc/issue | grep -q -E -i "ubuntu"; then
+    release="Ubuntu"
+else 
+    red "脚本不支持当前的系统。" && exit
+fi
+
+op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
+case $(uname -m) in
+    armv7l) cpu=armv7;; aarch64) cpu=arm64;; x86_64) cpu=amd64;;
+    *) red "目前脚本不支持$(uname -m)架构" && exit;;
+esac
+hostname=$(hostname)
+
+# 首次運行時安裝依賴
+if [ ! -f /tmp/sbyg_update_lock ]; then
+    install_dependencies
+fi
+
 main_menu
