@@ -474,13 +474,23 @@ result_vl_vm_hy_tu(){
     public_key=$(cat /etc/s-box/public.key); short_id=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/s-box/sb.json); 
     ws_path=$(jq -r '.inbounds[1].transport.path' /etc/s-box/sb.json); vm_port=$(jq -r '.inbounds[1].listen_port' /etc/s-box/sb.json); 
     tls=$(jq -r '.inbounds[1].tls.enabled' /etc/s-box/sb.json); vm_name=$(jq -r '.inbounds[1].tls.server_name' /etc/s-box/sb.json);
-    if [[ "$tls" = "false" ]]; then vmadd_local=$server_ipcl; else vmadd_local=$vm_name; fi
-    hy2_port=$(jq -r '.inbounds[2].listen_port' /etc/s-box/sb.json); local ym; ym=$(cat /root/ieduerca/ca.log 2>/dev/null || true); 
-    hy2_sniname=$(jq -r '.inbounds[2].tls.key_path' /etc/s-box/sb.json); 
-    if [[ "$hy2_sniname" = '/etc/s-box/private.key' ]]; then hy2_name=www.bing.com; cl_hy2_ip=$server_ipcl; hy2_ins=true; else hy2_name=$ym; cl_hy2_ip=$ym; hy2_ins=false; fi
-    tu5_port=$(jq -r '.inbounds[3].listen_port' /etc/s-box/sb.json); 
-    tu5_sniname=$(jq -r '.inbounds[3].tls.key_path' /etc/s-box/sb.json); 
-    if [[ "$tu5_sniname" = '/etc/s-box/private.key' ]]; then tu5_name=www.bing.com; cl_tu5_ip=$server_ipcl; tu5_ins=true; else tu5_name=$ym; cl_tu5_ip=$ym; tu5_ins=false; fi
+    vmadd_local=$server_ipcl
+    hy2_port=$(jq -r '.inbounds[2].listen_port' /etc/s-box/sb.json); local ym; ym=$(cat /root/ieduerca/ca.log 2>/dev/null || true);
+    hy2_sniname=$(jq -r '.inbounds[2].tls.key_path' /etc/s-box/sb.json);
+    if [[ "$hy2_sniname" = '/etc/s-box/private.key' ]]; then
+      hy2_name=www.bing.com; hy2_ins=true
+    else
+      hy2_name=$ym; hy2_ins=false
+    fi
+    cl_hy2_ip=$server_ipcl
+    tu5_port=$(jq -r '.inbounds[3].listen_port' /etc/s-box/sb.json);
+    tu5_sniname=$(jq -r '.inbounds[3].tls.key_path' /etc/s-box/sb.json);
+    if [[ "$tu5_sniname" = '/etc/s-box/private.key' ]]; then
+      tu5_name=www.bing.com; tu5_ins=true
+    else
+      tu5_name=$ym; tu5_ins=false
+    fi
+    cl_tu5_ip=$server_ipcl
 }
 
 resvless(){ echo; white "~~~~~~~~~~~~~~~~~"; vl_link="vless://$uuid@$server_ipcl:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_name&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#vl-reality-$hostname"; echo "$vl_link" > /etc/s-box/vl_reality.txt; red "🚀 VLESS-Reality"; echo "链接:"; echo -e "${yellow}$vl_link${plain}"; echo "二维码:"; qrencode -o - -t ANSIUTF8 "$vl_link"; }
@@ -503,7 +513,7 @@ gen_clash_sub(){
   },
   "dns": {
     "servers": [
-      { "tag": "proxydns", "address": "https://dns.google/dns-query", "detour": "select", "address_resolver": "localdns" },
+      { "tag": "proxydns", "address": "${sbdnsip}", "detour": "${tag_vless}", "address_resolver": "localdns" },
       { "tag": "localdns", "address": "https://223.5.5.5/dns-query", "detour": "direct" },
       { "tag": "dns_fakeip", "address": "fakeip" }
     ],
@@ -537,7 +547,7 @@ gen_clash_sub(){
       "tls": { "enabled": true, "server_name": "${vl_name}", "utls": { "enabled": true, "fingerprint": "chrome" },
                "reality": { "enabled": true, "public_key": "${public_key}", "short_id": "${short_id}" } } },
     { "type": "vmess", "tag": "${tag_vmess}",
-      "server": "${vmadd_local}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "packet_encoding": "packetaddr",
+      "server": "${server_ipcl}", "server_port": ${vm_port}, "uuid": "${uuid}", "security": "auto", "packet_encoding": "packetaddr",
       "transport": { "type": "ws", "path": "${ws_path}", "headers": { "Host": ["${vm_name}"] } },
       "tls": { "enabled": ${tls}, "server_name": "${vm_name}", "insecure": false, "utls": { "enabled": true, "fingerprint": "chrome" }, "alpn": ["http/1.1"] } },
     { "type": "hysteria2", "tag": "${tag_hy2}",
