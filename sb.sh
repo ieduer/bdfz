@@ -3,22 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
- # --- Logging ---
- LOG_FILE="/var/log/sb.sh.log"
- mkdir -p "$(dirname "$LOG_FILE")"
- touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
- # tee all stdout/stderr to log file
- exec > >(tee -a "$LOG_FILE") 2>&1
-
- error_trap(){
-     local code=$?
-     local line="$1"
-     local cmd="$2"
-     echo -e "\033[31m\033[01m[ERROR]\033[0m at line $line while running: $cmd (exit $code)"
-     logger -t "sb.sh" "[ERROR] line $line cmd: $cmd exit: $code"
-     return $code
- }
- trap 'error_trap $LINENO "$BASH_COMMAND"' ERR
+trap 'code=$?; echo -e "\033[31m\033[01m[ERROR]\033[0m at line $LINENO while running: ${BASH_COMMAND} (exit $code)"; exit $code' ERR
 export LANG=en_US.UTF-8
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; plain='\033[0m'
 
@@ -33,8 +18,26 @@ readp(){ read -p "$(yellow "$1")" "$2";}
 # === ACME defaults (can be overridden via environment) ===
 : "${SB_ACME_CA:=letsencrypt}"   # letsencrypt | zerossl
 : "${SB_ACME_EMAIL:=}"           # if empty, will default to admin@<your-domain>
+: "${ACME_RENEW_BEFORE_DAYS:=30}"   # skip re-issue if cert has more than N days left
 
 base64_n0() { if base64 --help 2>/dev/null | grep -q -- '--wrap'; then base64 --wrap=0; elif base64 --help 2>/dev/null | grep -q -- '-w'; then base64 -w 0; else base64; fi; }
+
+# Helper: compute days left for certificate expiry
+cert_days_left(){
+    local crt="$1"
+    [[ -s "$crt" ]] || { echo 0; return; }
+    local end now_epoch end_epoch
+    end=$(openssl x509 -noout -enddate -in "$crt" 2>/dev/null | cut -d= -f2) || { echo 0; return; }
+    now_epoch=$(date +%s)
+    # GNU date
+    end_epoch=$(date -d "$end" +%s 2>/dev/null || true)
+    # Fallback (BusyBox/Alpine util-linux is already installed in deps)
+    if [[ -z "$end_epoch" || "$end_epoch" == "" ]]; then
+        end_epoch=$(busybox date -D "%b %d %H:%M:%S %Y %Z" -d "$end" +%s 2>/dev/null || echo 0)
+    fi
+    [[ "$end_epoch" -gt 0 ]] || { echo 0; return; }
+    echo $(( (end_epoch - now_epoch) / 86400 ))
+}
 
 [[ $EUID -ne 0 ]] && yellow "請以root模式運行腳本" && exit
 export sbfiles="/etc/s-box/sb.json"
@@ -65,9 +68,9 @@ check_dependencies() {
 }
 
 install_dependencies() {
-    green "開始安裝必要的依賴……"; if [[ x"${release}" == x"alpine" ]]; then apk update && apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what bind-tools
-    else if [ -x "$(command -v apt-get)" ]; then apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what dnsutils
-    elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then local PKG_MANAGER; PKG_MANAGER=$(command -v yum || command -v dnf); $PKG_MANAGER install -y epel-release || true; $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what bind-utils; systemctl enable --now cronie 2>/dev/null || true; systemctl enable --now iptables 2>/dev/null || true; fi; fi
+    green "開始安裝必要的依賴……"; if [[ x"${release}" == x"alpine" ]]; then apk update && apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what
+    else if [ -x "$(command -v apt-get)" ]; then apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what
+    elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then local PKG_MANAGER; PKG_MANAGER=$(command -v yum || command -v dnf); $PKG_MANAGER install -y epel-release || true; $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what; systemctl enable --now cronie 2>/dev/null || true; systemctl enable --now iptables 2>/dev/null || true; fi; fi
     green "依賴安裝完成。"
 }
 
@@ -85,12 +88,7 @@ v6_setup(){
 
 configure_firewall() {
     green "正在配置防火牆..."; local ports_to_open=("$@")
-    for port in "${ports_to_open[@]}"; do
-        if [[ -n "$port" ]]; then
-            iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
-            iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
-        fi
-    done
+    for port in "${ports_to_open[@]}"; do if [[ -n "$port" ]]; then iptables -I INPUT -p tcp --dport "$port" -j ACCEPT; iptables -I INPUT -p udp --dport "$port" -j ACCEPT; fi; done
     if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; elif command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; elif [[ -d /etc/iptables ]]; then iptables-save >/etc/iptables/rules.v4 2>/dev/null || true; fi
     green "防火牆規則已保存。"
 }
@@ -110,15 +108,14 @@ apply_acme_cert() {
         if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then red "acme.sh 安裝失敗"; return 1; fi
     fi
 
-    readp "請輸入您解析到本機的域名: " domain
-    if [[ -z "$domain" ]]; then red "域名不能為空。"; return 1; fi
-
-    # Best-effort: verify domain points to this server (for ACME success)
-    v4v6
-    local a="" aaaa=""; a=$(dig +short A "$domain" 2>/dev/null | head -n1 || true); aaaa=$(dig +short AAAA "$domain" 2>/dev/null | head -n1 || true)
-    if [[ -n "$a" && -n "$v4" && "$a" != "$v4" ]] && [[ -n "$aaaa" && -n "$v6" && "$aaaa" != "$v6" ]]; then
-        yellow "警告: $domain 的 A/AAAA 記錄可能未指向本機 (A=$a AAAA=$aaaa，本機 v4=$v4 v6=$v6)，ACME 可能失敗。"
+    local prev_domain=""; [[ -s "/root/ieduerca/ca.log" ]] && prev_domain=$(cat /root/ieduerca/ca.log 2>/dev/null || true)
+    if [[ -n "$prev_domain" ]]; then
+        readp "請輸入您解析到本機的域名 (默認 ${prev_domain}): " domain
+        [[ -z "$domain" ]] && domain="$prev_domain"
+    else
+        readp "請輸入您解析到本機的域名: " domain
     fi
+    if [[ -z "$domain" ]]; then red "域名不能為空。"; return 1; fi
 
     # Decide CA & email
     local ca_server email
@@ -147,19 +144,62 @@ apply_acme_cert() {
     iptables -C INPUT -p tcp --dport 80  -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80  -j ACCEPT
     iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 
-    green "正在申請證書（HTTP-01 on :80）..."
-    if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone --httpport 80 -k ec-256 --server "${ca_server}"; then
-        yellow "HTTP-01 失敗，嘗試 TLS-ALPN-01（:443）..."
-        # If 443 is in use, stop sing-box temporarily
-        if ss -H -tnlp 2>/dev/null | grep -q ':443'; then
-            systemctl stop sing-box 2>/dev/null || true
-            stopped+=("sing-box")
+    # Check for existing valid cert, skip re-issue if still valid enough
+    local acme_cert_dir="$HOME/.acme.sh/${domain}_ecc"
+    local acme_cert_file="${acme_cert_dir}/${domain}.cer"
+    local days_left=0
+    if [[ -s "$acme_cert_file" ]]; then
+        days_left=$(cert_days_left "$acme_cert_file")
+        if [[ "$days_left" -gt "$ACME_RENEW_BEFORE_DAYS" ]]; then
+            green "檢測到現有證書有效（剩餘 ${days_left} 天）→ 跳過重新簽發，只刷新安裝與重載命令。"
+            local cert_path="/root/ieduerca"; mkdir -p "$cert_path"
+            ~/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+              --key-file       "${cert_path}/private.key" \
+              --fullchain-file "${cert_path}/cert.crt" \
+              --reloadcmd "systemctl reload sing-box || systemctl restart sing-box"
+            echo "$domain"    > "${cert_path}/ca.log"
+            echo "$ca_server" > "${cert_path}/issuer.log"
+            # 保證自動升級與續期任務存在
+            ~/.acme.sh/acme.sh --upgrade --auto-upgrade 1>/dev/null 2>&1 || true
+            ~/.acme.sh/acme.sh --install-cronjob        1>/dev/null 2>&1 || true
+            green "證書已安裝並綁定自動重載；未重新申請。"
+            return 0
         fi
-        if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --alpn -k ec-256 --server "${ca_server}"; then
-            red "證書申請失敗。"
-            # Restore services
-            for s in "${stopped[@]}"; do systemctl start "$s" 2>/dev/null || true; done
-            return 1
+    fi
+
+    yellow "現有證書缺失或即將到期（<= ${ACME_RENEW_BEFORE_DAYS} 天），將嘗試續期/重新簽發。"
+
+    local had_cert=0; [[ -s "$acme_cert_file" ]] && had_cert=1
+    if [[ "$had_cert" -eq 1 ]]; then
+        green "嘗試續期（renew）..."
+        if ! ~/.acme.sh/acme.sh --renew -d "${domain}" --ecc --server "${ca_server}"; then
+            yellow "續期失敗，改為重新簽發（HTTP-01 :80）..."
+            if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone --httpport 80 -k ec-256 --server "${ca_server}"; then
+                yellow "HTTP-01 失敗，嘗試 TLS-ALPN-01（:443）..."
+                if ss -H -tnlp 2>/dev/null | grep -q ':443'; then
+                    systemctl stop sing-box 2>/dev/null || true
+                    stopped+=("sing-box")
+                fi
+                if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --alpn -k ec-256 --server "${ca_server}"; then
+                    red "證書申請/續期最終失敗。"
+                    for s in "${stopped[@]}"; do systemctl start "$s" 2>/dev/null || true; done
+                    return 1
+                fi
+            fi
+        fi
+    else
+        green "首次申請證書（HTTP-01 on :80）..."
+        if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone --httpport 80 -k ec-256 --server "${ca_server}"; then
+            yellow "HTTP-01 失敗，嘗試 TLS-ALPN-01（:443）..."
+            if ss -H -tnlp 2>/dev/null | grep -q ':443'; then
+                systemctl stop sing-box 2>/dev/null || true
+                stopped+=("sing-box")
+            fi
+            if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --alpn -k ec-256 --server "${ca_server}"; then
+                red "證書申請失敗。"
+                for s in "${stopped[@]}"; do systemctl start "$s" 2>/dev/null || true; done
+                return 1
+            fi
         fi
     fi
 
@@ -178,6 +218,11 @@ apply_acme_cert() {
 
     echo "${domain}"     > "${cert_path}/ca.log"
     echo "${ca_server}"  > "${cert_path}/issuer.log"
+
+    if [[ -s "$acme_cert_file" ]]; then
+        days_left=$(cert_days_left "$acme_cert_file")
+        blue "證書當前剩餘有效期：約 ${days_left} 天"
+    fi
 
     # Restore services stopped earlier
     for s in "${stopped[@]}"; do systemctl start "$s" 2>/dev/null || true; done
@@ -287,7 +332,7 @@ inssbjsonser(){
     { "type": "direct", "tag": "direct", "domain_strategy": "${dns_strategy:-prefer_ipv4}" },
     { "type": "block", "tag": "block" }
   ],
-  "route": { "rules": [ { "geosite": ["cn"], "outbound": "direct"}, { "protocol": ["stun"], "outbound": "block" } ], "final": "direct" }
+  "route": { "rules": [ { "geosite": ["cn"], "outbound": "direct"}, { "protocol": ["quic", "stun"], "outbound": "block" } ], "final": "direct" }
 }
 EOF
 )
@@ -302,8 +347,8 @@ EOF
     { "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2}, "users": [ { "password": "${uuid}" } ], "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" } },
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
-  "outbounds": [ { "type": "direct", "tag": "direct" } ],
-  "route": { "rules": [ { "protocol": ["stun"], "action": "block" } ], "final": "direct" }
+  "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ],
+  "route": { "rules": [ { "protocol": ["quic", "stun"], "outbound": "block" }, { "outbound": "direct" } ], "final": "direct" }
 }
 EOF
 )
@@ -418,7 +463,7 @@ gen_clash_sub(){
       { "tag": "dns_fakeip", "address": "fakeip" }
     ],
     "rules": [
-      { "action": "route", "server": "localdns", "disable_cache": true },
+      { "outbound": "any", "server": "localdns", "disable_cache": true },
       { "clash_mode": "Global", "server": "proxydns" },
       { "clash_mode": "Direct", "server": "localdns" },
       { "rule_set": "geosite-cn", "server": "localdns" },
@@ -445,7 +490,7 @@ gen_clash_sub(){
     ],
     "auto_detect_interface": true, "final": "select",
     "rules": [
-      { "inbound": "tun-in", "action": "sniff" }, { "protocol": "dns", "action": "hijack-dns" },
+      { "inbound": "tun-in", "action": "sniff" }, { "protocol": "dns", "action": "hijack-dns" }, { "port": 443, "network": "udp", "action": "reject" },
       { "clash_mode": "Direct", "outbound": "direct" }, { "clash_mode": "Global", "outbound": "select" },
       { "rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct" }, { "ip_is_private": true, "outbound": "direct" },
       { "rule_set": "geosite-geolocation-!cn", "outbound": "select" }
@@ -475,9 +520,7 @@ stclre(){
     fi
 }
 
-sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; 
-  echo "\n[Log saved to $LOG_FILE]"
-}
+sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; }
 upsbyg(){ yellow "正在嘗試更新..."; bootstrap_and_exec; }
 sbsm(){ blue "安裝內核 → 自動生成默認配置 → 開機自啟。"; blue "可用功能：變更證書/端口、生成訂閱、查看日誌、開啟BBR。"; blue "分享/訂閱輸出：選 7 或 11。產物在 /etc/s-box/"; }
 
