@@ -3,7 +3,22 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-trap 'code=$?; echo -e "\033[31m\033[01m[ERROR]\033[0m at line $LINENO while running: ${BASH_COMMAND} (exit $code)"; exit $code' ERR
+ # --- Logging ---
+ LOG_FILE="/var/log/sb.sh.log"
+ mkdir -p "$(dirname "$LOG_FILE")"
+ touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
+ # tee all stdout/stderr to log file
+ exec > >(tee -a "$LOG_FILE") 2>&1
+
+ error_trap(){
+     local code=$?
+     local line="$1"
+     local cmd="$2"
+     echo -e "\033[31m\033[01m[ERROR]\033[0m at line $line while running: $cmd (exit $code)"
+     logger -t "sb.sh" "[ERROR] line $line cmd: $cmd exit: $code"
+     return $code
+ }
+ trap 'error_trap $LINENO "$BASH_COMMAND"' ERR
 export LANG=en_US.UTF-8
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; plain='\033[0m'
 
@@ -12,7 +27,12 @@ green(){ echo -e "\033[32m\033[01m$1\033[0m";}
 yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
 blue(){ echo -e "\033[36m\033[01m$1\033[0m";}
 white(){ echo -e "\033[37m\033[01m$1\033[0m";}
+
 readp(){ read -p "$(yellow "$1")" "$2";}
+
+# === ACME defaults (can be overridden via environment) ===
+: "${SB_ACME_CA:=letsencrypt}"   # letsencrypt | zerossl
+: "${SB_ACME_EMAIL:=}"           # if empty, will default to admin@<your-domain>
 
 base64_n0() { if base64 --help 2>/dev/null | grep -q -- '--wrap'; then base64 --wrap=0; elif base64 --help 2>/dev/null | grep -q -- '-w'; then base64 -w 0; else base64; fi; }
 
@@ -45,9 +65,9 @@ check_dependencies() {
 }
 
 install_dependencies() {
-    green "開始安裝必要的依賴……"; if [[ x"${release}" == x"alpine" ]]; then apk update && apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what
-    else if [ -x "$(command -v apt-get)" ]; then apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what
-    elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then local PKG_MANAGER; PKG_MANAGER=$(command -v yum || command -v dnf); $PKG_MANAGER install -y epel-release || true; $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what; systemctl enable --now cronie 2>/dev/null || true; systemctl enable --now iptables 2>/dev/null || true; fi; fi
+    green "開始安裝必要的依賴……"; if [[ x"${release}" == x"alpine" ]]; then apk update && apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what bind-tools
+    else if [ -x "$(command -v apt-get)" ]; then apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what dnsutils
+    elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then local PKG_MANAGER; PKG_MANAGER=$(command -v yum || command -v dnf); $PKG_MANAGER install -y epel-release || true; $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what bind-utils; systemctl enable --now cronie 2>/dev/null || true; systemctl enable --now iptables 2>/dev/null || true; fi; fi
     green "依賴安裝完成。"
 }
 
@@ -65,7 +85,12 @@ v6_setup(){
 
 configure_firewall() {
     green "正在配置防火牆..."; local ports_to_open=("$@")
-    for port in "${ports_to_open[@]}"; do if [[ -n "$port" ]]; then iptables -I INPUT -p tcp --dport "$port" -j ACCEPT; iptables -I INPUT -p udp --dport "$port" -j ACCEPT; fi; done
+    for port in "${ports_to_open[@]}"; do
+        if [[ -n "$port" ]]; then
+            iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+            iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+        fi
+    done
     if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; elif command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; elif [[ -d /etc/iptables ]]; then iptables-save >/etc/iptables/rules.v4 2>/dev/null || true; fi
     green "防火牆規則已保存。"
 }
@@ -78,12 +103,87 @@ remove_firewall_rules() {
 }
 
 apply_acme_cert() {
-    if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then green "首次運行，正在安裝acme.sh..."; curl https://get.acme.sh | sh; if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then red "acme.sh 安裝失敗"; return 1; fi; fi
-    readp "請輸入您解析到本機的域名: " domain; if [ -z "$domain" ]; then red "域名不能為空。"; return 1; fi
-    if lsof -i:80 &>/dev/null; then yellow "80端口被佔用，嘗試臨時停止服務..."; systemctl stop nginx 2>/dev/null || true; systemctl stop apache2 2>/dev/null || true; systemctl stop httpd 2>/dev/null || true; fi
-    green "正在申請證書..."; ~/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256
-    systemctl start nginx 2>/dev/null || true; systemctl start apache2 2>/dev/null || true; systemctl start httpd 2>/dev/null || true
-    local cert_path="/root/ieduerca"; if ~/.acme.sh/acme.sh --list | grep -q "$domain"; then mkdir -p "$cert_path"; if ~/.acme.sh/acme.sh --install-cert -d "$domain" --key-file "${cert_path}/private.key" --fullchain-file "${cert_path}/cert.crt" --ecc; then green "證書申請成功"; echo "$domain" > "${cert_path}/ca.log"; return 0; else red "證書安裝失敗。"; return 1; fi; else red "證書申請失敗。"; return 1; fi
+    # Ensure acme.sh is installed
+    if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
+        green "首次運行，正在安裝acme.sh..."
+        curl https://get.acme.sh | sh
+        if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then red "acme.sh 安裝失敗"; return 1; fi
+    fi
+
+    readp "請輸入您解析到本機的域名: " domain
+    if [[ -z "$domain" ]]; then red "域名不能為空。"; return 1; fi
+
+    # Best-effort: verify domain points to this server (for ACME success)
+    v4v6
+    local a="" aaaa=""; a=$(dig +short A "$domain" 2>/dev/null | head -n1 || true); aaaa=$(dig +short AAAA "$domain" 2>/dev/null | head -n1 || true)
+    if [[ -n "$a" && -n "$v4" && "$a" != "$v4" ]] && [[ -n "$aaaa" && -n "$v6" && "$aaaa" != "$v6" ]]; then
+        yellow "警告: $domain 的 A/AAAA 記錄可能未指向本機 (A=$a AAAA=$aaaa，本機 v4=$v4 v6=$v6)，ACME 可能失敗。"
+    fi
+
+    # Decide CA & email
+    local ca_server email
+    case "${SB_ACME_CA,,}" in
+        letsencrypt|zerossl) ca_server="${SB_ACME_CA,,}" ;;
+        *) ca_server="letsencrypt" ;;
+    esac
+    email="${SB_ACME_EMAIL:-admin@${domain}}"
+
+    green "設置默認 CA: ${ca_server}"
+    ~/.acme.sh/acme.sh --set-default-ca --server "${ca_server}" || true
+
+    green "註冊 CA 帳號（若已註冊會自動跳過）..."
+    ~/.acme.sh/acme.sh --register-account -m "${email}" --server "${ca_server}" || true
+
+    # Free ports and open firewall for challenges
+    local stopped=()
+    for svc in nginx apache2 httpd; do
+        if systemctl is-active --quiet "$svc"; then
+            systemctl stop "$svc"
+            stopped+=("$svc")
+        fi
+    done
+
+    # Open ports 80/443 (idempotent)
+    iptables -C INPUT -p tcp --dport 80  -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80  -j ACCEPT
+    iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+
+    green "正在申請證書（HTTP-01 on :80）..."
+    if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone --httpport 80 -k ec-256 --server "${ca_server}"; then
+        yellow "HTTP-01 失敗，嘗試 TLS-ALPN-01（:443）..."
+        # If 443 is in use, stop sing-box temporarily
+        if ss -H -tnlp 2>/dev/null | grep -q ':443'; then
+            systemctl stop sing-box 2>/dev/null || true
+            stopped+=("sing-box")
+        fi
+        if ! ~/.acme.sh/acme.sh --issue -d "${domain}" --alpn -k ec-256 --server "${ca_server}"; then
+            red "證書申請失敗。"
+            # Restore services
+            for s in "${stopped[@]}"; do systemctl start "$s" 2>/dev/null || true; done
+            return 1
+        fi
+    fi
+
+    local cert_path="/root/ieduerca"
+    mkdir -p "${cert_path}"
+
+    green "安裝證書並配置自動續期後重載 sing-box..."
+    ~/.acme.sh/acme.sh --install-cert -d "${domain}" --ecc \
+      --key-file       "${cert_path}/private.key" \
+      --fullchain-file "${cert_path}/cert.crt" \
+      --reloadcmd "systemctl reload sing-box || systemctl restart sing-box"
+
+    # Keep acme.sh fresh & cron in place
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade 1>/dev/null 2>&1 || true
+    ~/.acme.sh/acme.sh --install-cronjob        1>/dev/null 2>&1 || true
+
+    echo "${domain}"     > "${cert_path}/ca.log"
+    echo "${ca_server}"  > "${cert_path}/issuer.log"
+
+    # Restore services stopped earlier
+    for s in "${stopped[@]}"; do systemctl start "$s" 2>/dev/null || true; done
+
+    green "證書申請與安裝成功：${domain}（CA: ${ca_server}，Email: ${email}）"
+    return 0
 }
 
 check_port_in_use() { if ss -H -tunlp "sport = :$1" 2>/dev/null | grep -q .; then return 0; else return 1; fi; }
@@ -187,7 +287,7 @@ inssbjsonser(){
     { "type": "direct", "tag": "direct", "domain_strategy": "${dns_strategy:-prefer_ipv4}" },
     { "type": "block", "tag": "block" }
   ],
-  "route": { "rules": [ { "geosite": ["cn"], "outbound": "direct"}, { "protocol": ["quic", "stun"], "outbound": "block" } ], "final": "direct" }
+  "route": { "rules": [ { "geosite": ["cn"], "outbound": "direct"}, { "protocol": ["stun"], "outbound": "block" } ], "final": "direct" }
 }
 EOF
 )
@@ -202,8 +302,8 @@ EOF
     { "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2}, "users": [ { "password": "${uuid}" } ], "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" } },
     { "type": "tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu}, "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr", "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" } }
   ],
-  "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ],
-  "route": { "rules": [ { "protocol": ["quic", "stun"], "outbound": "block" }, { "outbound": "direct" } ], "final": "direct" }
+  "outbounds": [ { "type": "direct", "tag": "direct" } ],
+  "route": { "rules": [ { "protocol": ["stun"], "action": "block" } ], "final": "direct" }
 }
 EOF
 )
@@ -250,18 +350,32 @@ EOF
 
 ipuuid(){
     for i in {1..3}; do
-        if [[ x"${release}" == x"alpine" ]]; then if rc-service sing-box status 2>/dev/null | grep -q 'started'; then break; fi
-        else if systemctl -q is-active sing-box; then break; fi; fi
-        if [ $i -eq 3 ]; then red "Sing-box服務未運行或啟動失敗。"; return 1; fi; sleep 1
+        if [[ x"${release}" == x"alpine" ]]; then
+            if rc-service sing-box status 2>/dev/null | grep -q 'started'; then break; fi
+        else
+            if systemctl -q is-active sing-box; then break; fi
+        fi
+        if [ $i -eq 3 ]; then red "Sing-box服務未運行或啟動失敗。"; return 1; fi
+        sleep 1
     done
     v4v6; local menu
     if [[ -n "$v4" && -n "$v6" ]]; then
         readp "雙棧VPS，請選擇IP配置輸出 (1: IPv4, 2: IPv6, 默認2): " menu
-        if [[ "$menu" == "1" ]]; then sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$v4"; server_ipcl="$v4"; else sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"; fi
-    elif [[ -n "$v6" ]]; then sbdnsip='tls://[2001:4860:4860::8888]/dns-query'; server_ip="[$v6]"; server_ipcl="$v6"
-    elif [[ -n "$v4" ]]; then sbdnsip='tls://8.8.8.8/dns-query'; server_ip="$v4"; server_ipcl="$v4"
-    else red "无法获取公網 IP 地址。" && return 1; fi
-    echo "$sbdnsip" > /etc/s-box/sbdnsip.log; echo "$server_ip" > /etc/s-box/server_ip.log; echo "$server_ipcl" > /etc/s-box/server_ipcl.log
+        if [[ "$menu" == "1" ]]; then
+            sbdnsip='tls://dns.google'; server_ip="$v4"; server_ipcl="$v4"
+        else
+            sbdnsip='tls://[2001:4860:4860::8888]'; server_ip="[$v6]"; server_ipcl="$v6"
+        fi
+    elif [[ -n "$v6" ]]; then
+        sbdnsip='tls://[2001:4860:4860::8888]'; server_ip="[$v6]"; server_ipcl="$v6"
+    elif [[ -n "$v4" ]]; then
+        sbdnsip='tls://dns.google'; server_ip="$v4"; server_ipcl="$v4"
+    else
+        red "无法获取公網 IP 地址。" && return 1
+    fi
+    echo "$sbdnsip" > /etc/s-box/sbdnsip.log
+    echo "$server_ip" > /etc/s-box/server_ip.log
+    echo "$server_ipcl" > /etc/s-box/server_ipcl.log
 }
 
 result_vl_vm_hy_tu(){
@@ -304,7 +418,7 @@ gen_clash_sub(){
       { "tag": "dns_fakeip", "address": "fakeip" }
     ],
     "rules": [
-      { "outbound": "any", "server": "localdns", "disable_cache": true },
+      { "action": "route", "server": "localdns", "disable_cache": true },
       { "clash_mode": "Global", "server": "proxydns" },
       { "clash_mode": "Direct", "server": "localdns" },
       { "rule_set": "geosite-cn", "server": "localdns" },
@@ -331,7 +445,7 @@ gen_clash_sub(){
     ],
     "auto_detect_interface": true, "final": "select",
     "rules": [
-      { "inbound": "tun-in", "action": "sniff" }, { "protocol": "dns", "action": "hijack-dns" }, { "port": 443, "network": "udp", "action": "reject" },
+      { "inbound": "tun-in", "action": "sniff" }, { "protocol": "dns", "action": "hijack-dns" },
       { "clash_mode": "Direct", "outbound": "direct" }, { "clash_mode": "Global", "outbound": "select" },
       { "rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct" }, { "ip_is_private": true, "outbound": "direct" },
       { "rule_set": "geosite-geolocation-!cn", "outbound": "select" }
@@ -361,7 +475,9 @@ stclre(){
     fi
 }
 
-sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; }
+sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager; fi; 
+  echo "\n[Log saved to $LOG_FILE]"
+}
 upsbyg(){ yellow "正在嘗試更新..."; bootstrap_and_exec; }
 sbsm(){ blue "安裝內核 → 自動生成默認配置 → 開機自啟。"; blue "可用功能：變更證書/端口、生成訂閱、查看日誌、開啟BBR。"; blue "分享/訂閱輸出：選 7 或 11。產物在 /etc/s-box/"; }
 
