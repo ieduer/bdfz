@@ -3,7 +3,7 @@ export LANG=en_US.UTF-8
 
 # --- 增强健壮性 ---
 set -e
-trap 'echo -e "\033[31m\033[01m[ERROR] An error occurred at line $LINENO\033[0m"; exit 1' ERR
+trap 'echo -e "\033[31m\033[01m[ERROR] An error occurred at line $LINENO in command: $BASH_COMMAND\033[0m"; exit 1' ERR
 # --- 结束 ---
 
 # --- 脚本1的颜色和基础函数 ---
@@ -23,7 +23,6 @@ v4v6(){
     v6=$(curl -s6m5 icanhazip.com -k)
 }
 
-# 新的防火墙逻辑
 configure_firewall(){
     green "正在配置防火牆..."
     systemctl stop firewalld.service >/dev/null 2>&1 || true
@@ -85,6 +84,10 @@ apply_acme_cert() {
         green "首次運行，正在安裝acme.sh..."; curl https://get.acme.sh | sh
         if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then red "acme.sh 安裝失敗"; return 1; fi
     fi
+    # 創建 /root/.acme.sh/account.conf 的軟鏈接，兼容腳本1的邏輯
+    mkdir -p /root/ygkkkca
+    ln -s "$HOME/.acme.sh/account.conf" /root/ygkkkca/account.conf 2>/dev/null || true
+
     local prev_domain=""; [[ -s "/root/ieduerca/ca.log" ]] && prev_domain=$(cat /root/ieduerca/ca.log 2>/dev/null || true)
     readp "請輸入您解析到本機的域名 (默認: ${prev_domain:-无}): " domain
     [[ -z "$domain" ]] && domain="$prev_domain"
@@ -102,8 +105,14 @@ apply_acme_cert() {
         red "證書申請失敗。"; for svc in "${stopped_services[@]}"; do systemctl start "$svc" || true; done; return 1;
     fi
     local cert_path="/root/ieduerca";
+    # 兼容腳本1的路徑
+    mkdir -p /root/ygkkkca
     ~/.acme.sh/acme.sh --install-cert -d "${domain}" --ecc --key-file "${cert_path}/private.key" --fullchain-file "${cert_path}/cert.crt" --reloadcmd "systemctl restart sing-box"
+    ln -s "${cert_path}/private.key" /root/ygkkkca/private.key 2>/dev/null || true
+    ln -s "${cert_path}/cert.crt" /root/ygkkkca/cert.crt 2>/dev/null || true
     echo "${domain}" > "${cert_path}/ca.log"
+    echo "${domain}" > /root/ygkkkca/ca.log
+
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade 1>/dev/null 2>&1 || true; ~/.acme.sh/acme.sh --install-cronjob 1>/dev/null 2>&1 || true
     for svc in "${stopped_services[@]}"; do if [[ "$svc" != "sing-box" ]]; then systemctl start "$svc" || true; fi; done
     green "證書申請與安裝成功：${domain}"; return 0
@@ -117,9 +126,10 @@ inscertificate(){
     openssl req -new -x509 -days 36500 -key /etc/s-box/private.key -out /etc/s-box/cert.pem -subj "/CN=www.bing.com" >/dev/null 2>&1
     
     local use_acme=false
-    if [[ -f /root/ieduerca/cert.crt && -s /root/ieduerca/cert.crt ]]; then
-        yellow "經檢測，之前已申請過Acme域名證書：$(cat /root/ieduerca/ca.log 2>/dev/null)"
-        readp "是否使用 $(cat /root/ieduerca/ca.log 2>/dev/null) 域名證書？(y/n, 默認n使用自簽): " choice
+    # 使用脚本1的 ygkkkca 路径判断
+    if [[ -f /root/ygkkkca/cert.crt && -s /root/ygkkkca/cert.crt ]]; then
+        yellow "经检测，之前已申请过Acme域名证书：$(cat /root/ygkkkca/ca.log 2>/dev/null)"
+        readp "是否使用 $(cat /root/ygkkkca/ca.log 2>/dev/null) 域名证书？(y/n, 默认n使用自签): " choice
         if [[ "${choice,,}" == "y" ]]; then use_acme=true; fi
     else
         readp "如果你有解析完成的域名，是否申请一个Acme域名证书？(y/n, 默认n使用自签): " choice
@@ -129,10 +139,10 @@ inscertificate(){
     fi
 
     if $use_acme; then
-        ym_vl_re="apple.com"; ym_vm_ws=$(cat /root/ieduerca/ca.log); tlsyn=true
-        certificatec_vmess_ws='/root/ieduerca/cert.crt'; certificatep_vmess_ws='/root/ieduerca/private.key'
-        certificatec_hy2='/root/ieduerca/cert.crt'; certificatep_hy2='/root/ieduerca/private.key'
-        certificatec_tuic='/root/ieduerca/cert.crt'; certificatep_tuic='/root/ieduerca/private.key'
+        ym_vl_re="apple.com"; ym_vm_ws=$(cat /root/ygkkkca/ca.log); tlsyn=true
+        certificatec_vmess_ws='/root/ygkkkca/cert.crt'; certificatep_vmess_ws='/root/ygkkkca/private.key'
+        certificatec_hy2='/root/ygkkkca/cert.crt'; certificatep_hy2='/root/ygkkkca/private.key'
+        certificatec_tuic='/root/ygkkkca/cert.crt'; certificatep_tuic='/root/ygkkkca/private.key'
         blue "Vless-reality SNI: apple.com"; blue "Vmess-ws, Hysteria-2, Tuic-v5 将使用 $ym_vm_ws 证书并开启TLS。"
     else
         ym_vl_re="apple.com"; ym_vm_ws="www.bing.com"; tlsyn=false
@@ -287,7 +297,7 @@ display_sharing_info() {
 }
 
 install_or_reinstall() {
-    mkdir -p /etc/s-box /root/ieduerca
+    mkdir -p /etc/s-box /root/ieduerca /root/ygkkkca
     inssb
     inscertificate
     insport
@@ -312,40 +322,37 @@ install_or_reinstall() {
 unins(){
     readp "確認卸載Sing-box嗎? [y/n]: " confirm; [[ "${confirm,,}" != "y" ]] && yellow "卸載已取消" && return
     if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box stop 2>/dev/null || true; rc-update del sing-box 2>/dev/null || true; rm -f /etc/init.d/sing-box; else systemctl stop sing-box 2>/dev/null || true; systemctl disable sing-box 2>/dev/null || true; rm -f /etc/systemd/system/sing-box.service; systemctl daemon-reload 2>/dev/null || true; fi
-    readp "是否刪除 /etc/s-box 和 /root/ieduerca 目錄與所有配置？(y/n, 默認n): " rmconf; if [[ "${rmconf,,}" == "y" ]]; then rm -rf /etc/s-box /root/ieduerca; green "已刪除配置目錄。"; fi
+    readp "是否刪除 /etc/s-box 和 /root/ieduerca, /root/ygkkkca 目錄與所有配置？(y/n, 默認n): " rmconf; if [[ "${rmconf,,}" == "y" ]]; then rm -rf /etc/s-box /root/ieduerca /root/ygkkkca; green "已刪除配置目錄。"; fi
     green "Sing-box 已卸載完成。"
 }
 
 stclre(){ 
     echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"; readp "選擇【0-3】：" act
     if [[ x"${release}" == x"alpine" ]]; then 
-        case "$act" in 1) rc-service sing-box restart;; 2) rc-service sing-box stop;; 3) rc-service sing-box start;; *) return;; esac
+        case "$act" in 1) rc-service sing-box restart;; 2) rc-service sing-box stop;; 3) rc-service sing-box start;; esac
     else 
-        case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; *) return;; esac
+        case "$act" in 1) systemctl restart sing-box;; 2) systemctl stop sing-box;; 3) systemctl start sing-box;; esac
     fi
     green "操作完成"
 }
 
 sblog(){ if [[ x"${release}" == x"alpine" ]]; then tail -n 100 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager -n 100; fi; }
 
-# 主菜單 (來自腳本2)
 main_menu() {
     clear
     white "Vless-reality, Vmess-ws, Hysteria-2, Tuic-v5 四協議共存腳本 (基於腳本1)"
-    white "快捷命令：sb"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green " 1. 安裝/重裝 Sing-box" 
     green " 2. 卸載 Sing-box"
     white "----------------------------------------------------------------------------------"
-    green " 3. 重置/變更配置 (將重新生成所有配置)"
+    green " 3. 重置/變更配置 (重新生成所有配置)"
     green " 4. 服務管理 (啟/停/重啟)"
-    green " 5. 更新 Sing-box 腳本"
-    green " 6. 更新 Sing-box 內核"
+    green " 5. 更新 Sing-box 內核"
     white "----------------------------------------------------------------------------------"
-    green " 7. 刷新並查看節點與配置"
-    green " 8. 查看 Sing-box 運行日誌"
-    green " 9. 申請 Acme 域名證書"
-    green "10. 雙棧VPS切換IP配置輸出"
+    green " 6. 刷新並查看節點與配置"
+    green " 7. 查看 Sing-box 運行日誌"
+    green " 8. 申請 Acme 域名證書"
+    green " 9. 雙棧VPS切換IP配置輸出"
     white "----------------------------------------------------------------------------------"
     green " 0. 退出腳本"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -361,40 +368,52 @@ main_menu() {
         yellow "Sing-box 核心未安裝，請先選 1 。"
     fi
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    readp "請輸入數字【0-10】：" Input
+    readp "請輸入數字【0-9】：" Input
     case "$Input" in  
      1 ) install_or_reinstall;;
      2 ) unins;;
      3 ) install_or_reinstall;;
      4 ) stclre;;
-     5 ) yellow "暫不支持此功能，請重新運行 curl 命令更新。";;
-     6 ) inssb && sbservice && post_install_check && display_sharing_info;;
-     7 ) display_sharing_info;;
-     8 ) sblog;;
-     9 ) apply_acme_cert;;
-    10 ) ipuuid && display_sharing_info;;
+     5 ) inssb && sbservice && post_install_check && display_sharing_info;;
+     6 ) display_sharing_info;;
+     7 ) sblog;;
+     8 ) apply_acme_cert;;
+     9 ) ipuuid && display_sharing_info;;
      * ) exit 
     esac
 }
 
 # --- 腳本主體執行 ---
 
+# 檢查 root
 [[ $EUID -ne 0 ]] && yellow "请以root模式运行脚本" && exit
 
-if [[ -f /etc/redhat-release ]]; then
-    release="Centos"
-elif cat /etc/issue | grep -q -E -i "alpine"; then
-    release="alpine"
-elif cat /etc/issue | grep -q -E -i "debian"; then
-    release="Debian"
-elif cat /etc/issue | grep -q -E -i "ubuntu"; then
-    release="Ubuntu"
-else 
-    red "脚本不支持当前的系统。" && exit
+# 系統檢測
+if [[ -f /etc/redhat-release ]]; then release="Centos"; elif cat /etc/issue | grep -q -E -i "alpine"; then release="alpine"; elif cat /etc/issue | grep -q -E -i "debian"; then release="Debian"; elif cat /etc/issue | grep -q -E -i "ubuntu"; then release="Ubuntu"; else red "脚本不支持当前的系统。" && exit; fi
+op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
+case $(uname -m) in armv7l) cpu=armv7;; aarch64) cpu=arm64;; x86_64) cpu=amd64;; *) red "目前脚本不支持$(uname -m)架构" && exit;; esac
+hostname=$(hostname)
+
+# 首次運行時安裝依賴
+if [ ! -f /tmp/sbyg_update_lock ]; then
+    green "首次運行，開始安裝必要的依賴……"
+    if [[ x"${release}" == x"alpine" ]]; then
+        apk update
+        apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what bind-tools xxd
+    else
+        if [ -x "$(command -v apt-get)" ]; then
+            apt-get update -y
+            apt-get install -y jq cron socat iptables-persistent coreutils util-linux curl openssl tar wget qrencode git iproute2 lsof virt-what dnsutils xxd
+        elif [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then
+            local PKG_MANAGER=$(command -v yum || command -v dnf)
+            $PKG_MANAGER install -y epel-release || true
+            $PKG_MANAGER install -y jq socat coreutils util-linux curl openssl tar wget qrencode git cronie iptables-services iproute lsof virt-what bind-utils xxd
+            systemctl enable --now cronie 2>/dev/null || true
+            systemctl enable --now iptables 2>/dev/null || true
+        fi
+    fi
+    touch /tmp/sbyg_update_lock
+    green "依賴安裝完成。"
 fi
 
-op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
-case $(uname -m) in
-    armv7l) cpu=armv7;; aarch64) cpu=arm64;; x86_64) cpu=amd64;;
-    *) red "目前脚本不支持$(uname -m)架构" && exit;;
-esac
+main_menu
