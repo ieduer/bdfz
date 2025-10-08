@@ -3,11 +3,10 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-# --- Logging ---
-LOG_FILE="/var/log/sb.sh.log"
+# --- 來自腳本2的健壯性增強 ---
+LOG_FILE="/var/log/sb-yg.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 : >"$LOG_FILE" 2>/dev/null || true
-# tee all stdout/stderr to log file
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 trap_error(){
@@ -15,67 +14,62 @@ trap_error(){
   local line="$1"
   local cmd="$2"
   echo -e "\033[31m\033[01m[ERROR]\033[0m at line $line while running: '$cmd' (exit code: $code)"
-  logger -t "sb.sh" "[ERROR] line $line cmd: $cmd exit: $code"
+  logger -t "sb-yg.sh" "[ERROR] line $line cmd: $cmd exit: $code"
   exit $code
 }
 trap 'trap_error $LINENO "$BASH_COMMAND"' ERR
+# --- 結束 ---
 
-export LANG=en_US.UTF_8
-red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; plain='\033[0m'
-
+export LANG=en_US.UTF-8
+red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; bblue='\033[0;34m'; plain='\033[0m'
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
-green(){ echo -e "\033[32m\033[01m$1\033[0m";}
-yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
-blue(){ echo -e "\033[36m\033[01m$1\033[0m";}
-white(){ echo -e "\033[37m\033[01m$1\033[0m";}
-
+green(){ echo -e "\033[32m\031m$1\033[0m";}
+yellow(){ echo -e "\033[33m\031m$1\033[0m";}
+blue(){ echo -e "\033[36m\031m$1\033[0m";}
+white(){ echo -e "\033[37m\031m$1\033[0m";}
 readp(){ read -p "$(yellow "$1")" "$2";}
-base64_n0() { if base64 --help 2>/dev/null | grep -q -- '--wrap'; then base64 --wrap=0; elif base64 --help 2>/dev/null | grep -q -- '-w'; then base64 -w 0; else base64; fi; }
 
 [[ $EUID -ne 0 ]] && yellow "請以root模式運行腳本" && exit
 
-# 全局變量
-export sbfiles="/etc/s-box/sb.json"
-hostname=$(hostname)
-
-bootstrap_and_exec() {
-    local permanent_path="/usr/local/lib/ieduer-sb.sh"
-    local shortcut_path="/usr/local/bin/sb"
-    # 使用 Github Raw 作為源，更穩定
-    local script_url="https://raw.githubusercontent.com/ieduer/bdfz/main/sb.sh"
-    if ! command -v wget &>/dev/null && ! command -v curl &>/dev/null; then red "wget 和 curl 都不可用，无法下载脚本。"; exit 1; fi
-    green "正在下載最新腳本到 $permanent_path ..."
-    if command -v curl &>/dev/null; then 
-        curl -fsSL --retry 3 "$script_url" -o "$permanent_path"
-    else 
-        wget -qO "$permanent_path" --tries=3 "$script_url"
-    fi
-    if [[ ! -s "$permanent_path" ]]; then red "腳本下載失敗，請檢查網絡或链接。"; exit 1; fi
-    chmod +x "$permanent_path"; ln -sf "$permanent_path" "$shortcut_path"; green "已安裝/更新快捷命令：sb"
-    # 使用 exec 替換當前進程，確保新腳本立即生效
-    exec "$shortcut_path" "$@"
-}
-
-# 恢復 upsbyg 函數
-upsbyg(){
-    yellow "正在嘗試更新腳本..."
-    bootstrap_and_exec
-}
-
-
+# --- 來自腳本2的系統檢測與依賴管理 ---
 check_os() {
-    if [[ -r /etc/os-release ]]; then . /etc/os-release; case "${ID,,}" in ubuntu|debian) release="Debian" ;; centos|rhel|rocky|almalinux) release="Centos" ;; alpine) release="alpine" ;; *) red "不支持的系統 (${PRETTY_NAME:-unknown})。" && exit 1 ;; esac; op="${PRETTY_NAME:-$ID}"; else red "無法識別的作業系統。" && exit 1; fi
-    case "$(uname -m)" in armv7l) cpu=armv7 ;; aarch64) cpu=arm64 ;; x86_64) cpu=amd64 ;; *) red "不支持的架構 $(uname -m)" && exit 1 ;; esac
+    if [[ -r /etc/os-release ]]; then 
+        . /etc/os-release
+        case "${ID,,}" in 
+            ubuntu|debian) release="Debian" ;; 
+            centos|rhel|rocky|almalinux) release="Centos" ;; 
+            alpine) release="alpine" ;; 
+            *) red "不支持的系統 (${PRETTY_NAME:-unknown})。" && exit 1 ;;
+        esac
+        op="${PRETTY_NAME:-$ID}"
+    else 
+        red "無法識別的作業系統。" && exit 1
+    fi
+    
+    case "$(uname -m)" in 
+        armv7l) cpu=armv7 ;; 
+        aarch64) cpu=arm64 ;; 
+        x86_64) cpu=amd64 ;; 
+        *) red "不支持的架構 $(uname -m)" && exit 1 ;; 
+    esac
 }
 
 check_dependencies() {
-    local pkgs=("curl" "openssl" "iptables" "tar" "wget" "jq" "socat" "qrencode" "git" "ss" "lsof" "virt-what" "dig" "xxd"); local missing_pkgs=()
-    for pkg in "${pkgs[@]}"; do if ! command -v "$pkg" &> /dev/null; then missing_pkgs+=("$pkg"); fi; done
-    if [ ${#missing_pkgs[@]} -gt 0 ]; then yellow "檢測到缺少依賴: ${missing_pkgs[*]}，將自動安裝。"; install_dependencies; fi
+    local pkgs=("curl" "openssl" "iptables" "tar" "wget" "jq" "socat" "qrencode" "git" "ss" "lsof" "virt-what" "dig" "xxd")
+    local missing_pkgs=()
+    for pkg in "${pkgs[@]}"; do 
+        if ! command -v "$pkg" &> /dev/null; then 
+            missing_pkgs+=("$pkg")
+        fi
+    done
+    if [ ${#missing_pkgs[@]} -gt 0 ]; then 
+        yellow "檢測到缺少依賴: ${missing_pkgs[*]}，將自動安裝。"
+        install_dependencies
+    fi
 }
 
 install_dependencies() {
-    green "開始安裝必要的依賴……"; 
+    green "開始安裝必要的依賴……"
     if [[ x"${release}" == x"alpine" ]]; then 
         apk update && apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata qrencode virt-what bind-tools xxd
     else 
@@ -94,25 +88,61 @@ install_dependencies() {
     fi
     green "依賴安裝完成。"
 }
+# --- 結束 ---
 
-ensure_dirs() { mkdir -p /etc/s-box /root/ieduerca; chmod 700 /etc/s-box /root/ieduerca; }
-v4v6(){ v4=$(curl -fsS4m5 --retry 2 icanhazip.com || true); v6=$(curl -fsS6m5 --retry 2 icanhazip.com || true); }
-
-configure_firewall() {
-    green "正在配置防火牆... (將清除所有現有iptables規則，並設置默認允許)"
-    systemctl stop firewalld.service >/dev/null 2>&1 || true; systemctl disable firewalld.service >/dev/null 2>&1 || true
-    setenforce 0 >/dev/null 2>&1 || true
-    ufw disable >/dev/null 2>&1 || true
-    iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT; iptables -P OUTPUT ACCEPT
-    iptables -F; iptables -X; iptables -t nat -F; iptables -t nat -X; iptables -t mangle -F; iptables -t mangle -X
-    ip6tables -P INPUT ACCEPT; ip6tables -P FORWARD ACCEPT; ip6tables -P OUTPUT ACCEPT
-    ip6tables -F; ip6tables -X; ip6tables -t nat -F; ip6tables -t nat -X; ip6tables -t mangle -F; ip6tables -t mangle -X
-    if command -v netfilter-persistent &>/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; fi
-    if command -v service &>/dev/null && service iptables save &>/dev/null; then service iptables save >/dev/null 2>&1 || true; fi
-    green "防火牆規則已清除，並設置為默認允許。"
+v4v6(){
+    v4=$(curl -s4m5 icanhazip.com -k)
+    v6=$(curl -s6m5 icanhazip.com -k)
 }
 
-setup_certificates() {
+# 沿用腳本1的防火牆邏輯
+close_firewall(){
+    systemctl stop firewalld.service >/dev/null 2>&1
+    systemctl disable firewalld.service >/dev/null 2>&1
+    setenforce 0 >/dev/null 2>&1
+    ufw disable >/dev/null 2>&1
+    iptables -P INPUT ACCEPT >/dev/null 2>&1
+    iptables -P FORWARD ACCEPT >/dev/null 2>&1
+    iptables -P OUTPUT ACCEPT >/dev/null 2>&1
+    iptables -t mangle -F >/dev/null 2>&1
+    iptables -F >/dev/null 2>&1
+    iptables -X >/dev/null 2>&1
+    netfilter-persistent save >/dev/null 2>&1
+    green "執行開放端口，關閉防火牆完畢"
+}
+
+# 沿用腳本1的安裝流程
+inssb(){
+    red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    green "安裝最新正式版 Sing-box 內核..."
+    
+    # 使用來自腳本2的更健壯的版本號獲取方式
+    local versions_json=$(curl -fsSL --retry 3 "https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box")
+    local sbcore=$(echo "$versions_json" | jq -r '.versions[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -n 1)
+
+    if [[ -z "$sbcore" || ! "$sbcore" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then 
+        red "從 jsdelivr 獲取最新版本號失敗。"; exit 1; 
+    fi
+    
+    green "正在下載 Sing-box v$sbcore ..."
+    local sbname="sing-box-$sbcore-linux-$cpu"
+    curl -L -o /etc/s-box/sing-box.tar.gz -# --retry 3 --fail "https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz"
+    
+    if [[ ! -s '/etc/s-box/sing-box.tar.gz' ]]; then red "下載內核失敗"; exit 1; fi
+    tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
+    mv "/etc/s-box/$sbname/sing-box" /etc/s-box
+    rm -rf "/etc/s-box/sing-box.tar.gz" "/etc/s-box/$sbname"
+    
+    if [[ -x '/etc/s-box/sing-box' ]]; then
+        chmod +x /etc/s-box/sing-box
+        blue "成功安裝內核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')"
+    else 
+        red "解壓內核失敗"; exit 1; 
+    fi
+}
+
+# 沿用腳本1的證書邏輯
+setup_certificates(){
     green "二、生成並設置相關證書"
     blue "自動生成bing自簽證書中……" && sleep 1
     openssl ecparam -genkey -name prime256v1 -out /etc/s-box/private.key >/dev/null 2>&1
@@ -126,39 +156,36 @@ setup_certificates() {
     else
         readp "如果你有解析完成的域名，是否申請一個Acme域名證書？(y/n, 默認n使用自簽): " choice
         if [[ "${choice,,}" == "y" ]]; then
+            # 使用來自腳本2的 ACME 函數
             if apply_acme_cert; then use_acme=true; else red "Acme證書申請失敗，回退到自簽證書。"; use_acme=false; fi
         fi
     fi
 
     if $use_acme; then
-        local ym_acme=$(cat /root/ieduerca/ca.log)
-        jq -n --arg vl_re "apple.com" \
-              --arg vm_ws "$ym_acme" \
-              --arg hy2 "$ym_acme" \
-              --arg tuic "$ym_acme" \
-              --arg cert "/root/ieduerca/cert.crt" \
-              --arg key "/root/ieduerca/private.key" \
-              --argjson tlsyn true \
-              '{vl_re: $vl_re, vm_ws: $vm_ws, hy2: $hy2, tuic: $tuic, cert: $cert, key: $key, tlsyn: $tlsyn}' > /tmp/cert_config.json
+        ym_vl_re="apple.com"
+        ym_vm_ws=$(cat /root/ieduerca/ca.log)
+        tlsyn=true
+        certificatec_vmess_ws='/root/ieduerca/cert.crt'; certificatep_vmess_ws='/root/ieduerca/private.key'
+        certificatec_hy2='/root/ieduerca/cert.crt'; certificatep_hy2='/root/ieduerca/private.key'
+        certificatec_tuic='/root/ieduerca/cert.crt'; certificatep_tuic='/root/ieduerca/private.key'
         blue "Vless-reality SNI: apple.com"
-        blue "Vmess-ws, Hysteria-2, Tuic-v5 將使用 $ym_acme 證書並開啟TLS。"
+        blue "Vmess-ws, Hysteria-2, Tuic-v5 將使用 $ym_vm_ws 證書並開啟TLS。"
     else
-        jq -n --arg vl_re "apple.com" \
-              --arg vm_ws "www.bing.com" \
-              --arg hy2 "www.bing.com" \
-              --arg tuic "www.bing.com" \
-              --arg cert "/etc/s-box/cert.pem" \
-              --arg key "/etc/s-box/private.key" \
-              --argjson tlsyn false \
-              '{vl_re: $vl_re, vm_ws: $vm_ws, hy2: $hy2, tuic: $tuic, cert: $cert, key: $key, tlsyn: $tlsyn}' > /tmp/cert_config.json
+        ym_vl_re="apple.com"
+        ym_vm_ws="www.bing.com"
+        tlsyn=false
+        certificatec_vmess_ws='/etc/s-box/cert.pem'; certificatep_vmess_ws='/etc/s-box/private.key'
+        certificatec_hy2='/etc/s-box/cert.pem'; certificatep_hy2='/etc/s-box/private.key'
+        certificatec_tuic='/etc/s-box/cert.pem'; certificatep_tuic='/etc/s-box/private.key'
         blue "Vless-reality SNI: apple.com"
         blue "Vmess-ws 將關閉TLS，Hysteria-2, Tuic-v5 將使用bing自簽證書。"
     fi
 }
 
+# 沿用腳本1的端口邏輯
 setup_ports() {
     green "三、設置各個協議端口"
-    local ports=()
+    ports=()
     for i in {1..4}; do
         while true; do
             local p=$(shuf -i 10000-65535 -n 1)
@@ -167,107 +194,75 @@ setup_ports() {
             fi
         done
     done
+    port_vl_re=${ports[0]}; port_hy2=${ports[1]}; port_tu=${ports[2]}
     
-    local tls_enabled=$(jq -r .tlsyn /tmp/cert_config.json)
     local cdn_ports
-    if [[ "$tls_enabled" == "true" ]]; then cdn_ports=("2053" "2083" "2087" "2096" "8443"); else cdn_ports=("8080" "8880" "2052" "2082" "2086" "2095"); fi
-    local port_vm_ws=${cdn_ports[$RANDOM % ${#cdn_ports[@]}]}
+    if [[ "$tlsyn" == "true" ]]; then cdn_ports=("2053" "2083" "2087" "2096" "8443"); else cdn_ports=("8080" "8880" "2052" "2082" "2086" "2095"); fi
+    port_vm_ws=${cdn_ports[$RANDOM % ${#cdn_ports[@]}]}
     while ss -H -tunlp "sport = :$port_vm_ws" | grep -q . || [[ " ${ports[@]} " =~ " $port_vm_ws " ]]; do
         port_vm_ws=${cdn_ports[$RANDOM % ${#cdn_ports[@]}]}
     done
-    
-    jq -n --argjson vl ${ports[0]} --argjson vm $port_vm_ws --argjson hy2 ${ports[1]} --argjson tuic ${ports[2]} \
-        '{vl: $vl, vm: $vm, hy2: $hy2, tuic: $tuic}' > /tmp/port_config.json
-        
-    blue "Vless-reality端口：${ports[0]}"
+
+    blue "Vless-reality端口：$port_vl_re"
     blue "Vmess-ws端口：$port_vm_ws"
-    blue "Hysteria-2端口：${ports[1]}"
-    blue "Tuic-v5端口：${ports[2]}"
+    blue "Hysteria-2端口：$port_hy2"
+    blue "Tuic-v5端口：$port_tu"
 }
 
+# 沿用腳本1的UUID和Reality邏輯
 setup_uuid_and_reality() {
-    green "四、生成 UUID 和 Reality 密鑰"
-    local uuid=$(/etc/s-box/sing-box generate uuid)
+    green "四、自動生成 UUID 和 Reality 密鑰"
+    uuid=$(/etc/s-box/sing-box generate uuid)
     local key_pair=$(/etc/s-box/sing-box generate reality-keypair)
-    local private_key=$(echo "$key_pair" | awk '/PrivateKey/ {print $2}' | tr -d '"')
-    local public_key=$(echo "$key_pair" | awk '/PublicKey/ {print $2}' | tr -d '"')
-    local short_id=$(/etc/s-box/sing-box generate rand --hex 4)
-    
-    jq -n --arg uuid "$uuid" --arg pk "$private_key" --arg pubk "$public_key" --arg sid "$short_id" \
-        '{uuid: $uuid, private_key: $pk, public_key: $pubk, short_id: $sid}' > /tmp/user_config.json
-
+    private_key=$(echo "$key_pair" | awk '/PrivateKey/ {print $2}' | tr -d '"')
+    public_key=$(echo "$key_pair" | awk '/PublicKey/ {print $2}' | tr -d '"')
+    echo "$public_key" > /etc/s-box/public.key
+    short_id=$(/etc/s-box/sing-box generate rand --hex 4)
     blue "已確認uuid (密碼)：${uuid}"
     blue "Vmess Path：/${uuid}-vm"
-    blue "Reality 公鑰和 short_id 已生成。"
 }
 
+# 核心：沿用腳本1的JSON生成，確保穩定性，但移除了Warp出站
 inssbjsonser(){
-    green "正在使用 jq 生成服務端配置文件..."
-    local cert_conf="/tmp/cert_config.json"
-    local port_conf="/tmp/port_config.json"
-    local user_conf="/tmp/user_config.json"
-    
     local dns_strategy="prefer_ipv4"
     if [[ -z "$(curl -s4m5 icanhazip.com -k)" ]]; then dns_strategy="prefer_ipv6"; fi
     
-    local base_json='{
-        "log": { "disabled": false, "level": "info", "timestamp": true },
-        "inbounds": [],
-        "outbounds": [
-            { "type":"direct", "tag":"direct", "domain_strategy": "'$dns_strategy'" },
-            { "type": "block", "tag": "block" }
-        ],
-        "route":{ "rules":[ { "protocol": ["quic", "stun"], "outbound": "block" } ], "final": "direct" }
-    }'
-    
-    # 逐個構建 inbound
-    local vless_inbound=$(jq -n \
-        --argjson port "$(jq -r .vl $port_conf)" \
-        --arg uuid "$(jq -r .uuid $user_conf)" \
-        --arg sni "$(jq -r .vl_re $cert_conf)" \
-        --arg pk "$(jq -r .private_key $user_conf)" \
-        --arg sid "$(jq -r .short_id $user_conf)" \
-        '{type: "vless", tag: "vless-sb", listen: "::", listen_port: $port, sniff: true, sniff_override_destination: true, users: [{uuid: $uuid, flow: "xtls-rprx-vision"}], tls: {enabled: true, server_name: $sni, reality: {enabled: true, handshake: {server: $sni, server_port: 443}, private_key: $pk, short_id: [$sid]}}}')
-    
-    local vmess_inbound=$(jq -n \
-        --argjson port "$(jq -r .vm $port_conf)" \
-        --arg uuid "$(jq -r .uuid $user_conf)" \
-        --arg path "/$(jq -r .uuid $user_conf)-vm" \
-        --argjson tls_enabled "$(jq -r .tlsyn $cert_conf)" \
-        --arg sni "$(jq -r .vm_ws $cert_conf)" \
-        --arg cert "$(jq -r .cert $cert_conf)" \
-        --arg key "$(jq -r .key $cert_conf)" \
-        '
-        {
-            type: "vmess", tag: "vmess-sb", listen: "::", listen_port: $port, sniff: true, sniff_override_destination: true,
-            users: [{uuid: $uuid, alterId: 0}],
-            transport: {type: "ws", path: $path, max_early_data: 2048, early_data_header_name: "Sec-WebSocket-Protocol"},
-            tls: {enabled: $tls_enabled, server_name: $sni, certificate_path: $cert, key_path: $key}
-        }
-        | if .tls.enabled then .tls.alpn = ["http/1.1"] else . end
-        ')
+    local vmess_tls_alpn=""
+    if [[ "${tlsyn}" == "true" ]]; then vmess_tls_alpn=', "alpn": ["http/1.1"]'; fi
 
-    local hy2_inbound=$(jq -n \
-        --argjson port "$(jq -r .hy2 $port_conf)" \
-        --arg pass "$(jq -r .uuid $user_conf)" \
-        --arg sni "$(jq -r .hy2 $cert_conf)" \
-        --arg cert "$(jq -r .cert $cert_conf)" \
-        --arg key "$(jq -r .key $cert_conf)" \
-        '{type: "hysteria2", tag: "hy2-sb", listen: "::", listen_port: $port, sniff: true, sniff_override_destination: true, users: [{password: $pass}], tls: {enabled: true, server_name: $sni, alpn: ["h3"], certificate_path: $cert, key_path: $key}}')
-        
-    local tuic_inbound=$(jq -n \
-        --argjson port "$(jq -r .tuic $port_conf)" \
-        --arg uuid "$(jq -r .uuid $user_conf)" \
-        --arg sni "$(jq -r .tuic $cert_conf)" \
-        --arg cert "$(jq -r .cert $cert_conf)" \
-        --arg key "$(jq -r .key $cert_conf)" \
-        '{type: "tuic", tag: "tuic5-sb", listen: "::", listen_port: $port, sniff: true, sniff_override_destination: true, users: [{uuid: $uuid, password: $uuid}], congestion_control: "bbr", tls: {enabled: true, server_name: $sni, alpn: ["h3"], certificate_path: $cert, key_path: $key}}')
-
-    # 使用 jq 將 inbound 添加到基礎 json 中
-    echo "$base_json" | jq ".inbounds += [$vless_inbound, $vmess_inbound, $hy2_inbound, $tuic_inbound]" > "$sbfiles"
-    
-    # 清理臨時文件
-    rm -f /tmp/cert_config.json /tmp/port_config.json /tmp/user_config.json
+    cat > /etc/s-box/sb.json <<EOF
+{
+"log": { "disabled": false, "level": "info", "timestamp": true },
+"inbounds": [
+    {
+      "type": "vless", "sniff": true, "sniff_override_destination": true, "tag": "vless-sb", "listen": "::", "listen_port": ${port_vl_re},
+      "users": [ { "uuid": "${uuid}", "flow": "xtls-rprx-vision" } ],
+      "tls": { "enabled": true, "server_name": "${ym_vl_re}", "reality": { "enabled": true, "handshake": { "server": "${ym_vl_re}", "server_port": 443 }, "private_key": "$private_key", "short_id": ["$short_id"] } }
+    },
+    {
+      "type": "vmess", "sniff": true, "sniff_override_destination": true, "tag": "vmess-sb", "listen": "::", "listen_port": ${port_vm_ws},
+      "users": [ { "uuid": "${uuid}", "alterId": 0 } ],
+      "transport": { "type": "ws", "path": "/${uuid}-vm", "max_early_data":2048, "early_data_header_name": "Sec-WebSocket-Protocol" },
+      "tls":{ "enabled": ${tlsyn}, "server_name": "${ym_vm_ws}", "certificate_path": "$certificatec_vmess_ws", "key_path": "$certificatep_vmess_ws"${vmess_tls_alpn} }
+    }, 
+    {
+      "type": "hysteria2", "sniff": true, "sniff_override_destination": true, "tag": "hy2-sb", "listen": "::", "listen_port": ${port_hy2},
+      "users": [ { "password": "${uuid}" } ], "ignore_client_bandwidth":false,
+      "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_hy2", "key_path": "$certificatep_hy2" }
+    },
+    {
+      "type":"tuic", "sniff": true, "sniff_override_destination": true, "tag": "tuic5-sb", "listen": "::", "listen_port": ${port_tu},
+      "users": [ { "uuid": "${uuid}", "password": "${uuid}" } ], "congestion_control": "bbr",
+      "tls":{ "enabled": true, "alpn": ["h3"], "certificate_path": "$certificatec_tuic", "key_path": "$certificatep_tuic" }
+    }
+],
+"outbounds": [
+    { "type":"direct", "tag":"direct", "domain_strategy": "$dns_strategy" },
+    { "type": "block", "tag": "block" }
+],
+"route":{ "rules":[ { "protocol": ["quic", "stun"], "outbound": "block" } ], "final": "direct" }
+}
+EOF
     green "服務端配置文件 /etc/s-box/sb.json 已生成。"
 }
 
@@ -306,127 +301,89 @@ EOF
 
 post_install_check() {
     green "執行安裝後檢查..."
-    
-    # 1. 檢查配置文件語法
-    if /etc/s-box/sing-box check -c "$sbfiles"; then
-        green "✅ 配置文件語法檢查通過。"
+    if ! /etc/s-box/sing-box check -c "/etc/s-box/sb.json"; then
+        red "❌ 配置文件語法錯誤！請檢查 $LOG_FILE 日誌。"; return 1;
     else
-        red "❌ 配置文件語法錯誤！請檢查 $LOG_FILE 日誌。"
-        return 1
+        green "✅ 配置文件語法檢查通過。"
     fi
     
-    # 2. 檢查服務狀態
-    sleep 3 # 給服務一點啟動時間
+    sleep 3
     if systemctl is-active --quiet sing-box || ( [[ x"${release}" == x"alpine" ]] && rc-service sing-box status | grep -q 'started' ); then
         green "✅ Sing-box 服務正在運行。"
     else
-        red "❌ Sing-box 服務啟動失敗！請使用選項 8 查看日誌。"
-        return 1
+        red "❌ Sing-box 服務啟動失敗！請使用選項 8 查看日誌。"; return 1;
     fi
     
-    # 3. 檢查端口監聽
     blue "檢查端口監聽狀態:"
     local all_ports_listening=true
-    local ports_to_check
-    ports_to_check=$(jq -r '.inbounds[].listen_port' "$sbfiles")
+    local ports_to_check=$(jq -r '.inbounds[].listen_port' "/etc/s-box/sb.json")
     
     for port in $ports_to_check; do
         if ss -H -tunlp "sport = :$port" | grep -q "sing-box"; then
             green "  ✅ 端口 $port 正在被 sing-box 監聽。"
         else
-            red "  ❌ 端口 $port 未被監聽！"
-            all_ports_listening=false
+            red "  ❌ 端口 $port 未被監聽！"; all_ports_listening=false
         fi
     done
     
     if $all_ports_listening; then
-        green "✅ 所有協議端口均已成功監聽。"
+        green "✅ 所有協議端口均已成功監聽。"; return 0;
     else
-        red "❌ 部分協議端口監聽失敗，請檢查日誌和配置。"
-        return 1
+        red "❌ 部分協議端口監聽失敗，請檢查日誌和配置。"; return 1;
     fi
-    return 0
 }
 
-ipuuid(){
-    for i in {1..3}; do if [[ x"${release}" == x"alpine" ]] && rc-service sing-box status 2>/dev/null | grep -q 'started'; then break; elif systemctl -q is-active sing-box; then break; fi; if [ $i -eq 3 ]; then red "Sing-box服務未運行或啟動失敗。"; return 1; fi; sleep 1; done
-    v4v6; local menu
-    if [[ -n "$v4" && -n "$v6" ]]; then
-        readp "雙棧VPS，請選擇IP配置輸出 (1: IPv4, 2: IPv6, 默認2): " menu
-        if [[ "$menu" == "1" ]]; then
-            server_ip="$v4"; server_ipcl="$v4"; sbdnsip='https://dns.google/dns-query'
-        else
-            server_ip="[$v6]"; server_ipcl="$v6"; sbdnsip='https://[2001:4860:4860::8888]/dns-query'
-        fi
-    elif [[ -n "$v6" ]]; then
-        server_ip="[$v6]"; server_ipcl="$v6"; sbdnsip='https://[2001:4860:4860::8888]/dns-query'
-    elif [[ -n "$v4" ]]; then
-        server_ip="$v4"; server_ipcl="$v4"; sbdnsip='https://dns.google/dns-query'
-    else red "无法获取公網 IP 地址。" && return 1; fi
-}
-
-# 分享鏈接和客戶端配置生成函數
-result_vl_vm_hy_tu() {
-    if [[ ! -s "$sbfiles" ]]; then red "配置文件 sb.json 不存在或為空。"; return 1; fi
-    ipuuid # 獲取IP
-    
-    local config; config=$(cat "$sbfiles")
+# 沿用腳本1的分享鏈接和客戶端配置生成函數，已移除 Argo
+# 這裡將所有生成函數合併，簡化調用
+generate_all_sharing_info() {
+    rm -f /etc/s-box/*.txt
+    # 獲取最新配置
+    local config=$(cat "/etc/s-box/sb.json")
     local uuid=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .users[0].uuid')
     local public_key=$(cat /etc/s-box/public.key 2>/dev/null || true)
-    if [[ -z "$public_key" ]]; then
-      # 如果公鑰文件不存在，從配置中重新生成一次（雖然正常流程不該發生）
-      setup_uuid_and_reality >/dev/null
-      public_key=$(jq -r .public_key /tmp/user_config.json)
-    fi
-
-    # 提取所有節點信息
+    v4v6; ipuuid
+    
+    # VLESS
     local vl_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .listen_port')
     local vl_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.server_name')
     local vl_short_id=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vless-sb") | .tls.reality.short_id[0]')
+    local vl_link="vless://$uuid@$server_ipcl:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_sni&fp=chrome&pbk=$public_key&sid=$vl_short_id&type=tcp&headerType=none#vl-reality-$hostname"
+    echo "$vl_link" > /etc/s-box/vl_reality.txt
     
+    # VMESS
     local vm_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .listen_port')
     local vm_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .transport.path')
     local vm_tls=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.enabled')
     local vm_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="vmess-sb") | .tls.server_name')
-    
-    local hy2_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .listen_port')
-    local hy2_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.server_name')
-    local hy2_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.certificate_path')
-    
-    local tu_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .listen_port')
-    local tu_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.server_name')
-    local tu_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.certificate_path')
-
-    # 生成 VLESS 鏈接
-    local vl_link="vless://$uuid@$server_ipcl:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_sni&fp=chrome&pbk=$public_key&sid=$vl_short_id&type=tcp&headerType=none#vl-reality-$hostname"
-    echo "$vl_link" > /etc/s-box/vl_reality.txt
-    
-    # 生成 VMESS 鏈接
-    local vm_link vm_json
     if [[ "$vm_tls" == "true" ]]; then
-        vm_json="{\"add\":\"$vm_sni\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-tls-$hostname\",\"tls\":\"tls\",\"sni\":\"$vm_sni\",\"type\":\"none\",\"v\":\"2\"}"
+        local vm_json="{\"add\":\"$vm_sni\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-tls-$hostname\",\"tls\":\"tls\",\"sni\":\"$vm_sni\",\"type\":\"none\",\"v\":\"2\"}"
         echo "vmess://$(echo "$vm_json" | base64_n0)" > /etc/s-box/vm_ws_tls.txt
     else
-        vm_json="{\"add\":\"$server_ipcl\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-$hostname\",\"tls\":\"\",\"type\":\"none\",\"v\":\"2\"}"
+        local vm_json="{\"add\":\"$server_ipcl\",\"aid\":\"0\",\"host\":\"$vm_sni\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$vm_port\",\"ps\":\"vm-ws-$hostname\",\"tls\":\"\",\"type\":\"none\",\"v\":\"2\"}"
         echo "vmess://$(echo "$vm_json" | base64_n0)" > /etc/s-box/vm_ws.txt
     fi
     
-    # 生成 HYSTERIA2 鏈接
+    # HYSTERIA2
+    local hy2_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .listen_port')
+    local hy2_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.server_name')
+    local hy2_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="hy2-sb") | .tls.certificate_path')
     local hy2_insecure hy2_server
-    if [[ "$hy2_cert_path" == "/etc/s-box/cert.pem" ]]; then hy2_insecure=true; hy2_server=$server_ipcl; else hy2_insecure=false; hy2_server=$hy2_sni; fi
+    if [[ "$hy2_cert_path" == "/etc/s-box/private.key" ]]; then hy2_insecure=true; hy2_server=$server_ipcl; else hy2_insecure=false; hy2_server=$hy2_sni; fi
     local hy2_link="hysteria2://$uuid@$hy2_server:$hy2_port?security=tls&alpn=h3&insecure=$hy2_insecure&sni=$hy2_sni#hy2-$hostname"
     echo "$hy2_link" > /etc/s-box/hy2.txt
     
-    # 生成 TUIC 鏈接
+    # TUIC
+    local tu_port=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .listen_port')
+    local tu_sni=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.server_name')
+    local tu_cert_path=$(echo "$config" | jq -r '.inbounds[] | select(.tag=="tuic5-sb") | .tls.certificate_path')
     local tu_insecure tu_server
-    if [[ "$tu_cert_path" == "/etc/s-box/cert.pem" ]]; then tu_insecure=true; tu_server=$server_ipcl; else tu_insecure=false; tu_server=$tu_sni; fi
+    if [[ "$tu_cert_path" == "/etc/s-box/private.key" ]]; then tu_insecure=true; tu_server=$server_ipcl; else tu_insecure=false; tu_server=$tu_sni; fi
     local tu_link="tuic://$uuid:$uuid@$tu_server:$tu_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu_sni&allow_insecure=$tu_insecure#tuic5-$hostname"
     echo "$tu_link" > /etc/s-box/tuic5.txt
 }
 
 display_sharing_info() {
-    rm -f /etc/s-box/*.txt
-    result_vl_vm_hy_tu
+    generate_all_sharing_info
 
     for f in /etc/s-box/vl_reality.txt /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt /etc/s-box/hy2.txt /etc/s-box/tuic5.txt; do
         if [[ -s "$f" ]]; then
@@ -439,7 +396,6 @@ display_sharing_info() {
         fi
     done
 
-    # 聚合訂閱
     cat /etc/s-box/*.txt > /tmp/all_links.txt 2>/dev/null
     if [[ -s /tmp/all_links.txt ]]; then
         local sub_link=$(base64_n0 < /tmp/all_links.txt)
@@ -449,47 +405,11 @@ display_sharing_info() {
     fi
 }
 
-
-clash_sb_share(){
-    if ! ipuuid; then red "Sing-box 服務未運行，無法生成分享鏈接。"; return; fi
-    display_sharing_info
-}
-
-install_or_reinstall_sb() {
-    ensure_dirs
-    red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green "安裝最新正式版 Sing-box 內核..."
-    
-    # 修復版本號獲取邏輯
-    local versions_json=$(curl -fsSL --retry 3 "https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box")
-    local sbcore=$(echo "$versions_json" | jq -r '.versions[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -n 1)
-
-    if [[ -z "$sbcore" || ! "$sbcore" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then 
-        red "從 jsdelivr 獲取最新版本號失敗。"; exit 1; 
-    fi
-    
-    green "正在下載 Sing-box v$sbcore ..."
-    local sbname="sing-box-$sbcore-linux-$cpu"
-    curl -L -o /etc/s-box/sing-box.tar.gz -# --retry 3 --fail "https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz"
-    
-    if [[ ! -s '/etc/s-box/sing-box.tar.gz' ]]; then red "下載內核失敗"; exit 1; fi
-    tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
-    mv "/etc/s-box/$sbname/sing-box" /etc/s-box
-    rm -rf "/etc/s-box/sing-box.tar.gz" "/etc/s-box/$sbname"
-    
-    if [[ -x '/etc/s-box/sing-box' ]]; then
-        chmod +x /etc/s-box/sing-box
-        blue "成功安裝內核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')"
-        rebuild_config_and_start # 安裝完畢後直接進入配置流程
-    else 
-        red "解壓內核失敗"; exit 1; 
-    fi
-}
-
-rebuild_config_and_start(){
-    red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green "開始生成配置..."
-    configure_firewall
+# 總安裝流程
+install_process() {
+    mkdir -p /etc/s-box
+    close_firewall
+    inssb
     setup_certificates
     setup_ports
     setup_uuid_and_reality
@@ -497,12 +417,10 @@ rebuild_config_and_start(){
     sbservice
     
     if post_install_check; then
-        if ! ipuuid; then red "獲取服務器 IP 信息失敗，部分分享鏈接可能不準確。"; fi
         display_sharing_info
-        enable_bbr_autonomously
-        green "配置已更新並成功啟動所有服務。"
+        green "✅ Sing-box 安裝並配置成功！"
     else
-        red "安裝或配置過程中出現嚴重錯誤，請檢查日誌。"
+        red "❌ 安裝過程出現問題，請檢查日誌！"
     fi
 }
 
@@ -544,16 +462,6 @@ apply_acme_cert() {
     return 0
 }
 
-enable_bbr_autonomously() {
-    if [[ $(sysctl -n net.ipv4.tcp_congestion_control) == "bbr" ]]; then green "BBR 已啟用。"; return 0; fi
-    if [[ $(uname -r | cut -d. -f1) -lt 5 && $(uname -r | cut -d. -f2) -lt 9 && $(uname -r | cut -d. -f1) -eq 4 ]]; then return 0; fi
-    green "正在嘗試啟用 BBR..."
-    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    sysctl -p >/dev/null 2>&1
-    if [[ $(sysctl -n net.ipv4.tcp_congestion_control) == "bbr" ]]; then green "BBR 已成功啟用！"; else red "BBR 啟用失敗。"; fi
-}
-
 stclre(){ 
     echo -e "1) 重啟  2) 停止  3) 啟動  0) 返回"; readp "選擇【0-3】：" act
     if [[ x"${release}" == x"alpine" ]]; then 
@@ -565,9 +473,10 @@ stclre(){
 
 sblog(){ if [[ x"${release}" == x"alpine" ]]; then rc-service sing-box status || true; tail -n 200 /var/log/messages 2>/dev/null || true; else journalctl -u sing-box -e --no-pager -n 100; fi; echo -e "\n[Log saved to $LOG_FILE]"; }
 
+# 主菜單
 main_menu() {
     clear
-    white "Vless-reality, Vmess-ws, Hysteria-2, Tuic-v5 四協議共存腳本"
+    white "Vless-reality, Vmess-ws, Hysteria-2, Tuic-v5 四協議共存腳本 (融合版)"
     white "快捷命令：sb"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green " 1. 安裝/重裝 Sing-box" 
@@ -588,7 +497,7 @@ main_menu() {
     if [[ -x '/etc/s-box/sing-box' ]]; then 
         local corev; corev=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}'); 
         green "Sing-box 核心已安裝：$corev"
-        if systemctl is-active --quiet sing-box || ( [[ x"${release}" == x"alpine" ]] && rc-service sing-box status | grep -q 'started' ); then
+        if systemctl is-active --quiet sing-box || ( [[ x"${release}" == x"alpine" ]] && rc-service sing-box status 2>/dev/null | grep -q 'started' ); then
             green "服務狀態：$(green '運行中')"
         else
             yellow "服務狀態：$(yellow '未運行')"
@@ -599,13 +508,13 @@ main_menu() {
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     readp "請輸入數字【0-10】：" Input
     case "$Input" in  
-     1 ) install_or_reinstall_sb;;
+     1 ) install_process;;
      2 ) unins;;
-     3 ) rebuild_config_and_start;;
+     3 ) install_process;; # 重置配置和安裝是同一個流程
      4 ) stclre;;
      5 ) upsbyg;; 
-     6 ) install_or_reinstall_sb;;
-     7 ) clash_sb_share;;
+     6 ) inssb && sbservice && post_install_check && display_sharing_info;; # 僅更新內核
+     7 ) display_sharing_info;;
      8 ) sblog;;
      9 ) apply_acme_cert;;
     10 ) ipuuid && display_sharing_info;;
