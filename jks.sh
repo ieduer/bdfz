@@ -197,8 +197,17 @@ PY
     fi
 
   if [ -z "${USE_SYSTEM_PY:-}" ]; then
-    # shellcheck disable=SC1091
-    source "$VENV_DIR/bin/activate"
+    if [ -f "$VENV_DIR/bin/activate" ]; then
+      # shellcheck disable=SC1091
+      . "$VENV_DIR/bin/activate"
+    else
+      echo "[!] venv 構建不完整，找不到 $VENV_DIR/bin/activate，將改用系統 Python 繼續。" >&2
+      USE_SYSTEM_PY=1
+      if [ -f /tmp/venv.err ]; then
+        echo "[i] venv 建立錯誤摘要：" >&2
+        tail -n 50 /tmp/venv.err >&2 || true
+      fi
+    fi
   fi
 
   # 安裝依賴
