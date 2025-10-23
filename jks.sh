@@ -94,7 +94,14 @@ USAGE
     case "$pm" in
       apt)
         $SUDO apt-get update -y
-        $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip ca-certificates
+        APTI=(apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confnew)
+        if [ -n "$SUDO" ]; then
+          $SUDO env DEBIAN_FRONTEND=noninteractive "${APTI[@]}" \
+            python3 python3-venv python3-pip ca-certificates
+        else
+          DEBIAN_FRONTEND=noninteractive "${APTI[@]}" \
+            python3 python3-venv python3-pip ca-certificates
+        fi
         ;;
       dnf)
         $SUDO dnf install -y python3 python3-pip
@@ -155,18 +162,24 @@ PY
 
   # --- 建立虛擬環境（失敗則修復後重試，仍失敗 fallback 系統 Python） ---
   VENV_DIR="./.venv"
-  if [ ! -d "$VENV_DIR" ]; then
-    echo "[*] 創建虛擬環境 $VENV_DIR"
-    if ! python3 -m venv "$VENV_DIR" 2>/tmp/venv.err; then
-      echo "[!] venv 建立失敗，嘗試修復..."
-      if [ "$pm" = apt ]; then $SUDO apt-get install -y python3-venv || true; fi
-      python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
-      if ! python3 -m venv "$VENV_DIR" 2>>/tmp/venv.err; then
-        echo "[!] 仍無法建立 venv，將改用系統 Python 繼續（建議稍後修復 venv）。" >&2
-        USE_SYSTEM_PY=1
+    if [ ! -d "$VENV_DIR" ]; then
+      echo "[*] 創建虛擬環境 $VENV_DIR"
+      if ! python3 -m venv "$VENV_DIR" 2>/tmp/venv.err; then
+        echo "[!] venv 建立失敗，嘗試修復..."
+        if [ "$pm" = apt ]; then
+          if [ -n "$SUDO" ]; then
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv || true
+          else
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv || true
+          fi
+        fi
+        python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+        if ! python3 -m venv "$VENV_DIR" 2>>/tmp/venv.err; then
+          echo "[!] 仍無法建立 venv，將改用系統 Python 繼續（建議稍後修復 venv）。" >&2
+          USE_SYSTEM_PY=1
+        fi
       fi
     fi
-  fi
 
   if [ -z "${USE_SYSTEM_PY:-}" ]; then
     # shellcheck disable=SC1091
