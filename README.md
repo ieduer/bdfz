@@ -1,23 +1,26 @@
- # SAA
+ # 1、教科書
+
+> 需要語文，順便下載 K12 全部教科書，嗯。   
+其實是在構想一個更大教科書項目。  
+
+ ```bash
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/jks.sh)
+```
+
+ 
+ 
+ # 2、SAA
 
 > 基於 <a href="https://github.com/c-jeremy/sue/blob/main/pseudo-auth.php" target="_blank" rel="noopener noreferrer">pseudo-auth.php</a> ，通過最小抓包實現；提供 API 化版本。**該版本無視時間限制**；此倉庫附帶「暴力」舊版供研究與自用。
 
-
-
 ---
 
-## macOS / Homebrew
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)
-# 或
-bash <(wget -qO- https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)
 ```
 
-> 若 `curl` / `wget` 均不可用，請手動下載 `saa.sh` 後執行：`bash saa.sh`。
-
 ---
-
 
 ## 背景與記錄
 
@@ -28,17 +31,9 @@ bash <(wget -qO- https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)
 
 ---
 
-## 免責聲明
+# 3、IP Menu
 
-- 本項目僅供學術研究與個人學習之用，請勿用於任何違規行為。
-- 使用產生的風險由使用者自行承擔。
-- 直接都考了，不太好吧。😜
-
----
-
-# IP Menu
-
-A tiny macOS **menubar** utility that shows your public IP (with country + ASN/ISP) and reacts quickly to VPN/proxy node changes (e.g., **sing-box**). Runs without a Dock icon and auto-starts via LaunchAgent. Single-file installer.
+> A tiny macOS **menubar** utility that shows your public IP (with country + ASN/ISP) and reacts quickly to VPN/proxy node changes (e.g., **sing-box**). Runs without a Dock icon and auto-starts via LaunchAgent. Single-file installer.
 
 - **Menubar-only** (no Dock icon), built with `rumps` + `pyobjc`
 - **Public IP** with fast refresh; falls back to local IP
@@ -48,12 +43,21 @@ A tiny macOS **menubar** utility that shows your public IP (with country + ASN/I
 - **Change notifications** for public/local IP; optional sound
 - **LaunchAgent** autostart; one-click **Reload** from the menu
 
----
-
-## Install (one-liner)
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
-# 或
-bash <(wget -qO- https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
 ```
+
+# 4、Vps
+
+> 需要十幾台機子的實時情況的隨時 Tele 消息，所以寫了。  
+
+```bash
+<(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/vps.sh)
+```
+
+# 免責聲明
+
+- 皆為個人項目，僅供學術研究與個人學習之用，請勿用於任何違規行為。
+- 使用產生的風險由使用者自行承擔。
+- 直接都考了，不太好吧。😜
