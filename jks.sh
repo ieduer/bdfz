@@ -20,6 +20,11 @@ if [ -n "${PYTHON_EXEC:-}" ]; then
 else
   set -euo pipefail
 
+  # 對於 apt 系統，預設為非互動模式，避免安裝中途停下
+  if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive}
+  fi
+
   # 預設參數
   PHASE="高中"
   SUBJECTS="语文,数学,英语,思想政治,历史,地理,物理,化学,生物"
@@ -93,14 +98,19 @@ USAGE
     echo "[*] 準備 Python 環境... (pkgmgr=$pm)"
     case "$pm" in
       apt)
-        $SUDO apt-get update -y
-        APTI=(apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confnew)
+        $SUDO apt-get update -y -qq || true
         if [ -n "$SUDO" ]; then
-          $SUDO env DEBIAN_FRONTEND=noninteractive "${APTI[@]}" \
-            python3 python3-venv python3-pip ca-certificates
+          $SUDO env DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive} \
+            apt-get install -y -qq \
+              -o Dpkg::Options::=--force-confdef \
+              -o Dpkg::Options::=--force-confnew \
+              python3 python3-venv python3-pip ca-certificates
         else
-          DEBIAN_FRONTEND=noninteractive "${APTI[@]}" \
-            python3 python3-venv python3-pip ca-certificates
+          env DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive} \
+            apt-get install -y -qq \
+              -o Dpkg::Options::=--force-confdef \
+              -o Dpkg::Options::=--force-confnew \
+              python3 python3-venv python3-pip ca-certificates
         fi
         ;;
       dnf)
@@ -152,7 +162,12 @@ PY
   else
     # 某些 Debian/Ubuntu 精簡鏡像雖有 python3 但缺 venv 模塊
     if [ "$pm" = apt ] && ! python3 -c 'import venv' 2>/dev/null; then
-      echo "[*] 安裝 python3-venv ..."; $SUDO apt-get update -y; $SUDO apt-get install -y python3-venv
+      echo "[*] 安裝 python3-venv ..."; $SUDO apt-get update -y -qq; \
+      if [ -n "$SUDO" ]; then
+        $SUDO env DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive} apt-get install -y -qq python3-venv
+      else
+        env DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive} apt-get install -y -qq python3-venv
+      fi
     fi
     # 若無 pip 亦補齊
     if ! python3 -m pip --version >/dev/null 2>&1; then
@@ -168,9 +183,9 @@ PY
         echo "[!] venv 建立失敗，嘗試修復..."
         if [ "$pm" = apt ]; then
           if [ -n "$SUDO" ]; then
-            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv || true
+            $SUDO env DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive} apt-get install -y -qq python3-venv || true
           else
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv || true
+            env DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive} apt-get install -y -qq python3-venv || true
           fi
         fi
         python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
