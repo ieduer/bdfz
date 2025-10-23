@@ -603,41 +603,81 @@ async def run_normal_mode(session: aiohttp.ClientSession, settings: Settings):
         if r: resolved_raw.append(r)
     LOGGER.info("🔗 解析完成（直鏈有效）: %d 本", len(resolved_raw))
 
-    # 填寫實際保存路徑，對命名衝突自動加內容ID後綴，避免“下載數少於解析數”
+    # 讀取既有 index.json，按 book_id 重用已下載路徑，避免下一輪改名後重下
+    existing_map: Dict[str, Path] = {}
+    try:
+        idx_path = settings.OUT_DIR / "index.json"
+        if idx_path.exists():
+            async with aiofiles.open(idx_path, "r", encoding="utf-8") as f:
+                old_items = json.loads(await f.read())
+            for it in old_items or []:
+                bid0 = str(it.get("id", "")).strip()
+                p0 = it.get("path")
+                if bid0 and isinstance(p0, str) and p0.strip():
+                    existing_map[bid0] = Path(p0)
+    except Exception as e:
+        LOGGER.debug("讀取 index.json 失敗: %s", e)
+
+    # 填寫實際保存路徑，處理命名衝突；優先沿用既有路徑
     resolved: List[Tuple[str, str, str, str, Path]] = []
-    used_paths = set()
-    collisions = 0
+    used_paths = set(existing_map.values())
+    collisions, reused = 0, 0
     for bid, title, subj, url, _ in resolved_raw:
-        subj_dir = settings.OUT_DIR / subj
-        base = subj_dir / f"{title}.pdf"
-        dest = base
-        if dest in used_paths:
-            collisions += 1
-            # 以內容ID前 8 位作後綴，仍衝突則追加序號
-            cand = subj_dir / f"{title}__{bid[:8]}.pdf"
-            idx = 2
-            while cand in used_paths:
-                cand = subj_dir / f"{title}__{bid[:8]}_{idx}.pdf"
-                idx += 1
-            dest = cand
+        # 若已有記錄，優先沿用（即使文件暫不完整也會用同一路徑以便續傳）
+        if bid in existing_map:
+            dest = existing_map[bid]
+            reused += 1
+        else:
+            subj_dir = settings.OUT_DIR / subj
+            base = subj_dir / f"{title}.pdf"
+            dest = base
+            # 若與既有路徑/本輪路徑衝突（或磁碟已有同名），追加內容ID後綴
+            if dest in used_paths or base.exists():
+                collisions += 1
+                cand = subj_dir / f"{title}__{bid[:8]}.pdf"
+                idx = 2
+                while cand in used_paths or cand.exists():
+                    cand = subj_dir / f"{title}__{bid[:8]}_{idx}.pdf"
+                    idx += 1
+                dest = cand
         used_paths.add(dest)
         resolved.append((bid, title, subj, url, dest))
 
-    LOGGER.info("🔗 解析完成: %d 本；計劃下載: %d 本（命名衝突自動處理 %d）", len(resolved_raw), len(resolved), collisions)
+    LOGGER.info("🔗 解析完成: %d 本；計劃下載: %d 本（命名衝突自動處理 %d；沿用既有路徑 %d）",
+                len(resolved_raw), len(resolved), collisions, reused)
 
-    # 下載（首輪）
-    down_tasks = [asyncio.create_task(download_pdf(session, url, dest, bid)) for (bid, title, subj, url, dest) in resolved]
-    success, failed = 0, 0
+    # 預掃：已存在且有效的直接計入成功清單，不建下載任務，避免再次全量進度條
     index_success, failed_list = [], []
-    for fut, meta in zip(tqdm(asyncio.as_completed(down_tasks), total=len(down_tasks), desc="PDF 下載", ncols=100), resolved):
-        ok = await fut
+    already_ok: List[Tuple[str, str, str, str, Path]] = []
+    work_list: List[Tuple[str, str, str, str, Path]] = []
+    for meta in resolved:
         bid, title, subj, url, dest = meta
-        if ok:
-            success += 1
-            index_success.append({"id": bid, "title": title, "subject": subj, "pdf_url": url, "path": str(dest)})
+        if is_valid_pdf(dest):
+            already_ok.append(meta)
+            index_success.append({
+                "id": bid, "title": title, "subject": subj,
+                "pdf_url": url, "path": str(dest)
+            })
         else:
-            failed += 1
-            failed_list.append({"id": bid, "title": title, "subject": subj, "url": url, "path": str(dest)})
+            work_list.append(meta)
+
+    LOGGER.info("📦 已存在且有效: %d，本次需要下載: %d", len(already_ok), len(work_list))
+
+    # 下載（首輪）：僅對需要下載的項目建立任務
+    success, failed = len(already_ok), 0
+    if work_list:
+        down_tasks = [asyncio.create_task(download_pdf(session, url, dest, bid)) for (bid, title, subj, url, dest) in work_list]
+        for fut, meta in zip(tqdm(asyncio.as_completed(down_tasks), total=len(down_tasks), desc="PDF 下載", ncols=100), work_list):
+            ok = await fut
+            bid, title, subj, url, dest = meta
+            if ok:
+                success += 1
+                index_success.append({"id": bid, "title": title, "subject": subj, "pdf_url": url, "path": str(dest)})
+            else:
+                failed += 1
+                failed_list.append({"id": bid, "title": title, "subject": subj, "url": url, "path": str(dest)})
+    else:
+        LOGGER.info("🎉 全部文件已完整，無需下載。")
 
     # 自動重試（僅針對失敗項）
     rounds = settings.POST_RETRY
