@@ -42,6 +42,7 @@ else
   DCON=5
   LIMIT=""
   POST_RETRY=2
+  AUTO_RUN="0"
 
   usage() {
     cat >&2 <<'USAGE'
@@ -59,6 +60,7 @@ else
   -d N             下載並發，預設 5
   -n N             只處理前 N 本（調試用）
   -T N             整輪結束後自動重試 N 輪（預設 2；0=關閉）
+  -y               非互動直跑（跳過交互選擇，使用當前參數）
   -h               顯示此幫助
 
 示例:
@@ -68,7 +70,7 @@ else
 USAGE
   }
 
-  while getopts ":p:s:m:i:o:Rc:d:n:T:h" opt; do
+  while getopts ":p:s:m:i:o:Rc:d:n:T:hy" opt; do
     case "$opt" in
       p) PHASE="$OPTARG" ;;
       s) SUBJECTS="$OPTARG" ;;
@@ -80,13 +82,72 @@ USAGE
       d) DCON="$OPTARG" ;;
       n) LIMIT="$OPTARG" ;;
       T) POST_RETRY="$OPTARG" ;;
+      y) AUTO_RUN="1" ;;
       h) usage; exit 0 ;;
       :) echo "錯誤：選項 -$OPTARG 需要一個參數。" >&2; usage; exit 2 ;;
       \?) echo "錯誤：未知選項 -$OPTARG" >&2; usage; exit 2 ;;
     esac
   done
 
-  # --- 參數數值校驗（避免非數字導致後續報錯） ---
+  # ---- 交互式配置（默認開啟；用 -y 跳過） ----
+  if [ "$AUTO_RUN" != "1" ] && [ -t 0 ]; then
+    echo "\n================ 下載配置嚮導 ================"
+    echo "提示：直接回車採用當前值；輸入新值以覆蓋。"
+
+    # 教育階段
+    echo "\n[1] 教育階段："
+    phases=("小学" "初中" "高中" "特殊教育" "小学54" "初中54")
+    echo "   1) 小学    2) 初中    3) 高中    4) 特殊教育    5) 小学54    6) 初中54"
+    read -r -p "選擇 1-6 (默認: $PHASE): " ans
+    case "$ans" in
+      1) PHASE="小学";; 2) PHASE="初中";; 3) PHASE="高中";; 4) PHASE="特殊教育";; 5) PHASE="小学54";; 6) PHASE="初中54";;
+      "" ) : ;;
+      *) echo "[i] 非法選擇，保持: $PHASE";;
+    esac
+
+    # 學科
+    echo "\n[2] 學科（逗號分隔，留空=全部預設）"
+    echo "    當前: $SUBJECTS"
+    read -r -p "輸入學科: " ans
+    [ -n "$ans" ] && SUBJECTS="$ans"
+
+    # 關鍵詞
+    echo "\n[3] 書名關鍵詞（可空，多詞以空格分隔）"
+    read -r -p "關鍵詞 (當前: \"${MATCH}\"): " ans
+    [ -n "$ans" ] && MATCH="$ans"
+
+    # 僅重試失敗
+    echo "\n[4] 僅重試上次失敗？(y/N)"
+    read -r -p "> " yn
+    case "$yn" in [Yy]*) ONLY_FAILED="1";; *) ONLY_FAILED="0";; esac
+
+    # 限制本數
+    echo "\n[5] 僅處理前 N 本（調試；空=不限制）"
+    read -r -p "N (當前: ${LIMIT:-空}): " ans
+    [ -n "$ans" ] && LIMIT="$ans"
+
+    # 自動重試輪數
+    echo "\n[6] 整輪結束後自動重試輪數 0~5"
+    read -r -p "重試 (當前: $POST_RETRY): " ans
+    [ -n "$ans" ] && POST_RETRY="$ans"
+
+    # 輸出目錄
+    echo "\n[7] 輸出目錄"
+    read -r -p "目錄 (當前: ${OUT_DIR:-./smartedu_textbooks}): " ans
+    [ -n "$ans" ] && OUT_DIR="$ans"
+
+    # 最終確認
+    echo "\n----------------------------------------------"
+    echo "階段: $PHASE"
+    echo "學科: $SUBJECTS"
+    echo "關鍵: ${MATCH:-無}"
+    echo "僅重試: $ONLY_FAILED    限制本數: ${LIMIT:-不限制}    自動重試輪數: $POST_RETRY"
+    echo "輸出目錄: ${OUT_DIR:-./smartedu_textbooks}"
+    read -r -p "確認開始下載？ [y/N]: " go
+    case "$go" in [Yy]*) : ;; *) echo "已取消。"; exit 0;; esac
+  fi
+
+  # 交互輸入後再做一次數值校驗
   int_re='^[0-9]+$'
   if ! [[ "$HCON" =~ $int_re ]]; then echo "[!] -c 必須為整數" >&2; exit 2; fi
   if ! [[ "$DCON" =~ $int_re ]]; then echo "[!] -d 必須為整數" >&2; exit 2; fi
@@ -569,17 +630,29 @@ async def run_normal_mode(session: aiohttp.ClientSession, settings: Settings):
     for fut in tqdm(asyncio.as_completed(resolve_tasks), total=len(resolve_tasks), desc="解析直鏈", ncols=100):
         r = await fut
         if r: resolved_raw.append(r)
-    LOGGER.info("🔗 解析完成: %d 本可下載", len(resolved_raw))
+    LOGGER.info("🔗 解析完成（直鏈有效）: %d 本", len(resolved_raw))
 
-    # 填寫實際保存路徑並去重（按目標路徑）
+    # 填寫實際保存路徑，對命名衝突自動加內容ID後綴，避免“下載數少於解析數”
     resolved: List[Tuple[str, str, str, str, Path]] = []
-    seen_paths = set()
+    used_paths = set()
+    collisions = 0
     for bid, title, subj, url, _ in resolved_raw:
-        dest = settings.OUT_DIR / subj / f"{title}.pdf"
-        if dest in seen_paths:
-            continue
-        seen_paths.add(dest)
+        subj_dir = settings.OUT_DIR / subj
+        base = subj_dir / f"{title}.pdf"
+        dest = base
+        if dest in used_paths:
+            collisions += 1
+            # 以內容ID前 8 位作後綴，仍衝突則追加序號
+            cand = subj_dir / f"{title}__{bid[:8]}.pdf"
+            idx = 2
+            while cand in used_paths:
+                cand = subj_dir / f"{title}__{bid[:8]}_{idx}.pdf"
+                idx += 1
+            dest = cand
+        used_paths.add(dest)
         resolved.append((bid, title, subj, url, dest))
+
+    LOGGER.info("🔗 解析完成: %d 本；計劃下載: %d 本（命名衝突自動處理 %d）", len(resolved_raw), len(resolved), collisions)
 
     # 下載（首輪）
     down_tasks = [asyncio.create_task(download_pdf(session, url, dest, bid)) for (bid, title, subj, url, dest) in resolved]
