@@ -300,6 +300,120 @@ from typing import List, Dict, Any, Tuple, Optional
 from collections import namedtuple
 from tqdm import tqdm
 
+# ---------------- HTML 索引生成 ----------------
+
+async def write_html(out_dir: Path, items: List[Dict[str, Any]], failed: List[Dict[str, Any]]):
+    # 構建主題集合與條目 HTML
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    subjects = sorted({it.get("subject", "綜合") for it in items})
+    li_ok = []
+    for it in items:
+        p = Path(it.get("path", ""))
+        try:
+            rel = os.path.relpath(p, out_dir)
+        except Exception:
+            rel = p.name
+        href = quote(rel.replace(os.sep, "/"), safe="/")
+        li_ok.append(f'<li data-subj="{esc(it.get("subject",""))}" data-title="{esc(it.get("title",""))}">'
+                     f'<a href="{href}" target="_blank" download>{esc(it.get("title","未命名教材"))}</a>'
+                     f'<span class="subj">{esc(it.get("subject",""))}</span>'
+                     '</li>')
+
+    li_fail = []
+    for it in failed or []:
+        p = Path(it.get("path", ""))
+        try:
+            rel = os.path.relpath(p, out_dir)
+        except Exception:
+            rel = p.name
+        href = quote(rel.replace(os.sep, "/"), safe="/")
+        li_fail.append(f'<li data-subj="{esc(it.get("subject",""))}" data-title="{esc(it.get("title",""))}">'
+                       f'<a href="{href}" target="_blank">{esc(it.get("title","未命名教材"))}</a>'
+                       f' <code>未完成/失敗</code>'
+                       '</li>')
+
+    html = f"""<!doctype html>
+<html lang=zh-CN>
+<head>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>SmartEdu 本地教材索引</title>
+<style>
+  :root {{ --bg:#0b0d10; --fg:#e6edf3; --muted:#9aa4ad; --accent:#6ab7ff; --chip:#1f2937; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; font:14px/1.6 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Noto Sans CJK SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; background:var(--bg); color:var(--fg); }}
+  header {{ padding:16px 20px; border-bottom:1px solid #11161c; position:sticky; top:0; background:rgba(11,13,16,.9); backdrop-filter: blur(8px); }}
+  h1 {{ margin:0 0 6px; font-size:18px; }}
+  .muted {{ color:var(--muted); }}
+  .row {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; }}
+  select, input[type="search"] {{ background:#0f141a; color:var(--fg); border:1px solid #17212b; border-radius:8px; padding:8px 10px; outline:none; min-width:180px; }}
+  main {{ padding:18px 20px; }}
+  ul {{ list-style:none; padding:0; margin:0; display:grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap:10px; }}
+  li {{ background:#0f141a; border:1px solid #161f29; border-radius:10px; padding:10px 12px; display:flex; justify-content:space-between; align-items:center; gap:10px; }}
+  li a {{ color:var(--fg); text-decoration:none; }}
+  li a:hover {{ color:var(--accent); text-decoration:underline; }}
+  li .subj {{ color:var(--muted); font-size:12px; background:var(--chip); padding:2px 6px; border-radius:999px; }}
+  section {{ margin-top:22px; }}
+  code {{ background:#111820; color:#c9defc; padding:2px 6px; border-radius:6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+</style>
+</head>
+<body>
+  <header>
+    <h1>SmartEdu 本地教材索引</h1>
+    <div class=row>
+      <div class=muted>共 <b id=cntAll>{len(items)}</b> 本；失敗 <b id=cntFail>{len(failed or [])}</b> 本</div>
+      <select id=selSubj>
+        <option value="">全部學科</option>
+        {''.join(f'<option value="{esc(s)}">{esc(s)}</option>' for s in subjects)}
+      </select>
+      <input id=kw type=search placeholder="關鍵詞過濾（書名）">
+    </div>
+  </header>
+  <main>
+    <section>
+      <h3 class=muted>已完成</h3>
+      <ul id=listOk>
+        {''.join(li_ok)}
+      </ul>
+    </section>
+    <section>
+      <h3 class=muted>未完成/失敗</h3>
+      <ul id=listFail>
+        {''.join(li_fail) if li_fail else '<li class="muted">無</li>'}
+      </ul>
+    </section>
+  </main>
+<script>
+(function(){
+  const sel=document.getElementById('selSubj');
+  const kw=document.getElementById('kw');
+  const listOk=document.getElementById('listOk');
+  const listFail=document.getElementById('listFail');
+  function apply(){
+    const s=sel.value.trim();
+    const k=kw.value.trim().toLowerCase();
+    for(const ul of [listOk, listFail]){
+      for(const li of ul.querySelectorAll('li')){
+        const subj=li.getAttribute('data-subj')||'';
+        const title=(li.getAttribute('data-title')||'').toLowerCase();
+        const okSubj=!s || subj.includes(s);
+        const okKw=!k || title.includes(k);
+        li.style.display=(okSubj && okKw)?'flex':'none';
+      }
+    }
+  }
+  sel.addEventListener('change', apply);
+  kw.addEventListener('input', apply);
+})();
+</script>
+</body>
+</html>
+"""
+    async with aiofiles.open(out_dir / "index.html", "w", encoding="utf-8") as f:
+        await f.write(html)
+
 # ---------------- 設定 ----------------
 Settings = namedtuple("Settings", [
     "PHASE", "SUBJECTS", "MATCH", "IDS", "OUT_DIR", "ONLY_FAILED",
@@ -703,6 +817,9 @@ async def run_normal_mode(session: aiohttp.ClientSession, settings: Settings):
         await f.write(json.dumps(index_success, ensure_ascii=False, indent=2))
     async with aiofiles.open(settings.OUT_DIR / "failed.json", "w", encoding="utf-8") as f:
         await f.write(json.dumps(failed_list, ensure_ascii=False, indent=2))
+    # 生成靜態網頁索引，使用本地相對路徑，避免 403 防盜鏈
+    await write_html(settings.OUT_DIR, index_success, failed_list)
+    LOGGER.info("🌐 網頁索引: %s", settings.OUT_DIR / "index.html")
 
     retried = settings.POST_RETRY if settings.POST_RETRY else 0
     LOGGER.info("✅ 總結：成功 %d，仍失敗 %d（自動重試輪數 %d）", success, len(failed_list), retried)
@@ -730,6 +847,14 @@ async def run_retry_mode(session: aiohttp.ClientSession, settings: Settings):
     async with aiofiles.open(failed_path, "w", encoding="utf-8") as f:
         await f.write(json.dumps(new_failed, ensure_ascii=False, indent=2))
     LOGGER.info("✅ 重試完成：成功 %d，仍失敗 %d", ok, len(new_failed))
+    # 重新生成索引頁
+    try:
+        async with aiofiles.open(settings.OUT_DIR / "index.json", "r", encoding="utf-8") as f:
+            items2 = json.loads(await f.read())
+    except Exception:
+        items2 = []
+    await write_html(settings.OUT_DIR, items2, new_failed)
+    LOGGER.info("🌐 網頁索引: %s", settings.OUT_DIR / "index.html")
 
 
 async def main():
