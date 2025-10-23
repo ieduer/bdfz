@@ -20,6 +20,12 @@ if [ -n "${PYTHON_EXEC:-}" ]; then
 else
   set -euo pipefail
 
+  # 調試模式：DEBUG=1 時打印執行細節
+  if [ "${DEBUG:-0}" = "1" ]; then set -x; fi
+
+  # 記錄當前工作目錄，避免 /dev/fd 路徑造成相對路徑混亂
+  PWD_ABS="$(pwd)"
+
   # 對於 apt 系統，預設為非互動模式，避免安裝中途停下
   if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive}
@@ -176,7 +182,13 @@ PY
   fi
 
   # --- 建立虛擬環境（失敗則修復後重試，仍失敗 fallback 系統 Python） ---
-  VENV_DIR="./.venv"
+  # 允許外部強制使用系統 Python：USE_SYSTEM_PY=1 bash jks.sh ...
+  if [ "${USE_SYSTEM_PY:-0}" = "1" ]; then
+    echo "[i] 已指定 USE_SYSTEM_PY=1，跳過 venv 構建，直接使用系統 Python。"
+  fi
+
+  VENV_DIR="${VENV_DIR:-$PWD_ABS/.venv}"
+  if [ "${USE_SYSTEM_PY:-0}" != "1" ]; then
     if [ ! -d "$VENV_DIR" ]; then
       echo "[*] 創建虛擬環境 $VENV_DIR"
       if ! python3 -m venv "$VENV_DIR" 2>/tmp/venv.err; then
@@ -195,22 +207,28 @@ PY
         fi
       fi
     fi
+  fi
 
-  if [ -z "${USE_SYSTEM_PY:-}" ]; then
-    if [ -f "$VENV_DIR/bin/activate" ]; then
+  if [ "${USE_SYSTEM_PY:-0}" != "1" ]; then
+    if [ -f "$VENV_DIR/bin/activate" ] && [ -x "$VENV_DIR/bin/python3" ]; then
       # shellcheck disable=SC1091
       . "$VENV_DIR/bin/activate"
+      echo "[i] 已啟用虛擬環境：$VENV_DIR"
     else
-      echo "[!] venv 構建不完整，找不到 $VENV_DIR/bin/activate，將改用系統 Python 繼續。" >&2
+      echo "[!] venv 構建不完整，找不到 $VENV_DIR/bin/activate 或 python3；將改用系統 Python 繼續。" >&2
       USE_SYSTEM_PY=1
       if [ -f /tmp/venv.err ]; then
         echo "[i] venv 建立錯誤摘要：" >&2
         tail -n 50 /tmp/venv.err >&2 || true
       fi
+      echo "[i] 當前工作目錄：$PWD_ABS；VENV_DIR=$VENV_DIR"
+      echo "[i] 目錄列舉："; ls -la "$PWD_ABS" || true
     fi
   fi
 
   # 安裝依賴
+  echo "[i] 使用的 Python: $(command -v python3)"
+  python3 --version || true
   python3 -m pip install -U pip wheel setuptools >/dev/null
   python3 -m pip install -U aiohttp aiofiles tqdm >/dev/null
 
@@ -230,6 +248,8 @@ PY
   TMP_PY="$(mktemp)"
   awk '/^# >>>PYTHON>>>$/{p=1;next} /^# <<<PYTHON<<</{p=0} p' "$0" > "$TMP_PY"
   exec python3 "$TMP_PY"
+  echo "[!] 無法啟動 Python 子進程，請檢查上方日誌。" >&2
+  exit 1
 fi
 
 # >>>PYTHON>>>
