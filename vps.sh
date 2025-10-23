@@ -2,7 +2,10 @@
 # ===== Sentinel 安装/更新脚本 (生产优化版) =====
 # 适用于包括超低内存VPS在内的所有环境，可重复执行。
 # 已移除硬编码的 Telegram Secret，改为交互式安全设置。
+
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 
 # --- 辅助函数：获取并验证 Telegram 配置 ---
 function _setup_telegram_config() {
@@ -59,9 +62,13 @@ function _setup_telegram_config() {
 }
 
 echo ">>> [1/5] Installing dependencies..."
-apt-get update
+apt-get update -qq
 # 已加入 openssl 依赖，用于本地证书检查
-apt-get install -y python3 ca-certificates curl iproute2 iputils-ping openssl procps
+apt-get install -yq python3 ca-certificates curl iproute2 iputils-ping openssl procps
+# 确保不会因 needrestart 卡住；若不存在 needrestart 则忽略
+if command -v needrestart >/dev/null 2>&1; then
+  needrestart -r a || true
+fi
 
 echo ">>> [2/5] Creating directories and handling configuration..."
 mkdir -p /etc/sentinel /var/lib/sentinel
