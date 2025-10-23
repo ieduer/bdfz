@@ -82,24 +82,99 @@ USAGE
   if [[ -n "$LIMIT" ]] && ! [[ "$LIMIT" =~ $int_re ]]; then echo "[!] -n 必須為整數" >&2; exit 2; fi
   if ! [[ "$POST_RETRY" =~ $int_re ]]; then echo "[!] -T 必須為整數" >&2; exit 2; fi
 
-  echo "[*] 準備 Python 環境..."
-  if ! command -v python3 >/dev/null 2>&1; then
-    if [[ "$(uname)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-      echo "[*] 用 Homebrew 安裝 python..."; brew install python
-    elif [[ "$(uname)" == "Linux" ]] && command -v apt-get >/dev/null 2>&1; then
-      echo "[*] 用 apt 安裝 python3..."; sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip
-    else
-      echo "[!] 未找到 python3，且無法自動安裝。" >&2; exit 1
+  # --- 權限與包管理器偵測 ---
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
+  have() { command -v "$1" >/dev/null 2>&1; }
+  pm=""
+  if have apt-get; then pm=apt; elif have apt; then pm=apt; elif have dnf; then pm=dnf; elif have yum; then pm=yum; elif have pacman; then pm=pacman; elif have zypper; then pm=zypper; elif have apk; then pm=apk; elif have brew; then pm=brew; fi
+
+  # --- 安裝 Python 與 pip/venv，涵蓋主流發行版 ---
+  install_python() {
+    echo "[*] 準備 Python 環境... (pkgmgr=$pm)"
+    case "$pm" in
+      apt)
+        $SUDO apt-get update -y
+        $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip ca-certificates
+        ;;
+      dnf)
+        $SUDO dnf install -y python3 python3-pip
+        ;;
+      yum)
+        $SUDO yum install -y python3 python3-pip
+        ;;
+      pacman)
+        $SUDO pacman -Sy --noconfirm python python-pip
+        ;;
+      zypper)
+        $SUDO zypper -n install python3 python3-pip
+        ;;
+      apk)
+        $SUDO apk add --no-cache python3 py3-pip ca-certificates
+        ;;
+      brew)
+        brew update >/dev/null || true
+        brew install python || true
+        ;;
+      *)
+        echo "[!] 未識別的包管理器，請手動安裝 python3/pip。" >&2
+        ;;
+    esac
+
+    # 若缺 ensurepip，嘗試修復
+    if ! python3 - <<'PY' 2>/dev/null
+import ensurepip; print('ok')
+PY
+    then
+      echo "[*] 嘗試啟用 ensurepip..."
+      python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+    fi
+
+    # 若仍無 pip，使用 get-pip 引導
+    if ! python3 -m pip --version >/dev/null 2>&1; then
+      echo "[*] 使用 get-pip 引導安裝 pip..."
+      TMPPIP="$(mktemp -t getpip_XXXX).py"
+      if have curl; then curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$TMPPIP"; elif have wget; then wget -qO "$TMPPIP" https://bootstrap.pypa.io/get-pip.py; else echo "[!] 需要 curl 或 wget 下載 get-pip.py" >&2; exit 1; fi
+      python3 "$TMPPIP" >/dev/null
+      rm -f "$TMPPIP"
+    fi
+  }
+
+  if ! have python3; then
+    if [ -z "$pm" ]; then echo "[!] 未檢測到包管理器且系統無 python3，請先手動安裝。" >&2; exit 1; fi
+    install_python
+  else
+    # 某些 Debian/Ubuntu 精簡鏡像雖有 python3 但缺 venv 模塊
+    if [ "$pm" = apt ] && ! python3 -c 'import venv' 2>/dev/null; then
+      echo "[*] 安裝 python3-venv ..."; $SUDO apt-get update -y; $SUDO apt-get install -y python3-venv
+    fi
+    # 若無 pip 亦補齊
+    if ! python3 -m pip --version >/dev/null 2>&1; then
+      install_python
     fi
   fi
 
+  # --- 建立虛擬環境（失敗則修復後重試，仍失敗 fallback 系統 Python） ---
   VENV_DIR="./.venv"
   if [ ! -d "$VENV_DIR" ]; then
-    echo "[*] 創建虛擬環境 $VENV_DIR"; python3 -m venv "$VENV_DIR"
+    echo "[*] 創建虛擬環境 $VENV_DIR"
+    if ! python3 -m venv "$VENV_DIR" 2>/tmp/venv.err; then
+      echo "[!] venv 建立失敗，嘗試修復..."
+      if [ "$pm" = apt ]; then $SUDO apt-get install -y python3-venv || true; fi
+      python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+      if ! python3 -m venv "$VENV_DIR" 2>>/tmp/venv.err; then
+        echo "[!] 仍無法建立 venv，將改用系統 Python 繼續（建議稍後修復 venv）。" >&2
+        USE_SYSTEM_PY=1
+      fi
+    fi
   fi
-  # shellcheck disable=SC1091
-  source "$VENV_DIR/bin/activate"
-  python3 -m pip install -U pip >/dev/null
+
+  if [ -z "${USE_SYSTEM_PY:-}" ]; then
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+  fi
+
+  # 安裝依賴
+  python3 -m pip install -U pip wheel setuptools >/dev/null
   python3 -m pip install -U aiohttp aiofiles tqdm >/dev/null
 
   export SMARTEDU_PHASE="$PHASE"
