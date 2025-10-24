@@ -70,13 +70,14 @@ else
 USAGE
   }
 
-  while getopts ":p:s:m:i:o:Rc:d:n:T:hy" opt; do
+  while getopts ":p:s:m:i:o:w:Rc:d:n:T:hy" opt; do
     case "$opt" in
       p) PHASE="$OPTARG" ;;
       s) SUBJECTS="$OPTARG" ;;
       m) MATCH="$OPTARG" ;;
       i) IDS="$OPTARG" ;;
       o) OUT_DIR="$OPTARG" ;;
+      w) WEB_DIR="$OPTARG" ;;
       R) ONLY_FAILED="1" ;;
       c) HCON="$OPTARG" ;;
       d) DCON="$OPTARG" ;;
@@ -279,12 +280,50 @@ PY
   fi
   export SMARTEDU_OUT_DIR="$OUT_DIR"
   echo "[i] 下載輸出目錄: $SMARTEDU_OUT_DIR"
+
+  # --- 確定網頁根目錄（WEB_DIR）：未指定則默認 /srv/smartedu_textbooks，否則沿用 OUT_DIR ---
+  if [ -z "${WEB_DIR:-}" ]; then
+    if [ -d /srv/smartedu_textbooks ] || [ -w /srv ]; then
+      WEB_DIR="/srv/smartedu_textbooks"
+      mkdir -p "$WEB_DIR"
+    else
+      WEB_DIR="$OUT_DIR"
+    fi
+  fi
+  export SMARTEDU_WEB_DIR="$WEB_DIR"
+  echo "[i] 網頁根目錄: $SMARTEDU_WEB_DIR"
   export SMARTEDU_ONLY_FAILED="$ONLY_FAILED"
   export SMARTEDU_HCON="$HCON"
   export SMARTEDU_DCON="$DCON"
   export SMARTEDU_LIMIT="$LIMIT"
   export SMARTEDU_POST_RETRY="$POST_RETRY"
+  export SMARTEDU_WEB_DIR="$WEB_DIR"
   export PYTHON_EXEC=1
+
+  # --- 配置 Nginx PDF 訪問專用日誌（若系統有 nginx） ---
+  setup_nginx_pdf_logging() {
+    if ! command -v nginx >/dev/null 2>&1; then return; fi
+    local cfg="/etc/nginx/conf.d/textbook_pdf_logging.conf"
+    if [ -f "$cfg" ]; then
+      echo "[i] Nginx PDF logging 已存在: $cfg"; return;
+    fi
+    echo "[*] 配置 Nginx PDF 專用訪問日誌..."
+    $SUDO tee "$cfg" >/dev/null <<'NG'
+# 在 http 區塊生效：按請求 URI 是否為 .pdf 決定是否記錄
+map $request_uri $is_textbook_pdf {
+  default 0;
+  ~*\.pdf$ 1;
+}
+log_format textbook '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for" "$http_cf_connecting_ip" '
+                    'host=$host uri=$request_uri bytes=$bytes_sent '
+                    'sent_type=$sent_http_content_type';
+access_log /var/log/nginx/textbook_access.log textbook if=$is_textbook_pdf;
+NG
+    $SUDO nginx -t && $SUDO systemctl reload nginx || echo "[!] Nginx 配置測試/重載失敗，請手動檢查。"
+  }
+  setup_nginx_pdf_logging
 
   echo "[🚀] 啟動 Python 下載器..."
   TMP_PY="$(mktemp)"
@@ -307,6 +346,7 @@ SmartEdu 批量下載器 (polyglot v5.0)
 from __future__ import annotations
 
 import os, re, json, asyncio, aiohttp, aiofiles, time, logging
+import shutil
 from logging import handlers
 from pathlib import Path
 from urllib.parse import quote
@@ -316,8 +356,8 @@ from tqdm import tqdm
 
 # ---------------- 基本配置 / 常量 ----------------
 Settings = namedtuple("Settings", [
-    "PHASE", "SUBJECTS", "MATCH", "IDS", "OUT_DIR", "ONLY_FAILED",
-    "HCON", "DCON", "LIMIT", "POST_RETRY"
+    "PHASE","SUBJECTS","MATCH","IDS","OUT_DIR","WEB_DIR","ONLY_FAILED",
+    "HCON","DCON","LIMIT","POST_RETRY"
 ])
 
 PHASE_TAGS = {
@@ -422,12 +462,15 @@ def load_settings_from_env() -> Settings:
     pr_raw = os.getenv("SMARTEDU_POST_RETRY", "2").strip()
     try: pr = max(0, min(5, int(pr_raw)))
     except ValueError: pr = 2
+    web_env = os.getenv("SMARTEDU_WEB_DIR","").strip()
+    web_dir = Path(os.path.expanduser(web_env)) if web_env else out_dir
     return Settings(
         PHASE=os.getenv("SMARTEDU_PHASE","高中"),
-        SUBJECTS=[s.strip() for s in os.getenv("SMARTEDU_SUBJ","语文,数学,英语,思想政治,历史,地理,物理,化学,生物").split(",") if s.strip()],
+        SUBJECTS=[s.strip().replace(" ","") for s in os.getenv("SMARTEDU_SUBJ","语文,数学,英语,思想政治,历史,地理,物理,化学,生物").split(",") if s.strip()],
         MATCH=os.getenv("SMARTEDU_MATCH","").strip(),
         IDS=[s.strip() for s in os.getenv("SMARTEDU_IDS","").split(",") if s.strip()],
         OUT_DIR=out_dir,
+        WEB_DIR=web_dir,
         ONLY_FAILED=os.getenv("SMARTEDU_ONLY_FAILED","0")=="1",
         HCON=int(os.getenv("SMARTEDU_HCON","12")),
         DCON=int(os.getenv("SMARTEDU_DCON","5")),
@@ -567,6 +610,42 @@ def build_existing_map(out_dir: Path) -> Dict[str, Dict[str,Any]]:
         if key not in m:
             m[key] = {"title": canon_title(p.stem), "subject": subj_guess, "phase": "", "path": str(p), "size": p.stat().st_size}
     return m
+
+# --- 合併現有文件映射：primary 覆蓋 secondary，保留更大者 ---
+def merge_maps(primary: Dict[str,Any], secondary: Dict[str,Any]) -> Dict[str,Any]:
+    """按 key 合併，保留 size 更大者；相等時保留路徑更短者。"""
+    out = dict(secondary)
+    for k,v in primary.items():
+        ov = out.get(k)
+        if not ov:
+            out[k]=v; continue
+        try:
+            sz1 = int(v.get("size") or 0)
+            sz2 = int(ov.get("size") or 0)
+        except Exception:
+            sz1 = int(v.get("size") or 0); sz2 = int(ov.get("size") or 0)
+        if (sz1 > sz2) or (sz1==sz2 and len(str(v.get("path",""))) < len(str(ov.get("path","")))):
+            out[k]=v
+    return out
+
+def mirror_to_web_dir(out_dir: Path, web_dir: Path, combined: Dict[str,Any]) -> None:
+    """把 OUT_DIR 的文件鏡像到 WEB_DIR：若目標不存在或更小則覆蓋，保留目錄結構。"""
+    for it in combined.values():
+        p = Path(it.get("path",""))
+        src = (out_dir / p) if not p.is_absolute() else p
+        if not src.exists(): 
+            continue
+        try:
+            rel = src.relative_to(out_dir)
+        except Exception:
+            continue
+        dst = web_dir / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if (not dst.exists()) or (dst.stat().st_size < src.stat().st_size):
+                shutil.copy2(src, dst)
+        except Exception as e:
+            LOGGER.warning("鏡像到網頁目錄失敗: %s -> %s (%s)", src, dst, e)
 
 async def download_pdf(session: aiohttp.ClientSession, url: str, dest: Path, referer: str) -> bool:
     if have_pdf_head(dest):
@@ -802,8 +881,10 @@ async def resolve_all_books(session: aiohttp.ClientSession, st: Settings) -> Lis
 async def main():
     st = load_settings_from_env()
     out_dir: Path = st.OUT_DIR
+    web_dir: Path = st.WEB_DIR
     setup_logging(out_dir)
     LOGGER.info("📁 下載目錄: %s", out_dir)
+    LOGGER.info("🌐 網頁目錄: %s", web_dir)
     LOGGER.info("階段=%s | 學科=%s | 匹配='%s' | 只重試失敗=%s | 自動重試輪=%d",
                 st.PHASE, ",".join(st.SUBJECTS), st.MATCH, st.ONLY_FAILED, st.POST_RETRY)
 
@@ -813,8 +894,8 @@ async def main():
         if not books:
             LOGGER.warning("沒有匹配的條目。仍將刷新網頁索引。")
 
-        # 構建現有文件映射（避免重複下載）
-        exist_map = build_existing_map(out_dir)
+        # 構建現有文件映射（合併 OUT_DIR 與 WEB_DIR，保留更大者）
+        exist_map = merge_maps(build_existing_map(out_dir), build_existing_map(web_dir))
 
         # 準備下載隊列（解析直鏈）
         sem = asyncio.Semaphore(st.HCON)
@@ -898,21 +979,25 @@ async def main():
                 tasks = [asyncio.create_task(worker(ch)) for ch in chunks]
                 await asyncio.gather(*tasks)
 
-        # —— 最終寫出 index.json（以 exist_map 為準） —— 
-        items=[]
-        for key,it in exist_map.items():
+        # —— 把 OUT_DIR 的新增/更大檔鏡像到 WEB_DIR —— 
+        mirror_to_web_dir(out_dir, web_dir, exist_map)
+
+        # —— 以 WEB_DIR 為準重建 index.json 與頁面 —— 
+        web_map = build_existing_map(web_dir)
+        items = []
+        for k,it in web_map.items():
             p = Path(it["path"])
-            abs_p = (out_dir/p) if not p.is_absolute() else p
+            abs_p = (web_dir/p) if not p.is_absolute() else p
             if abs_p.exists() and have_pdf_head(abs_p):
                 it["size"] = abs_p.stat().st_size
                 it["title"]= canon_title(it.get("title") or p.stem)
                 try:
-                    rel = abs_p.relative_to(out_dir).as_posix()
+                    rel = abs_p.relative_to(web_dir).as_posix()
                 except Exception:
                     rel = str(abs_p)
                 it["path"] = rel
                 items.append(it)
-        (out_dir/"index.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), "utf-8")
+        (web_dir/"index.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), "utf-8")
 
         # 失敗清單
         if failures:
@@ -923,9 +1008,9 @@ async def main():
             except FileNotFoundError: pass
             LOGGER.info("✅ 本輪全部成功或已存在（去重跳過）。")
 
-        # 生成最終版網頁
-        render_html(out_dir, items)
-        LOGGER.info("🧭 已更新 index.html（點擊學科標籤即可同時看到初中/高中等學段的該學科）。")
+        # 生成最終版網頁（寫入 WEB_DIR）
+        render_html(web_dir, items)
+        LOGGER.info("🧭 已更新 %s", (web_dir/"index.html"))
 
 if __name__ == "__main__":
     try:
