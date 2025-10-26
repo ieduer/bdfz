@@ -56,6 +56,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
 <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/vps.sh)
 ```
 
+# 5、WX2HTML 
+
+微信不公號：<a href="https://bdfz.net/posts/fuckwechat/" target="_blank" rel="noopener noreferrer">那麼，我搬。</a>
+
+---
+
 # 免責聲明
 
 - 皆為個人項目，僅供學術研究與個人學習之用，請勿用於任何違規行為。
