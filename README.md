@@ -60,6 +60,14 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
 
 微信不公號：<a href="https://bdfz.net/posts/fuckwechat/" target="_blank" rel="noopener noreferrer">那麼，我搬。</a>
 
+# 5、Taiwanebook 
+
+> 偶爾需要下載庫內書，寫下。  
+
+```bash
+<(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/taiwanebook.sh)
+```
+
 ---
 
 # 免責聲明
