@@ -75,6 +75,30 @@ PY
   fi
 }
 
+url_encode() {
+  local s="${1:-}"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$s" <<'PY' 2>/dev/null
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=""))
+PY
+  elif command -v perl >/dev/null 2>&1; then
+    perl -MURI::Escape -e 'print uri_escape($ARGV[0])' "$s"
+  else
+    local out="$s"
+    out="${out//%/%25}"
+    out="${out// /%20}"
+    out="${out//\//%2F}"
+    printf '%s' "$out"
+  fi
+}
+
+viewer_url_for_path() {
+  local file_path="$1"
+  local enc; enc="$(url_encode "$file_path")"
+  printf "%s/pdfjs/web/viewer.html?file=%s" "$BASE" "$enc"
+}
+
 sanitize_name() { sed -E 's#[/[:cntrl:]]#_#g' | tr -c '[:alnum:]._-+' '_'; }
 
 stat_size() {
@@ -91,9 +115,16 @@ stat_size() {
 # Returns 0 if URL exists; echoes size (bytes) to stdout if determinable, else empty
 probe_url_and_size() {
   local url="$1"
-  # Try byte-range first to get Content-Range total size
+  local ref="${2:-${BASE}/}"
+  # Check HTTP code first (byte-range probe)
+  local code
+  code="$(curl -sSIL -H "Referer: ${ref}" -H "$UA_HEADER" --range 0-0 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+  if [[ "$code" != "200" && "$code" != "206" ]]; then
+    return 1
+  fi
+  # Fetch headers to parse size info
   local headers
-  headers="$(curl -fsSLI -H "$REF_HEADER" -H "$UA_HEADER" --range 0-0 "$url" 2>/dev/null || true)"
+  headers="$(curl -fsSLI -H "Referer: ${ref}" -H "$UA_HEADER" --range 0-0 "$url" 2>/dev/null || true)"
   if [[ -n "$headers" ]]; then
     # Content-Range: bytes 0-0/123456
     local total
@@ -133,6 +164,18 @@ extract_from_reader_or_book_page() {
   extract_file_param "$html" || return 1
 }
 
+extract_all_file_paths_from_reader() {
+  local page="$1"
+  local html
+  html="$(curl -fsSL -H "$UA_HEADER" "$page" 2>/dev/null || true)"
+  [[ -z "$html" ]] && return 1
+  printf '%s\n' "$html" \
+  | grep -oE 'viewer\.html\?file=[^"&]+' \
+  | sed 's/.*file=//' \
+  | while IFS= read -r enc; do url_decode "$enc" | trim; done \
+  | awk '/^\/ebkFiles\//{ if(!seen[$0]++){ print $0 } }'
+}
+
 guess_pdf_paths_by_id() {
   local id="$1"
   echo "/ebkFiles/${id}/${id}.PDF"
@@ -166,6 +209,21 @@ resolve_token() {
         id="$id_from"
       fi
     fi
+    if [[ -z "${file_path:-}" && -n "${id:-$id_from}" ]]; then
+      local list
+      list="$(extract_all_file_paths_from_reader "${BASE}/en/book/${id_from}/reader" || true)"
+      [[ -z "$list" ]] && list="$(extract_all_file_paths_from_reader "${BASE}/zh-tw/book/${id_from}/reader" || true)"
+      if [[ -n "$list" ]]; then
+        while IFS= read -r p; do
+          url="${BASE%/}${p}"
+          local ref_each
+          ref_each="$(viewer_url_for_path "$p")"
+          size="$(probe_url_and_size "$url" "$ref_each" || true)"
+          printf "%s\t%s\t%s\n" "$url" "${size:-}" "$ref_each"
+        done <<<"$list"
+        return 0
+      fi
+    fi
   fi
 
   # 3) Pure ID
@@ -176,9 +234,11 @@ resolve_token() {
   # If we have a concrete file_path, validate and return it
   if [[ -n "${file_path:-}" ]]; then
     url="${BASE%/}${file_path}"
-    size="$(probe_url_and_size "$url" || true)"
+    local ref
+    ref="$(viewer_url_for_path "$file_path")"
+    size="$(probe_url_and_size "$url" "$ref" || true)"
     if [[ $? -eq 0 ]]; then
-      printf "%s\t%s\n" "$url" "${size:-}"
+      printf "%s\t%s\t%s\n" "$url" "${size:-}" "$ref"
       return 0
     else
       log_err "Probe failed (viewer file path) for: $url"
@@ -187,6 +247,21 @@ resolve_token() {
 
   # If we have an ID, apply multi-part strategy
   if [[ -n "${id:-}" ]]; then
+    # Reader-first: prefer extracting all exact file paths from reader pages over guessing
+    local list_by_id
+    list_by_id="$(extract_all_file_paths_from_reader "${BASE}/en/book/${id}/reader" | sed '/^$/d' || true)"
+    [[ -z "$list_by_id" ]] && list_by_id="$(extract_all_file_paths_from_reader "${BASE}/zh-tw/book/${id}/reader" | sed '/^$/d' || true)"
+    if [[ -n "$list_by_id" ]]; then
+      while IFS= read -r p; do
+        url="${BASE%/}${p}"
+        local ref_each
+        ref_each="$(viewer_url_for_path "$p")"
+        size="$(probe_url_and_size "$url" "$ref_each" || true)"
+        printf "%s\t%s\t%s\n" "$url" "${size:-}" "$ref_each"
+      done <<<"$list_by_id"
+      return 0
+    fi
+
     local found_any=0
     local first_single="/ebkFiles/${id}/${id}.PDF"
     local s
@@ -194,17 +269,22 @@ resolve_token() {
     case "$MULTIPART_MODE" in
       single)
         url="${BASE%/}${first_single}"
-        s="$(probe_url_and_size "$url" || true)"
-        if [[ $? -eq 0 ]]; then echo -e "${url}\t${s}"; return 0; fi
+        local ref_single
+        ref_single="$(viewer_url_for_path "$first_single")"
+        s="$(probe_url_and_size "$url" "$ref_single" || true)"
+        if [[ $? -eq 0 ]]; then printf "%s\t%s\t%s\n" "$url" "$s" "$ref_single"; return 0; fi
         ;;
       all|auto)
         # Try F01.. first to detect multi-part
         local parts=() i part_url part_size
         for i in $(seq -w 1 "$MAX_PARTS"); do
-          part_url="${BASE%/}/ebkFiles/${id}/${id}F${i}.PDF"
-          part_size="$(probe_url_and_size "$part_url" || true)"
+          local part_path="/ebkFiles/${id}/${id}F${i}.PDF"
+          part_url="${BASE%/}${part_path}"
+          local part_ref
+          part_ref="$(viewer_url_for_path "$part_path")"
+          part_size="$(probe_url_and_size "$part_url" "$part_ref" || true)"
           if [[ $? -eq 0 ]]; then
-            parts+=("${part_url}\t${part_size}")
+            parts+=("$part_url"$'\t'"$part_size"$'\t'"$part_ref")
             found_any=1
           else
             # Stop at first miss if we already found at least F01
@@ -221,8 +301,10 @@ resolve_token() {
           fi
           # fallback to single file
           url="${BASE%/}${first_single}"
-          s="$(probe_url_and_size "$url" || true)"
-          if [[ $? -eq 0 ]]; then echo -e "${url}\t${s}"; return 0; fi
+          local ref_auto
+          ref_auto="$(viewer_url_for_path "$first_single")"
+          s="$(probe_url_and_size "$url" "$ref_auto" || true)"
+          if [[ $? -eq 0 ]]; then printf "%s\t%s\t%s\n" "$url" "$s" "$ref_auto"; return 0; fi
         fi
         ;;
       *)
@@ -294,15 +376,22 @@ ensure_alias || true
 
 # ------------------------ download routine ---------------------------
 download_one_url() {
-  local url="$1"
+  local url_raw="$1"
+  # Trim any trailing tabs/spaces/newlines to avoid corrupting filenames or requests
+  local url
+  url="$(printf '%s' "$url_raw" | sed -e 's/[[:space:]]*$//')"
   local size_bytes="${2:-}" # may be empty
+  local ref="${3:-${BASE}/}"
   local fname out existing before_human after_human
 
-  fname="$(basename "$url" | sanitize_name)"
+  fname="$(basename "$url" | trim | sanitize_name)"
+  # Remove any trailing underscores (e.g., caused by stray delimiters)
+  while [[ "$fname" == *_ ]]; do fname="${fname%_}"; done
+
   out="${OUTDIR%/}/$fname"
 
   # pre-flight
-  if [[ -n "$size_bytes" ]]; then
+  if [[ -n "$size_bytes" && "$size_bytes" != "0" ]]; then
     before_human="$(printf "%s\n" "$size_bytes" | human_size)"
     [[ $QUIET -eq 0 ]] && echo "• Target: $fname  | Size: ${before_human}  | URL: $url"
   else
@@ -320,16 +409,19 @@ download_one_url() {
   local tmp_out; tmp_out="$(mktemp)"
   set +e
   curl -fL -C - --retry 3 --retry-all-errors \
-       -H "$REF_HEADER" -H "$UA_HEADER" \
+       --connect-timeout 15 --speed-time 30 --speed-limit 1024 \
+       -H "Referer: ${ref}" -H "$UA_HEADER" \
        --progress-bar \
        --write-out 'http=%{http_code} size=%{size_download} speed=%{speed_download} time=%{time_total}\n' \
-       -o "$out" "$url" 2>/dev/null | tee "$tmp_out" >/dev/null
+       -o "$out" "$url" | tee "$tmp_out" >/dev/null
   local rc=$?
+  local http_probe
+  http_probe="$(curl -sS -o /dev/null -w '%{http_code}' -H "Referer: ${ref}" -H "$UA_HEADER" "$url" || true)"
   set -e
 
   if [[ $rc -ne 0 ]]; then
     [[ $QUIET -eq 0 ]] && echo "  ✗ Download failed (code $rc). See $LOG_FILE"
-    log_err "Download error rc=$rc url=$url out=$out"
+    log_err "Download error rc=$rc http=$http_probe url=$url out=$out"
     return $rc
   fi
 
@@ -354,7 +446,12 @@ download_one_url() {
   local spd_human
   spd_human="$(printf "%s\n" "${spd:-0}" | awk '{x=$1; s="B/s KB/s MB/s GB/s"; split(s,a); i=1; while(x>=1024 && i<4){x/=1024;i++} printf("%.2f %s", x, a[i])}')"
 
-  [[ $QUIET -eq 0 ]] && echo "  ✓ Saved: $out  | Downloaded: ${after_human}  | Avg speed: ${spd_human}  | Time: ${ttot}s"
+  local out_abs
+  out_abs="$(abspath "$out")"
+  if [[ $QUIET -eq 0 ]]; then
+    echo "  ✓ Download completed successfully: $fname"
+    echo "    Path: $out_abs | Size: ${after_human} | Avg speed: ${spd_human} | Time: ${ttot}s"
+  fi
   return 0
 }
 
@@ -368,10 +465,10 @@ process_token() {
     return 1
   fi
 
-  # each line: URL<TAB>SIZE
-  while IFS=$'\t' read -r url size; do
+  # each line: URL<TAB>SIZE<TAB>REFERER
+  while IFS=$'\t' read -r url size ref; do
     # empty size means unknown; still attempt download
-    download_one_url "$url" "${size:-}"
+    download_one_url "$url" "${size:-}" "${ref:-}"
     sleep "$SLEEP_BETWEEN"
   done <<<"$lines"
 }
