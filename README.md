@@ -60,7 +60,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
 
 微信不公號：<a href="https://bdfz.net/posts/fuckwechat/" target="_blank" rel="noopener noreferrer">那麼，我搬。</a>
 
-# 6、Taiwanebook 
+# 6、臺灣華文電子書庫
 
 > 偶爾需要下載庫內書，寫下。  
 
