@@ -68,6 +68,15 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
 <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/taiwanebook.sh)
 ```
 
+# 7、Seiue Notification → Telegram
+
+> 網頁的通知算通知嗎？當然 TM 不算。所以，推過來吧。
+
+
+```bash
+<(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/seiue-notify.sh)
+```
+
 ---
 
 # 免責聲明
