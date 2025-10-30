@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - One-click Installer (Sidecar)
-# v1.4-per-type-confirm
+# v1.4.1-per-type-confirm-cc
 # - 保持原功能：/chalk/me/received-messages 全类型抓取、聚合内容、附件、强去重与水位
 # - 新增：安装确认阶段 --confirm-per-type，一次性推送【请假/考勤/评价/通知/消息】各类型最新 1 条
-# - 确认完成后提升水位到这批里时间最大者，避免重复
-# - 仍支持 --confirm-once（仅 1 条）以兼容老习惯
+# - 确认阶段强制包含 CC（不加 is_cc 过滤）且忽略已读筛选，至少扫描 10 页
+# - 常驻轮询仍尊重 .env（INCLUDE_CC / READ_FILTER）以避免影响既有行为
 
 set -euo pipefail
 
@@ -135,7 +135,7 @@ setup_layout() {
 
   if ! run_as_user "$PYBIN" -m venv "$VENV_DIR"; then
     warn "python -m venv 失敗，嘗試安裝/修復後重試一次..."
-    if command -v apt-get >/devnull 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
       apt-get update -y
       apt-get install -y python3-venv python3.12-venv || apt-get install -y python3-venv || true
     fi
@@ -158,21 +158,19 @@ setup_layout() {
 
 # ----------------- 4) Write Python notifier -----------------
 write_python() {
-  info "生成 Python 通知輪詢器（ALL TYPES + per-type confirm）..."
+  info "生成 Python 通知輪詢器（ALL TYPES + per-type confirm, CC-included in confirm）..."
   local TMP="$(mktemp)"
   cat > "$TMP" <<'EOF_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Seiue Notification → Telegram sidecar (me/received-messages, ALL TYPES)
-v1.4.0 — per-type confirm + aggregated_messages + robust _sid dedupe
- - Fetches ALL types (leave/attendance/evaluation/notice/message); no notice-only filter.
- - expand=sender_reflection,aggregated_messages for reliable title/content & attachments.
- - Stable _sid: prefer `id`; else first aggregated id; else CRC32(title|published_at).
- - Watermark = (last_seen_ts, last_seen_id_int), ensures at-most-once.
- - New: --confirm-per-type → scan first N pages once, pick the latest ONE item for each type and push.
+v1.4.1 — per-type confirm includes CC + stronger type detection + wider scan
+ - Per-type confirm: include CC (no is_cc filter) and ignore read filter, scan up to 10 pages.
+ - Type detection: item.type → any aggregated_messages[].type → Chinese keyword fallback.
+ - Normal polling still respects .env (INCLUDE_CC, READ_FILTER) for backward-compat.
 """
-import json, logging, os, sys, time, html, fcntl, argparse
+import json, logging, os, sys, time, html, fcntl, argparse, re
 from zlib import crc32
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
@@ -462,13 +460,17 @@ class SeiueClient:
                     break
         sid = it.get("id")
         if sid is None and agg:
-            sid = agg[0].get("id")
+            sid = next((a.get("id") for a in agg if a.get("id") is not None), None)
         if sid is None:
             basis = f"{it.get('title') or ''}|{it.get('published_at') or it.get('created_at') or ''}"
             sid = crc32(basis.encode("utf-8")) & 0xffffffff
         it["_sid"] = str(sid)
 
-    def _list_page(self, page: int, per_page: int = 20) -> List[Dict[str, Any]]:
+    def _list_page(self, page: int, per_page: int = 20, *, include_cc: Optional[str]=None, read_filter: Optional[str]=None) -> List[Dict[str, Any]]:
+        """
+        include_cc: None → follow global; "all" → 不加 is_cc；"false"/"true" → 显式过滤
+        read_filter: None → follow global; "all"/"unread"
+        """
         params = {
             "expand": "sender_reflection,aggregated_messages",
             "owner.id": self.reflection_id,
@@ -477,10 +479,18 @@ class SeiueClient:
             "page": str(page),
             "per_page": str(per_page),
         }
-        if READ_FILTER == "unread":
+        rf = READ_FILTER if read_filter is None else read_filter
+        if rf == "unread":
             params["readed"] = "false"
-        if not INCLUDE_CC:
-            params["is_cc"] = "false"
+        icc = include_cc
+        if icc is None:
+            if not INCLUDE_CC:
+                params["is_cc"] = "false"
+        else:
+            if icc in ("true","false"):
+                params["is_cc"] = icc
+            # icc == "all" → 不加 is_cc
+
         logging.info(f"GET /me/received-messages params={params}")
         r = self._retry_after_auth(lambda: self.s.get(self.inbox_url, params=params, timeout=30))
         if r.status_code != 200:
@@ -490,6 +500,29 @@ class SeiueClient:
         for it in items:
             self.normalize_item_inplace(it)
         return items
+
+    def _guess_type(self, it: Dict[str, Any]) -> str:
+        t = (it.get("type") or "").lower()
+        if not t:
+            for a in it.get("aggregated_messages") or []:
+                at = (a.get("type") or "").lower()
+                if at:
+                    t = at; break
+        if not t or t not in ("leave","attendance","evaluation","notice","message"):
+            zh = (it.get("title") or "") + "\n" + (it.get("content") or "")
+            def has(patterns: List[str]) -> bool:
+                return any(p in zh for p in patterns)
+            if has(["请假", "請假", "销假", "銷假"]):
+                t = "leave"
+            elif has(["考勤", "出勤", "打卡", "迟到", "早退", "缺勤", "旷课", "曠課"]):
+                t = "attendance"
+            elif has(["评价", "評價", "德育", "已发布评价", "已發佈評價"]):
+                t = "evaluation"
+            elif has(["通知", "公告"]):
+                t = "notice"
+            else:
+                t = "message"
+        return t
 
     def list_my_received_incremental(self) -> List[Dict[str, Any]]:
         state = load_state()
@@ -534,19 +567,9 @@ class SeiueClient:
         return items[0] if items else None
 
     def fetch_latest_by_type_once(self) -> Dict[str, Optional[Dict[str, Any]]]:
-        """掃前 N 頁，從結果里挑出每種 type（leave/attendance/evaluation/notice/message）最新的 1 條。"""
+        """掃前 N 頁（至少 10 頁），包含 CC、忽略已讀，挑出每種 type 最新 1 條。"""
         want_types = ["leave", "attendance", "evaluation", "notice", "message"]
         picked: Dict[str, Optional[Dict[str, Any]]] = {t: None for t in want_types}
-
-        def _type_of(it: Dict[str, Any]) -> str:
-            t = (it.get("type") or "").lower()
-            if not t:
-                agg = it.get("aggregated_messages") or []
-                if agg and isinstance(agg, list):
-                    t = (agg[0].get("type") or "").lower()
-            if t not in want_types:
-                t = "message"  # 回落
-            return t
 
         def _key(it: Dict[str, Any]):
             ts_str = it.get("published_at") or it.get("created_at") or ""
@@ -559,17 +582,19 @@ class SeiueClient:
 
         page = 1
         seen_any = False
-        while page <= max(MAX_LIST_PAGES, 3):  # 确保至少扫 3 页
-            items = self._list_page(page)
+        target_pages = max(MAX_LIST_PAGES, 10)
+        while page <= target_pages:
+            items = self._list_page(page, include_cc="all", read_filter="all")
             if not items:
                 break
             seen_any = True
             for it in items:
-                t = _type_of(it)
+                t = self._guess_type(it)
+                if t not in picked:
+                    t = "message"
                 cur = picked.get(t)
                 if cur is None or _key(it) > _key(cur):
                     picked[t] = it
-            # 如果五種類型都已經選到，提前停止
             if all(picked.values()):
                 break
             page += 1
@@ -694,10 +719,7 @@ def send_one_item(tg: "Telegram", cli: "SeiueClient", item: Dict[str, Any]) -> b
     if not content_str:
         content_str = json.dumps({"blocks": [{"text": ""}]})
     html_body, atts = render_draftjs_content(content_str)
-    # 判定類型（主 or 聚合）
-    type_guess = (item.get("type") or "").lower()
-    if not type_guess and agg:
-        type_guess = (agg[0].get("type") or "").lower()
+    type_guess = cli._guess_type(item)
     header = build_header(item.get("sender_reflection") or {}, type_guess)
     created = item.get("published_at") or item.get("created_at") or ""
     created_fmt = format_time(created)
@@ -727,7 +749,6 @@ def ensure_startup_watermark(cli: "SeiueClient"):
         return
     if not SKIP_HISTORY_ON_FIRST_RUN:
         return
-    # 如果首啟選擇跳過歷史，只設一個基準水位，後續由確認階段再抬高
     newest_ts = 0.0
     newest_id = 0
     try:
@@ -760,9 +781,7 @@ def confirm_per_type_once(tg: "Telegram", cli: "SeiueClient"):
     for t, it in picked.items():
         if not it:
             continue
-        # 发送
         ok = send_one_item(tg, cli, it)
-        # 更新 seen / 水位
         ts_str = it.get("published_at") or it.get("created_at") or ""
         ts = SeiueClient._parse_ts(ts_str) if ts_str else int(time.time())
         sid = str(it.get("_sid"))
@@ -783,7 +802,7 @@ def confirm_per_type_once(tg: "Telegram", cli: "SeiueClient"):
         save_state(state)
         logging.info("per-type 確認完成，已提升水位到: ts=%s id=%s", max_ts, max_id)
     else:
-        logging.info("per-type 確認：無可發送項（可能頁面上都早於基準水位或確實沒有消息）。")
+        logging.info("per-type 確認：無可發送項。")
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
@@ -834,7 +853,7 @@ def main():
             logging.info("無可用的最新消息可確認發送。")
         sys.exit(0)
 
-    # 常駐輪詢
+    # 常駐輪詢（保留原行為：是否包含CC取決於 .env 的 INCLUDE_CC）
     state = load_state()
     seen: Dict[str, Any] = state.get("seen") or {}
     logging.info(f"開始輪詢（每 {POLL_SECONDS}s）...")
@@ -843,10 +862,20 @@ def main():
         try:
             items = cli.list_my_received_incremental()
             new_items = [it for it in items if str(it.get("_sid")) not in seen]
+            # 按時間/ID 排序，依次推送
+            def _key(it: Dict[str, Any]):
+                ts_str = it.get("published_at") or it.get("created_at") or ""
+                ts = SeiueClient._parse_ts(ts_str) if ts_str else 0.0
+                try:
+                    nid = int(str(it.get("_sid")))
+                except Exception:
+                    nid = crc32(str(it.get("_sid")).encode("utf-8")) & 0xffffffff
+                return (ts, nid)
+            new_items.sort(key=_key)
 
-            for d in sorted(new_items, key=lambda x: str(x.get("_sid"))):
+            for d in new_items:
                 sid = str(d.get("_sid"))
-                seen[sid] = {"pushed_at": now_cst_str()}
+                seen[sid] = {"pushed_at": now_cst_str(), "type": cli._guess_type(d)}
                 state["seen"] = seen
                 save_state(state)
                 send_one_item(tg, cli, d)
@@ -865,7 +894,7 @@ EOF_PY
 
   install -m 0644 -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$TMP" "${INSTALL_DIR}/${PY_SCRIPT}"
   rm -f "$TMP"
-  success "Python 輪詢器（ALL TYPES + per-type confirm）已生成。"
+  success "Python 輪詢器（ALL TYPES + per-type confirm, CC-included in confirm）已生成。"
 }
 
 # ----------------- 5) Write .env and runner -----------------
@@ -887,7 +916,7 @@ NOTIFY_POLL_SECONDS=${POLL}
 MAX_LIST_PAGES=3
 # all | unread
 READ_FILTER=all
-# include cc messages? true/false
+# include cc messages in polling? true/false
 INCLUDE_CC=false
 # 每條 Telegram 消息最小間隔（秒），避免 429
 TELEGRAM_MIN_INTERVAL_SECS=1.5
@@ -983,12 +1012,12 @@ send_one_shot_confirmation() {
 # ----------------- main -----------------
 main() {
   LOCKDIR="/tmp/seiue_notify_installer.lock"
-  if ! mkdir "$LOCKDIR" 2>/null; then
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
     error "安裝器已在另一程序執行。"; exit 1
   fi
   trap 'rmdir "$LOCKDIR"' EXIT
 
-  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.4-per-type-confirm ---${C_RESET}"
+  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.4.1-per-type-confirm-cc ---${C_RESET}"
   check_environment
   mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
 
