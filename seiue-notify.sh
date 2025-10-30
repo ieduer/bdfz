@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - One-click Installer (Sidecar)
-# v1.0-me-inbox-noninteractive
+# v1.1-me-inbox-alltypes
 # - Auto-install & start systemd (no prompts)
 # - ExecStartPre clears stale lock
 # - 安裝後：先「發一次確認」→ 再啟動服務（避免與單例鎖競爭）
-# - 僅走 me 收件箱: /chalk/me/received-messages (owner.id=reflection_id)
+# - me 收件箱: /chalk/me/received-messages（owner.id=reflection_id）→ 默認推送「全部類型」（含請假/考勤/評價/通知/消息）；可用 READ_FILTER 與 INCLUDE_CC 控制。
 # - 強 at-most-once：singleton + (last_ts,last_id) 水位 + per-id seen
 
 set -euo pipefail
@@ -66,7 +66,7 @@ check_environment() {
   if command -v python3 >/dev/null 2>&1; then PYBIN="$(command -v python3)"; fi
   if [ -z "$PYBIN" ]; then
     warn "系統未找到 python3，將嘗試安裝（Ubuntu/Debian 使用 apt；CentOS 使用 yum）。"
-    if command -v apt-get >/devnull 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
       apt-get update -y && apt-get install -y python3 python3-venv
     elif command -v yum >/dev/null 2>&1; then
       yum install -y python3 python3-venv || true
@@ -159,14 +159,14 @@ setup_layout() {
 
 # ----------------- 4) Write Python notifier -----------------
 write_python() {
-  info "生成 Python 通知輪詢器（me/received-messages 單跳 + 去重強化 + 一次性確認）..."
+  info "生成 Python 通知輪詢器（me/received-messages 全類型 + 去重強化 + 一次性確認）..."
   local TMP="$(mktemp)"
   cat > "$TMP" <<'EOF_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Seiue Notification → Telegram sidecar (me/received-messages, single-hop)
-v1.8.1 — singleton lock, startup watermark, (ts,id) dedupe, at-most-once, --confirm-once
+Seiue Notification → Telegram sidecar (me/received-messages, all types)
+v1.9.0 — singleton lock, startup watermark, (ts,id) dedupe, at-most-once, --confirm-once
 """
 import json, logging, os, sys, time, html, fcntl, argparse
 from typing import Dict, Any, List, Tuple, Optional
@@ -363,7 +363,8 @@ class Telegram:
 # -------- Seiue API --------
 class SeiueClient:
     def __init__(self, username: str, password: str):
-        self.username = username; self.password = password
+        self.username = username
+        self.password = password
         self.s = requests.Session()
         retries = Retry(total=5, backoff_factor=1.7, status_forcelist=(429,500,502,503,504))
         self.s.mount("https://", HTTPAdapter(max_retries=retries))
@@ -373,37 +374,59 @@ class SeiueClient:
             "Origin": "https://chalk-c3.seiue.com",
             "Referer": "https://chalk-c3.seiue.com/",
         })
-        self.bearer = None; self.reflection_id = None
+        self.bearer = None
+        self.reflection_id = None
         self.login_url = "https://passport.seiue.com/login?school_id=3"
         self.authorize_url = "https://passport.seiue.com/authorize"
         self.inbox_url = "https://api.seiue.com/chalk/me/received-messages"
 
     def _preflight(self):
-        try: self.s.get(self.login_url, timeout=15)
-        except requests.RequestException: pass
+        try:
+            self.s.get(self.login_url, timeout=15)
+        except requests.RequestException:
+            pass
 
     def login(self) -> bool:
         self._preflight()
         try:
-            r = self.s.post(self.login_url,
-                headers={"Content-Type":"application/x-www-form-urlencoded","Origin":"https://passport.seiue.com","Referer":self.login_url},
+            r = self.s.post(
+                self.login_url,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://passport.seiue.com",
+                    "Referer": self.login_url,
+                },
                 data={"email": self.username, "password": self.password},
-                timeout=30, allow_redirects=True)
+                timeout=30,
+                allow_redirects=True,
+            )
         except requests.RequestException as e:
-            logging.error(f"Login network error: {e}"); return False
+            logging.error(f"Login network error: {e}")
+            return False
         try:
-            a = self.s.post(self.authorize_url,
-                headers={"Content-Type":"application/x-www-form-urlencoded","X-Requested-With":"XMLHttpRequest","Origin":"https://chalk-c3.seiue.com","Referer":"https://chalk-c3.seiue.com/"},
-                data={'client_id':'GpxvnjhVKt56qTmnPWH1sA','response_type':'token'},
-                timeout=30)
+            a = self.s.post(
+                self.authorize_url,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": "https://chalk-c3.seiue.com",
+                    "Referer": "https://chalk-c3.seiue.com/",
+                },
+                data={"client_id": "GpxvnjhVKt56qTmnPWH1sA", "response_type": "token"},
+                timeout=30,
+            )
             a.raise_for_status()
             data = a.json()
         except Exception as e:
-            logging.error(f"Authorize failed: {e}"); return False
-        token = data.get("access_token"); ref = data.get("active_reflection_id")
+            logging.error(f"Authorize failed: {e}")
+            return False
+        token = data.get("access_token")
+        ref = data.get("active_reflection_id")
         if not token or not ref:
-            logging.error("Authorize missing token or reflection id."); return False
-        self.bearer = token; self.reflection_id = str(ref)
+            logging.error("Authorize missing token or reflection id.")
+            return False
+        self.bearer = token
+        self.reflection_id = str(ref)
         self.s.headers.update({
             "Authorization": f"Bearer {self.bearer}",
             "x-school-id": X_SCHOOL_ID,
@@ -415,17 +438,20 @@ class SeiueClient:
 
     def _retry_after_auth(self, fn):
         r = fn()
-        if getattr(r, "status_code", None) in (401,403):
+        if getattr(r, "status_code", None) in (401, 403):
             logging.warning("401/403 encountered. Re-auth...")
-            if self.login(): r = fn()
+            if self.login():
+                r = fn()
         return r
 
     @staticmethod
     def _parse_ts(s: str) -> float:
-        fmts = ("%Y-%m-%d %H:%M:%S","%Y-%m-%dT%H:%M:%S%z","%Y-%m-%dT%H:%M:%S")
+        fmts = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S")
         for f in fmts:
-            try: return datetime.strptime(s, f).timestamp()
-            except Exception: pass
+            try:
+                return datetime.strptime(s, f).timestamp()
+            except Exception:
+                pass
         return 0.0
 
     def _json_items(self, r: requests.Response) -> List[Dict[str, Any]]:
@@ -451,7 +477,6 @@ class SeiueClient:
         params_base = {
             "expand": "sender_reflection",
             "owner.id": self.reflection_id,
-            "type": "message",
             "paginated": "1",
             "sort": "-published_at,-created_at",
         }
@@ -507,7 +532,6 @@ class SeiueClient:
         params = {
             "expand": "sender_reflection",
             "owner.id": self.reflection_id or "",
-            "type": "message",
             "paginated": "1",
             "sort": "-published_at,-created_at",
             "page": "1",
@@ -530,8 +554,10 @@ def render_draftjs_content(content_json: str):
 
     entities = {}
     for k, v in entity_map.items():
-        try: entities[int(k)] = v
-        except Exception: pass
+        try:
+            entities[int(k)] = v
+        except Exception:
+            pass
 
     from typing import List, Dict, Any
     lines: List[str] = []
@@ -541,45 +567,64 @@ def render_draftjs_content(content_json: str):
         add_prefix = ""
         for r in ranges or []:
             style = r.get("style") or ""
-            if style == "BOLD": text = f"<b>{escape_html(text)}</b>"
+            if style == "BOLD":
+                text = f"<b>{escape_html(text)}</b>"
             elif style.startswith("color_"):
-                if "red" in style: add_prefix = "❗" + add_prefix
-                elif "orange" in style: add_prefix = "⚠️" + add_prefix
-                elif "theme" in style: add_prefix = "⭐" + add_prefix
-        if not text.startswith("<b>"): text = escape_html(text)
+                if "red" in style:
+                    add_prefix = "❗" + add_prefix
+                elif "orange" in style:
+                    add_prefix = "⚠️" + add_prefix
+                elif "theme" in style:
+                    add_prefix = "⭐" + add_prefix
+        if not text.startswith("<b>"):
+            text = escape_html(text)
         return add_prefix + text
 
     for blk in blocks:
-        t = blk.get("text","") or ""
+        t = blk.get("text", "") or ""
         line = decorate_styles(t, blk.get("inlineStyleRanges") or [])
 
         for er in blk.get("entityRanges") or []:
             key = er.get("key")
-            if key is None: continue
+            if key is None:
+                continue
             ent = entities.get(int(key))
-            if not ent: continue
+            if not ent:
+                continue
             etype = (ent.get("type") or "").upper()
             data = ent.get("data") or {}
             if etype == "FILE":
-                attachments.append({"type":"file","name":data.get("name") or "附件","size":data.get("size") or "","url":data.get("url") or ""})
+                attachments.append(
+                    {"type": "file", "name": data.get("name") or "附件", "size": data.get("size") or "", "url": data.get("url") or ""}
+                )
             elif etype == "IMAGE":
-                attachments.append({"type":"image","name":"image.jpg","size":"","url":data.get("src") or ""})
+                attachments.append({"type": "image", "name": "image.jpg", "size": "", "url": data.get("src") or ""})
 
         align = (blk.get("data") or {}).get("align")
-        if align == "align_right" and line.strip(): line = "—— " + line
+        if align == "align_right" and line.strip():
+            line = "—— " + line
         lines.append(line)
 
-    while lines and not lines[-1].strip(): lines.pop()
+    while lines and not lines[-1].strip():
+        lines.pop()
     html_text = "\n\n".join([ln if ln.strip() else "​" for ln in lines])
     return html_text, attachments
 
-def build_header(sender_reflection):
+def build_header(sender_reflection, type_str: str):
     name = ""
     try:
         name = sender_reflection.get("name") or sender_reflection.get("realname") or ""
     except Exception:
         pass
-    return f"📩 <b>校內訊息</b>{' · 來自 ' + escape_html(name) if name else ''}\n"
+    label = {
+        "leave": "请假",
+        "attendance": "考勤",
+        "evaluation": "评价",
+        "notice": "通知",
+        "message": "消息",
+    }.get((type_str or "").lower(), "消息")
+    who = f" · 來自 {escape_html(name)}" if name else ""
+    return f"📩 <b>校內{label}</b>{who}\n"
 
 def format_time(ts: str) -> str:
     try:
@@ -594,16 +639,18 @@ def download_with_auth(cli: "SeiueClient", url: str) -> Tuple[bytes, str]:
         if r.status_code != 200:
             logging.error(f"download HTTP {r.status_code}: {r.text[:300]}")
             return b"", "attachment.bin"
-        content = r.content; name = "attachment.bin"
+        content = r.content
+        name = "attachment.bin"
         cd = r.headers.get("Content-Disposition") or ""
         if "filename=" in cd:
-            name = cd.split("filename=",1)[1].strip('"; ')
+            name = cd.split("filename=", 1)[1].strip('"; ')
         else:
             from urllib.parse import urlparse, unquote
             try:
                 path = urlparse(r.url).path
-                name = unquote(path.rsplit('/',1)[-1]) or name
-            except Exception: pass
+                name = unquote(path.rsplit("/", 1)[-1]) or name
+            except Exception:
+                pass
         return content, name
     except requests.RequestException as e:
         logging.error(f"download failed: {e}")
@@ -635,12 +682,11 @@ def ensure_startup_watermark(cli: "SeiueClient"):
     save_state(state)
     logging.info("啟動已設置水位（跳過歷史），last_seen_ts=%s last_seen_id=%s", newest_ts, newest_id)
 
-def send_one_item(tg:"Telegram", cli:"SeiueClient", item: Dict[str,Any]) -> bool:
-    nid = str(item.get("id"))
+def send_one_item(tg: "Telegram", cli: "SeiueClient", item: Dict[str, Any]) -> bool:
     title = item.get("title") or ""
     content_str = item.get("content") or ""
     html_body, atts = render_draftjs_content(content_str)
-    header = build_header(item.get("sender_reflection") or {})
+    header = build_header(item.get("sender_reflection") or {}, item.get("type") or "")
     created = item.get("published_at") or item.get("created_at") or ""
     created_fmt = format_time(created)
     time_line = f"— 發布於 {created_fmt}" if created_fmt else ""
@@ -648,17 +694,20 @@ def send_one_item(tg:"Telegram", cli:"SeiueClient", item: Dict[str,Any]) -> bool
     ok = tg.send_message_safely(main_msg)
     # attachments
     images = [a for a in atts if a.get("type") == "image" and a.get("url")]
-    files  = [a for a in atts if a.get("type") == "file" and a.get("url")]
+    files = [a for a in atts if a.get("type") == "file" and a.get("url")]
     for a in images:
         data, _ = download_with_auth(cli, a["url"])
-        if data: ok = tg.send_photo_bytes(data, caption_html="") and ok
+        if data:
+            ok = tg.send_photo_bytes(data, caption_html="") and ok
     for a in files:
         data, fname = download_with_auth(cli, a["url"])
         if data:
             cap = f"📎 <b>{escape_html(a.get('name') or fname)}</b>"
             size = a.get("size")
-            if size: cap += f"（{escape_html(size)}）"
-            if len(cap) > 1024: cap = cap[:1008] + "…"
+            if size:
+                cap += f"（{escape_html(size)}）"
+            if len(cap) > 1024:
+                cap = cap[:1008] + "…"
             ok = tg.send_document_bytes(data, filename=(a.get("name") or fname), caption_html=cap) and ok
     return ok
 
@@ -676,7 +725,8 @@ def main():
     tg = Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     cli = SeiueClient(SEIUE_USERNAME, SEIUE_PASSWORD)
     if not cli.login():
-        print("Seiue 登入失敗。", file=sys.stderr); sys.exit(2)
+        print("Seiue 登入失敗。", file=sys.stderr)
+        sys.exit(2)
 
     ensure_startup_watermark(cli)
 
@@ -691,11 +741,14 @@ def main():
                 ts = SeiueClient._parse_ts(ts_str) if ts_str else int(time.time())
                 nid_int = int(str(it0.get("id") or 0))
             except Exception:
-                ts = int(time.time()); nid_int = 0
+                ts = int(time.time())
+                nid_int = 0
             state["last_seen_ts"] = max(float(state.get("last_seen_ts") or 0.0), ts)
             state["last_seen_id"] = max(int(state.get("last_seen_id") or 0), nid_int)
-            seen = state.get("seen") or {}; seen[str(it0.get("id"))] = {"pushed_at": now_cst_str()}
-            state["seen"] = seen; save_state(state)
+            seen = state.get("seen") or {}
+            seen[str(it0.get("id"))] = {"pushed_at": now_cst_str()}
+            state["seen"] = seen
+            save_state(state)
             logging.info("確認消息已發送（id=%s） ok=%s", it0.get("id"), ok)
         else:
             logging.info("無可用的最新消息可確認發送。")
@@ -722,7 +775,8 @@ def main():
 
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
-            logging.info("收到中斷，退出。"); break
+            logging.info("收到中斷，退出。")
+            break
         except Exception as e:
             logging.exception(f"主循環異常：{e}")
             time.sleep(min(POLL_SECONDS, 60))
@@ -733,7 +787,7 @@ EOF_PY
 
   install -m 0644 -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$TMP" "${INSTALL_DIR}/${PY_SCRIPT}"
   rm -f "$TMP"
-  success "Python 輪詢器（去重強化 + 一次性確認）已生成。"
+  success "Python 輪詢器（全類型 + 去重強化 + 一次性確認）已生成。"
 }
 
 # ----------------- 5) Write .env and runner -----------------
@@ -857,7 +911,7 @@ main() {
   fi
   trap 'rmdir "$LOCKDIR"' EXIT
 
-  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.8.1-me-inbox-noninteractive ---${C_RESET}"
+  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.1-me-inbox-alltypes ---${C_RESET}"
   check_environment
   mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
 
