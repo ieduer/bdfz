@@ -1,22 +1,24 @@
+# 寫入並執行（Linux/macOS 皆可；需 root）
+cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.1.0  (NO subcommands; dual-channel: notice + system; idempotent watermark + global dedup; system channel push-all)
+# v2.2.1  (dual-channel: notice + system; push-all; watermark + global dedup; send test-on-start)
 # Usage: sudo bash ./seiue-notify.sh
 set -euo pipefail
 
 # ---------- pretty ----------
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
-info()    { echo -e "${C_BLUE}INFO:${C_RESET} $1"; }
-success() { echo -e "${C_GREEN}SUCCESS:${C_RESET} $1"; }
-warn()    { echo -e "${C_YELLOW}WARNING:${C_RESET} $1"; }
-error()   { echo -e "${C_RED}ERROR:${C_RESET} $1" >&2; }
+info(){ echo -e "${C_BLUE}INFO:${C_RESET} $1"; }
+success(){ echo -e "${C_GREEN}SUCCESS:${C_RESET} $1"; }
+warn(){ echo -e "${C_YELLOW}WARNING:${C_RESET} $1"; }
+error(){ echo -e "${C_RED}ERROR:${C_RESET} $1" >&2; }
 
 # ---------- platform ----------
 OS="$(uname -s || true)"; IS_LINUX=0; IS_DARWIN=0
 [ "$OS" = "Linux" ] && IS_LINUX=1
 [ "$OS" = "Darwin" ] && IS_DARWIN=1
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  echo "需要 root 执行以写入依赖与系统服务。使用 sudo 继续…"
+  echo "需要 root 權限。使用 sudo 重新執行…"
   exec sudo -E bash "$0" "$@"
 fi
 
@@ -31,49 +33,50 @@ OUT_LOG="${LOG_DIR}/notify.out.log"
 ERR_LOG="${LOG_DIR}/notify.err.log"
 UNIT_NAME="seiue-notify"
 
-# 代理透传（如需）
+# 代理透傳（如需）
 PROXY_ENV="$(env | grep -i -E '^(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' || true)"
 
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 ensure_dirs(){ mkdir -p "$INSTALL_DIR" "$LOG_DIR"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"; }
 
 preflight(){
-  info "环境预检中…"
+  info "環境預檢…"
   if ! need_cmd python3; then
-    warn "未发现 python3，尝试安装…"
+    warn "未發現 python3，嘗試安裝…"
     if need_cmd apt-get; then apt-get update -y && apt-get install -y python3 python3-venv python3-pip || true; fi
     if need_cmd yum; then yum install -y python3 python3-pip || true; fi
     if [ $IS_DARWIN -eq 1 ] && need_cmd brew; then brew install python || true; fi
   fi
   need_cmd python3 || { error "仍未找到 python3"; exit 1; }
-  success "预检通过。"
+  success "預檢通過。"
 }
 
 collect_env_if_needed(){
   if [ -f "$ENV_FILE" ]; then
-    info "检测到现有 .env，跳过交互式输入。"
+    info "檢測到現有 .env，跳過交互式輸入。"
     return
   fi
-  info "首次配置：写入 $ENV_FILE（权限 600）"
-  read -p "Seiue 用户名: " SEIUE_USERNAME
-  read -s -p "Seiue 密码: " SEIUE_PASSWORD; echo
+  info "首次配置：寫入 $ENV_FILE（600）"
+  read -p "Seiue 用戶名: " SEIUE_USERNAME
+  read -s -p "Seiue 密碼: " SEIUE_PASSWORD; echo
   read -p "Telegram Bot Token: " TELEGRAM_BOT_TOKEN
   read -p "Telegram Chat ID: " TELEGRAM_CHAT_ID
-  read -p "轮询间隔秒(默认90): " POLL; POLL="${POLL:-90}"
+  read -p "輪詢間隔秒(默認90): " POLL; POLL="${POLL:-90}"
   cat >"$ENV_FILE" <<EOF
 SEIUE_USERNAME=${SEIUE_USERNAME}
 SEIUE_PASSWORD=${SEIUE_PASSWORD}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 
-# 可选项：
+# 可選項（均有合理默認）：
 NOTIFY_POLL_SECONDS=${POLL}
 MAX_LIST_PAGES=10
-READ_FILTER=all         # all|unread  （system 通道无关键词过滤，全部直发）
-INCLUDE_CC=false        # 是否包含抄送
+READ_FILTER=all           # all|unread
+INCLUDE_CC=false          # 是否包含抄送
 SKIP_HISTORY_ON_FIRST_RUN=1
 TELEGRAM_MIN_INTERVAL_SECS=1.5
-# NOTICE_EXCLUDE_NOISE=1   # 置空或=0 可关闭对通知中心的大型“考试/校历”等噪声排除
+NOTICE_EXCLUDE_NOISE=0    # 0=不排除任何類型，通知中心“全量直推”
+SEND_TEST_ON_START=1      # 啟動後各通道自發最新1條作為安裝驗證
 EOF
   chmod 600 "$ENV_FILE"; chown "$REAL_USER:$(id -gn "$REAL_USER")" "$ENV_FILE"
 }
@@ -86,7 +89,7 @@ setup_venv(){
   fi
   su - "$REAL_USER" -c "$PYBIN -m venv '$VENV_DIR'" || true
   su - "$REAL_USER" -c "env ${PROXY_ENV} '$VENV_DIR/bin/python' -m pip install -U pip >/dev/null 2>&1" || true
-  info "安装/升级依赖…"
+  info "安裝/升級依賴…"
   su - "$REAL_USER" -c "env ${PROXY_ENV} '$VENV_DIR/bin/python' -m pip install -q requests pytz urllib3"
 }
 
@@ -103,11 +106,11 @@ from urllib3.util.retry import Retry
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE, "logs"); os.makedirs(LOG_DIR, exist_ok=True)
-STATE_FILE = os.path.join(BASE, "notify_state.json")  # 保存双通道水位 & 全局去重
+STATE_FILE = os.path.join(BASE, "notify_state.json")
 LOCK_FILE  = os.path.join(BASE, ".notify.lock")
 LOG_FILE   = os.path.join(LOG_DIR, "notify.log")
 
-# 环境变量
+# 環境變量
 SEIUE_USERNAME = os.getenv("SEIUE_USERNAME","")
 SEIUE_PASSWORD = os.getenv("SEIUE_PASSWORD","")
 X_SCHOOL_ID = os.getenv("X_SCHOOL_ID","3")
@@ -120,7 +123,8 @@ READ_FILTER = (os.getenv("READ_FILTER","all").strip().lower())
 INCLUDE_CC = os.getenv("INCLUDE_CC","false").strip().lower() in ("1","true","yes","on")
 SKIP_HISTORY_ON_FIRST_RUN = os.getenv("SKIP_HISTORY_ON_FIRST_RUN","1").strip().lower() in ("1","true","yes","on")
 TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS","1.5") or "1.5")
-NOTICE_EXCLUDE_NOISE = os.getenv("NOTICE_EXCLUDE_NOISE","1").strip().lower() in ("1","true","yes","on")
+NOTICE_EXCLUDE_NOISE = os.getenv("NOTICE_EXCLUDE_NOISE","0").strip().lower() in ("1","true","yes","on")
+SEND_TEST_ON_START = os.getenv("SEND_TEST_ON_START","1").strip().lower() in ("1","true","yes","on")
 
 BEIJING_TZ = pytz.timezone("Asia/Shanghai")
 
@@ -146,16 +150,12 @@ def fmt_time(s:str)->str:
   except: return s or ""
 
 def load_state()->Dict[str,Any]:
-  # 结构：
-  # {"seen": {"system:123":"ts", "notice:456":"ts"}, "watermark":{"system":{"ts":..., "id":...}, "notice":{"ts":..., "id":...}}}
   if not os.path.exists(STATE_FILE):
     return {"seen":{}, "watermark":{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}}}
   try:
     with open(STATE_FILE,"r",encoding="utf-8") as f: st=json.load(f)
-    st.setdefault("seen",{})
-    st.setdefault("watermark",{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}})
-    for k in ("system","notice"):
-      st["watermark"].setdefault(k,{"ts":0.0,"id":0})
+    st.setdefault("seen",{}); st.setdefault("watermark",{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}})
+    for k in ("system","notice"): st["watermark"].setdefault(k,{"ts":0.0,"id":0})
     return st
   except:
     return {"seen":{}, "watermark":{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}}}
@@ -169,10 +169,9 @@ def save_state(st:Dict[str,Any])->None:
 def acquire_lock_or_exit():
   fd=os.open(LOCK_FILE, os.O_CREAT|os.O_RDWR, 0o644)
   try:
-    fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)
-    os.ftruncate(fd,0); os.write(fd, str(os.getpid()).encode()); return fd
+    fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB); os.ftruncate(fd,0); os.write(fd, str(os.getpid()).encode()); return fd
   except OSError:
-    logging.error("已有实例运行，本实例退出。"); sys.exit(0)
+    logging.error("已有實例運行，本實例退出。"); sys.exit(0)
 
 class Telegram:
   def __init__(self, token:str, chat_id:str):
@@ -261,14 +260,14 @@ class Seiue:
     return r
 
   def list_system(self, pages:int)->List[Dict[str,Any]]:
-    # system 通道：type=message（系统消息） —— 不做关键词式过滤，全量直发
+    # 系統消息（無關鍵詞過濾，全部直推）
     base={"expand":"sender_reflection","owner.id":self.reflection,"type":"message","paginated":"1","sort":"-published_at,-created_at"}
     if READ_FILTER=="unread": base["readed"]="false"
     if not INCLUDE_CC: base["is_cc"]="false"
     return self._collect(base, pages)
 
   def list_notice(self, pages:int)->List[Dict[str,Any]]:
-    # notice 通道：notice=true
+    # 通知中心（全量；是否排除噪音由 NOTICE_EXCLUDE_NOISE 控制，默認 0=不排除）
     base={"expand":"sender_reflection,aggregated_messages","owner.id":self.reflection,"paginated":"1","sort":"-published_at,-created_at","notice":"true"}
     if NOTICE_EXCLUDE_NOISE:
       base["type_not_in"]="exam.schedule_result_for_examinee,exam.schedule_result_for_examiner,exam.stats_received,exam.published_for_adminclass_teacher,exam.published_for_examinee,exam.published_scoring_for_examinee,exam.published_for_teacher,exam.published_for_mentor,schcal.holiday_created,schcal.holiday_deleted,schcal.holiday_updated,schcal.makeup_created,schcal.makeup_deleted"
@@ -300,7 +299,7 @@ class Seiue:
     return r.content, name
 
 def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
-  # Draft.js 风格 content
+  # Draft.js 風格
   try: raw=json.loads(raw_json or "{}")
   except: raw={}
   blocks=raw.get("blocks") or []; entity_map=raw.get("entityMap") or {}
@@ -335,11 +334,11 @@ def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
   return html_txt, attachments
 
 def classify(title:str, body_html:str)->Tuple[str,str]:
-  # 仅用于“标签装饰”，不参与任何过滤决策
+  # 僅用於標籤裝飾；不影響是否推送
   z=(title or "")+"\n"+(body_html or "")
-  PAIRS=[("leave","【请假】",["请假","請假","销假","銷假"]),
-         ("attendance","【考勤】",["考勤","出勤","打卡","迟到","早退","缺勤","旷课","曠課"]),
-         ("evaluation","【评价】",["评价","評價","德育","已发布评价","已發佈評價"]),
+  PAIRS=[("leave","【請假】",["請假","请假","銷假","销假"]),
+         ("attendance","【考勤】",["考勤","出勤","打卡","遲到","迟到","早退","缺勤","曠課","旷课"]),
+         ("evaluation","【評價】",["評價","评价","德育","已發布評價","已发布评价"]),
          ("notice","【通知】",["通知","公告","告知","提醒"])]
   for key, tag, kws in PAIRS:
     for k in kws:
@@ -348,17 +347,17 @@ def classify(title:str, body_html:str)->Tuple[str,str]:
 
 def sender_name(it:Dict[str,Any])->str:
   sr=it.get("sender_reflection") or {}
-  return sr.get("name") or sr.get("nickname") or "系统"
+  return sr.get("name") or sr.get("nickname") or "系統"
 
-def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str)->bool:
+def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str="")->bool:
   title=it.get("title") or ""
   content=it.get("content") or ""
   body, atts=render_content(content)
-  typ, tag = classify(title, body)   # 仅装饰
+  _, tag = classify(title, body)   # 只裝飾
   src = sender_name(it)
-  hdr = f"📩 <b>{ '通知中心' if ch=='notice' else '系统消息' }</b>｜<b>{esc(src)}</b>\n"
+  hdr = f"📩 <b>{ '通知中心' if ch=='notice' else '系統消息' }</b>｜<b>{esc(src)}</b>\n"
   t = it.get("published_at") or it.get("created_at") or ""
-  msg=f"{hdr}\n{tag}<b>{esc(title)}</b>\n\n{body}\n\n— 发布于 {fmt_time(t)}"
+  msg=f"{hdr}\n{prefix}{tag}<b>{esc(title)}</b>\n\n{body}\n\n— 發佈於 {fmt_time(t)}"
   ok=tg.send(msg)
   imgs=[a for a in atts if a.get("type")=="image" and a.get("url")]
   fils=[a for a in atts if a.get("type")=="file"  and a.get("url")]
@@ -379,8 +378,7 @@ def latest_of_channel(cli:"Seiue", ch:str)->Optional[Dict[str,Any]]:
 
 def ensure_startup_watermark(cli:"Seiue"):
   st=load_state()
-  if st["watermark"]["system"]["ts"]>0.0 and st["watermark"]["notice"]["ts"]>0.0:
-    return
+  if st["watermark"]["system"]["ts"]>0.0 and st["watermark"]["notice"]["ts"]>0.0: return
   if not SKIP_HISTORY_ON_FIRST_RUN: return
   for ch in ("system","notice"):
     it=latest_of_channel(cli, ch)
@@ -391,36 +389,37 @@ def ensure_startup_watermark(cli:"Seiue"):
     else:
       ts=time.time(); mid=0
     st["watermark"][ch]={"ts":ts,"id":mid}
-  save_state(st)
-  logging.info("启动设置水位完成：%s", st["watermark"])
+  save_state(st); logging.info("啟動設置水位完成：%s", st["watermark"])
 
 def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
-  st=load_state()
-  pending=[]
+  st=load_state(); pending=[]
   for ch in ("system","notice"):
     w=st["watermark"][ch]; last_ts=float(w.get("ts") or 0.0); last_id=int(w.get("id") or 0)
     arr = cli.list_system(MAX_LIST_PAGES) if ch=="system" else cli.list_notice(MAX_LIST_PAGES)
     for it in arr:
-      t=it.get("published_at") or it.get("created_at") or ""
-      ts=parse_ts(t) if t else 0.0
+      t=it.get("published_at") or it.get("created_at") or ""; ts=parse_ts(t) if t else 0.0
       try: nid=int(str(it.get("id"))); 
       except: nid=0
-      # 按通道水位截断（时间+ID）
       if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)): continue
       pending.append((ch,it,ts,nid))
-  # 全局时间顺序（早→晚）
-  pending.sort(key=lambda x:(x[2], x[3]))
-  return pending
+  pending.sort(key=lambda x:(x[2], x[3])); return pending
 
 def main_loop():
   if not (SEIUE_USERNAME and SEIUE_PASSWORD and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-    print("缺少必要环境变量。", file=sys.stderr); sys.exit(1)
+    print("缺少必要環境變量。", file=sys.stderr); sys.exit(1)
   _lock=acquire_lock_or_exit()
   tg=Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
   cli=Seiue(SEIUE_USERNAME, SEIUE_PASSWORD)
-  if not cli.login(): print("Seiue 登录失败", file=sys.stderr); sys.exit(2)
+  if not cli.login(): print("Seiue 登錄失敗", file=sys.stderr); sys.exit(2)
   ensure_startup_watermark(cli)
-  print(f"{datetime.now().strftime('%F %T')} 开始轮询（notice+system，全量直发 system），每 {POLL_SECONDS}s，页数<= {MAX_LIST_PAGES}")
+  # 安裝/啟動驗證：各通道各發最新1條（不改水位/seen）
+  if SEND_TEST_ON_START:
+    for ch in ("system","notice"):
+      it=latest_of_channel(cli, ch)
+      if it:
+        try: send_one(tg, cli, it, ch, prefix="🧪 <b>安裝驗證</b>｜")
+        except Exception as e: logging.error("test send error(%s): %s", ch, e)
+  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system，全量直推），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}")
   while True:
     try:
       st=load_state()
@@ -431,19 +430,16 @@ def main_loop():
         ok=send_one(tg, cli, it, ch)
         if ok:
           st["seen"][key]=ts
-          # 提升对应通道水位（按时间+ID）
           wm=st["watermark"][ch]
-          if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]):
-            wm["ts"]=ts; wm["id"]=nid
+          if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
           save_state(st)
       time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
-      print(f"{datetime.now().strftime('%F %T')} 收到中断，退出"); break
+      print(f"{datetime.now().strftime('%F %T')} 收到中斷，退出"); break
     except Exception as e:
       logging.error("loop error: %s", e); time.sleep(3)
 
-if __name__=="__main__":
-  main_loop()
+if __name__=="__main__": main_loop()
 PY
   chmod 755 "$PY_SCRIPT"
   chown "$REAL_USER:$(id -gn "$REAL_USER")" "$PY_SCRIPT"
@@ -506,7 +502,7 @@ start_service(){
 }
 
 # -------- main (zero-arg only) --------
-info "Seiue sidecar（零参数版，无子命令）"
+info "Seiue sidecar（零參數版，無子命令；雙通道全量推送）"
 preflight
 ensure_dirs
 collect_env_if_needed
@@ -518,6 +514,9 @@ if [ $IS_LINUX -eq 1 ]; then
 else
   write_service_darwin
 fi
-success "已安装/升级并启动。"
-echo "查看状态：systemctl status ${UNIT_NAME} --no-pager   （macOS: launchctl list | grep ${UNIT_NAME})"
-echo "查看日志：journalctl -u ${UNIT_NAME} -f            或   tail -F ${OUT_LOG} ${ERR_LOG}"
+success "已安裝/升級並啟動。"
+echo "狀態：systemctl status ${UNIT_NAME} --no-pager   （macOS: launchctl list | grep ${UNIT_NAME})"
+echo "日誌：journalctl -u ${UNIT_NAME} -f            或   tail -F ${OUT_LOG} ${ERR_LOG}"
+SH
+
+bash /root/seiue-notify.sh
