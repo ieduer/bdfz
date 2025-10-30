@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Seiue 全類型系統消息 → Telegram（單文件版，無子命令）
 # 目標：推送 “全部類型”（請假/考勤/評價/通知/消息）
-# 來源端點：/chalk/me/received-messages （包含 aggregated_messages）
+# 來源端點：
+#   1) 收件箱：/chalk/me/received-messages
+#   2) 通知中心（系統消息列表）：/chalk/me/received-messages?notice=true&readed=false&type_not_in=...
 # 首次啟動會各類型各推 1 條作為成功確認，之後走增量推送
 set -euo pipefail
 
@@ -156,6 +158,7 @@ class Seiue:
         self.login_url = "https://passport.seiue.com/login?school_id=3"
         self.auth_url  = "https://passport.seiue.com/authorize"
         self.inbox_url = "https://api.seiue.com/chalk/me/received-messages"
+        self.notice_url = self.inbox_url  # same endpoint, different filters
     def login(self)->bool:
         try:
             self.s.post(self.login_url, headers={"Content-Type":"application/x-www-form-urlencoded","Origin":"https://passport.seiue.com"},
@@ -203,7 +206,6 @@ class Seiue:
             "page": str(page),
             "per_page": str(per_page)
         }
-        # include_cc_all=True 表示不加 is_cc 過濾（同時含收件與抄送）
         if TRACE_HTTP:
             safe_headers = {k:("Bearer ***" if k.lower()=="authorization" else v) for k,v in self.s.headers.items()}
             log(f"GET inbox page={page} params={params} headers={safe_headers}")
@@ -231,6 +233,37 @@ class Seiue:
                 sid = crc32(basis.encode("utf-8")) & 0xffffffff
             it["_sid"] = str(sid)
         return items
+    def list_notice_page(self, page:int, per_page:int=20)->List[Dict[str,Any]]:
+        # 系統消息列表（通知中心）
+        params = {
+            "expand": "aggregated_messages",
+            "notice": "true",
+            "owner.id": self.rid,
+            "readed": "false",
+            "type_not_in": "exam.schedule_result_for_examinee,exam.schedule_result_for_examiner,exam.stats_received,exam.published_for_adminclass_teacher,exam.published_for_examinee,exam.published_scoring_for_examinee,exam.published_for_teacher,exam.published_for_mentor,schcal.holiday_created,schcal.holiday_deleted,schcal.holiday_updated,schcal.makeup_created,schcal.makeup_deleted,schcal.makeup_updated,evaluation.completed_notice_for_subject,reporting.warning_received,report_report.report_publish_published,class_adjustment.stage_approved,class_adjustment.stage_invalid,intl_goal.goal_submitted,intl_goal.goal_changed,class_review.un_completed,election.lotting_result",
+            "paginated": "1",
+            "sort": "-published_at,-created_at",
+            "page": str(page),
+            "per_page": str(per_page)
+        }
+        if TRACE_HTTP:
+            safe_headers = {k:("Bearer ***" if k.lower()=="authorization" else v) for k,v in self.s.headers.items()}
+            log(f"GET notice page={page} params={params} headers={safe_headers}")
+        r = self._req(lambda: self.s.get(self.notice_url, params=params, timeout=30))
+        if TRACE_HTTP:
+            try: log(f"RES {r.status_code} len={len(r.content)} headers={dict(r.headers)}")
+            except: pass
+        if r.status_code != 200:
+            log(f"notice HTTP {r.status_code}: {r.text[:200]}")
+            return []
+        items = self._items(r)
+        for it in items:
+            sid = it.get("id") or it.get("_id")
+            if sid is None:
+                basis = f"{it.get('title') or ''}|{it.get('published_at') or it.get('created_at') or ''}"
+                sid = crc32(str(basis).encode("utf-8")) & 0xffffffff
+            it["_sid"] = str(sid)
+        return items
 
 def render_draft(content_json:str)->str:
     try:
@@ -243,7 +276,6 @@ def render_draft(content_json:str)->str:
         t = b.get("text","") or ""
         if not t.strip(): out.append("​"); continue
         text = html.escape(t, quote=False)
-        # 簡單處理粗體/顏色提示
         for r in b.get("inlineStyleRanges") or []:
             style = r.get("style") or ""
             if style=="BOLD":
@@ -256,10 +288,22 @@ def render_draft(content_json:str)->str:
     while out and not out[-1].strip(): out.pop()
     return "\n\n".join(out) if out else "​"
 
-def guess_type(title:str, content:str)->str:
+def render_content(raw_content: str, rendered_flag: bool) -> str:
+    # 系統消息多為純文本（rendered=true）
+    if rendered_flag or (raw_content and not raw_content.strip().startswith("{")):
+        return html.escape(raw_content or "")
+    return render_draft(raw_content or "")
+
+def guess_type(title:str, content:str, domain:str="", typ_str:str="")->str:
+    d = (domain or "").lower()
+    t = (typ_str or "").lower()
+    if "attendance" in d or "attendance" in t: return "attendance"
+    if "leave" in d or "absence" in t or "leave" in t: return "leave"
+    if "evaluation" in d or "evaluation" in t: return "evaluation"
+    if "notice" in d: return "notice"
     z = (title or "") + "\n" + (content or "")
     if re.search(r"请假|請假|销假|銷假|审批|審批|批复|銷假", z): return "leave"
-    if re.search(r"考勤|出勤|签到|簽到|打卡|迟到|遲到|早退|缺勤|旷课|曠課|出勤统计|考勤记录", z): return "attendance"
+    if re.search(r"考勤|出勤|签到|簽到|打卡|迟到|遲到|早退|缺勤|旷课|曠課|出勤统计|考勤记录|考勤结果通知", z): return "attendance"
     if re.search(r"评价|評價|德育|操行|评语|評語|已发布评价|已發佈評價|測評|问卷|問卷", z): return "evaluation"
     if re.search(r"通知|公告|通告|已发布通知|已發佈通知", z): return "notice"
     return "message"
@@ -278,13 +322,13 @@ def fmt_time(s:str)->str:
 def send_item(tg:TG, it:Dict[str,Any])->bool:
     title = it.get("title") or ""
     content = it.get("content") or ""
-    body = render_draft(content)
+    body = render_content(content, bool(it.get("rendered")))
     sender = ""
     try:
         sr = it.get("sender_reflection") or {}
         sender = sr.get("name") or sr.get("realname") or ""
     except: pass
-    typ = guess_type(title, content)
+    typ = guess_type(title, content, str(it.get("domain") or ""), str(it.get("type") or ""))
     when = it.get("published_at") or it.get("created_at") or ""
     line_time = f"\n\n— 發布於 {fmt_time(when)}" if when else ""
     text = f"{header(sender,typ)}\n<b>{html.escape(title)}</b>\n\n{body}{line_time}"
@@ -303,21 +347,22 @@ def fetch_latest_per_type(cli:Seiue)->Dict[str,Optional[Dict[str,Any]]]:
     page=1
     while page<=MAX_PAGES:
         items = cli.list_inbox_page(page, per_page=20, include_cc_all=True)
-        if not items: break
-        for it in items:
-            typ = guess_type(it.get("title") or "", it.get("content") or "")
-            if typ not in want: typ="message"
-            cur = want[typ]
-            if cur is None or sid_key(it)>sid_key(cur):
-                want[typ]=it
+        nitems = cli.list_notice_page(page, per_page=20)
+        for src in (items, nitems):
+            if not src: 
+                continue
+            for it in src:
+                typ = guess_type(it.get("title") or "", it.get("content") or "", str(it.get("domain") or ""), str(it.get("type") or ""))
+                if typ not in want: typ="message"
+                cur = want[typ]
+                if cur is None or sid_key(it)>sid_key(cur):
+                    want[typ]=it
         if all(v is not None for v in want.values()): break
         page+=1
     return want
 
 def main():
-    # 單實例
     lock_singleton()
-    # 檢查環境
     for k in ("SEIUE_USERNAME","SEIUE_PASSWORD","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"):
         if not os.getenv(k): print(f"缺少 {k}", file=sys.stderr); sys.exit(2)
     tg = TG(os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"))
@@ -339,15 +384,13 @@ def main():
                 max_ts, max_id = t,i
             any_pushed = ok or any_pushed
             log(f"確認推送：{typ} sid={it.get('_sid')} ok={ok}")
-        # 設置水位（避免回灌歷史）
         if SKIP_HISTORY_ON_FIRST_RUN:
             if max_ts==0.0: max_ts = time.time()
             st["last_seen_ts"], st["last_seen_id"] = max_ts, max_id
         st["confirm_done"] = True
         save_state(st)
 
-    # 常駐輪詢：拉全部（含抄送），僅用水位做增量
-    log(f"開始輪詢，每 {POLL_SECONDS}s，頁數<= {MAX_PAGES}")
+    log(f"開始輪詢（收件箱+通知中心），每 {POLL_SECONDS}s，頁數<= {MAX_PAGES}")
     while True:
         try:
             last_ts = float(st.get("last_seen_ts",0.0)); last_id = int(st.get("last_seen_id",0))
@@ -355,22 +398,34 @@ def main():
             page=1
             while page<=MAX_PAGES:
                 items = cli.list_inbox_page(page, per_page=20, include_cc_all=True)
-                if not items: break
-                for it in items:
-                    t,i = sid_key(it)
-                    if last_ts and (t<last_ts or (t==last_ts and i<=last_id)): 
+                nitems = cli.list_notice_page(page, per_page=20)
+                any_items = False
+                for src in (items, nitems):
+                    if not src: 
                         continue
-                    new_items.append(it)
+                    any_items = True
+                    for it in src:
+                        t,i = sid_key(it)
+                        if last_ts and (t<last_ts or (t==last_ts and i<=last_id)):
+                            continue
+                        new_items.append(it)
+                if not any_items:
+                    break
                 page+=1
-            # 按時間/ID從舊到新
-            new_items.sort(key=sid_key)
+            # 去重、排序（舊→新）
+            seen=set(); uniq=[]
             for it in new_items:
+                sid=str(it.get("_sid"))
+                if sid in seen: continue
+                seen.add(sid); uniq.append(it)
+            uniq.sort(key=sid_key)
+            for it in uniq:
                 ok = send_item(tg, it)
                 t,i = sid_key(it)
                 if (t>last_ts) or (t==last_ts and i>last_id):
                     last_ts, last_id = t,i
                 log(f"推送 sid={it.get('_sid')} ok={ok}")
-            if new_items:
+            if uniq:
                 st["last_seen_ts"], st["last_seen_id"] = last_ts, last_id
                 save_state(st)
             time.sleep(POLL_SECONDS)
