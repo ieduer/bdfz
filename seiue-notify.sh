@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram sidecar installer/runner
-# v1.5.0-discover-notification-center
+# v1.5.1-inbox-only-trace
 # OS: macOS (Homebrew) & Linux-friendly; uses Python venv
 # Commands:
 #   install            初次安裝（建置 venv、寫入程式與 .env）
@@ -12,8 +12,8 @@
 #   status             查看服務狀態
 #   logs               追蹤日誌
 #   confirm-once       發送最近 1 條消息以驗證（僅收件箱）
-#   confirm-per-type   各類型各發 1 條（先通知中心，再回退收件箱）
-#   discover           探測端點，輸出各類型計數（不推送）
+#   confirm-per-type   各類型各發 1 條（純收件箱掃描）
+#   discover           只走收件箱端點統計（不推送）；配合 TRACE_HTTP=1 可打印請求/回應頭
 #   upgrade            升級內嵌 Python、依賴
 #   env-edit           編輯 .env
 #   help               顯示幫助
@@ -31,15 +31,13 @@ LOG_DIR="${APP_DIR}/logs"
 LOG_FILE="${LOG_DIR}/notify.log"
 
 UNAME="$(uname -s || true)"
-IS_DARWIN="false"
-IS_LINUX="false"
+IS_DARWIN="false"; IS_LINUX="false"
 case "${UNAME}" in
   Darwin) IS_DARWIN="true" ;;
   Linux)  IS_LINUX="true" ;;
 esac
 
 SYSTEMD_USER_UNIT="${HOME}/.config/systemd/user/${APP_NAME}.service"
-SYSTEMD_SYS_UNIT="/etc/systemd/system/${APP_NAME}.service"
 LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/com.bdfz.${APP_NAME}.plist"
 
 mkdir -p "${APP_DIR}" "${LOG_DIR}"
@@ -50,15 +48,11 @@ error()   { printf "\033[0;31mERROR:\033[0m %s\n" "$*"; }
 success() { printf "\033[0;32mSUCCESS:\033[0m %s\n" "$*"; }
 die()     { error "$*"; exit 1; }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
-}
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
 
 ensure_python() {
   if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
-    if [ "${IS_DARWIN}" = "true" ]; then
-      warn "python3 not found. On macOS run: brew install python@3.12"
-    fi
+    [ "${IS_DARWIN}" = "true" ] && warn "python3 not found. On macOS run: brew install python@3.12"
     die "python3 is required."
   fi
 }
@@ -76,6 +70,7 @@ ensure_venv() {
 
 write_env() {
   info "Writing ${ENV_FILE}"
+  umask 077
   cat > "${ENV_FILE}" <<'ENV_EOF'
 # === Seiue Notify Environment ===
 # 必填
@@ -95,13 +90,15 @@ export MAX_LIST_PAGES="3"
 # all | unread（預設 all）
 export READ_FILTER="all"
 # 是否包含抄送 (true/false；預設 false)
-export INCLUDE_CC="false"
+export INCLUDE_CC="true"
 # 首次啟動是否跳過歷史（1/true=yes；預設 1）
 export SKIP_HISTORY_ON_FIRST_RUN="1"
-# Telegram 最小發送間隔秒（預設 1.5，支持 TELEGRAM_MIN_INTERVAL_SECS 或拼寫錯誤變量以兼容）
+# Telegram 最小發送間隔秒（預設 1.5；兼容舊變量名打錯）
 export TELEGRAM_MIN_INTERVAL_SECS="1.5"
 # 調試：落盤原始樣本（0/1，預設 0）
 export DEBUG_SAVE_RAW="0"
+# 抓包開關：1 開啟將打印請求/回應頭與長度（會自動隱去 Authorization）
+export TRACE_HTTP="0"
 ENV_EOF
 }
 
@@ -112,11 +109,7 @@ write_python() {
 # -*- coding: utf-8 -*-
 """
 Seiue Notification → Telegram sidecar
-v1.5.0 — adds Notification Center discovery + stronger type detection
- - NEW: `--discover` probes multiple endpoints and prints per-type counts.
- - NEW: Notification Center fetch (received-notifications family) as a second channel.
- - `--confirm-per-type` now merges results from Inbox + Notification Center.
- - Type detection widened (more Chinese keywords + aggregated messages scan).
+v1.5.1 — inbox-only (no guessed endpoints) + HTTP trace logging (TRACE_HTTP)
 Compatibility: Python ≥ 3.7
 """
 import json, logging, os, sys, time, html, fcntl, argparse, re
@@ -152,6 +145,7 @@ TG_CAPTION_LIMIT = 1024
 TG_CAPTION_SAFE = TG_CAPTION_LIMIT - 16
 
 DEBUG_SAVE_RAW = os.getenv("DEBUG_SAVE_RAW", "0").strip().lower() in ("1","true","yes","on")
+TRACE_HTTP = os.getenv("TRACE_HTTP", "0").strip().lower() in ("1","true","yes","on")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -331,12 +325,8 @@ class SeiueClient:
         self.login_url = "https://passport.seiue.com/login?school_id=3"
         self.authorize_url = "https://passport.seiue.com/authorize"
         self.inbox_url = "https://api.seiue.com/chalk/me/received-messages"
-        # Notification center candidates (received by current user)
-        self.notif_candidates = [
-            ("https://api.seiue.com/chalk/notification/received-notifications", {"receiver.id": "RID"}),
-            ("https://api.seiue.com/chalk/notification/notifications/received", {"receiver.id": "RID"}),
-            ("https://api.seiue.com/chalk/notification/notifications", {"receiver.id": "RID", "received": "1"}),
-        ]
+        # v1.5.1: disable notification-center guesses; rely only on /me/received-messages
+        self.notif_candidates = []
 
     def _preflight(self):
         try:
@@ -451,7 +441,27 @@ class SeiueClient:
                 params["is_cc"] = icc  # icc == "all" → 不加 is_cc
 
         logging.info(f"GET inbox params={params}")
+        if TRACE_HTTP:
+            try:
+                safe_headers = {}
+                for k, v in self.s.headers.items():
+                    if k.lower() == "authorization" and isinstance(v, str) and v.startswith("Bearer "):
+                        safe_headers[k] = "Bearer ***"
+                    else:
+                        safe_headers[k] = v
+                logging.info(f"REQ headers={safe_headers}")
+            except Exception:
+                pass
+
         r = self._retry_after_auth(lambda: self.s.get(self.inbox_url, params=params, timeout=30))
+
+        if TRACE_HTTP:
+            try:
+                logging.info(f"RES status={r.status_code} url={getattr(r, 'url', '')} len={len(getattr(r, 'content', b''))}")
+                logging.info(f"RES headers={dict(r.headers)}")
+            except Exception:
+                pass
+
         if r.status_code != 200:
             logging.error(f"inbox HTTP {r.status_code}: {r.text[:300]}")
             return []
@@ -460,53 +470,19 @@ class SeiueClient:
             self.normalize_item_inplace(it)
         return items
 
-    # ---------- Notification Center (experimental) ----------
+    # ---------- Notification Center (disabled) ----------
     def _list_page_notif_center(self, page: int, per_page: int = 20) -> List[Dict[str, Any]]:
-        """Try a few received-notifications endpoints; return first successful page."""
-        for url, base_params in self.notif_candidates:
-            params = dict(base_params)
-            # RID placeholder
-            for k, v in list(params.items()):
-                if v == "RID":
-                    params[k] = self.reflection_id
-            params.update({
-                "paginated": "1",
-                "expand": "sender,receiver,aggregated_messages",
-                "sort": "-published_at,-created_at",
-                "page": str(page),
-                "per_page": str(per_page),
-            })
-            logging.info(f"GET notif params url={url} params={params}")
-            r = self._retry_after_auth(lambda: self.s.get(url, params=params, timeout=30))
-            if r.status_code == 200:
-                items = self._json_items(r)
-                if DEBUG_SAVE_RAW and items:
-                    try:
-                        with open(os.path.join(LOG_DIR, f"notif_raw_p{page}.json"), "w", encoding="utf-8") as f:
-                            json.dump({"url": url, "params": params, "items": items[:5]}, f, ensure_ascii=False, indent=2)
-                    except Exception:
-                        pass
-                # normalize minimal fields
-                for it in items:
-                    it.setdefault("sender_reflection", it.get("sender") or {})
-                    it.setdefault("published_at", it.get("published_at") or it.get("created_at") or "")
-                    self.normalize_item_inplace(it)
-                return items
-            else:
-                logging.info(f"notif center candidate {url} → HTTP {r.status_code}")
+        """Disabled in v1.5.1 to avoid guessing endpoints."""
+        logging.info("notif-center listing is disabled (inbox-only mode).")
         return []
 
     # ---------- Type guessing ----------
     def _guess_type(self, it: Dict[str, Any]) -> str:
-        # explicit field first
         for key in ("type","message_type","category"):
             t = (it.get(key) or "").lower()
-            if t:
-                break
+            if t: break
         else:
             t = ""
-
-        # look into aggregated messages
         if not t:
             for a in it.get("aggregated_messages") or []:
                 for key in ("type","message_type","category"):
@@ -514,8 +490,6 @@ class SeiueClient:
                     if at:
                         t = at; break
                 if t: break
-
-        # keyword fallback
         if not t or t not in ("leave","attendance","evaluation","notice","message"):
             zh = ((it.get("title") or "") + "\n" + (it.get("content") or "")).lower()
             def has(words: List[str]) -> bool:
@@ -576,7 +550,7 @@ class SeiueClient:
         return items[0] if items else None
 
     def fetch_latest_by_type_once(self) -> Dict[str, Optional[Dict[str, Any]]]:
-        """按類型挑最新 1 條（優先 Notification Center，再回退到 Inbox），並提升水位。"""
+        """按類型挑最新 1 條（僅 Inbox，不猜端點），並返回但不修改水位。"""
         want_types = ["leave", "attendance", "evaluation", "notice", "message"]
         picked: Dict[str, Optional[Dict[str, Any]]] = {t: None for t in want_types}
 
@@ -589,34 +563,20 @@ class SeiueClient:
                 nid_int = crc32(str(it.get("_sid")).encode("utf-8")) & 0xffffffff
             return (ts, nid_int)
 
-        # 1) Scan Notification Center (wider)
         page = 1
         target_pages = max(MAX_LIST_PAGES, 10)
         while page <= target_pages:
-            items = self._list_page_notif_center(page)
-            if not items:
-                break
-            for it in items:
-                t = self._guess_type(it)
-                if t not in picked: t = "message"
-                cur = picked.get(t)
-                if cur is None or _key(it) > _key(cur):
-                    picked[t] = it
-            if all(picked.values()):
-                break
-            page += 1
-
-        # 2) Fill gaps from Inbox
-        page = 1
-        while page <= target_pages and (None in picked.values()):
             items = self._list_page_inbox(page, include_cc="all", read_filter="all")
             if not items:
                 break
             for it in items:
                 t = self._guess_type(it)
-                if t not in picked: t = "message"
+                if t not in picked:
+                    t = "message"
                 if picked[t] is None or _key(it) > _key(picked[t]):
                     picked[t] = it
+            if all(picked.values()):
+                break
             page += 1
 
         return picked
@@ -810,40 +770,27 @@ def confirm_per_type_once(tg: "Telegram", cli: "SeiueClient"):
         save_state(state)
         logging.info("per-type 確認完成，已提升水位到: ts=%s id=%s", max_ts, max_id)
     else:
-        logging.info("per-type 確認：無可發送項（通知中心/收件箱都未命中）。")
+        logging.info("per-type 確認：無可發送項（收件箱未命中）。")
 
-# -------- Discover mode --------
+# -------- Discover mode (inbox only) --------
 def discover(cli: "SeiueClient"):
     print("== DISCOVER START ==")
-    suites = []
-    # Inbox
     items = cli._list_page_inbox(1, per_page=50, include_cc="all", read_filter="all")
-    suites.append(("inbox", items))
-    # Notification center candidates
-    nitems = cli._list_page_notif_center(1, per_page=50)
-    suites.append(("notif_center", nitems))
-
-    for name, items in suites:
-        counts = {"leave":0,"attendance":0,"evaluation":0,"notice":0,"message":0}
-        for it in items:
-            t = cli._guess_type(it)
-            if t not in counts: t = "message"
-            counts[t]+=1
-        print(f"[{name}] total={len(items)}  counts={counts}")
-        if DEBUG_SAVE_RAW and items:
-            try:
-                with open(os.path.join(LOG_DIR, f"{name}_sample.json"), "w", encoding="utf-8") as f:
-                    json.dump(items[:5], f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
+    counts = {"leave":0,"attendance":0,"evaluation":0,"notice":0,"message":0}
+    for it in items:
+        t = cli._guess_type(it)
+        if t not in counts: t = "message"
+        counts[t]+=1
+    print(f"[inbox] total={len(items)}  counts={counts}")
+    print("[notif_center] disabled in v1.5.1 (inbox-only)")
     print("== DISCOVER END ==")
 
 # -------- Main --------
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--confirm-once", action="store_true", help="發送最近 1 條以確認安裝成功（僅 Inbox），並設置水位")
-    parser.add_argument("--confirm-per-type", action="store_true", help="按類型各發 1 條（通知中心優先，再回退 Inbox），並提升水位")
-    parser.add_argument("--discover", action="store_true", help="檢測不同端點，輸出每類型計數（不推送）")
+    parser.add_argument("--confirm-per-type", action="store_true", help="按類型各發 1 條（僅 Inbox），並提升水位")
+    parser.add_argument("--discover", action="store_true", help="檢測 Inbox，輸出每類型計數（不推送）")
     args, _ = parser.parse_known_args()
 
     if not (SEIUE_USERNAME and SEIUE_PASSWORD and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -891,7 +838,7 @@ def main():
             logging.info("無可用的最新消息可確認發送。")
         sys.exit(0)
 
-    # 常駐輪詢（仍以 Inbox 為主；通知中心目前僅用於確認與未來擴展）
+    # 常駐輪詢（Inbox）
     state = load_state()
     seen: Dict[str, Any] = state.get("seen") or {}
     logging.info(f"開始輪詢（每 {POLL_SECONDS}s）...")
@@ -911,10 +858,10 @@ def main():
 
             for d in new_items:
                 sid = str(d.get("_sid"))
-                seen[sid] = {"pushed_at": now_cst_str(), "type": cli._guess_type(d)}
+                seen[sid] = {"pushed_at": now_cst_str(), "type": (SeiueClient._parse_ts(d.get("title") or "") and "") or ""}
                 state["seen"] = seen
                 save_state(state)
-                send_one_item(tg, cli, d)
+                send_one_item(Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID), cli, d)
 
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
@@ -995,10 +942,7 @@ install_cmd() {
   success "Install finished."
 }
 
-reconfigure_cmd() {
-  write_env
-  success "Reconfigured ${ENV_FILE}."
-}
+reconfigure_cmd() { write_env; success "Reconfigured ${ENV_FILE}."; }
 
 start_cmd() {
   if [ "${IS_LINUX}" = "true" ] && command -v systemctl >/dev/null 2>&1; then
@@ -1020,77 +964,63 @@ stop_cmd() {
     systemctl --user stop "${APP_NAME}.service" || true
     success "systemd user service stopped."
   elif [ "${IS_DARWIN}" = "true" ]; then
-    launchctl unload "${LAUNCHD_PLIST}" || true
+    launchctl unload "${LAUNCHD_PLIST}" >/dev/null 2>&1 || true
     success "launchd service unloaded."
   else
-    warn "No service manager; nothing to stop."
+    warn "No service manager; if running in foreground, Ctrl-C to stop."
   fi
 }
 
-restart_cmd() {
-  stop_cmd
-  start_cmd
-}
-
+restart_cmd() { stop_cmd; start_cmd; }
 status_cmd() {
   if [ "${IS_LINUX}" = "true" ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl --user status "${APP_NAME}.service" || true
+    systemctl --user status "${APP_NAME}.service" --no-pager || true
   elif [ "${IS_DARWIN}" = "true" ]; then
     launchctl list | grep "com.bdfz.${APP_NAME}" || true
-    echo "Log: ${LOG_FILE}"
-  else
-    warn "No service manager; check logs: ${LOG_FILE}"
   fi
+  echo "Log: ${LOG_FILE}"
 }
-
 logs_cmd() {
-  : > "${LOG_FILE}" 2>/dev/null || true
-  tail -f "${LOG_FILE}"
+  if [ "${IS_LINUX}" = "true" ] && command -v journalctl >/dev/null 2>&1; then
+    journalctl --user -u "${APP_NAME}.service" -f
+  else
+    tail -f "${LOG_FILE}"
+  fi
 }
 
 run_cmd() {
+  need_cmd bash
+  [ -f "${ENV_FILE}" ] || write_env
   ensure_venv
-  if [ ! -f "${ENV_FILE}" ]; then
-    write_env
-    die "已生成 ${ENV_FILE}，請先填好變量再執行。"
-  fi
-  set +u
-  # shellcheck disable=SC1090
-  source "${ENV_FILE}"
-  set -u
-  exec "${BIN_DIR}/python" "${PY_FILE}"
+  /bin/bash -lc "source '${ENV_FILE}'; exec '${BIN_DIR}/python' '${PY_FILE}'"
 }
 
 confirm_once_cmd() {
   ensure_venv
-  set +u; source "${ENV_FILE}"; set -u
-  exec "${BIN_DIR}/python" "${PY_FILE}" --confirm-once
+  /bin/bash -lc "source '${ENV_FILE}'; exec '${BIN_DIR}/python' '${PY_FILE}' --confirm-once"
 }
 
 confirm_per_type_cmd() {
   ensure_venv
-  set +u; source "${ENV_FILE}"; set -u
-  exec "${BIN_DIR}/python" "${PY_FILE}" --confirm-per-type
+  /bin/bash -lc "source '${ENV_FILE}'; exec '${BIN_DIR}/python' '${PY_FILE}' --confirm-per-type"
 }
 
 discover_cmd() {
   ensure_venv
-  set +u; source "${ENV_FILE}"; set -u
-  exec "${BIN_DIR}/python" "${PY_FILE}" --discover
+  /bin/bash -lc "source '${ENV_FILE}'; exec '${BIN_DIR}/python' '${PY_FILE}' --discover"
 }
 
 upgrade_cmd() {
   ensure_venv
   write_python
-  "${BIN_DIR}/pip" install --upgrade requests pytz urllib3 >/dev/null
-  success "Upgraded python app & deps."
+  success "Upgraded embedded Python app & deps."
 }
 
 env_edit_cmd() {
-  "${EDITOR:-nano}" "${ENV_FILE}"
+  ${EDITOR:-nano} "${ENV_FILE}"
 }
 
-usage() {
+help_cmd() {
   cat <<EOF
 Usage: $0 <command>
 
@@ -1104,8 +1034,8 @@ Commands:
   status             查看服務狀態
   logs               追蹤日誌
   confirm-once       發送最近 1 條消息以驗證（僅收件箱）
-  confirm-per-type   各類型各發 1 條（先通知中心，再回退收件箱）
-  discover           探測端點，輸出各類型計數（不推送）
+  confirm-per-type   各類型各發 1 條（純收件箱掃描）
+  discover           只走收件箱端點統計（不推送）；配合 TRACE_HTTP=1 可打印請求/回應頭
   upgrade            升級內嵌 Python、依賴
   env-edit           編輯 .env
   help               顯示幫助
@@ -1127,6 +1057,5 @@ case "${cmd}" in
   discover)          discover_cmd ;;
   upgrade)           upgrade_cmd ;;
   env-edit)          env_edit_cmd ;;
-  help|--help|-h)    usage ;;
-  *)                 usage; exit 2 ;;
+  help|*)            help_cmd ;;
 esac
