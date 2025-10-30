@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Seiue Notification → Telegram - One-click Installer (Sidecar) v1.3.0-inbox-twohop
+# Seiue Notification → Telegram - One-click Installer (Sidecar)
+# v1.4.0-inbox-probe
 # Target: Linux VPS (Ubuntu/Debian/CentOS 等)，macOS 亦可
-# 行為：安裝到 ~/.seiue-notify ，建立 venv、生成 Python 通知輪詢器（收件箱兩段式：read-statuses → received-notifications）、推送到 Telegram
+# 行為：安裝到 ~/.seiue-notify ，建立 venv、生成 Python 通知輪詢器（收件箱兩段式：自動探測第一跳 → received-notifications），推送到 Telegram
 
 set -euo pipefail
 
@@ -153,25 +154,26 @@ setup_layout() {
   success "虛擬環境與依賴就緒。"
 }
 
-# ----------------- 4) Write Python notifier (Inbox two-hop) -----------------
+# ----------------- 4) Write Python notifier (Inbox two-hop with probe) -----------------
 write_python() {
-  info "生成 Python 通知輪詢器（inbox-twohop）..."
+  info "生成 Python 通知輪詢器（inbox-twohop + route-probe）..."
   local TMP="$(mktemp)"
   cat > "$TMP" <<'EOF_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Seiue Notification → Telegram sidecar (Inbox two-hop)
-- 正確的收件箱拉取流程（避免 403）：
-  1) 用 /chalk/notification/notification-read-statuses?receiver.reflection_id=<me>
-     分頁拉取「發給我」的通知 ID 列表（並可帶 expand=notification）。
-  2) 用 /chalk/notification/received-notifications?id_in=...&expand=read_statuses,receiver
-     批量換取詳細內容（含 DraftJS content）。
-- 用 created_at 水位線控制增量；401/403 自動重登（帶 Origin/Referer）。
-- Telegram: HTML 文字 + 圖片 sendPhoto + 檔案 sendDocument。
+Seiue Notification → Telegram sidecar (Inbox two-hop + route probe)
+- 第一跳：自動探測「我的收件箱」可用端點（依序）
+    A) /chalk/notification/read-statuses
+    B) /chalk/notification/notification-read-statuses
+    C) /chalk/notification/received-notifications?receiver.reflection_id=<ME>  （部分集群支持列表）
+  解析出通知 ID 後
+- 第二跳：/chalk/notification/received-notifications?id_in=...&expand=read_statuses,receiver 取詳情
+- 用 created_at 水位線控制增量；401/403 自動重登；404 會降級切換路由
+- Telegram: HTML 文字 + 圖片 sendPhoto + 檔案 sendDocument
 """
 import json, logging, os, sys, time, html
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 
 import requests, pytz
@@ -194,6 +196,7 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 STATE_FILE = os.path.join(BASE_DIR, "notify_state.json")
 LOG_FILE = os.path.join(LOG_DIR, "notify.log")
+ROUTE_CACHE_FILE = os.path.join(BASE_DIR, "route_cache.json")
 
 BEIJING_TZ = pytz.timezone("Asia/Shanghai")
 
@@ -225,6 +228,22 @@ def save_state(state: Dict[str, Any]) -> None:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.warning(f"Failed to save state: {e}")
+
+def load_route_cache() -> Dict[str, Any]:
+    if not os.path.exists(ROUTE_CACHE_FILE):
+        return {}
+    try:
+        with open(ROUTE_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_route_cache(d: Dict[str, Any]) -> None:
+    try:
+        with open(ROUTE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning(f"Failed to save route cache: {e}")
 
 # -------- Telegram --------
 class Telegram:
@@ -286,8 +305,14 @@ class SeiueClient:
         self.bearer = None; self.reflection_id = None
         self.login_url = "https://passport.seiue.com/login?school_id=3"
         self.authorize_url = "https://passport.seiue.com/authorize"
-        self.read_status_url = "https://api.seiue.com/chalk/notification/notification-read-statuses"
-        self.received_url    = "https://api.seiue.com/chalk/notification/received-notifications"
+        # 第一跳候選
+        self.candidates = [
+            {"type": "read-statuses", "url": "https://api.seiue.com/chalk/notification/read-statuses"},
+            {"type": "read-statuses-legacy", "url": "https://api.seiue.com/chalk/notification/notification-read-statuses"},
+            {"type": "received-list", "url": "https://api.seiue.com/chalk/notification/received-notifications"},
+        ]
+        self.inbox_route: Optional[Dict[str, str]] = None
+        self.received_url = "https://api.seiue.com/chalk/notification/received-notifications"
 
     def _preflight(self):
         try: self.s.get(self.login_url, timeout=15)
@@ -340,35 +365,130 @@ class SeiueClient:
             except Exception: pass
         return 0.0
 
+    def _json_items(self, r: requests.Response) -> List[Dict[str, Any]]:
+        try:
+            data = r.json()
+            if isinstance(data, dict):
+                if "items" in data and isinstance(data["items"], list):
+                    return data["items"]
+                # 某些返回就是列表字段名不同，兜底
+                return []
+            elif isinstance(data, list):
+                return data
+            return []
+        except Exception as e:
+            logging.error(f"JSON parse error: {e}")
+            return []
+
+    def probe_inbox_route(self) -> Optional[Dict[str, str]]:
+        # 優先使用緩存
+        cache = load_route_cache()
+        cached = cache.get("inbox_route")
+        if cached:
+            logging.info(f"probe: using cached inbox route {cached}")
+            return cached
+
+        test_params_common = {
+            "paginated": "1",
+            "order": "-created_at",
+            "page": "1",
+        }
+        for cand in self.candidates:
+            rtype = cand["type"]; url = cand["url"]
+            if rtype.startswith("read-statuses"):
+                params = dict(test_params_common, **{
+                    "receiver.reflection_id": self.reflection_id,
+                    "expand": "notification",
+                })
+            elif rtype == "received-list":
+                params = dict(test_params_common, **{
+                    "receiver.reflection_id": self.reflection_id,
+                    "expand": "receiver",
+                })
+            else:
+                params = dict(test_params_common)
+
+            r = self._retry_after_auth(lambda: self.s.get(url, params=params, timeout=30))
+            sc = r.status_code
+            if sc == 200:
+                items = self._json_items(r)
+                # 判斷能否提取 ID
+                ok = False
+                for it in items[:3]:
+                    if any(k in it for k in ("notification_id","notification","id")):
+                        ok = True; break
+                if ok:
+                    self.inbox_route = cand
+                    cache["inbox_route"] = cand
+                    save_route_cache(cache)
+                    logging.info(f"probe: selected {cand}")
+                    return cand
+                else:
+                    logging.info(f"probe: {url} 200 but structure not match, continue")
+            elif sc in (400,404):
+                logging.info(f"probe: {url} -> {sc}, try next")
+            elif sc == 403:
+                logging.info(f"probe: {url} -> 403 (permission), try next")
+            else:
+                logging.info(f"probe: {url} -> {sc}, try next")
+
+        logging.error("probe: no inbox route matched.")
+        return None
+
     def list_my_received_ids(self, page: int) -> List[str]:
-        """從 read-statuses 拉取與我相關的通知 ID（發給我）"""
+        """使用已探測的第一跳端點，拉取第 page 頁與我相關的通知 ID"""
+        if not self.inbox_route:
+            if not self.probe_inbox_route():
+                return []
+        rtype = self.inbox_route["type"]; url = self.inbox_route["url"]
         params = {
             "paginated": "1",
             "order": "-created_at",
             "page": str(page),
-            "receiver.reflection_id": self.reflection_id,
-            "expand": "notification",
         }
-        r = self._retry_after_auth(lambda: self.s.get(self.read_status_url, params=params, timeout=30))
+        if rtype.startswith("read-statuses"):
+            params.update({
+                "receiver.reflection_id": self.reflection_id,
+                "expand": "notification",
+            })
+        elif rtype == "received-list":
+            params.update({
+                "receiver.reflection_id": self.reflection_id,
+                "expand": "receiver",
+            })
+
+        r = self._retry_after_auth(lambda: self.s.get(url, params=params, timeout=30))
+        if r.status_code == 404:
+            # 路由失效，清掉緩存，重新探測一次
+            logging.warning(f"inbox route 404 for {url}, re-probe")
+            cache = load_route_cache(); cache.pop("inbox_route", None); save_route_cache(cache)
+            self.inbox_route = None
+            if not self.probe_inbox_route():
+                return []
+            return self.list_my_received_ids(page)
+
         if r.status_code != 200:
-            logging.error(f"read-statuses HTTP {r.status_code}: {r.text[:300]}")
+            logging.error(f"inbox list HTTP {r.status_code}: {r.text[:300]} (page={page})")
             return []
-        try:
-            data = r.json()
-            items = data["items"] if isinstance(data, dict) and "items" in data else (data if isinstance(data, list) else [])
-        except Exception as e:
-            logging.error(f"read-statuses JSON parse error: {e}")
-            return []
+
+        items = self._json_items(r)
         ids: List[str] = []
         for it in items:
-            nid = it.get("notification_id") or (it.get("notification", {}) or {}).get("id")
-            if nid: ids.append(str(nid))
+            # 三種可能來源
+            nid = it.get("notification_id")
+            if not nid:
+                nobj = it.get("notification") or {}
+                nid = nobj.get("id")
+            if not nid and "id" in it and rtype == "received-list":
+                nid = it.get("id")
+            if nid:
+                ids.append(str(nid))
         return ids
 
     def list_notifications_incremental(self) -> List[Dict[str, Any]]:
         """
         兩段式收件箱：
-          - 先從 read-statuses 取 ID（限定我）。
+          - 先從「已探測」端點取 ID（限定我）。
           - 再用 received-notifications 批量取詳情。
         用 created_at 水位線截斷，減少重複推送。
         """
@@ -383,7 +503,8 @@ class SeiueClient:
         page = 1
         while page <= MAX_LIST_PAGES:
             ids = self.list_my_received_ids(page)
-            if not ids: break
+            if not ids:
+                break
             all_ids.extend(ids)
             page += 1
         if not all_ids:
@@ -409,12 +530,7 @@ class SeiueClient:
             if r.status_code != 200:
                 logging.error(f"received-notifications HTTP {r.status_code}: {r.text[:300]}")
                 continue
-            try:
-                data = r.json()
-                items = data["items"] if isinstance(data, dict) and "items" in data else (data if isinstance(data, list) else [])
-            except Exception as e:
-                logging.error(f"received-notifications JSON parse error: {e}")
-                items = []
+            items = self._json_items(r)
 
             for it in items:
                 created = it.get("created_at") or it.get("updated_at") or ""
@@ -602,7 +718,7 @@ EOF_PY
   # 寫入並設置權限
   install -m 0644 -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$TMP" "${INSTALL_DIR}/${PY_SCRIPT}"
   rm -f "$TMP"
-  success "Python 輪詢器（inbox-twohop）已生成。"
+  success "Python 輪詢器（inbox-twohop + probe）已生成。"
 }
 
 # ----------------- 5) Write .env and runner -----------------
@@ -619,7 +735,7 @@ TELEGRAM_BOT_TOKEN=${TG_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TG_CHAT_ID}
 
 NOTIFY_POLL_SECONDS=${POLL}
-# 少量翻頁（通常 3 頁足夠）
+# 掃描頁數（收件箱第一跳最大頁；可視需求調大）
 MAX_LIST_PAGES=3
 EOF
     run_as_user chmod 600 "${INSTALL_DIR}/${ENV_FILE}"
@@ -655,7 +771,7 @@ maybe_install_systemd() {
   local SVC="/etc/systemd/system/seiue-notify.service"
   cat > "$SVC" <<EOF
 [Unit]
-Description=Seiue Notification to Telegram Sidecar (Inbox two-hop)
+Description=Seiue Notification to Telegram Sidecar (Inbox two-hop + probe)
 After=network-online.target
 Wants=network-online.target
 
@@ -697,7 +813,7 @@ main() {
   fi
   trap 'rmdir "$LOCKDIR"' EXIT
 
-  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.3.0-inbox-twohop ---${C_RESET}"
+  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.4.0-inbox-probe ---${C_RESET}"
   check_environment
   mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
 
