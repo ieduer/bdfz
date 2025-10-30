@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - One-click Installer (Sidecar)
-# v1.5.0-me-inbox
-# Target: Linux VPS (Ubuntu/Debian/CentOS 等)，macOS 亦可
-# 行為：安裝到 ~/.seiue-notify ，建立 venv、生成 Python 通知輪詢器
-#       直接調用 /chalk/me/received-messages（owner.id=<ME>），推送到 Telegram
+# v1.7.0-me-inbox-dedupe
+# - Singleton lock to prevent duplicate sending
+# - Startup watermark to skip history
+# - (ts,id) watermark to avoid same-second duplicates
+# - At-most-once: mark seen before sending
 
 set -euo pipefail
 
@@ -14,7 +15,7 @@ success() { echo -e "${C_GREEN}SUCCESS:${C_RESET} $1"; }
 warn()    { echo -e "${C_YELLOW}WARNING:${C_RESET} $1"; }
 error()   { echo -e "${C_RED}ERROR:${C_RESET} $1" >&2; }
 
-# ---- root escalate（僅用於安裝依賴；程式本身以一般使用者身份跑）----
+# ---- root escalate for install only ----
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   echo "此腳本需要 root 權限以安裝依賴/寫檔，正在使用 sudo 提權..."
   exec sudo -E bash "$0" "$@"
@@ -97,16 +98,16 @@ collect_inputs() {
   info "請輸入必要配置（僅用於生成 ${ENV_FILE}，權限 600 保存）。"
 
   read -p "Seiue 用戶名: " SEIUE_USERNAME
-  if [ -z "$SEIUE_USERNAME" ]; then error "用戶名不能為空"; exit 1; fi
+  [ -z "$SEIUE_USERNAME" ] && { error "用戶名不能為空"; exit 1; }
 
   read -s -p "Seiue 密碼: " SEIUE_PASSWORD; echo
-  if [ -z "$SEIUE_PASSWORD" ]; then error "密碼不能為空"; exit 1; fi
+  [ -z "$SEIUE_PASSWORD" ] && { error "密碼不能為空"; exit 1; }
 
   read -p "Telegram Bot Token（如：123456:ABC...）: " TG_BOT_TOKEN
-  if [ -z "$TG_BOT_TOKEN" ]; then error "Bot Token 不能為空"; exit 1; fi
+  [ -z "$TG_BOT_TOKEN" ] && { error "Bot Token 不能為空"; exit 1; }
 
   read -p "Telegram Chat ID（群/頻道/個人）: " TG_CHAT_ID
-  if [ -z "$TG_CHAT_ID" ]; then error "Chat ID 不能為空"; exit 1; fi
+  [ -z "$TG_CHAT_ID" ] && { error "Chat ID 不能為空"; exit 1; }
 
   read -p "輪詢間隔秒數（預設 90）: " POLL
   POLL="${POLL:-90}"
@@ -155,22 +156,18 @@ setup_layout() {
   success "虛擬環境與依賴就緒。"
 }
 
-# ----------------- 4) Write Python notifier (me/received-messages) -----------------
+# ----------------- 4) Write Python notifier -----------------
 write_python() {
-  info "生成 Python 通知輪詢器（me/received-messages 單跳）..."
+  info "生成 Python 通知輪詢器（me/received-messages 單跳 + 去重強化）..."
   local TMP="$(mktemp)"
   cat > "$TMP" <<'EOF_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Seiue Notification → Telegram sidecar (me/received-messages, single-hop)
-- 直接調用 /chalk/me/received-messages 拉取「發給我」的訊息（owner.id = <ME>）
-- 參數：expand=sender_reflection，sort=-published_at,-created_at
-- 可選：READ_FILTER=all|unread；INCLUDE_CC=true|false
-- 401/403 自動重登；用 published_at/created_at 水位線做增量
-- Telegram: sendMessage / sendPhoto / sendDocument
+v1.7.0 — singleton lock, startup watermark, (ts,id) dedupe, at-most-once
 """
-import json, logging, os, sys, time, html
+import json, logging, os, sys, time, html, fcntl
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 
@@ -191,6 +188,18 @@ MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES", "3") or "3"), 20))
 READ_FILTER = os.getenv("READ_FILTER", "all").strip().lower()   # all | unread
 INCLUDE_CC = os.getenv("INCLUDE_CC", "false").strip().lower() in ("1","true","yes","on")
 
+# 控制是否啟動時跳過歷史（只從當前時間/最新一條之後開始收）
+SKIP_HISTORY_ON_FIRST_RUN = os.getenv("SKIP_HISTORY_ON_FIRST_RUN", "1").strip().lower() in ("1","true","yes","on")
+# 簡單單例鎖：避免多進程同時運行導致重複推送
+SINGLETON_LOCK_FILE = ".notify.lock"
+
+# Telegram 控制
+TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS", "1.2"))
+TG_MSG_LIMIT = 4096
+TG_MSG_SAFE = TG_MSG_LIMIT - 64
+TG_CAPTION_LIMIT = 1024
+TG_CAPTION_SAFE = TG_CAPTION_LIMIT - 16
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -206,6 +215,18 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8", mode="a"), logging.StreamHandler(sys.stdout)],
 )
 
+def acquire_singleton_lock_or_exit(base_dir: str):
+    lock_path = os.path.join(base_dir, SINGLETON_LOCK_FILE)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        return fd  # keep fd open to hold the lock
+    except OSError:
+        logging.error("另一個實例正在運行，為避免重複，本實例退出。")
+        sys.exit(0)
+
 def now_cst_str() -> str:
     return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -214,17 +235,25 @@ def escape_html(s: str) -> str:
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
-        return {"seen": {}, "last_seen_ts": None}
+        return {"seen": {}, "last_seen_ts": None, "last_seen_id": 0}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            st = json.load(f)
+            st.setdefault("seen", {})
+            st.setdefault("last_seen_ts", None)
+            st.setdefault("last_seen_id", 0)
+            return st
     except Exception:
-        return {"seen": {}, "last_seen_ts": None}
+        return {"seen": {}, "last_seen_ts": None, "last_seen_id": 0}
 
 def save_state(state: Dict[str, Any]) -> None:
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
     except Exception as e:
         logging.warning(f"Failed to save state: {e}")
 
@@ -234,43 +263,101 @@ class Telegram:
         self.base = f"https://api.telegram.org/bot{token}"
         self.chat_id = chat_id
         self.s = requests.Session()
-        retries = Retry(total=4, backoff_factor=1.5, status_forcelist=(429,500,502,503,504))
+        retries = Retry(total=3, backoff_factor=1.2, status_forcelist=(429,500,502,503,504))
         self.s.mount("https://", HTTPAdapter(max_retries=retries))
+        self._last_send_ts = 0.0
+
+    def _honor_min_interval(self):
+        delta = time.time() - self._last_send_ts
+        if delta < TELEGRAM_MIN_INTERVAL:
+            time.sleep(TELEGRAM_MIN_INTERVAL - delta)
+
+    def _post_with_retry(self, endpoint: str, data: dict, files: Optional[dict] = None, label: str = "sendMessage", timeout: int = 60) -> bool:
+        max_attempts = 6
+        backoff = 1.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._honor_min_interval()
+                url = f"{self.base}/{endpoint}"
+                r = self.s.post(url, data=data, files=files, timeout=timeout)
+                self._last_send_ts = time.time()
+                if r.status_code == 200:
+                    return True
+                if r.status_code == 429:
+                    retry_after = 3
+                    try:
+                        j = r.json()
+                        retry_after = int(j.get("parameters", {}).get("retry_after", retry_after))
+                    except Exception:
+                        pass
+                    retry_after = max(1, min(retry_after + 1, 60))
+                    logging.warning(f"{label} 429: retry after {retry_after}s (attempt {attempt}/{max_attempts})")
+                    time.sleep(retry_after); continue
+                if 500 <= r.status_code < 600:
+                    logging.warning(f"{label} {r.status_code}: {r.text[:200]} (attempt {attempt}/{max_attempts})")
+                    time.sleep(backoff); backoff = min(backoff * 2, 15); continue
+                logging.warning(f"{label} failed {r.status_code}: {r.text[:300]}"); return False
+            except requests.RequestException as e:
+                logging.warning(f"{label} network error: {e} (attempt {attempt}/{max_attempts})")
+                time.sleep(backoff); backoff = min(backoff * 2, 15)
+        logging.warning(f"{label} failed after {max_attempts} attempts."); return False
 
     def send_message(self, html_text: str) -> bool:
-        try:
-            r = self.s.post(f"{self.base}/sendMessage", data={
-                "chat_id": self.chat_id, "text": html_text, "parse_mode": "HTML", "disable_web_page_preview": True
-            }, timeout=30)
-            if r.status_code == 200: return True
-            logging.warning(f"sendMessage failed {r.status_code}: {r.text[:300]}")
-        except requests.RequestException as e:
-            logging.warning(f"sendMessage network error: {e}")
-        return False
+        return self._post_with_retry("sendMessage", {
+            "chat_id": self.chat_id, "text": html_text, "parse_mode": "HTML", "disable_web_page_preview": True
+        }, None, "sendMessage", timeout=30)
 
     def send_photo_bytes(self, data: bytes, caption_html: str = "") -> bool:
+        if caption_html and len(caption_html) > TG_CAPTION_LIMIT:
+            caption_html = caption_html[:TG_CAPTION_SAFE] + "…"
         files = {"photo": ("image.jpg", data)}
-        try:
-            r = self.s.post(f"{self.base}/sendPhoto", data={
-                "chat_id": self.chat_id, "caption": caption_html, "parse_mode": "HTML",
-            }, files=files, timeout=60)
-            if r.status_code == 200: return True
-            logging.warning(f"sendPhoto failed {r.status_code}: {r.text[:300]}")
-        except requests.RequestException as e:
-            logging.warning(f"sendPhoto network error: {e}")
-        return False
+        return self._post_with_retry("sendPhoto", {
+            "chat_id": self.chat_id, "caption": caption_html, "parse_mode": "HTML",
+        }, files, "sendPhoto", timeout=90)
 
     def send_document_bytes(self, data: bytes, filename: str, caption_html: str = "") -> bool:
+        if caption_html and len(caption_html) > TG_CAPTION_LIMIT:
+            caption_html = caption_html[:TG_CAPTION_SAFE] + "…"
         files = {"document": (filename, data)}
-        try:
-            r = self.s.post(f"{self.base}/sendDocument", data={
-                "chat_id": self.chat_id, "caption": caption_html, "parse_mode": "HTML",
-            }, files=files, timeout=120)
-            if r.status_code == 200: return True
-            logging.warning(f"sendDocument failed {r.status_code}: {r.text[:300]}")
-        except requests.RequestException as e:
-            logging.warning(f"sendDocument network error: {e}")
-        return False
+        return self._post_with_retry("sendDocument", {
+            "chat_id": self.chat_id, "caption": caption_html, "parse_mode": "HTML",
+        }, files, "sendDocument", timeout=180)
+
+    def send_message_safely(self, html_text: str) -> bool:
+        if len(html_text) <= TG_MSG_LIMIT:
+            return self.send_message(html_text)
+        parts: List[str] = []
+        def split_para(s: str) -> List[str]:
+            return [p for p in s.split("\n\n")]
+        buf = ""
+        for para in split_para(html_text):
+            add = (("\n\n" if buf else "") + para)
+            if len(add) > TG_MSG_SAFE:
+                lines = para.split("\n")
+                for ln in lines:
+                    tentative = (buf + ("\n" if buf else "") + ln)
+                    if len(tentative) > TG_MSG_SAFE:
+                        if buf:
+                            parts.append(buf); buf = ln
+                        else:
+                            start = 0
+                            while start < len(ln):
+                                parts.append(ln[start:start+TG_MSG_SAFE]); start += TG_MSG_SAFE
+                            buf = ""
+                    else:
+                        buf = tentative
+            else:
+                tentative = buf + add
+                if len(tentative) > TG_MSG_SAFE:
+                    parts.append(buf); buf = para
+                else:
+                    buf = tentative
+        if buf: parts.append(buf)
+        ok = True; total = len(parts)
+        for i, chunk in enumerate(parts, 1):
+            head = f"(Part {i}/{total})\n"
+            ok = self.send_message(head + chunk) and ok
+        return ok
 
 # -------- Seiue API --------
 class SeiueClient:
@@ -303,7 +390,6 @@ class SeiueClient:
                 timeout=30, allow_redirects=True)
         except requests.RequestException as e:
             logging.error(f"Login network error: {e}"); return False
-
         try:
             a = self.s.post(self.authorize_url,
                 headers={"Content-Type":"application/x-www-form-urlencoded","X-Requested-With":"XMLHttpRequest","Origin":"https://chalk-c3.seiue.com","Referer":"https://chalk-c3.seiue.com/"},
@@ -313,11 +399,9 @@ class SeiueClient:
             data = a.json()
         except Exception as e:
             logging.error(f"Authorize failed: {e}"); return False
-
         token = data.get("access_token"); ref = data.get("active_reflection_id")
         if not token or not ref:
             logging.error("Authorize missing token or reflection id."); return False
-
         self.bearer = token; self.reflection_id = str(ref)
         self.s.headers.update({
             "Authorization": f"Bearer {self.bearer}",
@@ -356,13 +440,12 @@ class SeiueClient:
             return []
 
     def list_my_received_incremental(self) -> List[Dict[str, Any]]:
-        """
-        直接列出「發給我」的訊息，按時間增量過濾。
-        """
         state = load_state()
-        last_ts = state.get("last_seen_ts") or 0.0
+        last_ts = float(state.get("last_seen_ts") or 0.0)
+        last_id = int(state.get("last_seen_id") or 0)
         results: List[Dict[str, Any]] = []
         newest_ts = last_ts
+        newest_id = last_id
 
         params_base = {
             "expand": "sender_reflection",
@@ -394,23 +477,32 @@ class SeiueClient:
             for it in items:
                 ts_str = it.get("published_at") or it.get("created_at") or ""
                 ts = self._parse_ts(ts_str) if ts_str else 0.0
-                if last_ts and ts <= last_ts:
-                    continue
+                nid_raw = it.get("id")
+                try:
+                    nid_int = int(str(nid_raw))
+                except Exception:
+                    nid_int = 0
+
+                if last_ts:
+                    if ts < last_ts or (ts == last_ts and nid_int <= last_id):
+                        continue
+
                 results.append(it)
-                if ts > newest_ts: newest_ts = ts
+                if (ts > newest_ts) or (ts == newest_ts and nid_int > newest_id):
+                    newest_ts = ts
+                    newest_id = nid_int
 
             page += 1
 
-        if newest_ts and newest_ts > last_ts:
+        if newest_ts and ((newest_ts > last_ts) or (newest_ts == last_ts and newest_id > last_id)):
             state["last_seen_ts"] = newest_ts
+            state["last_seen_id"] = newest_id
             save_state(state)
 
         logging.info(f"list: fetched={len(results)} pages_scanned={min(page-1, MAX_LIST_PAGES)}")
         return results
 
-# -------- DraftJS renderer --------
 def render_draftjs_content(content_json: str):
-    """解析 Draft.js，返回 (html_text, attachments[{type:'image'|'file',name,size,url}])"""
     try:
         raw = json.loads(content_json or "{}")
     except Exception:
@@ -423,6 +515,7 @@ def render_draftjs_content(content_json: str):
         try: entities[int(k)] = v
         except Exception: pass
 
+    from typing import List, Dict, Any
     lines: List[str] = []
     attachments: List[Dict[str, Any]] = []
 
@@ -498,16 +591,55 @@ def download_with_auth(cli: "SeiueClient", url: str) -> Tuple[bytes, str]:
         logging.error(f"download failed: {e}")
         return b"", "attachment.bin"
 
+def ensure_startup_watermark(cli: "SeiueClient"):
+    state = load_state()
+    if state.get("last_seen_ts"):
+        return
+    if not SKIP_HISTORY_ON_FIRST_RUN:
+        return
+    newest_ts = 0.0
+    try:
+        params = {
+            "expand": "sender_reflection",
+            "owner.id": cli.reflection_id or "",
+            "type": "message",
+            "paginated": "1",
+            "sort": "-published_at,-created_at",
+            "page": "1",
+            "per_page": "1",
+        }
+        r = cli._retry_after_auth(lambda: cli.s.get(cli.inbox_url, params=params, timeout=30))
+        if r.status_code == 200:
+            data = r.json()
+            items = data.get("items") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            if items:
+                it0 = items[0]
+                ts_str = it0.get("published_at") or it0.get("created_at") or ""
+                newest_ts = SeiueClient._parse_ts(ts_str) if ts_str else 0.0
+    except Exception as e:
+        logging.warning(f"無法獲取啟動水位（使用當前時間）: {e}")
+    if not newest_ts:
+        newest_ts = time.time()
+    state["last_seen_ts"] = newest_ts
+    state.setdefault("last_seen_id", 0)
+    save_state(state)
+    logging.info("啟動已設置水位（跳過歷史），last_seen_ts=%s", newest_ts)
+
 # -------- Main --------
 def main():
     if not (SEIUE_USERNAME and SEIUE_PASSWORD and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("缺少環境變量：SEIUE_USERNAME / SEIUE_PASSWORD / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID", file=sys.stderr)
         sys.exit(1)
 
+    # 單例鎖，避免並發
+    lock_fd = acquire_singleton_lock_or_exit(BASE_DIR)
+
     tg = Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     cli = SeiueClient(SEIUE_USERNAME, SEIUE_PASSWORD)
     if not cli.login():
         print("Seiue 登入失敗。", file=sys.stderr); sys.exit(2)
+
+    ensure_startup_watermark(cli)
 
     state = load_state()
     seen: Dict[str, Any] = state.get("seen") or {}
@@ -530,7 +662,13 @@ def main():
                 time_line = f"— 發布於 {created_fmt}" if created_fmt else ""
 
                 main_msg = f"{header}\n<b>{escape_html(title)}</b>\n\n{html_body}\n\n{time_line}"
-                tg.send_message(main_msg)
+
+                # 先標記為已處理（至多一次）
+                seen[nid] = {"pushed_at": now_cst_str()}
+                state["seen"] = seen
+                save_state(state)
+
+                tg.send_message_safely(main_msg)
 
                 images = [a for a in atts if a.get("type") == "image" and a.get("url")]
                 files  = [a for a in atts if a.get("type") == "file" and a.get("url")]
@@ -545,11 +683,8 @@ def main():
                         cap = f"📎 <b>{escape_html(a.get('name') or fname)}</b>"
                         size = a.get("size")
                         if size: cap += f"（{escape_html(size)}）"
+                        if len(cap) > TG_CAPTION_LIMIT: cap = cap[:TG_CAPTION_SAFE] + "…"
                         tg.send_document_bytes(data, filename=(a.get("name") or fname), caption_html=cap)
-
-                seen[nid] = {"pushed_at": now_cst_str()}
-                state["seen"] = seen
-                save_state(state)
 
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
@@ -562,10 +697,9 @@ if __name__ == "__main__":
     main()
 EOF_PY
 
-  # 寫入並設置權限
   install -m 0644 -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$TMP" "${INSTALL_DIR}/${PY_SCRIPT}"
   rm -f "$TMP"
-  success "Python 輪詢器（me/received-messages 單跳）已生成。"
+  success "Python 輪詢器（去重強化版）已生成。"
 }
 
 # ----------------- 5) Write .env and runner -----------------
@@ -581,6 +715,7 @@ X_ROLE=teacher
 TELEGRAM_BOT_TOKEN=${TG_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TG_CHAT_ID}
 
+# 主輪詢間隔（秒）
 NOTIFY_POLL_SECONDS=${POLL}
 # 掃描頁數（最大頁；可視需求調大）
 MAX_LIST_PAGES=3
@@ -588,6 +723,11 @@ MAX_LIST_PAGES=3
 READ_FILTER=all
 # include cc messages? true/false
 INCLUDE_CC=false
+# 每條 Telegram 消息最小間隔（秒），避免 429
+# TELEGRAM_MIN_INTERVAL_SECS=1.2
+
+# 啟動時跳過歷史（僅從當前水位之後推送）
+SKIP_HISTORY_ON_FIRST_RUN=1
 EOF
     run_as_user chmod 600 "${INSTALL_DIR}/${ENV_FILE}"
   else
@@ -622,7 +762,7 @@ maybe_install_systemd() {
   local SVC="/etc/systemd/system/seiue-notify.service"
   cat > "$SVC" <<EOF
 [Unit]
-Description=Seiue Notification to Telegram Sidecar (me/received-messages inbox)
+Description=Seiue Notification to Telegram Sidecar (me/inbox)
 After=network-online.target
 Wants=network-online.target
 
@@ -664,7 +804,7 @@ main() {
   fi
   trap 'rmdir "$LOCKDIR"' EXIT
 
-  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.5.0-me-inbox ---${C_RESET}"
+  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.7.0-me-inbox-dedupe ---${C_RESET}"
   check_environment
   mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
 
