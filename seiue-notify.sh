@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.0.0  (NO subcommands; dual-channel: notice + system; idempotent watermark + dedup)
+# v2.1.0  (NO subcommands; dual-channel: notice + system; idempotent watermark + global dedup; system channel push-all)
 # Usage: sudo bash ./seiue-notify.sh
 set -euo pipefail
 
@@ -35,10 +35,7 @@ UNIT_NAME="seiue-notify"
 PROXY_ENV="$(env | grep -i -E '^(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' || true)"
 
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
-ensure_dirs(){
-  mkdir -p "$INSTALL_DIR" "$LOG_DIR"
-  chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
-}
+ensure_dirs(){ mkdir -p "$INSTALL_DIR" "$LOG_DIR"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"; }
 
 preflight(){
   info "环境预检中…"
@@ -72,10 +69,11 @@ TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 # 可选项：
 NOTIFY_POLL_SECONDS=${POLL}
 MAX_LIST_PAGES=10
-READ_FILTER=all         # all|unread
+READ_FILTER=all         # all|unread  （system 通道无关键词过滤，全部直发）
 INCLUDE_CC=false        # 是否包含抄送
 SKIP_HISTORY_ON_FIRST_RUN=1
 TELEGRAM_MIN_INTERVAL_SECS=1.5
+# NOTICE_EXCLUDE_NOISE=1   # 置空或=0 可关闭对通知中心的大型“考试/校历”等噪声排除
 EOF
   chmod 600 "$ENV_FILE"; chown "$REAL_USER:$(id -gn "$REAL_USER")" "$ENV_FILE"
 }
@@ -122,6 +120,7 @@ READ_FILTER = (os.getenv("READ_FILTER","all").strip().lower())
 INCLUDE_CC = os.getenv("INCLUDE_CC","false").strip().lower() in ("1","true","yes","on")
 SKIP_HISTORY_ON_FIRST_RUN = os.getenv("SKIP_HISTORY_ON_FIRST_RUN","1").strip().lower() in ("1","true","yes","on")
 TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS","1.5") or "1.5")
+NOTICE_EXCLUDE_NOISE = os.getenv("NOTICE_EXCLUDE_NOISE","1").strip().lower() in ("1","true","yes","on")
 
 BEIJING_TZ = pytz.timezone("Asia/Shanghai")
 
@@ -262,16 +261,17 @@ class Seiue:
     return r
 
   def list_system(self, pages:int)->List[Dict[str,Any]]:
-    # system 通道：type=message（站内信/系统消息）
+    # system 通道：type=message（系统消息） —— 不做关键词式过滤，全量直发
     base={"expand":"sender_reflection","owner.id":self.reflection,"type":"message","paginated":"1","sort":"-published_at,-created_at"}
     if READ_FILTER=="unread": base["readed"]="false"
     if not INCLUDE_CC: base["is_cc"]="false"
     return self._collect(base, pages)
 
   def list_notice(self, pages:int)->List[Dict[str,Any]]:
-    # notice 通道：notice=true（通知中心），排除大批考试播报与校历噪音
-    base={"expand":"sender_reflection,aggregated_messages","owner.id":self.reflection,"paginated":"1","sort":"-published_at,-created_at","notice":"true",
-          "type_not_in":"exam.schedule_result_for_examinee,exam.schedule_result_for_examiner,exam.stats_received,exam.published_for_adminclass_teacher,exam.published_for_examinee,exam.published_scoring_for_examinee,exam.published_for_teacher,exam.published_for_mentor,schcal.holiday_created,schcal.holiday_deleted,schcal.holiday_updated,schcal.makeup_created,schcal.makeup_deleted"}
+    # notice 通道：notice=true
+    base={"expand":"sender_reflection,aggregated_messages","owner.id":self.reflection,"paginated":"1","sort":"-published_at,-created_at","notice":"true"}
+    if NOTICE_EXCLUDE_NOISE:
+      base["type_not_in"]="exam.schedule_result_for_examinee,exam.schedule_result_for_examiner,exam.stats_received,exam.published_for_adminclass_teacher,exam.published_for_examinee,exam.published_scoring_for_examinee,exam.published_for_teacher,exam.published_for_mentor,schcal.holiday_created,schcal.holiday_deleted,schcal.holiday_updated,schcal.makeup_created,schcal.makeup_deleted"
     if READ_FILTER=="unread": base["readed"]="false"
     return self._collect(base, pages)
 
@@ -335,6 +335,7 @@ def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
   return html_txt, attachments
 
 def classify(title:str, body_html:str)->Tuple[str,str]:
+  # 仅用于“标签装饰”，不参与任何过滤决策
   z=(title or "")+"\n"+(body_html or "")
   PAIRS=[("leave","【请假】",["请假","請假","销假","銷假"]),
          ("attendance","【考勤】",["考勤","出勤","打卡","迟到","早退","缺勤","旷课","曠課"]),
@@ -345,12 +346,17 @@ def classify(title:str, body_html:str)->Tuple[str,str]:
       if k in z: return key, tag
   return "message","【消息】"
 
+def sender_name(it:Dict[str,Any])->str:
+  sr=it.get("sender_reflection") or {}
+  return sr.get("name") or sr.get("nickname") or "系统"
+
 def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str)->bool:
   title=it.get("title") or ""
   content=it.get("content") or ""
   body, atts=render_content(content)
-  typ, tag = classify(title, body)
-  hdr = f"📩 <b>校内{ '通知中心' if ch=='notice' else '系统消息' }</b>\n"
+  typ, tag = classify(title, body)   # 仅装饰
+  src = sender_name(it)
+  hdr = f"📩 <b>{ '通知中心' if ch=='notice' else '系统消息' }</b>｜<b>{esc(src)}</b>\n"
   t = it.get("published_at") or it.get("created_at") or ""
   msg=f"{hdr}\n{tag}<b>{esc(title)}</b>\n\n{body}\n\n— 发布于 {fmt_time(t)}"
   ok=tg.send(msg)
@@ -399,7 +405,7 @@ def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
       ts=parse_ts(t) if t else 0.0
       try: nid=int(str(it.get("id"))); 
       except: nid=0
-      # 按通道水位截断
+      # 按通道水位截断（时间+ID）
       if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)): continue
       pending.append((ch,it,ts,nid))
   # 全局时间顺序（早→晚）
@@ -414,7 +420,7 @@ def main_loop():
   cli=Seiue(SEIUE_USERNAME, SEIUE_PASSWORD)
   if not cli.login(): print("Seiue 登录失败", file=sys.stderr); sys.exit(2)
   ensure_startup_watermark(cli)
-  print(f"{datetime.now().strftime('%F %T')} 开始轮询（notice+system），每 {POLL_SECONDS}s，页数<= {MAX_LIST_PAGES}")
+  print(f"{datetime.now().strftime('%F %T')} 开始轮询（notice+system，全量直发 system），每 {POLL_SECONDS}s，页数<= {MAX_LIST_PAGES}")
   while True:
     try:
       st=load_state()
