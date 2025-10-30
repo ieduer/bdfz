@@ -387,36 +387,78 @@ class SeiueClient:
 
     def list_inbox_incremental(self) -> List[Dict[str, Any]]:
         """
-        從 /notifications 端點取得可見通知（acting_as_sender=false，倒序），
-        使用水位線（created_at）早停；返回「列表項（僅含 id/created_at）」。
-        詳情與附件稍後用 /received-notifications?id_in=... 拉取。
+        嘗試兩種列表方式：
+        1) 首選：/received-notifications?paginated=1&order=-created_at&page=N （受眾收件箱合法）
+        2) 後備：/notifications?acting_as_sender=false&paginated=1&order=-created_at&page=N
+        用 created_at 水位線早停；返回 [{id, created_at}...]
         """
         state = load_state()
         last_seen_ts = state.get("last_seen_created_at")
         results: List[Dict[str, Any]] = []
         newest_ts_seen: str = last_seen_ts or ""
 
+        def parse_items(resp_json):
+            if isinstance(resp_json, dict):
+                if "items" in resp_json and isinstance(resp_json["items"], list):
+                    return resp_json["items"]
+            if isinstance(resp_json, list):
+                return resp_json
+            return []
+
         page = 1
         stop_by_watermark = False
+        tried_recv_listing = False
+        tried_notif_listing = False
+
         while page <= MAX_LIST_PAGES and not stop_by_watermark:
-            params = {
-                "acting_as_sender": "false",
-                "paginated": "1",
-                "order": "-created_at",
-                "page": str(page),
-            }
-            r = self._retry_after_auth(lambda: self.s.get(self.notif_list_url, params=params, timeout=30))
-            if r.status_code != 200:
-                # 舊行為：若服務端要求 id_in，代表不支持列表，直接退出（交由詳情路徑處理）
-                logging.error(f"notifications list HTTP {r.status_code}: {r.text[:300]} (page={page})")
-                break
-            try:
-                data = r.json()
-                items = data.get("items") if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                items = items or []
-            except Exception as e:
-                logging.error(f"notifications list JSON parse error: {e}")
-                break
+            items = []
+            # ---- A) 嘗試收件箱列表（門檻最低，適合受眾）----
+            if not tried_recv_listing:
+                params_recv = {
+                    "paginated": "1",
+                    "order": "-created_at",
+                    "page": str(page),
+                }
+                r = self._retry_after_auth(lambda: self.s.get(self.recv_list_url, params=params_recv, timeout=30))
+                if r.status_code == 200:
+                    try:
+                        items = parse_items(r.json())
+                    except Exception as e:
+                        logging.error(f"received-notifications JSON parse error: {e}")
+                        items = []
+                    # 成功走 A 路徑，後續都用 A
+                elif r.status_code in (400, 404):
+                    # 400 多見於「該端點僅支持 id_in 批量查詢」；標記不可用，轉 B
+                    logging.info(f"received-notifications listing not available (HTTP {r.status_code}) → fallback to /notifications")
+                    tried_recv_listing = True  # 標記為已嘗試且不可用
+                elif r.status_code in (401, 403):
+                    logging.info(f"received-notifications forbidden (HTTP {r.status_code}) → fallback to /notifications")
+                    tried_recv_listing = True
+                else:
+                    logging.warning(f"received-notifications unexpected HTTP {r.status_code}: {r.text[:300]}")
+                    tried_recv_listing = True
+
+            # ---- B) 後備：通知總表（對非發送者可能 403）----
+            if not items and not tried_notif_listing:
+                params_notif = {
+                    "acting_as_sender": "false",
+                    "paginated": "1",
+                    "order": "-created_at",
+                    "page": str(page),
+                }
+                r2 = self._retry_after_auth(lambda: self.s.get(self.notif_list_url, params=params_notif, timeout=30))
+                if r2.status_code == 200:
+                    try:
+                        items = parse_items(r2.json())
+                    except Exception as e:
+                        logging.error(f"notifications JSON parse error: {e}")
+                        items = []
+                elif r2.status_code in (401, 403):
+                    logging.error(f"notifications list HTTP {r2.status_code}: {r2.text[:300]} (page={page})")
+                    tried_notif_listing = True
+                else:
+                    logging.warning(f"notifications unexpected HTTP {r2.status_code}: {r2.text[:300]}")
+                    tried_notif_listing = True
 
             if not items:
                 break
@@ -443,7 +485,7 @@ class SeiueClient:
             state["last_seen_created_at"] = newest_ts_seen
             save_state(state)
 
-        logging.info("notifications list aggregated items=%d pages=%d", len(results), min(page-1, MAX_LIST_PAGES))
+        logging.info("inbox list aggregated items=%d pages=%d", len(results), min(page-1, MAX_LIST_PAGES))
         return results
 
     # 詳情拉取：確保 content / read_statuses / 附件等字段完整
