@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - One-click Installer (Sidecar)
-# v1.8.0-me-inbox-noninteractive
+# v1.0-me-inbox-noninteractive
 # - Auto-install & start systemd (no prompts)
 # - ExecStartPre clears stale lock
-# - No background first_run (避免重复实例)
-# - 安装后一次性推送“最新一条”到 Telegram 作为成功确认（并设置水位避免重发）
-# - 仅走 me 收件箱: /chalk/me/received-messages (owner.id=reflection_id)
-# - 强 at-most-once：singleton + (last_ts,last_id) 水位 + per-id seen
+# - 安裝後：先「發一次確認」→ 再啟動服務（避免與單例鎖競爭）
+# - 僅走 me 收件箱: /chalk/me/received-messages (owner.id=reflection_id)
+# - 強 at-most-once：singleton + (last_ts,last_id) 水位 + per-id seen
 
 set -euo pipefail
 
@@ -67,7 +66,7 @@ check_environment() {
   if command -v python3 >/dev/null 2>&1; then PYBIN="$(command -v python3)"; fi
   if [ -z "$PYBIN" ]; then
     warn "系統未找到 python3，將嘗試安裝（Ubuntu/Debian 使用 apt；CentOS 使用 yum）。"
-    if command -v apt-get >/dev/null 2>&1; then
+    if command -v apt-get >/devnull 2>&1; then
       apt-get update -y && apt-get install -y python3 python3-venv
     elif command -v yum >/dev/null 2>&1; then
       yum install -y python3 python3-venv || true
@@ -167,7 +166,7 @@ write_python() {
 # -*- coding: utf-8 -*-
 """
 Seiue Notification → Telegram sidecar (me/received-messages, single-hop)
-v1.8.0 — singleton lock, startup watermark, (ts,id) dedupe, at-most-once, --confirm-once
+v1.8.1 — singleton lock, startup watermark, (ts,id) dedupe, at-most-once, --confirm-once
 """
 import json, logging, os, sys, time, html, fcntl, argparse
 from typing import Dict, Any, List, Tuple, Optional
@@ -376,7 +375,7 @@ class SeiueClient:
         })
         self.bearer = None; self.reflection_id = None
         self.login_url = "https://passport.seiue.com/login?school_id=3"
-               self.authorize_url = "https://passport.seiue.com/authorize"
+        self.authorize_url = "https://passport.seiue.com/authorize"
         self.inbox_url = "https://api.seiue.com/chalk/me/received-messages"
 
     def _preflight(self):
@@ -672,6 +671,7 @@ def main():
         print("缺少環境變量：SEIUE_USERNAME / SEIUE_PASSWORD / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID", file=sys.stderr)
         sys.exit(1)
 
+    # 單例鎖：避免與常駐輪詢並發
     lock_fd = acquire_singleton_lock_or_exit(BASE_DIR)
     tg = Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     cli = SeiueClient(SEIUE_USERNAME, SEIUE_PASSWORD)
@@ -780,14 +780,25 @@ EOF
   success "環境與啟動腳本就緒。"
 }
 
-# ----------------- 6) Install & Start systemd (no prompt) -----------------
-install_and_start_systemd() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    warn "此系統無 systemd，改用前台/後台工具（tmux/screen/nohup）自啟。"
-    # 保險：先殺舊，清鎖，再後台起一份
+# ----------------- 6) (Re)Start model: confirm first, then service -----------------
+stop_service_if_running() {
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet seiue-notify; then
+      info "檢測到服務在運行，先停止以便發送確認..."
+      systemctl stop seiue-notify || true
+      sleep 1
+    fi
+  else
+    # 非 systemd 環境：殺殘留
     pkill -f '/\.seiue-notify/venv/bin/python .*/seiue_notify\.py' 2>/dev/null || true
     pkill -f '/\.seiue-notify/run\.sh' 2>/dev/null || true
-    rm -f "${INSTALL_DIR}/.notify.lock" 2>/dev/null || true
+  fi
+  rm -f "${INSTALL_DIR}/.notify.lock" 2>/dev/null || true
+}
+
+install_and_start_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "此系統無 systemd，改用後台工具（nohup）自啟。"
     run_as_user bash -lc "cd '${INSTALL_DIR}' && nohup ./run.sh >/dev/null 2>&1 &"
     success "已在無 systemd 環境中後台啟動。"
     return 0
@@ -819,9 +830,9 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now seiue-notify.service
+  systemctl enable seiue-notify.service >/dev/null 2>&1 || true
+  systemctl start seiue-notify.service
 
-  # 确认服务已运行
   if systemctl is-active --quiet seiue-notify; then
     success "systemd 服務已啟動：seiue-notify.service"
   else
@@ -831,7 +842,7 @@ EOF
   fi
 }
 
-# ----------------- 7) One-shot confirmation message -----------------
+# ----------------- 7) One-shot confirmation message (run BEFORE starting service) -----------------
 send_one_shot_confirmation() {
   info "發送最近 1 條消息到 Telegram 作為安裝確認（並設置水位以避免重發）..."
   run_as_user bash -lc "cd '${INSTALL_DIR}' && set -a && source ./.env && set +a && ./venv/bin/python ./seiue_notify.py --confirm-once || true"
@@ -846,7 +857,7 @@ main() {
   fi
   trap 'rmdir "$LOCKDIR"' EXIT
 
-  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.8.0-me-inbox-noninteractive ---${C_RESET}"
+  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.8.1-me-inbox-noninteractive ---${C_RESET}"
   check_environment
   mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
 
@@ -859,9 +870,10 @@ main() {
   write_python
   write_env_and_runner
 
-  # 不啟用任何 first_run，改為 systemd 自啟 + 一次性確認
-  install_and_start_systemd
+  # 關鍵順序：先停服務/清鎖 → 發一次確認 → 再啟動服務
+  stop_service_if_running
   send_one_shot_confirmation
+  install_and_start_systemd
 
   success "全部完成。"
   echo -e "${C_BLUE}服務狀態：${C_RESET}systemctl status seiue-notify --no-pager"
