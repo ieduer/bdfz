@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - One-click Installer (Sidecar)
-# v1.3-me-inbox-alltypes-agg
-# - Auto-install & start systemd (no prompts)
-# - ExecStartPre clears stale lock
-# - 安裝後：先「發一次確認」→ 再啟動服務（避免與單例鎖競爭）
-# - me 收件箱: /chalk/me/received-messages（owner.id=reflection_id）→ 默認推送「全部類型」（含請假/考勤/評價/通知/消息）；可用 READ_FILTER 與 INCLUDE_CC 控制。
-# - 強 at-most-once：singleton + (last_ts,last_id) 水位 + per-sid 去重（缺 id 時用 CRC32）
+# v1.4-per-type-confirm
+# - 保持原功能：/chalk/me/received-messages 全类型抓取、聚合内容、附件、强去重与水位
+# - 新增：安装确认阶段 --confirm-per-type，一次性推送【请假/考勤/评价/通知/消息】各类型最新 1 条
+# - 确认完成后提升水位到这批里时间最大者，避免重复
+# - 仍支持 --confirm-once（仅 1 条）以兼容老习惯
 
 set -euo pipefail
 
@@ -159,19 +158,19 @@ setup_layout() {
 
 # ----------------- 4) Write Python notifier -----------------
 write_python() {
-  info "生成 Python 通知輪詢器（ALL TYPES + aggregated_messages + 去重強化）..."
+  info "生成 Python 通知輪詢器（ALL TYPES + per-type confirm）..."
   local TMP="$(mktemp)"
   cat > "$TMP" <<'EOF_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Seiue Notification → Telegram sidecar (me/received-messages, ALL TYPES)
-v1.3.0 — all-types + aggregated_messages + robust _sid dedupe
+v1.4.0 — per-type confirm + aggregated_messages + robust _sid dedupe
  - Fetches ALL types (leave/attendance/evaluation/notice/message); no notice-only filter.
  - expand=sender_reflection,aggregated_messages for reliable title/content & attachments.
- - Stable _sid for each item: prefer id; else first aggregated id; else CRC32(title|published_at).
- - Watermark uses (last_seen_ts, last_seen_id_int) derived from _sid.
- - One-shot confirmation logs sid instead of id=None.
+ - Stable _sid: prefer `id`; else first aggregated id; else CRC32(title|published_at).
+ - Watermark = (last_seen_ts, last_seen_id_int), ensures at-most-once.
+ - New: --confirm-per-type → scan first N pages once, pick the latest ONE item for each type and push.
 """
 import json, logging, os, sys, time, html, fcntl, argparse
 from zlib import crc32
@@ -469,6 +468,29 @@ class SeiueClient:
             sid = crc32(basis.encode("utf-8")) & 0xffffffff
         it["_sid"] = str(sid)
 
+    def _list_page(self, page: int, per_page: int = 20) -> List[Dict[str, Any]]:
+        params = {
+            "expand": "sender_reflection,aggregated_messages",
+            "owner.id": self.reflection_id,
+            "paginated": "1",
+            "sort": "-published_at,-created_at",
+            "page": str(page),
+            "per_page": str(per_page),
+        }
+        if READ_FILTER == "unread":
+            params["readed"] = "false"
+        if not INCLUDE_CC:
+            params["is_cc"] = "false"
+        logging.info(f"GET /me/received-messages params={params}")
+        r = self._retry_after_auth(lambda: self.s.get(self.inbox_url, params=params, timeout=30))
+        if r.status_code != 200:
+            logging.error(f"me/received-messages HTTP {r.status_code}: {r.text[:300]}")
+            return []
+        items = self._json_items(r)
+        for it in items:
+            self.normalize_item_inplace(it)
+        return items
+
     def list_my_received_incremental(self) -> List[Dict[str, Any]]:
         state = load_state()
         last_ts = float(state.get("last_seen_ts") or 0.0)
@@ -477,35 +499,12 @@ class SeiueClient:
         newest_ts = last_ts
         newest_id = last_id
 
-        params_base = {
-            "expand": "sender_reflection,aggregated_messages",
-            "owner.id": self.reflection_id,
-            "paginated": "1",
-            "sort": "-published_at,-created_at",
-        }
-        if READ_FILTER == "unread":
-            params_base["readed"] = "false"
-        if not INCLUDE_CC:
-            params_base["is_cc"] = "false"
-
         page = 1
         while page <= MAX_LIST_PAGES:
-            params = dict(params_base, **{"page": str(page), "per_page": "20"})
-            logging.info(f"GET /me/received-messages params={params}")
-            r = self._retry_after_auth(lambda: self.s.get(self.inbox_url, params=params, timeout=30))
-            if r.status_code == 404:
-                logging.error("me/received-messages not found (404)")
-                break
-            if r.status_code != 200:
-                logging.error(f"me/received-messages HTTP {r.status_code}: {r.text[:300]}")
-                break
-
-            items = self._json_items(r)
+            items = self._list_page(page)
             if not items:
                 break
-
             for it in items:
-                self.normalize_item_inplace(it)
                 ts_str = it.get("published_at") or it.get("created_at") or ""
                 ts = self._parse_ts(ts_str) if ts_str else 0.0
                 try:
@@ -513,15 +512,13 @@ class SeiueClient:
                 except Exception:
                     nid_int = crc32(str(it.get("_sid")).encode("utf-8")) & 0xffffffff
 
-                if last_ts:
-                    if ts < last_ts or (ts == last_ts and nid_int <= last_id):
-                        continue
+                if last_ts and (ts < last_ts or (ts == last_ts and nid_int <= last_id)):
+                    continue
 
                 results.append(it)
                 if (ts > newest_ts) or (ts == newest_ts and nid_int > newest_id):
                     newest_ts = ts
                     newest_id = nid_int
-
             page += 1
 
         if newest_ts and ((newest_ts > last_ts) or (newest_ts == last_ts and newest_id > last_id)):
@@ -533,24 +530,53 @@ class SeiueClient:
         return results
 
     def fetch_latest(self) -> Optional[Dict[str, Any]]:
-        params = {
-            "expand": "sender_reflection,aggregated_messages",
-            "owner.id": self.reflection_id or "",
-            "paginated": "1",
-            "sort": "-published_at,-created_at",
-            "page": "1",
-            "per_page": "1",
-        }
-        r = self._retry_after_auth(lambda: self.s.get(self.inbox_url, params=params, timeout=30))
-        if r.status_code != 200:
-            logging.error(f"fetch_latest HTTP {r.status_code}: {r.text[:300]}")
-            return None
-        items = self._json_items(r)
-        if not items:
-            return None
-        it0 = items[0]
-        self.normalize_item_inplace(it0)
-        return it0
+        items = self._list_page(1, per_page=1)
+        return items[0] if items else None
+
+    def fetch_latest_by_type_once(self) -> Dict[str, Optional[Dict[str, Any]]]:
+        """掃前 N 頁，從結果里挑出每種 type（leave/attendance/evaluation/notice/message）最新的 1 條。"""
+        want_types = ["leave", "attendance", "evaluation", "notice", "message"]
+        picked: Dict[str, Optional[Dict[str, Any]]] = {t: None for t in want_types}
+
+        def _type_of(it: Dict[str, Any]) -> str:
+            t = (it.get("type") or "").lower()
+            if not t:
+                agg = it.get("aggregated_messages") or []
+                if agg and isinstance(agg, list):
+                    t = (agg[0].get("type") or "").lower()
+            if t not in want_types:
+                t = "message"  # 回落
+            return t
+
+        def _key(it: Dict[str, Any]):
+            ts_str = it.get("published_at") or it.get("created_at") or ""
+            ts = SeiueClient._parse_ts(ts_str) if ts_str else 0.0
+            try:
+                nid_int = int(str(it.get("_sid")))
+            except Exception:
+                nid_int = crc32(str(it.get("_sid")).encode("utf-8")) & 0xffffffff
+            return (ts, nid_int)
+
+        page = 1
+        seen_any = False
+        while page <= max(MAX_LIST_PAGES, 3):  # 确保至少扫 3 页
+            items = self._list_page(page)
+            if not items:
+                break
+            seen_any = True
+            for it in items:
+                t = _type_of(it)
+                cur = picked.get(t)
+                if cur is None or _key(it) > _key(cur):
+                    picked[t] = it
+            # 如果五種類型都已經選到，提前停止
+            if all(picked.values()):
+                break
+            page += 1
+
+        if not seen_any:
+            logging.info("per-type confirm: 沒掃到任何消息。")
+        return picked
 
 def render_draftjs_content(content_json: str):
     try:
@@ -661,12 +687,47 @@ def download_with_auth(cli: "SeiueClient", url: str) -> Tuple[bytes, str]:
         logging.error(f"download failed: {e}")
         return b"", "attachment.bin"
 
+def send_one_item(tg: "Telegram", cli: "SeiueClient", item: Dict[str, Any]) -> bool:
+    agg = item.get("aggregated_messages") or []
+    title = item.get("title") or (agg and (agg[0].get("title") or "")) or ""
+    content_str = item.get("content") or (agg and (agg[0].get("content") or "")) or ""
+    if not content_str:
+        content_str = json.dumps({"blocks": [{"text": ""}]})
+    html_body, atts = render_draftjs_content(content_str)
+    # 判定類型（主 or 聚合）
+    type_guess = (item.get("type") or "").lower()
+    if not type_guess and agg:
+        type_guess = (agg[0].get("type") or "").lower()
+    header = build_header(item.get("sender_reflection") or {}, type_guess)
+    created = item.get("published_at") or item.get("created_at") or ""
+    created_fmt = format_time(created)
+    time_line = f"— 發布於 {created_fmt}" if created_fmt else ""
+    main_msg = f"{header}\n<b>{escape_html(title)}</b>\n\n{html_body}\n\n{time_line}"
+    ok = tg.send_message_safely(main_msg)
+
+    images = [a for a in atts if a.get("type") == "image" and a.get("url")]
+    files = [a for a in atts if a.get("type") == "file" and a.get("url")]
+    for a in images:
+        data, _ = download_with_auth(cli, a["url"])
+        if data:
+            ok = tg.send_photo_bytes(data, caption_html="") and ok
+    for a in files:
+        data, fname = download_with_auth(cli, a["url"])
+        if data:
+            cap = f"📎 <b>{escape_html(a.get('name') or fname)}</b>"
+            size = a.get("size")
+            if size: cap += f"（{escape_html(size)}）"
+            if len(cap) > 1024: cap = cap[:1008] + "…"
+            ok = tg.send_document_bytes(data, filename=(a.get("name") or fname), caption_html=cap) and ok
+    return ok
+
 def ensure_startup_watermark(cli: "SeiueClient"):
     state = load_state()
     if state.get("last_seen_ts"):
         return
     if not SKIP_HISTORY_ON_FIRST_RUN:
         return
+    # 如果首啟選擇跳過歷史，只設一個基準水位，後續由確認階段再抬高
     newest_ts = 0.0
     newest_id = 0
     try:
@@ -686,40 +747,48 @@ def ensure_startup_watermark(cli: "SeiueClient"):
     state["last_seen_ts"] = newest_ts
     state["last_seen_id"] = newest_id
     save_state(state)
-    logging.info("啟動已設置水位（跳過歷史），last_seen_ts=%s last_seen_id=%s", newest_ts, newest_id)
+    logging.info("啟動已設置水位（跳過歷史基準），last_seen_ts=%s last_seen_id=%s", newest_ts, newest_id)
 
-def send_one_item(tg: "Telegram", cli: "SeiueClient", item: Dict[str, Any]) -> bool:
-    agg = item.get("aggregated_messages") or []
-    title = item.get("title") or (agg and (agg[0].get("title") or "")) or ""
-    content_str = item.get("content") or (agg and (agg[0].get("content") or "")) or ""
-    if not content_str:
-        content_str = json.dumps({"blocks": [{"text": ""}]})
-    html_body, atts = render_draftjs_content(content_str)
-    header = build_header(item.get("sender_reflection") or {}, item.get("type") or "")
-    created = item.get("published_at") or item.get("created_at") or ""
-    created_fmt = format_time(created)
-    time_line = f"— 發布於 {created_fmt}" if created_fmt else ""
-    main_msg = f"{header}\n<b>{escape_html(title)}</b>\n\n{html_body}\n\n{time_line}"
-    ok = tg.send_message_safely(main_msg)
-    images = [a for a in atts if a.get("type") == "image" and a.get("url")]
-    files = [a for a in atts if a.get("type") == "file" and a.get("url")]
-    for a in images:
-        data, _ = download_with_auth(cli, a["url"])
-        if data:
-            ok = tg.send_photo_bytes(data, caption_html="") and ok
-    for a in files:
-        data, fname = download_with_auth(cli, a["url"])
-        if data:
-            cap = f"📎 <b>{escape_html(a.get('name') or fname)}</b>"
-            size = a.get("size")
-            if size: cap += f"（{escape_html(size)}）"
-            if len(cap) > 1024: cap = cap[:1008] + "…"
-            ok = tg.send_document_bytes(data, filename=(a.get("name") or fname), caption_html=cap) and ok
-    return ok
+def confirm_per_type_once(tg: "Telegram", cli: "SeiueClient"):
+    state = load_state()
+    picked = cli.fetch_latest_by_type_once()
+    pushed_any = False
+    max_ts = float(state.get("last_seen_ts") or 0.0)
+    max_id = int(state.get("last_seen_id") or 0)
+    seen = state.get("seen") or {}
+
+    for t, it in picked.items():
+        if not it:
+            continue
+        # 发送
+        ok = send_one_item(tg, cli, it)
+        # 更新 seen / 水位
+        ts_str = it.get("published_at") or it.get("created_at") or ""
+        ts = SeiueClient._parse_ts(ts_str) if ts_str else int(time.time())
+        sid = str(it.get("_sid"))
+        try:
+            nid_int = int(sid)
+        except Exception:
+            nid_int = crc32(sid.encode("utf-8")) & 0xffffffff
+        seen[sid] = {"pushed_at": now_cst_str(), "type": t}
+        if (ts > max_ts) or (ts == max_ts and nid_int > max_id):
+            max_ts, max_id = ts, nid_int
+        pushed_any = ok or pushed_any
+        logging.info("per-type 確認已發送（type=%s sid=%s ok=%s）", t, sid, ok)
+
+    if pushed_any:
+        state["seen"] = seen
+        state["last_seen_ts"] = max_ts
+        state["last_seen_id"] = max_id
+        save_state(state)
+        logging.info("per-type 確認完成，已提升水位到: ts=%s id=%s", max_ts, max_id)
+    else:
+        logging.info("per-type 確認：無可發送項（可能頁面上都早於基準水位或確實沒有消息）。")
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--confirm-once", action="store_true", help="發送最近 1 條以確認安裝成功，並設置水位避免重發")
+    parser.add_argument("--confirm-per-type", action="store_true", help="按類型各發 1 條（請假/考勤/評價/通知/消息）作為安裝確認，並提升水位")
     args, _ = parser.parse_known_args()
 
     if not (SEIUE_USERNAME and SEIUE_PASSWORD and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -734,6 +803,10 @@ def main():
         sys.exit(2)
 
     ensure_startup_watermark(cli)
+
+    if args.confirm_per_type:
+        confirm_per_type_once(tg, cli)
+        sys.exit(0)
 
     if args.confirm_once:
         it0 = cli.fetch_latest()
@@ -761,6 +834,7 @@ def main():
             logging.info("無可用的最新消息可確認發送。")
         sys.exit(0)
 
+    # 常駐輪詢
     state = load_state()
     seen: Dict[str, Any] = state.get("seen") or {}
     logging.info(f"開始輪詢（每 {POLL_SECONDS}s）...")
@@ -791,7 +865,7 @@ EOF_PY
 
   install -m 0644 -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$TMP" "${INSTALL_DIR}/${PY_SCRIPT}"
   rm -f "$TMP"
-  success "Python 輪詢器（ALL TYPES + aggregated_messages + 去重強化）已生成。"
+  success "Python 輪詢器（ALL TYPES + per-type confirm）已生成。"
 }
 
 # ----------------- 5) Write .env and runner -----------------
@@ -818,7 +892,7 @@ INCLUDE_CC=false
 # 每條 Telegram 消息最小間隔（秒），避免 429
 TELEGRAM_MIN_INTERVAL_SECS=1.5
 
-# 啟動時跳過歷史（僅從當前水位之後推送）
+# 啟動時跳過歷史（僅設基準水位；確認階段會抬高）
 SKIP_HISTORY_ON_FIRST_RUN=1
 EOF
     run_as_user chmod 600 "${INSTALL_DIR}/${ENV_FILE}"
@@ -838,7 +912,7 @@ EOF
   success "環境與啟動腳本就緒。"
 }
 
-# ----------------- 6) (Re)Start model: confirm first, then service -----------------
+# ----------------- 6) (Re)Start model: confirm per type, then service -----------------
 stop_service_if_running() {
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet seiue-notify; then
@@ -899,22 +973,22 @@ EOF
   fi
 }
 
-# ----------------- 7) One-shot confirmation message -----------------
+# ----------------- 7) One-shot confirmation (per type) -----------------
 send_one_shot_confirmation() {
-  info "發送最近 1 條消息到 Telegram 作為安裝確認（並設置水位以避免重發）..."
-  run_as_user bash -lc "cd '${INSTALL_DIR}' && set -a && source ./.env && set +a && ./venv/bin/python ./seiue_notify.py --confirm-once || true"
-  success "確認步驟已執行（若收件箱有最新一條，應已推送）。"
+  info "按類型各發 1 條到 Telegram 作為安裝確認（並提升水位，避免重發）..."
+  run_as_user bash -lc "cd '${INSTALL_DIR}' && set -a && source ./.env && set +a && ./venv/bin/python ./seiue_notify.py --confirm-per-type || true"
+  success "類型化確認已執行（如收件箱有內容，應已推送每種類型的最新 1 條）。"
 }
 
 # ----------------- main -----------------
 main() {
   LOCKDIR="/tmp/seiue_notify_installer.lock"
-  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  if ! mkdir "$LOCKDIR" 2>/null; then
     error "安裝器已在另一程序執行。"; exit 1
   fi
   trap 'rmdir "$LOCKDIR"' EXIT
 
-  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.3-me-inbox-alltypes-agg ---${C_RESET}"
+  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.4-per-type-confirm ---${C_RESET}"
   check_environment
   mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
 
