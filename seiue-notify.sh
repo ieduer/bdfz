@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Seiue Notification → Telegram - One-click Installer (Sidecar) v1.2.0-notif-only
+# Seiue Notification → Telegram - One-click Installer (Sidecar) v1.3.0-inbox-twohop
 # Target: Linux VPS (Ubuntu/Debian/CentOS 等)，macOS 亦可
-# 行為：安裝到 ~/.seiue-notify ，建立 venv、生成 Python 通知輪詢器（僅用 /chalk/notification/notifications）、推送到 Telegram
+# 行為：安裝到 ~/.seiue-notify ，建立 venv、生成 Python 通知輪詢器（收件箱兩段式：read-statuses → received-notifications）、推送到 Telegram
 
 set -euo pipefail
 
@@ -153,18 +153,21 @@ setup_layout() {
   success "虛擬環境與依賴就緒。"
 }
 
-# ----------------- 4) Write Python notifier (Notifications-only) -----------------
+# ----------------- 4) Write Python notifier (Inbox two-hop) -----------------
 write_python() {
-  info "生成 Python 通知輪詢器（notifications-only）..."
+  info "生成 Python 通知輪詢器（inbox-twohop）..."
   local TMP="$(mktemp)"
   cat > "$TMP" <<'EOF_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Seiue Notification → Telegram sidecar (Notifications-only)
-- 只用 /chalk/notification/notifications 做收件箱：acting_as_sender=false&paginated=1&order=-created_at&expand=read_statuses,receiver
-- 不再調用 /received-notifications，也不做 ID 二次詳情拉取。
-- 用 created_at 水位線控制增量；401/403 自動重登。
+Seiue Notification → Telegram sidecar (Inbox two-hop)
+- 正確的收件箱拉取流程（避免 403）：
+  1) 用 /chalk/notification/notification-read-statuses?receiver.reflection_id=<me>
+     分頁拉取「發給我」的通知 ID 列表（並可帶 expand=notification）。
+  2) 用 /chalk/notification/received-notifications?id_in=...&expand=read_statuses,receiver
+     批量換取詳細內容（含 DraftJS content）。
+- 用 created_at 水位線控制增量；401/403 自動重登（帶 Origin/Referer）。
 - Telegram: HTML 文字 + 圖片 sendPhoto + 檔案 sendDocument。
 """
 import json, logging, os, sys, time, html
@@ -184,7 +187,7 @@ X_ROLE = os.getenv("X_ROLE", "teacher")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 POLL_SECONDS = int(os.getenv("NOTIFY_POLL_SECONDS", os.getenv("POLL_SECONDS", "90")))
-MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES", "2") or "2"), 20))
+MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES", "3") or "3"), 20))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -277,11 +280,14 @@ class SeiueClient:
         self.s.headers.update({
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
+            "Origin": "https://chalk-c3.seiue.com",
+            "Referer": "https://chalk-c3.seiue.com/",
         })
         self.bearer = None; self.reflection_id = None
         self.login_url = "https://passport.seiue.com/login?school_id=3"
         self.authorize_url = "https://passport.seiue.com/authorize"
-        self.notif_list_url = "https://api.seiue.com/chalk/notification/notifications"
+        self.read_status_url = "https://api.seiue.com/chalk/notification/notification-read-statuses"
+        self.received_url    = "https://api.seiue.com/chalk/notification/received-notifications"
 
     def _preflight(self):
         try: self.s.get(self.login_url, timeout=15)
@@ -334,61 +340,95 @@ class SeiueClient:
             except Exception: pass
         return 0.0
 
+    def list_my_received_ids(self, page: int) -> List[str]:
+        """從 read-statuses 拉取與我相關的通知 ID（發給我）"""
+        params = {
+            "paginated": "1",
+            "order": "-created_at",
+            "page": str(page),
+            "receiver.reflection_id": self.reflection_id,
+            "expand": "notification",
+        }
+        r = self._retry_after_auth(lambda: self.s.get(self.read_status_url, params=params, timeout=30))
+        if r.status_code != 200:
+            logging.error(f"read-statuses HTTP {r.status_code}: {r.text[:300]}")
+            return []
+        try:
+            data = r.json()
+            items = data["items"] if isinstance(data, dict) and "items" in data else (data if isinstance(data, list) else [])
+        except Exception as e:
+            logging.error(f"read-statuses JSON parse error: {e}")
+            return []
+        ids: List[str] = []
+        for it in items:
+            nid = it.get("notification_id") or (it.get("notification", {}) or {}).get("id")
+            if nid: ids.append(str(nid))
+        return ids
+
     def list_notifications_incremental(self) -> List[Dict[str, Any]]:
         """
-        單一路徑：/chalk/notification/notifications?acting_as_sender=false&paginated=1
-        &order=-created_at&page=N&expand=read_statuses,receiver
-        返回含 content/read_statuses 的 items，按水位線截斷。
+        兩段式收件箱：
+          - 先從 read-statuses 取 ID（限定我）。
+          - 再用 received-notifications 批量取詳情。
+        用 created_at 水位線截斷，減少重複推送。
         """
         state = load_state()
         last_seen = state.get("last_seen_created_at")
-        last_seen_ts = self._parse_ts(last_seen) if last_seen else 0.0
+        last_ts = self._parse_ts(last_seen) if last_seen else 0.0
         newest = last_seen or ""
         results: List[Dict[str, Any]] = []
-        page = 1; stop = False
 
-        def parse_items(resp_json):
-            if isinstance(resp_json, dict) and isinstance(resp_json.get("items"), list):
-                return resp_json["items"]
-            if isinstance(resp_json, list):
-                return resp_json
+        # 1) 聚合最近幾頁 ID
+        all_ids: List[str] = []
+        page = 1
+        while page <= MAX_LIST_PAGES:
+            ids = self.list_my_received_ids(page)
+            if not ids: break
+            all_ids.extend(ids)
+            page += 1
+        if not all_ids:
+            logging.info("list: no ids, pages_scanned=%d", page-1)
             return []
 
-        while page <= MAX_LIST_PAGES and not stop:
+        # 去重保持順序（最新在前）
+        seen_set, uniq_ids = set(), []
+        for i in all_ids:
+            if i not in seen_set:
+                seen_set.add(i); uniq_ids.append(i)
+
+        # 2) 分批換詳情
+        from math import ceil
+        batch = 40
+        for b in range(ceil(len(uniq_ids)/batch)):
+            chunk = uniq_ids[b*batch:(b+1)*batch]
             params = {
-                "acting_as_sender": "false",
-                "paginated": "1",
-                "order": "-created_at",
-                "page": str(page),
+                "id_in": ",".join(chunk),
                 "expand": "read_statuses,receiver"
             }
-            r = self._retry_after_auth(lambda: self.s.get(self.notif_list_url, params=params, timeout=30))
+            r = self._retry_after_auth(lambda: self.s.get(self.received_url, params=params, timeout=30))
             if r.status_code != 200:
-                logging.error(f"notifications list HTTP {r.status_code}: {r.text[:300]}")
-                break
+                logging.error(f"received-notifications HTTP {r.status_code}: {r.text[:300]}")
+                continue
             try:
-                items = parse_items(r.json())
+                data = r.json()
+                items = data["items"] if isinstance(data, dict) and "items" in data else (data if isinstance(data, list) else [])
             except Exception as e:
-                logging.error(f"notifications JSON parse error: {e}")
-                break
-            if not items: break
+                logging.error(f"received-notifications JSON parse error: {e}")
+                items = []
 
             for it in items:
-                nid = str(it.get("id") or "")
                 created = it.get("created_at") or it.get("updated_at") or ""
-                if not nid: continue
                 cts = self._parse_ts(created) if created else 0.0
-                if last_seen_ts and cts <= last_seen_ts:
-                    stop = True; break
-                results.append(it)
+                if last_ts and cts <= last_ts:
+                    continue
                 if created and (self._parse_ts(created) > self._parse_ts(newest or "1970-01-01 00:00:00")):
                     newest = created
-
-            page += 1
+                results.append(it)
 
         if newest:
             state["last_seen_created_at"] = newest
             save_state(state)
+
         logging.info("list: aggregated=%d pages_scanned=%d", len(results), min(page-1, MAX_LIST_PAGES))
         return results
 
@@ -562,7 +602,7 @@ EOF_PY
   # 寫入並設置權限
   install -m 0644 -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$TMP" "${INSTALL_DIR}/${PY_SCRIPT}"
   rm -f "$TMP"
-  success "Python 輪詢器（notifications-only）已生成。"
+  success "Python 輪詢器（inbox-twohop）已生成。"
 }
 
 # ----------------- 5) Write .env and runner -----------------
@@ -579,8 +619,8 @@ TELEGRAM_BOT_TOKEN=${TG_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TG_CHAT_ID}
 
 NOTIFY_POLL_SECONDS=${POLL}
-# 少量翻頁（通常 2 頁足夠）
-MAX_LIST_PAGES=2
+# 少量翻頁（通常 3 頁足夠）
+MAX_LIST_PAGES=3
 EOF
     run_as_user chmod 600 "${INSTALL_DIR}/${ENV_FILE}"
   else
@@ -615,7 +655,7 @@ maybe_install_systemd() {
   local SVC="/etc/systemd/system/seiue-notify.service"
   cat > "$SVC" <<EOF
 [Unit]
-Description=Seiue Notification to Telegram Sidecar (Notifications-only)
+Description=Seiue Notification to Telegram Sidecar (Inbox two-hop)
 After=network-online.target
 Wants=network-online.target
 
@@ -657,7 +697,7 @@ main() {
   fi
   trap 'rmdir "$LOCKDIR"' EXIT
 
-  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.2.0-notif-only ---${C_RESET}"
+  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.3.0-inbox-twohop ---${C_RESET}"
   check_environment
   mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
 
