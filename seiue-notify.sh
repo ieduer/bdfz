@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - One-click Installer (Sidecar)
-# v1.7.0-me-inbox-dedupe
-# - Singleton lock to prevent duplicate sending
-# - Startup watermark to skip history
-# - (ts,id) watermark to avoid same-second duplicates
-# - At-most-once: mark seen before sending
+# v1.8.0-me-inbox-noninteractive
+# - Auto-install & start systemd (no prompts)
+# - ExecStartPre clears stale lock
+# - No background first_run (避免重复实例)
+# - 安装后一次性推送“最新一条”到 Telegram 作为成功确认（并设置水位避免重发）
+# - 仅走 me 收件箱: /chalk/me/received-messages (owner.id=reflection_id)
+# - 强 at-most-once：singleton + (last_ts,last_id) 水位 + per-id seen
 
 set -euo pipefail
 
@@ -158,16 +160,16 @@ setup_layout() {
 
 # ----------------- 4) Write Python notifier -----------------
 write_python() {
-  info "生成 Python 通知輪詢器（me/received-messages 單跳 + 去重強化）..."
+  info "生成 Python 通知輪詢器（me/received-messages 單跳 + 去重強化 + 一次性確認）..."
   local TMP="$(mktemp)"
   cat > "$TMP" <<'EOF_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Seiue Notification → Telegram sidecar (me/received-messages, single-hop)
-v1.7.0 — singleton lock, startup watermark, (ts,id) dedupe, at-most-once
+v1.8.0 — singleton lock, startup watermark, (ts,id) dedupe, at-most-once, --confirm-once
 """
-import json, logging, os, sys, time, html, fcntl
+import json, logging, os, sys, time, html, fcntl, argparse
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 
@@ -194,7 +196,7 @@ SKIP_HISTORY_ON_FIRST_RUN = os.getenv("SKIP_HISTORY_ON_FIRST_RUN", "1").strip().
 SINGLETON_LOCK_FILE = ".notify.lock"
 
 # Telegram 控制
-TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS", "1.2"))
+TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS", "1.5"))
 TG_MSG_LIMIT = 4096
 TG_MSG_SAFE = TG_MSG_LIMIT - 64
 TG_CAPTION_LIMIT = 1024
@@ -374,7 +376,7 @@ class SeiueClient:
         })
         self.bearer = None; self.reflection_id = None
         self.login_url = "https://passport.seiue.com/login?school_id=3"
-        self.authorize_url = "https://passport.seiue.com/authorize"
+               self.authorize_url = "https://passport.seiue.com/authorize"
         self.inbox_url = "https://api.seiue.com/chalk/me/received-messages"
 
     def _preflight(self):
@@ -502,6 +504,23 @@ class SeiueClient:
         logging.info(f"list: fetched={len(results)} pages_scanned={min(page-1, MAX_LIST_PAGES)}")
         return results
 
+    def fetch_latest(self) -> Optional[Dict[str, Any]]:
+        params = {
+            "expand": "sender_reflection",
+            "owner.id": self.reflection_id or "",
+            "type": "message",
+            "paginated": "1",
+            "sort": "-published_at,-created_at",
+            "page": "1",
+            "per_page": "1",
+        }
+        r = self._retry_after_auth(lambda: self.s.get(self.inbox_url, params=params, timeout=30))
+        if r.status_code != 200:
+            logging.error(f"fetch_latest HTTP {r.status_code}: {r.text[:300]}")
+            return None
+        items = self._json_items(r)
+        return items[0] if items else None
+
 def render_draftjs_content(content_json: str):
     try:
         raw = json.loads(content_json or "{}")
@@ -598,42 +617,62 @@ def ensure_startup_watermark(cli: "SeiueClient"):
     if not SKIP_HISTORY_ON_FIRST_RUN:
         return
     newest_ts = 0.0
+    newest_id = 0
     try:
-        params = {
-            "expand": "sender_reflection",
-            "owner.id": cli.reflection_id or "",
-            "type": "message",
-            "paginated": "1",
-            "sort": "-published_at,-created_at",
-            "page": "1",
-            "per_page": "1",
-        }
-        r = cli._retry_after_auth(lambda: cli.s.get(cli.inbox_url, params=params, timeout=30))
-        if r.status_code == 200:
-            data = r.json()
-            items = data.get("items") if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            if items:
-                it0 = items[0]
-                ts_str = it0.get("published_at") or it0.get("created_at") or ""
-                newest_ts = SeiueClient._parse_ts(ts_str) if ts_str else 0.0
+        it0 = cli.fetch_latest()
+        if it0:
+            ts_str = it0.get("published_at") or it0.get("created_at") or ""
+            newest_ts = SeiueClient._parse_ts(ts_str) if ts_str else 0.0
+            try:
+                newest_id = int(str(it0.get("id")))
+            except Exception:
+                newest_id = 0
     except Exception as e:
         logging.warning(f"無法獲取啟動水位（使用當前時間）: {e}")
     if not newest_ts:
         newest_ts = time.time()
     state["last_seen_ts"] = newest_ts
-    state.setdefault("last_seen_id", 0)
+    state["last_seen_id"] = newest_id
     save_state(state)
-    logging.info("啟動已設置水位（跳過歷史），last_seen_ts=%s", newest_ts)
+    logging.info("啟動已設置水位（跳過歷史），last_seen_ts=%s last_seen_id=%s", newest_ts, newest_id)
 
-# -------- Main --------
+def send_one_item(tg:"Telegram", cli:"SeiueClient", item: Dict[str,Any]) -> bool:
+    nid = str(item.get("id"))
+    title = item.get("title") or ""
+    content_str = item.get("content") or ""
+    html_body, atts = render_draftjs_content(content_str)
+    header = build_header(item.get("sender_reflection") or {})
+    created = item.get("published_at") or item.get("created_at") or ""
+    created_fmt = format_time(created)
+    time_line = f"— 發布於 {created_fmt}" if created_fmt else ""
+    main_msg = f"{header}\n<b>{escape_html(title)}</b>\n\n{html_body}\n\n{time_line}"
+    ok = tg.send_message_safely(main_msg)
+    # attachments
+    images = [a for a in atts if a.get("type") == "image" and a.get("url")]
+    files  = [a for a in atts if a.get("type") == "file" and a.get("url")]
+    for a in images:
+        data, _ = download_with_auth(cli, a["url"])
+        if data: ok = tg.send_photo_bytes(data, caption_html="") and ok
+    for a in files:
+        data, fname = download_with_auth(cli, a["url"])
+        if data:
+            cap = f"📎 <b>{escape_html(a.get('name') or fname)}</b>"
+            size = a.get("size")
+            if size: cap += f"（{escape_html(size)}）"
+            if len(cap) > 1024: cap = cap[:1008] + "…"
+            ok = tg.send_document_bytes(data, filename=(a.get("name") or fname), caption_html=cap) and ok
+    return ok
+
 def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--confirm-once", action="store_true", help="發送最近 1 條以確認安裝成功，並設置水位避免重發")
+    args, _ = parser.parse_known_args()
+
     if not (SEIUE_USERNAME and SEIUE_PASSWORD and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("缺少環境變量：SEIUE_USERNAME / SEIUE_PASSWORD / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID", file=sys.stderr)
         sys.exit(1)
 
-    # 單例鎖，避免並發
     lock_fd = acquire_singleton_lock_or_exit(BASE_DIR)
-
     tg = Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     cli = SeiueClient(SEIUE_USERNAME, SEIUE_PASSWORD)
     if not cli.login():
@@ -641,6 +680,28 @@ def main():
 
     ensure_startup_watermark(cli)
 
+    if args.confirm_once:
+        it0 = cli.fetch_latest()
+        if it0:
+            ok = send_one_item(tg, cli, it0)
+            # 更新水位與 seen，避免稍後主循環重發
+            state = load_state()
+            try:
+                ts_str = it0.get("published_at") or it0.get("created_at") or ""
+                ts = SeiueClient._parse_ts(ts_str) if ts_str else int(time.time())
+                nid_int = int(str(it0.get("id") or 0))
+            except Exception:
+                ts = int(time.time()); nid_int = 0
+            state["last_seen_ts"] = max(float(state.get("last_seen_ts") or 0.0), ts)
+            state["last_seen_id"] = max(int(state.get("last_seen_id") or 0), nid_int)
+            seen = state.get("seen") or {}; seen[str(it0.get("id"))] = {"pushed_at": now_cst_str()}
+            state["seen"] = seen; save_state(state)
+            logging.info("確認消息已發送（id=%s） ok=%s", it0.get("id"), ok)
+        else:
+            logging.info("無可用的最新消息可確認發送。")
+        sys.exit(0)
+
+    # 正常輪詢
     state = load_state()
     seen: Dict[str, Any] = state.get("seen") or {}
     logging.info(f"開始輪詢（每 {POLL_SECONDS}s）...")
@@ -652,39 +713,12 @@ def main():
 
             for d in sorted(new_items, key=lambda x: str(x.get("id"))):
                 nid = str(d.get("id"))
-                title = d.get("title") or ""
-                content_str = d.get("content") or ""
-
-                html_body, atts = render_draftjs_content(content_str)
-                header = build_header(d.get("sender_reflection") or {})
-                created = d.get("published_at") or d.get("created_at") or ""
-                created_fmt = format_time(created)
-                time_line = f"— 發布於 {created_fmt}" if created_fmt else ""
-
-                main_msg = f"{header}\n<b>{escape_html(title)}</b>\n\n{html_body}\n\n{time_line}"
-
                 # 先標記為已處理（至多一次）
                 seen[nid] = {"pushed_at": now_cst_str()}
                 state["seen"] = seen
                 save_state(state)
 
-                tg.send_message_safely(main_msg)
-
-                images = [a for a in atts if a.get("type") == "image" and a.get("url")]
-                files  = [a for a in atts if a.get("type") == "file" and a.get("url")]
-
-                for a in images:
-                    data, _ = download_with_auth(cli, a["url"])
-                    if data: tg.send_photo_bytes(data, caption_html="")
-
-                for a in files:
-                    data, fname = download_with_auth(cli, a["url"])
-                    if data:
-                        cap = f"📎 <b>{escape_html(a.get('name') or fname)}</b>"
-                        size = a.get("size")
-                        if size: cap += f"（{escape_html(size)}）"
-                        if len(cap) > TG_CAPTION_LIMIT: cap = cap[:TG_CAPTION_SAFE] + "…"
-                        tg.send_document_bytes(data, filename=(a.get("name") or fname), caption_html=cap)
+                send_one_item(tg, cli, d)
 
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
@@ -699,7 +733,7 @@ EOF_PY
 
   install -m 0644 -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$TMP" "${INSTALL_DIR}/${PY_SCRIPT}"
   rm -f "$TMP"
-  success "Python 輪詢器（去重強化版）已生成。"
+  success "Python 輪詢器（去重強化 + 一次性確認）已生成。"
 }
 
 # ----------------- 5) Write .env and runner -----------------
@@ -724,7 +758,7 @@ READ_FILTER=all
 # include cc messages? true/false
 INCLUDE_CC=false
 # 每條 Telegram 消息最小間隔（秒），避免 429
-# TELEGRAM_MIN_INTERVAL_SECS=1.2
+TELEGRAM_MIN_INTERVAL_SECS=1.5
 
 # 啟動時跳過歷史（僅從當前水位之後推送）
 SKIP_HISTORY_ON_FIRST_RUN=1
@@ -746,16 +780,16 @@ EOF
   success "環境與啟動腳本就緒。"
 }
 
-# ----------------- 6) Optional: systemd service -----------------
-maybe_install_systemd() {
+# ----------------- 6) Install & Start systemd (no prompt) -----------------
+install_and_start_systemd() {
   if ! command -v systemctl >/dev/null 2>&1; then
-    warn "此系統無 systemd，略過服務安裝。你可用 ${INSTALL_DIR}/run.sh 前台/後台工具（如 tmux/screen）。"
-    return 0
-  fi
-
-  read -p "要安裝為 systemd 常駐服務嗎？[y/N]: " choice
-  if [[ ! "$choice" =~ ^[Yy]$ ]]; then
-    info "略過 systemd 安裝。"
+    warn "此系統無 systemd，改用前台/後台工具（tmux/screen/nohup）自啟。"
+    # 保險：先殺舊，清鎖，再後台起一份
+    pkill -f '/\.seiue-notify/venv/bin/python .*/seiue_notify\.py' 2>/dev/null || true
+    pkill -f '/\.seiue-notify/run\.sh' 2>/dev/null || true
+    rm -f "${INSTALL_DIR}/.notify.lock" 2>/dev/null || true
+    run_as_user bash -lc "cd '${INSTALL_DIR}' && nohup ./run.sh >/dev/null 2>&1 &"
+    success "已在無 systemd 環境中後台啟動。"
     return 0
   fi
 
@@ -772,6 +806,7 @@ User=${REAL_USER}
 Group=$(id -gn "$REAL_USER")
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${INSTALL_DIR}/.env
+ExecStartPre=/usr/bin/rm -f ${INSTALL_DIR}/.notify.lock
 ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/seiue_notify.py
 Restart=always
 RestartSec=5
@@ -785,15 +820,22 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now seiue-notify.service
-  success "systemd 已啟用：seiue-notify.service"
-  info "查看日誌：journalctl -u seiue-notify -f"
+
+  # 确认服务已运行
+  if systemctl is-active --quiet seiue-notify; then
+    success "systemd 服務已啟動：seiue-notify.service"
+  else
+    error "systemd 服務未能啟動，輸出狀態如下："
+    systemctl status seiue-notify --no-pager || true
+    exit 2
+  fi
 }
 
-# ----------------- 7) First run -----------------
-first_run() {
-  info "首次啟動測試..."
-  run_as_user bash -lc "cd '${INSTALL_DIR}' && ./run.sh &>/dev/null & sleep 2 || true"
-  success "已啟動（若需前台觀察，直接執行 ${INSTALL_DIR}/run.sh）。"
+# ----------------- 7) One-shot confirmation message -----------------
+send_one_shot_confirmation() {
+  info "發送最近 1 條消息到 Telegram 作為安裝確認（並設置水位以避免重發）..."
+  run_as_user bash -lc "cd '${INSTALL_DIR}' && set -a && source ./.env && set +a && ./venv/bin/python ./seiue_notify.py --confirm-once || true"
+  success "確認步驟已執行（若收件箱有最新一條，應已推送）。"
 }
 
 # ----------------- main -----------------
@@ -804,7 +846,7 @@ main() {
   fi
   trap 'rmdir "$LOCKDIR"' EXIT
 
-  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.7.0-me-inbox-dedupe ---${C_RESET}"
+  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.8.0-me-inbox-noninteractive ---${C_RESET}"
   check_environment
   mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
 
@@ -816,11 +858,14 @@ main() {
   setup_layout
   write_python
   write_env_and_runner
-  first_run
-  maybe_install_systemd
 
-  success "全部完成。安裝路徑：${INSTALL_DIR}"
-  echo -e "${C_BLUE}手動啟動：${C_RESET}${INSTALL_DIR}/run.sh"
-  echo -e "${C_BLUE}重啟服務：${C_RESET}systemctl restart seiue-notify"
+  # 不啟用任何 first_run，改為 systemd 自啟 + 一次性確認
+  install_and_start_systemd
+  send_one_shot_confirmation
+
+  success "全部完成。"
+  echo -e "${C_BLUE}服務狀態：${C_RESET}systemctl status seiue-notify --no-pager"
+  echo -e "${C_BLUE}日誌查看：${C_RESET}journalctl -u seiue-notify -f"
+  echo -e "${C_BLUE}配置目錄：${C_RESET}${INSTALL_DIR}"
 }
 main
