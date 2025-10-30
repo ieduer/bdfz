@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - One-click Installer (Sidecar)
-# v1.4.0-inbox-probe
+# v1.5.0-me-inbox
 # Target: Linux VPS (Ubuntu/Debian/CentOS 等)，macOS 亦可
-# 行為：安裝到 ~/.seiue-notify ，建立 venv、生成 Python 通知輪詢器（收件箱兩段式：自動探測第一跳 → received-notifications），推送到 Telegram
+# 行為：安裝到 ~/.seiue-notify ，建立 venv、生成 Python 通知輪詢器
+#       直接調用 /chalk/me/received-messages（owner.id=<ME>），推送到 Telegram
 
 set -euo pipefail
 
@@ -154,23 +155,20 @@ setup_layout() {
   success "虛擬環境與依賴就緒。"
 }
 
-# ----------------- 4) Write Python notifier (Inbox two-hop with probe) -----------------
+# ----------------- 4) Write Python notifier (me/received-messages) -----------------
 write_python() {
-  info "生成 Python 通知輪詢器（inbox-twohop + route-probe）..."
+  info "生成 Python 通知輪詢器（me/received-messages 單跳）..."
   local TMP="$(mktemp)"
   cat > "$TMP" <<'EOF_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Seiue Notification → Telegram sidecar (Inbox two-hop + route probe)
-- 第一跳：自動探測「我的收件箱」可用端點（依序）
-    A) /chalk/notification/read-statuses
-    B) /chalk/notification/notification-read-statuses
-    C) /chalk/notification/received-notifications?receiver.reflection_id=<ME>  （部分集群支持列表）
-  解析出通知 ID 後
-- 第二跳：/chalk/notification/received-notifications?id_in=...&expand=read_statuses,receiver 取詳情
-- 用 created_at 水位線控制增量；401/403 自動重登；404 會降級切換路由
-- Telegram: HTML 文字 + 圖片 sendPhoto + 檔案 sendDocument
+Seiue Notification → Telegram sidecar (me/received-messages, single-hop)
+- 直接調用 /chalk/me/received-messages 拉取「發給我」的訊息（owner.id = <ME>）
+- 參數：expand=sender_reflection，sort=-published_at,-created_at
+- 可選：READ_FILTER=all|unread；INCLUDE_CC=true|false
+- 401/403 自動重登；用 published_at/created_at 水位線做增量
+- Telegram: sendMessage / sendPhoto / sendDocument
 """
 import json, logging, os, sys, time, html
 from typing import Dict, Any, List, Tuple, Optional
@@ -190,13 +188,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 POLL_SECONDS = int(os.getenv("NOTIFY_POLL_SECONDS", os.getenv("POLL_SECONDS", "90")))
 MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES", "3") or "3"), 20))
+READ_FILTER = os.getenv("READ_FILTER", "all").strip().lower()   # all | unread
+INCLUDE_CC = os.getenv("INCLUDE_CC", "false").strip().lower() in ("1","true","yes","on")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 STATE_FILE = os.path.join(BASE_DIR, "notify_state.json")
 LOG_FILE = os.path.join(LOG_DIR, "notify.log")
-ROUTE_CACHE_FILE = os.path.join(BASE_DIR, "route_cache.json")
 
 BEIJING_TZ = pytz.timezone("Asia/Shanghai")
 
@@ -215,12 +214,12 @@ def escape_html(s: str) -> str:
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
-        return {"seen": {}, "last_seen_created_at": None}
+        return {"seen": {}, "last_seen_ts": None}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"seen": {}, "last_seen_created_at": None}
+        return {"seen": {}, "last_seen_ts": None}
 
 def save_state(state: Dict[str, Any]) -> None:
     try:
@@ -228,22 +227,6 @@ def save_state(state: Dict[str, Any]) -> None:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.warning(f"Failed to save state: {e}")
-
-def load_route_cache() -> Dict[str, Any]:
-    if not os.path.exists(ROUTE_CACHE_FILE):
-        return {}
-    try:
-        with open(ROUTE_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_route_cache(d: Dict[str, Any]) -> None:
-    try:
-        with open(ROUTE_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.warning(f"Failed to save route cache: {e}")
 
 # -------- Telegram --------
 class Telegram:
@@ -305,14 +288,7 @@ class SeiueClient:
         self.bearer = None; self.reflection_id = None
         self.login_url = "https://passport.seiue.com/login?school_id=3"
         self.authorize_url = "https://passport.seiue.com/authorize"
-        # 第一跳候選
-        self.candidates = [
-            {"type": "read-statuses", "url": "https://api.seiue.com/chalk/notification/read-statuses"},
-            {"type": "read-statuses-legacy", "url": "https://api.seiue.com/chalk/notification/notification-read-statuses"},
-            {"type": "received-list", "url": "https://api.seiue.com/chalk/notification/received-notifications"},
-        ]
-        self.inbox_route: Optional[Dict[str, str]] = None
-        self.received_url = "https://api.seiue.com/chalk/notification/received-notifications"
+        self.inbox_url = "https://api.seiue.com/chalk/me/received-messages"
 
     def _preflight(self):
         try: self.s.get(self.login_url, timeout=15)
@@ -359,193 +335,77 @@ class SeiueClient:
             if self.login(): r = fn()
         return r
 
-    def _parse_ts(self, s: str) -> float:
-        for fmt in ("%Y-%m-%d %H:%M:%S","%Y-%m-%dT%H:%M:%S%z","%Y-%m-%dT%H:%M:%S"):
-            try: return datetime.strptime(s, fmt).timestamp()
+    @staticmethod
+    def _parse_ts(s: str) -> float:
+        fmts = ("%Y-%m-%d %H:%M:%S","%Y-%m-%dT%H:%M:%S%z","%Y-%m-%dT%H:%M:%S")
+        for f in fmts:
+            try: return datetime.strptime(s, f).timestamp()
             except Exception: pass
         return 0.0
 
     def _json_items(self, r: requests.Response) -> List[Dict[str, Any]]:
         try:
             data = r.json()
-            if isinstance(data, dict):
-                if "items" in data and isinstance(data["items"], list):
-                    return data["items"]
-                # 某些返回就是列表字段名不同，兜底
-                return []
-            elif isinstance(data, list):
+            if isinstance(data, dict) and isinstance(data.get("items"), list):
+                return data["items"]
+            if isinstance(data, list):
                 return data
             return []
         except Exception as e:
             logging.error(f"JSON parse error: {e}")
             return []
 
-    def probe_inbox_route(self) -> Optional[Dict[str, str]]:
-        # 優先使用緩存
-        cache = load_route_cache()
-        cached = cache.get("inbox_route")
-        if cached:
-            logging.info(f"probe: using cached inbox route {cached}")
-            return cached
-
-        test_params_common = {
-            "paginated": "1",
-            "order": "-created_at",
-            "page": "1",
-        }
-        for cand in self.candidates:
-            rtype = cand["type"]; url = cand["url"]
-            if rtype.startswith("read-statuses"):
-                params = dict(test_params_common, **{
-                    "receiver.reflection_id": self.reflection_id,
-                    "expand": "notification",
-                })
-            elif rtype == "received-list":
-                params = dict(test_params_common, **{
-                    "receiver.reflection_id": self.reflection_id,
-                    "expand": "receiver",
-                })
-            else:
-                params = dict(test_params_common)
-
-            r = self._retry_after_auth(lambda: self.s.get(url, params=params, timeout=30))
-            sc = r.status_code
-            if sc == 200:
-                items = self._json_items(r)
-                # 判斷能否提取 ID
-                ok = False
-                for it in items[:3]:
-                    if any(k in it for k in ("notification_id","notification","id")):
-                        ok = True; break
-                if ok:
-                    self.inbox_route = cand
-                    cache["inbox_route"] = cand
-                    save_route_cache(cache)
-                    logging.info(f"probe: selected {cand}")
-                    return cand
-                else:
-                    logging.info(f"probe: {url} 200 but structure not match, continue")
-            elif sc in (400,404):
-                logging.info(f"probe: {url} -> {sc}, try next")
-            elif sc == 403:
-                logging.info(f"probe: {url} -> 403 (permission), try next")
-            else:
-                logging.info(f"probe: {url} -> {sc}, try next")
-
-        logging.error("probe: no inbox route matched.")
-        return None
-
-    def list_my_received_ids(self, page: int) -> List[str]:
-        """使用已探測的第一跳端點，拉取第 page 頁與我相關的通知 ID"""
-        if not self.inbox_route:
-            if not self.probe_inbox_route():
-                return []
-        rtype = self.inbox_route["type"]; url = self.inbox_route["url"]
-        params = {
-            "paginated": "1",
-            "order": "-created_at",
-            "page": str(page),
-        }
-        if rtype.startswith("read-statuses"):
-            params.update({
-                "receiver.reflection_id": self.reflection_id,
-                "expand": "notification",
-            })
-        elif rtype == "received-list":
-            params.update({
-                "receiver.reflection_id": self.reflection_id,
-                "expand": "receiver",
-            })
-
-        r = self._retry_after_auth(lambda: self.s.get(url, params=params, timeout=30))
-        if r.status_code == 404:
-            # 路由失效，清掉緩存，重新探測一次
-            logging.warning(f"inbox route 404 for {url}, re-probe")
-            cache = load_route_cache(); cache.pop("inbox_route", None); save_route_cache(cache)
-            self.inbox_route = None
-            if not self.probe_inbox_route():
-                return []
-            return self.list_my_received_ids(page)
-
-        if r.status_code != 200:
-            logging.error(f"inbox list HTTP {r.status_code}: {r.text[:300]} (page={page})")
-            return []
-
-        items = self._json_items(r)
-        ids: List[str] = []
-        for it in items:
-            # 三種可能來源
-            nid = it.get("notification_id")
-            if not nid:
-                nobj = it.get("notification") or {}
-                nid = nobj.get("id")
-            if not nid and "id" in it and rtype == "received-list":
-                nid = it.get("id")
-            if nid:
-                ids.append(str(nid))
-        return ids
-
-    def list_notifications_incremental(self) -> List[Dict[str, Any]]:
+    def list_my_received_incremental(self) -> List[Dict[str, Any]]:
         """
-        兩段式收件箱：
-          - 先從「已探測」端點取 ID（限定我）。
-          - 再用 received-notifications 批量取詳情。
-        用 created_at 水位線截斷，減少重複推送。
+        直接列出「發給我」的訊息，按時間增量過濾。
         """
         state = load_state()
-        last_seen = state.get("last_seen_created_at")
-        last_ts = self._parse_ts(last_seen) if last_seen else 0.0
-        newest = last_seen or ""
+        last_ts = state.get("last_seen_ts") or 0.0
         results: List[Dict[str, Any]] = []
+        newest_ts = last_ts
 
-        # 1) 聚合最近幾頁 ID
-        all_ids: List[str] = []
+        params_base = {
+            "expand": "sender_reflection",
+            "owner.id": self.reflection_id,
+            "type": "message",
+            "paginated": "1",
+            "sort": "-published_at,-created_at",
+        }
+        if READ_FILTER == "unread":
+            params_base["readed"] = "false"
+        if not INCLUDE_CC:
+            params_base["is_cc"] = "false"
+
         page = 1
         while page <= MAX_LIST_PAGES:
-            ids = self.list_my_received_ids(page)
-            if not ids:
+            params = dict(params_base, **{"page": str(page), "per_page": "20"})
+            r = self._retry_after_auth(lambda: self.s.get(self.inbox_url, params=params, timeout=30))
+            if r.status_code == 404:
+                logging.error("me/received-messages not found (404)")
                 break
-            all_ids.extend(ids)
-            page += 1
-        if not all_ids:
-            logging.info("list: no ids, pages_scanned=%d", page-1)
-            return []
-
-        # 去重保持順序（最新在前）
-        seen_set, uniq_ids = set(), []
-        for i in all_ids:
-            if i not in seen_set:
-                seen_set.add(i); uniq_ids.append(i)
-
-        # 2) 分批換詳情
-        from math import ceil
-        batch = 40
-        for b in range(ceil(len(uniq_ids)/batch)):
-            chunk = uniq_ids[b*batch:(b+1)*batch]
-            params = {
-                "id_in": ",".join(chunk),
-                "expand": "read_statuses,receiver"
-            }
-            r = self._retry_after_auth(lambda: self.s.get(self.received_url, params=params, timeout=30))
             if r.status_code != 200:
-                logging.error(f"received-notifications HTTP {r.status_code}: {r.text[:300]}")
-                continue
+                logging.error(f"me/received-messages HTTP {r.status_code}: {r.text[:300]}")
+                break
+
             items = self._json_items(r)
+            if not items:
+                break
 
             for it in items:
-                created = it.get("created_at") or it.get("updated_at") or ""
-                cts = self._parse_ts(created) if created else 0.0
-                if last_ts and cts <= last_ts:
+                ts_str = it.get("published_at") or it.get("created_at") or ""
+                ts = self._parse_ts(ts_str) if ts_str else 0.0
+                if last_ts and ts <= last_ts:
                     continue
-                if created and (self._parse_ts(created) > self._parse_ts(newest or "1970-01-01 00:00:00")):
-                    newest = created
                 results.append(it)
+                if ts > newest_ts: newest_ts = ts
 
-        if newest:
-            state["last_seen_created_at"] = newest
+            page += 1
+
+        if newest_ts and newest_ts > last_ts:
+            state["last_seen_ts"] = newest_ts
             save_state(state)
 
-        logging.info("list: aggregated=%d pages_scanned=%d", len(results), min(page-1, MAX_LIST_PAGES))
+        logging.info(f"list: fetched={len(results)} pages_scanned={min(page-1, MAX_LIST_PAGES)}")
         return results
 
 # -------- DraftJS renderer --------
@@ -583,9 +443,9 @@ def render_draftjs_content(content_json: str):
         line = decorate_styles(t, blk.get("inlineStyleRanges") or [])
 
         for er in blk.get("entityRanges") or []:
-            key = er.get("key"); 
+            key = er.get("key")
             if key is None: continue
-            ent = entities.get(int(key)); 
+            ent = entities.get(int(key))
             if not ent: continue
             etype = (ent.get("type") or "").upper()
             data = ent.get("data") or {}
@@ -602,14 +462,13 @@ def render_draftjs_content(content_json: str):
     html_text = "\n\n".join([ln if ln.strip() else "​" for ln in lines])
     return html_text, attachments
 
-def build_header(scope_names):
-    scope = "、".join((scope_names or [])[:2]) if scope_names else "通知"
-    return f"🔔 <b>校內通知</b> · {escape_html(scope)}\n"
-
-def summarize_stats(read_statuses):
-    total = len(read_statuses or [])
-    readed = sum(1 for r in (read_statuses or []) if r.get("readed") is True)
-    return f"— 已讀 {readed}/{total}"
+def build_header(sender_reflection):
+    name = ""
+    try:
+        name = sender_reflection.get("name") or sender_reflection.get("realname") or ""
+    except Exception:
+        pass
+    return f"📩 <b>校內訊息</b>{' · 來自 ' + escape_html(name) if name else ''}\n"
 
 def format_time(ts: str) -> str:
     try:
@@ -656,34 +515,23 @@ def main():
 
     while True:
         try:
-            items = cli.list_notifications_incremental()
-            # 新訊息（按 id 去重）
+            items = cli.list_my_received_incremental()
             new_items = [it for it in items if str(it.get("id") or "") not in seen]
 
             for d in sorted(new_items, key=lambda x: str(x.get("id"))):
                 nid = str(d.get("id"))
+                title = d.get("title") or ""
                 content_str = d.get("content") or ""
+
                 html_body, atts = render_draftjs_content(content_str)
-
-                # 取 scope_names（從 read_statuses 中首個元素）
-                scope_names = []
-                try:
-                    rs = d.get("read_statuses") or []
-                    if rs and isinstance(rs, list):
-                        scope_names = rs[0].get("scope_names") or []
-                except Exception:
-                    pass
-
-                header = build_header(scope_names)
-                footer = summarize_stats(d.get("read_statuses") or [])
-                created = d.get("created_at") or d.get("updated_at") or ""
+                header = build_header(d.get("sender_reflection") or {})
+                created = d.get("published_at") or d.get("created_at") or ""
                 created_fmt = format_time(created)
                 time_line = f"— 發布於 {created_fmt}" if created_fmt else ""
 
-                main_msg = f"{header}\n{html_body}\n\n{time_line}  ·  {footer}"
+                main_msg = f"{header}\n<b>{escape_html(title)}</b>\n\n{html_body}\n\n{time_line}"
                 tg.send_message(main_msg)
 
-                # 附件：圖片先、文件後
                 images = [a for a in atts if a.get("type") == "image" and a.get("url")]
                 files  = [a for a in atts if a.get("type") == "file" and a.get("url")]
 
@@ -699,7 +547,6 @@ def main():
                         if size: cap += f"（{escape_html(size)}）"
                         tg.send_document_bytes(data, filename=(a.get("name") or fname), caption_html=cap)
 
-                # 記錄已推送
                 seen[nid] = {"pushed_at": now_cst_str()}
                 state["seen"] = seen
                 save_state(state)
@@ -718,7 +565,7 @@ EOF_PY
   # 寫入並設置權限
   install -m 0644 -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$TMP" "${INSTALL_DIR}/${PY_SCRIPT}"
   rm -f "$TMP"
-  success "Python 輪詢器（inbox-twohop + probe）已生成。"
+  success "Python 輪詢器（me/received-messages 單跳）已生成。"
 }
 
 # ----------------- 5) Write .env and runner -----------------
@@ -735,8 +582,12 @@ TELEGRAM_BOT_TOKEN=${TG_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TG_CHAT_ID}
 
 NOTIFY_POLL_SECONDS=${POLL}
-# 掃描頁數（收件箱第一跳最大頁；可視需求調大）
+# 掃描頁數（最大頁；可視需求調大）
 MAX_LIST_PAGES=3
+# all | unread
+READ_FILTER=all
+# include cc messages? true/false
+INCLUDE_CC=false
 EOF
     run_as_user chmod 600 "${INSTALL_DIR}/${ENV_FILE}"
   else
@@ -771,7 +622,7 @@ maybe_install_systemd() {
   local SVC="/etc/systemd/system/seiue-notify.service"
   cat > "$SVC" <<EOF
 [Unit]
-Description=Seiue Notification to Telegram Sidecar (Inbox two-hop + probe)
+Description=Seiue Notification to Telegram Sidecar (me/received-messages inbox)
 After=network-online.target
 Wants=network-online.target
 
@@ -813,7 +664,7 @@ main() {
   fi
   trap 'rmdir "$LOCKDIR"' EXIT
 
-  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.4.0-inbox-probe ---${C_RESET}"
+  echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.5.0-me-inbox ---${C_RESET}"
   check_environment
   mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"
 
