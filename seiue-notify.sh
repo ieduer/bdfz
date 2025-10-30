@@ -26,7 +26,15 @@ VENV_DIR="${INSTALL_DIR}/venv"
 PY_SCRIPT="seiue_notify.py"
 RUNNER="run.sh"
 ENV_FILE=".env"
+
 LOG_DIR="${INSTALL_DIR}/logs"
+
+# ---- reconfigure & collection flags ----
+RECONF=0
+for arg in "$@"; do
+  [ "$arg" = "--reconfigure" ] && RECONF=1
+done
+COLLECTED="0"
 
 # ---- proxy passthrough ----
 PROXY_ENV="$(env | grep -i -E '^(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' || true)"
@@ -57,7 +65,7 @@ check_environment() {
   if command -v python3 >/dev/null 2>&1; then PYBIN="$(command -v python3)"; fi
   if [ -z "$PYBIN" ]; then
     warn "系統未找到 python3，將嘗試安裝（Ubuntu/Debian 使用 apt；CentOS 使用 yum）。"
-    if command -v apt-get >/dev/null 2->&1; then
+    if command -v apt-get >/dev/null 2>&1; then
       apt-get update -y && apt-get install -y python3 python3-venv
     elif command -v yum >/dev/null 2>&1; then
       yum install -y python3 python3-venv || true
@@ -106,6 +114,7 @@ collect_inputs() {
   POLL="${POLL:-90}"
 
   export SEIUE_USERNAME SEIUE_PASSWORD TG_BOT_TOKEN TG_CHAT_ID POLL
+  COLLECTED="1"
 }
 
 # ----------------- 3) Install venv & deps -----------------
@@ -116,11 +125,38 @@ setup_layout() {
 
   local PYBIN="$(command -v python3)"
   info "使用 Python: ${PYBIN}"
-  run_as_user "$PYBIN" -m venv "$VENV_DIR"
+  # 確保 ensurepip/venv 可用（Ubuntu/Debian 可能未預裝）
+  if ! "$PYBIN" -c 'import ensurepip' >/dev/null 2>&1; then
+    info "未檢測到 ensurepip（python3-venv），嘗試安裝..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y
+      # 24.04 預設為 3.12，可同時嘗試通用包名與具體版本包名
+      apt-get install -y python3-venv python3.12-venv || apt-get install -y python3-venv || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y python3 python3-pip || true
+      # RHEL 系列通常自帶 ensurepip；若仍缺少，後續會用 ensurepip 補齊
+    fi
+  fi
+
+  # 建立 venv（若第一次失敗，安裝套件後重試一次）
+  if ! run_as_user "$PYBIN" -m venv "$VENV_DIR"; then
+    warn "python -m venv 失敗，嘗試安裝/修復後重試一次..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y
+      apt-get install -y python3-venv python3.12-venv || apt-get install -y python3-venv || true
+    fi
+    run_as_user "$PYBIN" -m venv "$VENV_DIR"
+  fi
   local VPY="${VENV_DIR}/bin/python"
 
+  # 若 venv 內尚無 pip，使用 ensurepip 引導
+  if ! run_as_user "$VPY" -m pip --version >/dev/null 2>&1; then
+    info "在 venv 內引導安裝 pip（ensurepip）..."
+    run_as_user "$VPY" -m ensurepip --upgrade || true
+  fi
+
   info "升級 pip..."
-  run_as_user env ${PROXY_ENV} "$VPY" -m pip install -q --upgrade pip
+  run_as_user env ${PROXY_ENV} "$VPY" -m pip install -q --upgrade pip || true
 
   info "安裝依賴（requests, pytz, urllib3）..."
   run_as_user env ${PROXY_ENV} "$VPY" -m pip install -q requests pytz urllib3
@@ -281,6 +317,7 @@ class SeiueClient:
         self.login_url = "https://passport.seiue.com/login?school_id=3"
         self.authorize_url = "https://passport.seiue.com/authorize"
         self.recv_list_url = "https://api.seiue.com/chalk/notification/received-notifications"
+        self.notif_list_url = "https://api.seiue.com/chalk/notification/notifications"
 
     def _preflight(self):
         try:
@@ -350,14 +387,13 @@ class SeiueClient:
 
     def list_inbox_incremental(self) -> List[Dict[str, Any]]:
         """
-        Inbox-only：按 token 的可見性列出「我收到的通知」，倒序。
-        不傳任何 scope；支援少量翻頁與水位線早停。
-        回傳為列表項（可能已含 content 等字段）。
+        從 /notifications 端點取得可見通知（acting_as_sender=false，倒序），
+        使用水位線（created_at）早停；返回「列表項（僅含 id/created_at）」。
+        詳情與附件稍後用 /received-notifications?id_in=... 拉取。
         """
         state = load_state()
         last_seen_ts = state.get("last_seen_created_at")
         results: List[Dict[str, Any]] = []
-        seen_ids: set = set()
         newest_ts_seen: str = last_seen_ts or ""
 
         page = 1
@@ -368,22 +404,18 @@ class SeiueClient:
                 "paginated": "1",
                 "order": "-created_at",
                 "page": str(page),
-                "expand": "receiver",
             }
-            if RECEIVER_IDS:
-                params["receiver.id_in"] = RECEIVER_IDS
-
-            r = self._retry_after_auth(lambda: self.s.get(self.recv_list_url, params=params, timeout=30))
+            r = self._retry_after_auth(lambda: self.s.get(self.notif_list_url, params=params, timeout=30))
             if r.status_code != 200:
-                logging.error(f"inbox list HTTP {r.status_code}: {r.text[:300]} (page={page})")
+                # 舊行為：若服務端要求 id_in，代表不支持列表，直接退出（交由詳情路徑處理）
+                logging.error(f"notifications list HTTP {r.status_code}: {r.text[:300]} (page={page})")
                 break
-
             try:
                 data = r.json()
                 items = data.get("items") if isinstance(data, dict) else (data if isinstance(data, list) else [])
                 items = items or []
             except Exception as e:
-                logging.error(f"inbox list JSON parse error: {e}")
+                logging.error(f"notifications list JSON parse error: {e}")
                 break
 
             if not items:
@@ -392,18 +424,14 @@ class SeiueClient:
             added_this_page = 0
             for it in items:
                 nid = str(it.get("id") or it.get("_id") or "")
-                if not nid or nid in seen_ids:
-                    continue
-
                 created = it.get("created_at") or it.get("updated_at") or ""
+                if not nid:
+                    continue
                 if last_seen_ts and created and self._parse_ts(created) <= self._parse_ts(last_seen_ts):
                     stop_by_watermark = True
                     break
-
-                results.append(it)
-                seen_ids.add(nid)
+                results.append({"id": nid, "created_at": created})
                 added_this_page += 1
-
                 if created and self._parse_ts(created) > self._parse_ts(newest_ts_seen or "1970-01-01 00:00:00"):
                     newest_ts_seen = created
 
@@ -415,7 +443,7 @@ class SeiueClient:
             state["last_seen_created_at"] = newest_ts_seen
             save_state(state)
 
-        logging.info("inbox list aggregated items=%d pages=%d", len(results), min(page-1, MAX_LIST_PAGES))
+        logging.info("notifications list aggregated items=%d pages=%d", len(results), min(page-1, MAX_LIST_PAGES))
         return results
 
     # 詳情拉取：確保 content / read_statuses / 附件等字段完整
@@ -539,7 +567,6 @@ def main():
     while True:
         try:
             base_items = cli.list_inbox_incremental()
-            # 新 ID
             new_ids: List[str] = []
             for it in base_items:
                 nid = str(it.get("id") or it.get("_id") or "")
@@ -644,7 +671,8 @@ EOF_PY
 # ----------------- 5) Write .env and runner -----------------
 write_env_and_runner() {
   info "寫入 ${ENV_FILE}（600 權限）與啟動腳本..."
-  run_as_user bash -lc "cat > '${INSTALL_DIR}/${ENV_FILE}'" <<EOF
+  if [ "$COLLECTED" = "1" ]; then
+    run_as_user bash -lc "cat > '${INSTALL_DIR}/${ENV_FILE}'" <<EOF
 SEIUE_USERNAME=${SEIUE_USERNAME}
 SEIUE_PASSWORD=${SEIUE_PASSWORD}
 X_SCHOOL_ID=3
@@ -661,7 +689,10 @@ MAX_LIST_PAGES=1
 # SEIUE_RECEIVER_IDS=
 
 EOF
-  run_as_user chmod 600 "${INSTALL_DIR}/${ENV_FILE}"
+    run_as_user chmod 600 "${INSTALL_DIR}/${ENV_FILE}"
+  else
+    info "檢測到現有 ${ENV_FILE}，保留不覆蓋。"
+  fi
 
   run_as_user bash -lc "cat > '${INSTALL_DIR}/${RUNNER}'" <<'EOF'
 #!/usr/bin/env bash
@@ -737,7 +768,12 @@ main() {
 
   echo -e "${C_GREEN}--- Seiue 通知 Sidecar 安裝程序 v1.1.0-inbox ---${C_RESET}"
   check_environment
-  collect_inputs
+  # 若已存在 .env 且未指定 --reconfigure，跳過交互式輸入
+  if [ -f "${INSTALL_DIR}/${ENV_FILE}" ] && [ "$RECONF" -ne 1 ]; then
+    info "檢測到已存在的 ${ENV_FILE}，跳過交互式輸入。"
+  else
+    collect_inputs
+  fi
   setup_layout
   write_python
   write_env_and_runner
