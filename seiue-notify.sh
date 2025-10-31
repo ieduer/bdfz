@@ -1,23 +1,19 @@
-# 寫入並執行（Linux/macOS 皆可；需 root）
 cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.3.0
-# - Dual channel: notice + system（全量直推）
-# - 全局去重（跨通道 id/內容哈希）
-# - 啟動自測也標記為已讀，不再二次推送
-# - 系統|請假|抄送：自動提取 申請人/時段/事由/狀態，插入摘要卡片
-# 用法：sudo bash ./seiue-notify.sh
+# v2.4.0
+# 變更：
+# - 單實例強制：安裝/啟動前清場任何歷史 run.sh/殘留 python 進程 + 刪鎖
+# - 服務 ExecStartPre 再次清場，避免重啟時雙實例
+# - Python 端加入 FAST_FORWARD_ON_START/HARD_CUTOFF/SOFT_DUP/考勤摘要抽取/請假卡片
 set -euo pipefail
 
-# ---------- pretty ----------
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
 info(){ echo -e "${C_BLUE}INFO:${C_RESET} $1"; }
 success(){ echo -e "${C_GREEN}SUCCESS:${C_RESET} $1"; }
 warn(){ echo -e "${C_YELLOW}WARNING:${C_RESET} $1"; }
 error(){ echo -e "${C_RED}ERROR:${C_RESET} $1" >&2; }
 
-# ---------- platform ----------
 OS="$(uname -s || true)"; IS_LINUX=0; IS_DARWIN=0
 [ "$OS" = "Linux" ] && IS_LINUX=1
 [ "$OS" = "Darwin" ] && IS_DARWIN=1
@@ -37,7 +33,6 @@ OUT_LOG="${LOG_DIR}/notify.out.log"
 ERR_LOG="${LOG_DIR}/notify.err.log"
 UNIT_NAME="seiue-notify"
 
-# 代理透傳（如需）
 PROXY_ENV="$(env | grep -i -E '^(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' || true)"
 
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
@@ -53,6 +48,25 @@ preflight(){
   fi
   need_cmd python3 || { error "仍未找到 python3"; exit 1; }
   success "預檢通過。"
+}
+
+cleanup_legacy(){
+  info "清理歷史殘留進程/鎖/腳本…"
+  # 停服務，避免搶資源
+  if [ $IS_LINUX -eq 1 ] && systemctl list-unit-files | grep -q "^${UNIT_NAME}\.service"; then
+    systemctl stop ${UNIT_NAME}.service || true
+  fi
+  # 杀掉任何手工跑的 python 舊實例
+  pkill -f '/\.seiue-notify/(venv/)?bin/python(3)? .*/seiue_notify\.py' || true
+  pkill -f 'cd.*/\.seiue-notify.* ./run\.sh' || true
+  # 禁用 run.sh（若有）
+  if [ -f "${INSTALL_DIR}/run.sh" ]; then
+    mv -f "${INSTALL_DIR}/run.sh" "${INSTALL_DIR}/run.sh.disabled.$(date +%s)" || true
+    printf '#!/usr/bin/env bash\necho "seiue-notify: run.sh disabled; use systemd"\n' > "${INSTALL_DIR}/run.sh"
+    chmod +x "${INSTALL_DIR}/run.sh"
+  fi
+  # 刪鎖
+  rm -f "${INSTALL_DIR}/.notify.lock"
 }
 
 collect_env_if_needed(){
@@ -75,12 +89,17 @@ TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 # 可選項（均有合理默認）：
 NOTIFY_POLL_SECONDS=${POLL}
 MAX_LIST_PAGES=10
-READ_FILTER=all           # all|unread
-INCLUDE_CC=true           # 是否包含抄送（默認：true）
+READ_FILTER=all
+INCLUDE_CC=true
 SKIP_HISTORY_ON_FIRST_RUN=1
 TELEGRAM_MIN_INTERVAL_SECS=1.5
-NOTICE_EXCLUDE_NOISE=0    # 0=不排除任何類型，通知中心“全量直推”
-SEND_TEST_ON_START=1      # 啟動後各通道自發最新1條作為安裝驗證（已自動標記為已讀）
+NOTICE_EXCLUDE_NOISE=0
+SEND_TEST_ON_START=1
+
+# 新增策略（不寫也有默認值）：
+FAST_FORWARD_ON_START=1         # 啟動快進水位到最新
+HARD_CUTOFF_MINUTES=60          # 嚴格丟棄啟動前 N 分鐘之前的消息
+SOFT_DUP_WINDOW_SECS=120        # 軟去重窗口（同標題+同發送者）
 EOF
   chmod 600 "$ENV_FILE"; chown "$REAL_USER:$(id -gn "$REAL_USER")" "$ENV_FILE"
 }
@@ -121,6 +140,7 @@ X_SCHOOL_ID = os.getenv("X_SCHOOL_ID","3")
 X_ROLE = os.getenv("X_ROLE","teacher")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","")
+
 POLL_SECONDS = int(os.getenv("NOTIFY_POLL_SECONDS","90") or "90")
 MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES","10") or "10"), 20))
 READ_FILTER = (os.getenv("READ_FILTER","all").strip().lower())
@@ -130,7 +150,14 @@ TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS","1.5") or "
 NOTICE_EXCLUDE_NOISE = os.getenv("NOTICE_EXCLUDE_NOISE","0").strip().lower() in ("1","true","yes","on")
 SEND_TEST_ON_START = os.getenv("SEND_TEST_ON_START","1").strip().lower() in ("1","true","yes","on")
 
+# 反歷史回刷策略
+FAST_FORWARD_ON_START = os.getenv("FAST_FORWARD_ON_START","1").strip().lower() in ("1","true","yes","on")
+HARD_CUTOFF_MINUTES  = int(os.getenv("HARD_CUTOFF_MINUTES","60") or "60")
+SOFT_DUP_WINDOW_SECS = int(os.getenv("SOFT_DUP_WINDOW_SECS","120") or "120")
+
 BEIJING_TZ = pytz.timezone("Asia/Shanghai")
+START_TS = time.time()
+HARD_CUTOFF_TS = START_TS - HARD_CUTOFF_MINUTES*60
 
 logging.basicConfig(
   level=logging.INFO,
@@ -174,20 +201,24 @@ def save_state(st:Dict[str,Any])->None:
 def acquire_lock_or_exit():
   fd=os.open(LOCK_FILE, os.O_CREAT|os.O_RDWR, 0o644)
   try:
-    fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB); os.ftruncate(fd,0); os.write(fd, str(os.getpid()).encode()); return fd
+    import fcntl as _fcntl
+    _fcntl.flock(fd, _fcntl.LOCK_EX|_fcntl.LOCK_NB); os.ftruncate(fd,0); os.write(fd, str(os.getpid()).encode()); return fd
   except OSError:
     logging.error("已有實例運行，本實例退出。"); sys.exit(0)
 
 def global_key(it: dict) -> str:
   nid = str(it.get("id") or "")
-  if nid:
-    return f"id:{nid}"
+  if nid: return f"id:{nid}"
   title = it.get("title") or ""
   t = it.get("published_at") or it.get("created_at") or ""
   src = (it.get("sender_reflection") or {}).get("id") or ""
   content = it.get("content") or ""
   h = hashlib.sha1(f"{title}|{t}|{src}|{content}".encode("utf-8", "ignore")).hexdigest()[:16]
   return f"h:{h}"
+
+def sender_name(it:Dict[str,Any])->str:
+  sr=it.get("sender_reflection") or {}
+  return sr.get("name") or sr.get("nickname") or "系統"
 
 class Telegram:
   def __init__(self, token:str, chat_id:str):
@@ -217,7 +248,6 @@ class Telegram:
   def send(self, html_text:str)->bool:
     if len(html_text)<=4096:
       return self._post("sendMessage", {"chat_id":self.chat_id,"text":html_text,"parse_mode":"HTML","disable_web_page_preview":True}, None, 30)
-    # 分片
     safe=4032; parts=[]; buf=""
     for para in html_text.split("\n\n"):
       add=(("\n\n" if buf else "")+para)
@@ -276,14 +306,12 @@ class Seiue:
     return r
 
   def list_system(self, pages:int)->List[Dict[str,Any]]:
-    # 系統消息（無關鍵詞過濾，全部直推）
     base={"expand":"sender_reflection","owner.id":self.reflection,"type":"message","paginated":"1","sort":"-published_at,-created_at"}
     if READ_FILTER=="unread": base["readed"]="false"
     if not INCLUDE_CC: base["is_cc"]="false"
     return self._collect(base, pages)
 
   def list_notice(self, pages:int)->List[Dict[str,Any]]:
-    # 通知中心（全量；是否排除噪音由 NOTICE_EXCLUDE_NOISE 控制，默認 0=不排除）
     base={"expand":"sender_reflection,aggregated_messages","owner.id":self.reflection,"paginated":"1","sort":"-published_at,-created_at","notice":"true"}
     if NOTICE_EXCLUDE_NOISE:
       base["type_not_in"]="exam.schedule_result_for_examinee,exam.schedule_result_for_examiner,exam.stats_received,exam.published_for_adminclass_teacher,exam.published_for_examinee,exam.published_scoring_for_examinee,exam.published_for_teacher,exam.published_for_mentor,schcal.holiday_created,schcal.holiday_deleted,schcal.holiday_updated,schcal.makeup_created,schcal.makeup_deleted"
@@ -315,7 +343,6 @@ class Seiue:
     return r.content, name
 
 def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
-  # Draft.js 風格
   try: raw=json.loads(raw_json or "{}")
   except: raw={}
   blocks=raw.get("blocks") or []; entity_map=raw.get("entityMap") or {}
@@ -350,7 +377,6 @@ def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
   return html_txt, attachments
 
 def classify(title:str, body_html:str)->Tuple[str,str]:
-  # 僅用於標籤裝飾；不影響是否推送
   z=(title or "")+"\n"+(body_html or "")
   PAIRS=[("leave","【請假】",["請假","请假","銷假","销假"]),
          ("attendance","【考勤】",["考勤","出勤","打卡","遲到","迟到","早退","缺勤","曠課","旷课"]),
@@ -361,15 +387,10 @@ def classify(title:str, body_html:str)->Tuple[str,str]:
       if k in z: return key, tag
   return "message","【消息】"
 
-def sender_name(it:Dict[str,Any])->str:
-  sr=it.get("sender_reflection") or {}
-  return sr.get("name") or sr.get("nickname") or "系統"
-
 def is_leave(title: str, body_html: str) -> bool:
   z = (title or "") + "\n" + (body_html or "")
   for k in ("請假","请假","銷假","销假"):
-    if k in z:
-      return True
+    if k in z: return True
   return False
 
 def extract_leave_details(text: str) -> dict:
@@ -386,19 +407,89 @@ def extract_leave_details(text: str) -> dict:
   if m: d["status"] = m.group(1)
   return d
 
+def extract_attendance_summary(it:Dict[str,Any]) -> str:
+  lines=[]
+  for m in (it.get("aggregated_messages") or [])[:10]:
+    t = (m.get("title") or "").strip()
+    b, _ = render_content(m.get("content") or "")
+    one = (t if t else b).strip()
+    if one:
+      one = re.sub(r"\n{3,}", "\n\n", one)
+      if len(one) > 200: one = one[:200] + "…"
+      lines.append(f"• {esc(one)}")
+  body_html, _ = render_content(it.get("content") or "")
+  body_txt = re.sub(r"<[^>]+>", "", body_html)
+  m = re.search(r"(?:班級|班级|班|課程|课程|科目|教學班|教学班)[:：]?\s*([^\s，,。]+)", body_txt)
+  if m: lines.insert(0, f"班級/課程：{esc(m.group(1))}")
+  m = re.search(r"(\d{4}-\d{1,2}-\d{1,2}\s*\d{1,2}:\d{2})\s*(?:至|到|—|-)\s*(\d{1,2}:\d{2}|\d{4}-\d{1,2}-\d{1,2}\s*\d{1,2}:\d{2})", body_txt)
+  if m: lines.insert(1, f"時段：{esc(m.group(1))} ～ {esc(m.group(2))}")
+  stat_map={"出勤": r"(?:出勤|到勤|簽到|签到)\s*[:：]?\s*(\d+)",
+            "請假": r"(?:請假|请假)\s*[:：]?\s*(\d+)",
+            "遲到": r"(?:遲到|迟到)\s*[:：]?\s*(\d+)",
+            "缺勤": r"(?:缺勤|曠課|旷课)\s*[:：]?\s*(\d+)"}
+  stats=[]
+  for k, rx in stat_map.items():
+    m = re.search(rx, body_txt)
+    if m: stats.append(f"{k} {m.group(1)}")
+  if stats: lines.append("統計：" + "，".join(stats))
+  if not lines and body_txt.strip():
+    sample = body_txt.strip()
+    if len(sample) > 200: sample = sample[:200] + "…"
+    lines.append(esc(sample))
+  return "\n".join(lines[:8])
+
+def soft_dup_key(it:Dict[str,Any], ts:float) -> str:
+  title = it.get("title") or ""
+  src = sender_name(it)
+  return f"soft:{src}|{title}|{int(ts//SOFT_DUP_WINDOW_SECS)}"
+
+def latest_of_channel(cli:"Seiue", ch:str)->Optional[Dict[str,Any]]:
+  arr = cli.list_notice(1) if ch=="notice" else cli.list_system(1)
+  return arr[0] if arr else None
+
+def ensure_startup_watermark(cli:"Seiue"):
+  st=load_state()
+  changed=False
+  for ch in ("system","notice"):
+    w=st["watermark"][ch]
+    last_ts=float(w.get("ts") or 0.0)
+    if FAST_FORWARD_ON_START or last_ts < (START_TS - 86400*365) or last_ts==0.0:
+      it=latest_of_channel(cli, ch)
+      if it:
+        ts=parse_ts(it.get("published_at") or it.get("created_at") or "") or START_TS
+        try: mid=int(str(it.get("id") or "0"))
+        except: mid=0
+      else:
+        ts=START_TS; mid=0
+      st["watermark"][ch]={"ts":ts,"id":mid}; changed=True
+  if changed:
+    save_state(st)
+    logging.info("fast-forward watermarks: %s", st["watermark"])
+
+def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
+  st=load_state(); pending=[]
+  for ch in ("system","notice"):
+    w=st["watermark"][ch]; last_ts=float(w.get("ts") or 0.0); last_id=int(w.get("id") or 0)
+    arr = cli.list_system(MAX_LIST_PAGES) if ch=="system" else cli.list_notice(MAX_LIST_PAGES)
+    for it in arr:
+      t=it.get("published_at") or it.get("created_at") or ""; ts=parse_ts(t) if t else 0.0
+      try: nid=int(str(it.get("id") or "0"))
+      except: nid=0
+      if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)): 
+        continue
+      pending.append((ch,it,ts,nid))
+  pending.sort(key=lambda x:(x[2], x[3])); return pending
+
 def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str="")->bool:
   title=it.get("title") or ""
   content=it.get("content") or ""
   body, atts=render_content(content)
-  kind, tag = classify(title, body)   # 只裝飾
+  kind, tag = classify(title, body)
   src = sender_name(it)
 
-  # 系統|請假|抄送 → 專用前綴 + 摘要卡片
-  leave = is_leave(title, body)
-  is_cc = bool(it.get("is_cc")) or str(it.get("is_cc")).lower() == "true"
   summary = ""
   custom_prefix = ""
-  if ch == "system" and leave and is_cc:
+  if ch == "system" and is_leave(title, body) and (bool(it.get("is_cc")) or str(it.get("is_cc")).lower()=="true"):
     det = extract_leave_details(body)
     lines = []
     if det.get("applicant"): lines.append(f"申請人：{esc(det['applicant'])}")
@@ -408,10 +499,15 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     summary = ("\n".join(lines) + "\n\n") if lines else ""
     custom_prefix = "【請假】收到一条请假抄送\n"
 
+  if kind == "attendance":
+    att = extract_attendance_summary(it)
+    if att: summary = (att + "\n\n") + summary
+
   hdr = f"📩 <b>{ '通知中心' if ch=='notice' else '系統消息' }</b>｜<b>{esc(src)}</b>\n"
   t = it.get("published_at") or it.get("created_at") or ""
   prefix_text = custom_prefix if custom_prefix else (tag)
-  msg=f"{hdr}\n{prefix}{prefix_text}<b>{esc(title)}</b>\n\n{summary}{body}\n\n— 發佈於 {fmt_time(t)}"
+  msg=f"{hdr}\n{prefix}{prefix_text}<b>{esc(title)}</b>\n\n{summary}{body}".rstrip()
+  msg += f"\n\n— 發佈於 {fmt_time(t)}"
 
   ok=tg.send(msg)
   imgs=[a for a in atts if a.get("type")=="image" and a.get("url")]
@@ -427,42 +523,6 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
       ok=tg.send_doc(data, (a.get("name") or name), cap) and ok
   return ok
 
-def latest_of_channel(cli:"Seiue", ch:str)->Optional[Dict[str,Any]]:
-  arr = cli.list_notice(1) if ch=="notice" else cli.list_system(1)
-  return arr[0] if arr else None
-
-def ensure_startup_watermark(cli:"Seiue"):
-  st=load_state()
-  if st["watermark"]["system"]["ts"]>0.0 and st["watermark"]["notice"]["ts"]>0.0: return
-  if not SKIP_HISTORY_ON_FIRST_RUN: return
-  for ch in ("system","notice"):
-    it=latest_of_channel(cli, ch)
-    if it:
-      ts=parse_ts(it.get("published_at") or it.get("created_at") or "") or time.time()
-      try:
-        mid=int(str(it.get("id") or "0"))
-      except:
-        mid=0
-    else:
-      ts=time.time(); mid=0
-    st["watermark"][ch]={"ts":ts,"id":mid}
-  save_state(st); logging.info("啟動設置水位完成：%s", st["watermark"])
-
-def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
-  st=load_state(); pending=[]
-  for ch in ("system","notice"):
-    w=st["watermark"][ch]; last_ts=float(w.get("ts") or 0.0); last_id=int(w.get("id") or 0)
-    arr = cli.list_system(MAX_LIST_PAGES) if ch=="system" else cli.list_notice(MAX_LIST_PAGES)
-    for it in arr:
-      t=it.get("published_at") or it.get("created_at") or ""; ts=parse_ts(t) if t else 0.0
-      try:
-        nid=int(str(it.get("id") or "0"))
-      except:
-        nid=0
-      if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)): continue
-      pending.append((ch,it,ts,nid))
-  pending.sort(key=lambda x:(x[2], x[3])); return pending
-
 def main_loop():
   if not (SEIUE_USERNAME and SEIUE_PASSWORD and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
     print("缺少必要環境變量。", file=sys.stderr); sys.exit(1)
@@ -472,17 +532,13 @@ def main_loop():
   if not cli.login(): print("Seiue 登錄失敗", file=sys.stderr); sys.exit(2)
   ensure_startup_watermark(cli)
 
-  # 安裝/啟動驗證：各通道各發最新1條（並標記為已讀，避免主循環再推）
   if SEND_TEST_ON_START:
     st = load_state()
     for ch in ("system","notice"):
       it=latest_of_channel(cli, ch)
       if it:
-        try:
-          send_one(tg, cli, it, ch, prefix="🧪 <b>安裝驗證</b>｜")
-        except Exception as e:
-          logging.error("test send error(%s): %s", ch, e)
-        # 標記為已讀（全局去重）
+        try: send_one(tg, cli, it, ch, prefix="🧪 <b>安裝驗證</b>｜")
+        except Exception as e: logging.error("test send error(%s): %s", ch, e)
         t = it.get("published_at") or it.get("created_at") or ""
         st["seen_global"][global_key(it)] = parse_ts(t) or time.time()
     save_state(st)
@@ -494,17 +550,27 @@ def main_loop():
       pending=list_increment_dual(cli)
       for ch,it,ts,nid in pending:
         gkey = global_key(it)
-        if gkey in st["seen_global"]: 
+        if gkey in st["seen_global"]:
           continue
+        # 硬截止：啟動前 N 分鐘以前的消息直接丟棄並推進水位
+        if ts < HARD_CUTOFF_TS:
+          st["seen_global"][gkey]=ts
+          wm=st["watermark"][ch]
+          if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
+          save_state(st); 
+          continue
+        # 兩分鐘窗口軟去重：同標題+發送者
+        sKey = soft_dup_key(it, ts)
+        if sKey in st["seen_global"]:
+          continue
+
         ok=send_one(tg, cli, it, ch)
         if ok:
           st["seen_global"][gkey]=ts
-          # 滾動清理，防止無限增長
-          if len(st["seen_global"]) > 20000:
-            oldest = sorted(st["seen_global"].items(), key=lambda kv: kv[1])[:5000]
-            for k, _ in oldest:
-              st["seen_global"].pop(k, None)
-          # 更新本通道水位
+          st["seen_global"][sKey]=ts
+          if len(st["seen_global"]) > 22000:
+            oldest = sorted(st["seen_global"].items(), key=lambda kv: kv[1])[:6000]
+            for k, _ in oldest: st["seen_global"].pop(k, None)
           wm=st["watermark"][ch]
           if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
           save_state(st)
@@ -523,7 +589,7 @@ PY
 write_service_linux(){
   cat >/etc/systemd/system/${UNIT_NAME}.service <<EOF
 [Unit]
-Description=Seiue → Telegram notifier (dual-channel; global dedup; no subcommands)
+Description=Seiue → Telegram notifier (dual-channel; global dedup; single-instance)
 After=network-online.target
 Wants=network-online.target
 
@@ -531,6 +597,9 @@ Wants=network-online.target
 User=${REAL_USER}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
+# 啟動前再次清場：殺殘留 python、刪鎖
+ExecStartPre=/usr/bin/bash -lc "pkill -f '\\.seiue-notify/(venv/)?bin/python(3)? .*/seiue_notify\\.py' || true"
+ExecStartPre=/usr/bin/rm -f ${INSTALL_DIR}/.notify.lock
 ExecStart=${VENV_DIR}/bin/python3 ${PY_SCRIPT}
 Restart=always
 RestartSec=5s
@@ -576,10 +645,11 @@ start_service(){
   fi
 }
 
-# -------- main (zero-arg only) --------
-info "Seiue sidecar（零參數版；雙通道全量推送＋全局去重＋請假抄送摘要）"
+# -------- main --------
+info "Seiue sidecar v2.4.0（單實例＋反歷史回刷＋雙通道＋全局去重＋考勤摘要＋請假卡）"
 preflight
 ensure_dirs
+cleanup_legacy
 collect_env_if_needed
 setup_venv
 write_python
@@ -590,8 +660,8 @@ else
   write_service_darwin
 fi
 success "已安裝/升級並啟動。"
-echo "狀態：systemctl status ${UNIT_NAME} --no-pager   （macOS: launchctl list | grep ${UNIT_NAME})"
-echo "日誌：journalctl -u ${UNIT_NAME} -f            或   tail -F ${OUT_LOG} ${ERR_LOG}"
+echo "狀態：systemctl status ${UNIT_NAME} --no-pager"
+echo "日誌：journalctl -u ${UNIT_NAME} -n 50 --no-pager"
 SH
 
 bash /root/seiue-notify.sh
