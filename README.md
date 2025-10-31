@@ -6,15 +6,12 @@
  ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/jks.sh)
 ```
-
- 
  
  # 2、SAA
 
-> 基於 <a href="https://github.com/c-jeremy/sue/blob/main/pseudo-auth.php" target="_blank" rel="noopener noreferrer">pseudo-auth.php</a> ，通過最小抓包實現；提供 API 化版本。**該版本無視時間限制**；此倉庫附帶「暴力」舊版供研究與自用。
+> 基於 <a href="https://github.com/c-jeremy/sue/blob/main/pseudo-auth.php" target="_blank" rel="noopener noreferrer">pseudo-auth.php</a> ，通過最小抓包實現 API 版本。**該版本無視時間限制**。
 
 ---
-
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/saa.sh)
