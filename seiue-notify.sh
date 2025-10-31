@@ -1,13 +1,14 @@
 cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.4.3-stable
-# 修正要点：
-# - systemd ExecStartPre 去掉 shell 語法，改用前綴「-」忽略不存在時的失敗（正確 systemd 寫法）
-# - login() 兜底解析 /authorize（text/html）時使用正確的正則：(\d+) 而非 (\\d+)
+# v2.4.4-fix
+# 變更重點：
+# - 100% 強制覆寫 systemd unit（去掉舊版的 "|| true"；用 '-' 前綴忽略不存在進程）
 # - 維持「三斬」：雙 pkill + 禁用 run.sh + 清鎖
-# - 默認「防歷史」：FAST_FORWARD + HARD_CUTOFF + SOFT_DUP；READ_FILTER 缺省置為 unread
-# - 【請假】卡片化四要素；【考勤】抽取班級/時段/統計 + 10 條聚合；附件/圖片跟發
+# - 服務固定使用 /root/.seiue-notify 路徑與 User=root，避免大小寫/家目錄差異
+# - 默認「防歷史」：FAST_FORWARD + HARD_CUTOFF + SOFT_DUP；READ_FILTER=unread
+# - 【請假】卡片化：申請人/時段/事由/狀態；【考勤】班級/時段/統計 + 聚合10條；附件/圖片跟發
+# - login() 兜底正則 (\d+) 正確；啟動時發🧪驗證且不回刷
 
 set -euo pipefail
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
@@ -16,36 +17,29 @@ success(){ echo -e "${C_GREEN}SUCCESS:${C_RESET} $1"; }
 warn(){ echo -e "${C_YELLOW}WARNING:${C_RESET} $1"; }
 error(){ echo -e "${C_RED}ERROR:${C_RESET} $1" >&2; }
 
-OS="$(uname -s || true)"; IS_LINUX=0; IS_DARWIN=0
-[ "$OS" = "Linux" ] && IS_LINUX=1
-[ "$OS" = "Darwin" ] && IS_DARWIN=1
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   echo "需要 root 權限。使用 sudo 重新執行…"
   exec sudo -E bash "$0" "$@"
 fi
 
-REAL_USER="${SUDO_USER:-$(whoami)}"
-REAL_HOME=$(eval echo ~"$REAL_USER")
-INSTALL_DIR="${REAL_HOME}/.seiue-notify"
+INSTALL_DIR="/root/.seiue-notify"
 VENV_DIR="${INSTALL_DIR}/venv"
 PY_SCRIPT="${INSTALL_DIR}/seiue_notify.py"
 ENV_FILE="${INSTALL_DIR}/.env"
 LOG_DIR="${INSTALL_DIR}/logs"
 OUT_LOG="${LOG_DIR}/notify.out.log"
 ERR_LOG="${LOG_DIR}/notify.err.log"
-UNIT_NAME="seiue-notify"
-PROXY_ENV="$(env | grep -i -E '^(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' || true)"
+UNIT_FILE="/etc/systemd/system/seiue-notify.service"
 
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
-ensure_dirs(){ mkdir -p "$INSTALL_DIR" "$LOG_DIR"; chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$INSTALL_DIR"; }
+ensure_dirs(){ mkdir -p "$INSTALL_DIR" "$LOG_DIR"; }
 
 preflight(){
   info "環境預檢…"
   if ! need_cmd python3; then
     warn "未發現 python3，嘗試安裝…"
-    if need_cmd apt-get; then apt-get update -y && apt-get install -y python3 python3-venv python3-pip || true; fi
-    if need_cmd yum;     then yum install -y python3 python3-pip || true; fi
-    if [ $IS_DARWIN -eq 1 ] && need_cmd brew; then brew install python || true; fi
+    if command -v apt-get >/dev/null; then apt-get update -y && apt-get install -y python3 python3-venv python3-pip || true; fi
+    if command -v yum >/dev/null;     then yum install -y python3 python3-pip || true; fi
   fi
   need_cmd python3 || { error "仍未找到 python3"; exit 1; }
   success "預檢通過。"
@@ -53,18 +47,14 @@ preflight(){
 
 cleanup_legacy(){
   info "清理歷史殘留進程/鎖/腳本（三斬）…"
-  if [ $IS_LINUX -eq 1 ] && systemctl list-unit-files | grep -q "^${UNIT_NAME}\.service"; then
-    systemctl stop ${UNIT_NAME}.service || true
-  fi
-  pkill -TERM -f 'python.*seiue_notify\.py' || true
+  systemctl stop seiue-notify 2>/dev/null || true
+  pkill -TERM -f 'python.*seiue_notify\.py' 2>/dev/null || true
   sleep 0.2
-  pkill -KILL -f 'python.*seiue_notify\.py' || true
-  pkill -f 'run\.sh' || true
-  if [ -f "${INSTALL_DIR}/run.sh" ]; then
-    mv -f "${INSTALL_DIR}/run.sh" "${INSTALL_DIR}/run.sh.disabled.$(date +%s)" || true
-    printf '#!/usr/bin/env bash\necho "seiue-notify: run.sh disabled; use systemd"\n' > "${INSTALL_DIR}/run.sh"
-    chmod +x "${INSTALL_DIR}/run.sh"
-  fi
+  pkill -KILL -f 'python.*seiue_notify\.py' 2>/dev/null || true
+  pkill -f 'run\.sh' 2>/dev/null || true
+  [ -f "${INSTALL_DIR}/run.sh" ] && mv -f "${INSTALL_DIR}/run.sh" "${INSTALL_DIR}/run.sh.disabled.$(date +%s)" || true
+  printf '#!/usr/bin/env bash\necho "seiue-notify: run.sh disabled; use systemd"\n' > "${INSTALL_DIR}/run.sh"
+  chmod +x "${INSTALL_DIR}/run.sh"
   rm -f "${INSTALL_DIR}/.notify.lock"
 }
 
@@ -100,10 +90,9 @@ FAST_FORWARD_ON_START=1
 HARD_CUTOFF_MINUTES=360
 SOFT_DUP_WINDOW_SECS=1800
 EOF
-  chmod 600 "$ENV_FILE"; chown "$REAL_USER:$(id -gn "$REAL_USER")" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
 }
 
-# 已有 .env 時補齊缺省鍵（不覆蓋既有值）
 ensure_env_defaults(){
   [ -f "$ENV_FILE" ] || return 0
   _set_if_missing(){ grep -qE "^$1=" "$ENV_FILE" || printf "%s=%s\n" "$1" "$2" >>"$ENV_FILE"; }
@@ -118,14 +107,13 @@ ensure_env_defaults(){
 
 setup_venv(){
   ensure_dirs
-  local PYBIN="$(command -v python3)"
-  if ! "$PYBIN" -c 'import ensurepip' >/dev/null 2>&1; then
-    if need_cmd apt-get; then apt-get update -y && apt-get install -y python3-venv || true; fi
+  if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null; then apt-get update -y && apt-get install -y python3-venv || true; fi
   fi
-  su - "$REAL_USER" -c "$PYBIN -m venv '$VENV_DIR'" || true
-  su - "$REAL_USER" -c "env ${PROXY_ENV} '$VENV_DIR/bin/python' -m pip install -U pip >/dev/null 2>&1" || true
+  python3 -m venv "$VENV_DIR" || true
+  "$VENV_DIR/bin/python" -m pip install -U pip >/dev/null 2>&1 || true
   info "安裝/升級依賴…"
-  su - "$REAL_USER" -c "env ${PROXY_ENV} '$VENV_DIR/bin/python' -m pip install -q requests pytz urllib3"
+  "$VENV_DIR/bin/python" -m pip install -q requests pytz urllib3
 }
 
 write_python(){
@@ -351,8 +339,7 @@ class Seiue:
       try:
         j=r.json()
       except Exception:
-        logging.error("list decode error; status=%s body_prefix=%r", r.status_code, (r.text or "")[:160])
-        break
+        logging.error("list decode error; status=%s body_prefix=%r", r.status_code, (r.text or "")[:160]); break
       arr=j["items"] if isinstance(j,dict) and "items" in j else (j if isinstance(j,list) else [])
       if not arr: break
       items.extend(arr)
@@ -475,11 +462,9 @@ def latest_of_channel(cli:"Seiue", ch:str)->Optional[Dict[str,Any]]:
   return arr[0] if arr else None
 
 def ensure_startup_watermark(cli:"Seiue"):
-  st=load_state()
-  changed=False
+  st=load_state(); changed=False
   for ch in ("system","notice"):
-    w=st["watermark"][ch]
-    last_ts=float(w.get("ts") or 0.0)
+    w=st["watermark"][ch]; last_ts=float(w.get("ts") or 0.0)
     if FAST_FORWARD_ON_START or last_ts < (START_TS - 86400*365) or last_ts==0.0:
       it=latest_of_channel(cli, ch)
       if it:
@@ -608,27 +593,30 @@ def main_loop():
 if __name__=="__main__": main_loop()
 PY
   chmod 755 "$PY_SCRIPT"
-  chown "$REAL_USER:$(id -gn "$REAL_USER")" "$PY_SCRIPT"
 }
 
-write_service_linux(){
-  cat >/etc/systemd/system/${UNIT_NAME}.service <<EOF
+write_service(){
+  cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=Seiue → Telegram notifier (dual-channel; global dedup; single-instance)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=${REAL_USER}
+User=root
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
 Environment=PYTHONUNBUFFERED=1
-# —— 三斬（正確 systemd 寫法；用前綴 - 忽略失敗）——
+
+# —— 三斬（正確 systemd 寫法；用 '-' 忽略失敗）——
 ExecStartPre=-/usr/bin/pkill -TERM -f python.*seiue_notify\.py
 ExecStartPre=-/usr/bin/pkill -KILL -f python.*seiue_notify\.py
 ExecStartPre=-/usr/bin/pkill -f run\.sh
 ExecStartPre=-/usr/bin/rm -f ${INSTALL_DIR}/.notify.lock
+
+# —— 正確 Python 路徑（/root）——
 ExecStart=${VENV_DIR}/bin/python3 -u ${PY_SCRIPT}
+
 Restart=always
 RestartSec=5s
 StandardOutput=append:${OUT_LOG}
@@ -638,42 +626,20 @@ StandardError=append:${ERR_LOG}
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-}
-
-write_service_darwin(){
-  local PLIST="/Library/LaunchDaemons/net.bdfz.${UNIT_NAME}.plist"
-  cat >"$PLIST" <<EOPL
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>net.bdfz.${UNIT_NAME}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${VENV_DIR}/bin/python3</string>
-    <string>${PY_SCRIPT}</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${OUT_LOG}</string>
-  <key>StandardErrorPath</key><string>${ERR_LOG}</string>
-  <key>WorkingDirectory</key><string>${INSTALL_DIR}</string>
-</dict></plist>
-EOPL
-  launchctl unload "$PLIST" 2>/dev/null || true
-  launchctl load "$PLIST"
+  # 顯示確保沒有 "|| true"
+  if grep -q "|| true" "$UNIT_FILE"; then
+    echo "ERROR: unit 仍含 || true，請回報。"
+    exit 17
+  fi
 }
 
 start_service(){
   mkdir -p "$LOG_DIR"; touch "$OUT_LOG" "$ERR_LOG"
-  chown -R "$REAL_USER:$(id -gn "$REAL_USER")" "$LOG_DIR"
-  if [ $IS_LINUX -eq 1 ]; then
-    systemctl enable --now ${UNIT_NAME}.service
-  else
-    write_service_darwin
-  fi
+  systemctl enable --now seiue-notify
 }
 
-info "Seiue sidecar v2.4.3-stable（單實例“三斬”＋防歷史回刷＋雙通道＋全局去重＋考勤摘要＋請假卡）"
+# —— 主流程 ——
+info "Seiue sidecar v2.4.4-fix（單實例“三斬”＋防歷史＋雙通道＋去重＋考勤摘要＋請假卡）"
 preflight
 ensure_dirs
 cleanup_legacy
@@ -681,15 +647,20 @@ collect_env_if_needed
 ensure_env_defaults
 setup_venv
 write_python
-if [ $IS_LINUX -eq 1 ]; then
-  write_service_linux
-  systemctl restart ${UNIT_NAME}.service || true
-else
-  write_service_darwin
-fi
+write_service
+systemctl restart seiue-notify || true
 success "已安裝/升級並啟動。"
-echo "狀態：systemctl status ${UNIT_NAME} --no-pager"
-echo "日誌：journalctl -u ${UNIT_NAME} -n 80 --no-pager -o cat"
+
+echo
+echo "=== 快速驗證 ==="
+echo "1) systemctl status："
+systemctl status seiue-notify --no-pager -l | sed -n '1,25p' || true
+echo
+echo "2) 只允許單實例："
+pgrep -fa 'python.*seiue_notify\.py' || echo '尚未啟動'
+echo
+echo "3) 關鍵日誌（Auth/水位/錯誤）："
+journalctl -u seiue-notify -n 120 --no-pager -o cat | egrep -i 'Auth OK|fast-forward|loop error|send error|authorize missing|login error' || true
 SH
 
 bash /root/seiue-notify.sh
