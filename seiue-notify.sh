@@ -1,13 +1,13 @@
 cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.4.2-hotfix
-# 修正：
-# - login() 兼容 /authorize 返回 text/html，兜底抽取 access_token / active_reflection_id
-# - systemd 加 Environment=PYTHONUNBUFFERED=1，日志即时刷新
-# - 保留“三斬”：TERM/KILL python.*seiue_notify.py + 砍 run.sh + 清鎖
-# - 反歷史（FAST_FORWARD + HARD_CUTOFF）+ 軟去重（SOFT_DUP）默認開
-# - 請假卡片化四要素；考勤提取班級/時段/統計 + 10 條聚合摘要；附圖/附件跟隨
+# v2.4.3-stable
+# 修正要点：
+# - systemd ExecStartPre 去掉 shell 語法，改用前綴「-」忽略不存在時的失敗（正確 systemd 寫法）
+# - login() 兜底解析 /authorize（text/html）時使用正確的正則：(\d+) 而非 (\\d+)
+# - 維持「三斬」：雙 pkill + 禁用 run.sh + 清鎖
+# - 默認「防歷史」：FAST_FORWARD + HARD_CUTOFF + SOFT_DUP；READ_FILTER 缺省置為 unread
+# - 【請假】卡片化四要素；【考勤】抽取班級/時段/統計 + 10 條聚合；附件/圖片跟發
 
 set -euo pipefail
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
@@ -88,7 +88,7 @@ TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 # 可選項（均有合理默認）：
 NOTIFY_POLL_SECONDS=${POLL}
 MAX_LIST_PAGES=10
-READ_FILTER=all
+READ_FILTER=unread
 INCLUDE_CC=true
 SKIP_HISTORY_ON_FIRST_RUN=1
 TELEGRAM_MIN_INTERVAL_SECS=1.5
@@ -97,10 +97,23 @@ SEND_TEST_ON_START=1
 
 # 反歷史 + 去重策略（可改）：
 FAST_FORWARD_ON_START=1
-HARD_CUTOFF_MINUTES=180
-SOFT_DUP_WINDOW_SECS=900
+HARD_CUTOFF_MINUTES=360
+SOFT_DUP_WINDOW_SECS=1800
 EOF
   chmod 600 "$ENV_FILE"; chown "$REAL_USER:$(id -gn "$REAL_USER")" "$ENV_FILE"
+}
+
+# 已有 .env 時補齊缺省鍵（不覆蓋既有值）
+ensure_env_defaults(){
+  [ -f "$ENV_FILE" ] || return 0
+  _set_if_missing(){ grep -qE "^$1=" "$ENV_FILE" || printf "%s=%s\n" "$1" "$2" >>"$ENV_FILE"; }
+  _set_if_missing READ_FILTER unread
+  _set_if_missing FAST_FORWARD_ON_START 1
+  _set_if_missing HARD_CUTOFF_MINUTES 360
+  _set_if_missing SOFT_DUP_WINDOW_SECS 1800
+  _set_if_missing INCLUDE_CC true
+  _set_if_missing NOTICE_EXCLUDE_NOISE 0
+  _set_if_missing SEND_TEST_ON_START 1
 }
 
 setup_venv(){
@@ -141,7 +154,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","")
 
 POLL_SECONDS = int(os.getenv("NOTIFY_POLL_SECONDS","90") or "90")
 MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES","10") or "10"), 20))
-READ_FILTER = (os.getenv("READ_FILTER","all").strip().lower())
+READ_FILTER = (os.getenv("READ_FILTER","unread").strip().lower())
 INCLUDE_CC = os.getenv("INCLUDE_CC","true").strip().lower() in ("1","true","yes","on")
 SKIP_HISTORY_ON_FIRST_RUN = os.getenv("SKIP_HISTORY_ON_FIRST_RUN","1").strip().lower() in ("1","true","yes","on")
 TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS","1.5") or "1.5")
@@ -149,8 +162,8 @@ NOTICE_EXCLUDE_NOISE = os.getenv("NOTICE_EXCLUDE_NOISE","0").strip().lower() in 
 SEND_TEST_ON_START = os.getenv("SEND_TEST_ON_START","1").strip().lower() in ("1","true","yes","on")
 
 FAST_FORWARD_ON_START = os.getenv("FAST_FORWARD_ON_START","1").strip().lower() in ("1","true","yes","on")
-HARD_CUTOFF_MINUTES  = int(os.getenv("HARD_CUTOFF_MINUTES","60") or "60")
-SOFT_DUP_WINDOW_SECS = int(os.getenv("SOFT_DUP_WINDOW_SECS","120") or "120")
+HARD_CUTOFF_MINUTES  = int(os.getenv("HARD_CUTOFF_MINUTES","360") or "360")
+SOFT_DUP_WINDOW_SECS = int(os.getenv("SOFT_DUP_WINDOW_SECS","1800") or "1800")
 
 BEIJING_TZ = pytz.timezone("Asia/Shanghai")
 START_TS = time.time()
@@ -296,7 +309,7 @@ class Seiue:
         txt = r.text or ""
         import re as _re
         m = _re.search(r'"access_token"\s*:\s*"([^"]+)"', txt)
-        n = _re.search(r'"active_reflection_id"\s*:\s*"?(\\d+)"?', txt)
+        n = _re.search(r'"active_reflection_id"\s*:\s*"?(\d+)"?', txt)
         j = {"access_token": m.group(1) if m else None,
              "active_reflection_id": n.group(1) if n else None}
       tok = j.get("access_token"); rid = str(j.get("active_reflection_id") or "")
@@ -383,7 +396,7 @@ def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
     for er in blk.get("entityRanges") or []:
       key=er.get("key"); ent=ents.get(int(key)) if key is not None else None
       if not ent: continue
-      et=(ent.get("type") or "").upper(); dat=ent.get("data") or {}
+      et=(ent.get("type") or "").upper(); dat=(ent.get("data") or {})
       if et=="FILE":  attachments.append({"type":"file","name":dat.get("name") or "附件","size":dat.get("size") or "","url":dat.get("url") or ""})
       if et=="IMAGE": attachments.append({"type":"image","name":"image.jpg","size":"","url":dat.get("src") or ""})
     if (blk.get("data") or {}).get("align")=="align_right" and line.strip(): line="—— "+line
@@ -405,9 +418,7 @@ def classify(title:str, body_html:str)->Tuple[str,str]:
 
 def is_leave(title: str, body_html: str) -> bool:
   z = (title or "") + "\n" + (body_html or "")
-  for k in ("請假","请假","銷假","销假"):
-    if k in z: return True
-  return False
+  return any(k in z for k in ("請假","请假","銷假","销假"))
 
 def extract_leave_details(text: str) -> dict:
   import html as _html
@@ -612,11 +623,11 @@ User=${REAL_USER}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
 Environment=PYTHONUNBUFFERED=1
-# —— 三斬 ——（覆蓋相對/絕對路徑殘留 + 干掉舊 run.sh）
-ExecStartPre=/usr/bin/pkill -TERM -f 'python.*seiue_notify\\.py' || true
-ExecStartPre=/usr/bin/pkill -KILL -f 'python.*seiue_notify\\.py' || true
-ExecStartPre=/usr/bin/pkill -f 'run\\.sh' || true
-ExecStartPre=/usr/bin/rm -f ${INSTALL_DIR}/.notify.lock
+# —— 三斬（正確 systemd 寫法；用前綴 - 忽略失敗）——
+ExecStartPre=-/usr/bin/pkill -TERM -f python.*seiue_notify\.py
+ExecStartPre=-/usr/bin/pkill -KILL -f python.*seiue_notify\.py
+ExecStartPre=-/usr/bin/pkill -f run\.sh
+ExecStartPre=-/usr/bin/rm -f ${INSTALL_DIR}/.notify.lock
 ExecStart=${VENV_DIR}/bin/python3 -u ${PY_SCRIPT}
 Restart=always
 RestartSec=5s
@@ -662,11 +673,12 @@ start_service(){
   fi
 }
 
-info "Seiue sidecar v2.4.2-hotfix（單實例“三斬”＋反歷史回刷＋雙通道＋全局去重＋考勤摘要＋請假卡）"
+info "Seiue sidecar v2.4.3-stable（單實例“三斬”＋防歷史回刷＋雙通道＋全局去重＋考勤摘要＋請假卡）"
 preflight
 ensure_dirs
 cleanup_legacy
 collect_env_if_needed
+ensure_env_defaults
 setup_venv
 write_python
 if [ $IS_LINUX -eq 1 ]; then
