@@ -30,21 +30,18 @@ install_pkgs() {
     apt-get install -y \
       python3 python3-venv python3-pip curl unzip jq ca-certificates \
       tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
-      poppler-utils ghostscript \
-      libxml2 libxslt1.1 libjpeg-turbo8 libpng16-16 coreutils
+      poppler-utils ghostscript coreutils
   elif have dnf || have yum; then
     local YUM=$(have dnf && echo dnf || echo yum)
     $YUM install -y epel-release || true
-    $YUM install -y python3 python3-pip python3-virtualenv curl unzip jq ca-certificates coreutils || \
-    $YUM install -y python3 python3-pip curl unzip jq ca-certificates coreutils
+    $YUM install -y python3 python3-pip python3-virtualenv curl unzip jq ca-certificates coreutils
     $YUM install -y tesseract poppler-utils ghostscript || true
     $YUM install -y tesseract-langpack-eng tesseract-langpack-chi_sim || true
     $YUM install -y tesseract-eng tesseract-chi_sim || true
-    $YUM install -y libjpeg-turbo libpng libxml2 libxslt || true
   elif have apk; then
     apk add --no-cache \
       python3 py3-pip py3-venv curl unzip jq ca-certificates coreutils \
-      tesseract-ocr poppler-utils ghostscript \
+      tesseract-ocr poppler-utils ghostscript libxml2 libxslt \
       tesseract-ocr-data-eng tesseract-ocr-data-chi_sim || true
   else
     echo "Unsupported package manager. Please install: python3, venv, pip, curl, jq, tesseract(+eng+chi_sim), poppler-utils, ghostscript, coreutils."
@@ -177,6 +174,7 @@ pytesseract==0.3.13
 pdfminer.six==20231228
 python-docx==1.1.2
 python-pptx==0.6.23
+lxml==5.3.0
 EOF
 
   # ---- docs ----
@@ -266,7 +264,7 @@ def _session_with_retries() -> requests.Session:
     r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "AGrader/1.2 (+login)",
+        "User-Agent": "AGrader/1.3 (+login)",
         "Accept": "application/json, text/plain, */*",
     })
     return s
@@ -277,7 +275,8 @@ def login(username: str, password: str) -> AuthResult:
         login_url = "https://passport.seiue.com/login?school_id=3&type=account&from=null&redirect_url=null"
         auth_url  = "https://passport.seiue.com/authorize"
 
-        login_form = {"email": username, "password": password}
+        # Be generous with field names (capture variability)
+        login_form = {"email": username, "login": username, "username": username, "password": password}
         login_headers = {
             "Referer": login_url,
             "Origin": "https://passport.seiue.com",
@@ -496,6 +495,15 @@ PY
 import os, logging, requests
 from typing import Dict, Any, List, Tuple
 from credentials import login, AuthResult
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def _session_with_retries() -> requests.Session:
+    s = requests.Session()
+    r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504),
+              allowed_methods=frozenset({"GET","POST"}))
+    s.mount("https://", HTTPAdapter(max_retries=r))
+    return s
 
 class Seiue:
     def __init__(self, base: str, bearer: str, school_id: str, role: str, reflection_id: str,
@@ -507,7 +515,7 @@ class Seiue:
         self.role = role
         self.reflection_id = str(reflection_id) if reflection_id else ""
         self.bearer = bearer or ""
-        self.session = requests.Session()
+        self.session = _session_with_retries()
         self._init_headers()
         if not self.bearer and self.username and self.password:
             self._login_and_apply()
@@ -515,7 +523,7 @@ class Seiue:
     def _init_headers(self):
         self.session.headers.update({
             "Accept": "application/json, text/plain, */*",
-            "User-Agent": "AGrader/1.2",
+            "User-Agent": "AGrader/1.3",
         })
         if self.bearer:
             self.session.headers.update({"Authorization": f"Bearer {self.bearer}"})
@@ -618,7 +626,7 @@ class Seiue:
         return r.status_code, r.text[:400]
 PY
 
-  # ---- main.py (logging + richer traces; attachments text to AI) ----
+  # ---- main.py ----
   cat > "$APP_DIR/main.py" <<'PY'
 import os, json, time, traceback, tempfile, logging
 from typing import Dict, Any, List
