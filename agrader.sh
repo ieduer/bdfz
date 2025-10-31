@@ -107,7 +107,7 @@ write_project() {
     ask "LOG_LEVEL (DEBUG/INFO/WARN/ERROR)" LOG_LEVEL "INFO"
     ask "LOG_FILE path" LOG_FILE "$APP_DIR/agrader.log"
 
-    cat > "$ENV_FILE" <<EOF
+  cat > "$ENV_FILE" <<EOF
 # ---- Seiue ----
 SEIUE_BASE=${SEIUE_BASE}
 SEIUE_USERNAME=${SEIUE_USERNAME}
@@ -119,18 +119,12 @@ SEIUE_REFLECTION_ID=${SEIUE_REFLECTION_ID}
 MONITOR_TASK_IDS=${MONITOR_TASK_IDS}
 POLL_INTERVAL=${POLL_INTERVAL}
 
-# Confirmed review endpoint (expect 201)
+# Confirmed review endpoint
 SEIUE_REVIEW_POST_TEMPLATE=/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews
 
-# Legacy single score endpoint (kept for compatibility; new code also supports multiple fallbacks)
-SEIUE_SCORE_POST_TEMPLATE=/vnas/common/items/{item_id}/scores?type=item_score
-# Optional fine-tune (if you insist a single template first):
-# SEIUE_SCORE_METHOD=POST        # POST or PUT
-# SEIUE_SCORE_BODY=array         # array or object
-
-# New: multiple fallback endpoints (semicolon separated). Format: METHOD:PATH[:BODY]
-# e.g. POST:/vnas/common/items/{item_id}/scores?type=item_score:array;PUT:/common/items/{item_id}/scores?type=item_score:array
-SEIUE_SCORE_ENDPOINTS=
+# Multiple fallback endpoints for score (METHOD:PATH[:BODY])
+# 405/MethodNotAllowed 時自動換路徑與方法；BODY=array|object（預設 array）
+SEIUE_SCORE_ENDPOINTS=PUT:/common/items/{item_id}/scores?type=item_score:array;PUT:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/vnas/common/items/{item_id}/scores?type=item_score:array
 
 # ---- AI ----
 AI_PROVIDER=${AI_PROVIDER}
@@ -156,8 +150,11 @@ KEEP_WORK_FILES=${KEEP_WORK_FILES}
 LOG_LEVEL=${LOG_LEVEL}
 LOG_FILE=${LOG_FILE}
 
-# ---- Scoring toggle ----
+# ---- Scoring/Review strategy ----
 SCORE_WRITE=1
+# 只要有任務ID：對「所有學生」執行一次覆蓋式處理（未評的必評；已評如需補分則只打分）
+REVIEW_ALL_EXISTING=1
+SCORE_GIVE_ALL_ON_START=1
 
 # ---- Paths/State ----
 STATE_PATH=${APP_DIR}/state.json
@@ -690,7 +687,7 @@ class Seiue:
         return last_code, last_text
 PY
 
-  # ---- main.py (SCORE_WRITE toggle + fixed startswith) ----
+  # ---- main.py (override with all-student review/score and startup behavior) ----
   cat > "$APP_DIR/main.py" <<'PY'
 import os, json, time, logging
 from typing import Dict, Any, List
@@ -701,28 +698,32 @@ from ai_providers import AIClient
 from seiue_api import Seiue
 import requests
 
+
 def setup_logging():
     level = os.getenv("LOG_LEVEL","INFO").upper()
     level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARN": logging.WARN, "WARNING": logging.WARN, "ERROR": logging.ERROR}
     log_level = level_map.get(level, logging.INFO)
     log_file = os.getenv("LOG_FILE","/opt/agrader/agrader.log")
-    fmt = "%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
-    logging.basicConfig(level=log_level, format=fmt, datefmt=datefmt)
+    fmt = "%Y-%m-%d %H:%M:%S.%(msecs)03d %(levelname)s %(name)s - %(message)s"
+    logging.basicConfig(level=log_level, format=fmt)
     try:
         fh = logging.FileHandler(log_file, encoding="utf-8", mode="a")
         fh.setLevel(log_level)
-        fh.setFormatter(logging.Formatter(fmt, datefmt))
+        fh.setFormatter(logging.Formatter(fmt))
         logging.getLogger().addHandler(fh)
     except Exception:
         logging.warning(f"Cannot open LOG_FILE={log_file} for writing.")
     if log_level == logging.DEBUG:
         logging.getLogger("urllib3").setLevel(logging.INFO)
 
+
 def load_env():
     load_dotenv(os.getenv("ENV_PATH",".env"))
     env = os.environ
     get = lambda k,d="": env.get(k,d)
+    def as_bool(x: str, default=True):
+        if x is None or x == "": return default
+        return x not in ("0","false","False","no","NO")
     cfg = {
         "base": get("SEIUE_BASE","https://api.seiue.com"),
         "username": get("SEIUE_USERNAME",""),
@@ -744,20 +745,25 @@ def load_env():
         "deepseek_model": get("DEEPSEEK_MODEL","deepseek-reasoner"),
         "tg_token": get("TELEGRAM_BOT_TOKEN",""),
         "tg_chat": get("TELEGRAM_CHAT_ID",""),
-        "tg_verbose": get("TELEGRAM_VERBOSE","1") not in ("0","false","False"),
-        "score_write": get("SCORE_WRITE","1") not in ("0","false","False"),
+        "tg_verbose": as_bool(get("TELEGRAM_VERBOSE","1")),
+        "score_write": as_bool(get("SCORE_WRITE","1")),
+        "review_all_existing": as_bool(get("REVIEW_ALL_EXISTING","1")),
+        "score_all_on_start": as_bool(get("SCORE_GIVE_ALL_ON_START","1")),
     }
     return cfg
+
 
 def load_state(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r") as f: return json.load(f)
-    except Exception: return {"processed": {}}
+    except Exception: return {"processed": {}, "scored": {}}
+
 
 def save_state(path: str, st: Dict[str, Any]):
     tmp = path + ".tmp"
     with open(tmp, "w") as f: json.dump(st, f)
     os.replace(tmp, path)
+
 
 def telegram_notify(token: str, chat: str, text: str):
     if not token or not chat: return
@@ -767,6 +773,7 @@ def telegram_notify(token: str, chat: str, text: str):
                       timeout=20)
     except Exception as e:
         logging.error(f"[TG] send error: {e}", exc_info=True)
+
 
 def build_prompt(task: Dict[str,Any], stu: Dict[str,Any], sub_text: str, attach_texts: List[str], perq, overall_max) -> str:
     task_title = task.get("title","(untitled)")
@@ -805,19 +812,23 @@ Rules: Never exceed maxima; use integers where natural; comments concise in Chin
 """)
     return "\n".join(lines)
 
+
 def extract_submission_text(sub: Dict[str,Any]) -> str:
     t = sub.get("content_text","") or sub.get("content","")
     try:
-        if isinstance(t, str) and t.strip().startswith("{"): 
+        if isinstance(t, str) and t.strip().startswith("{"):
             return draftjs_to_text(t)
-        if isinstance(t, str): 
+        if isinstance(t, str):
             return t
     except Exception:
         pass
     return ""
 
+
 def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
-    processed = state.setdefault("processed", {})
+    processed_all = state.setdefault("processed", {})
+    scored_all = state.setdefault("scored", {})  # per task: {receiver_id: true}
+
     os.makedirs(cfg["workdir"], exist_ok=True)
 
     for task_id in cfg["task_ids"]:
@@ -838,7 +849,8 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
         perq, overall_max = scan_question_maxima(task_obj)
         item_id = int(task_obj.get("custom_fields",{}).get("item_id", 0)) if isinstance(task_obj.get("custom_fields"), dict) else 0
 
-        tmap = processed.setdefault(str(task_id), {})
+        tmap = processed_all.setdefault(str(task_id), {})
+        smap = scored_all.setdefault(str(task_id), {})
 
         for a in assigns:
             assignee = a.get("assignee") or {}
@@ -846,12 +858,25 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
             if not receiver_id: continue
             sub = a.get("submission")
             if not sub: continue
+
             sub_id = str(sub.get("id") or "")
             updated = sub.get("updated_at") or sub.get("created_at") or ""
             sig = stable_hash((sub.get("content_text") or sub.get("content") or "") + "|" + (updated or ""))
+            already = (tmap.get(sub_id) == sig)
 
-            if tmap.get(sub_id) == sig: continue  # already processed
+            # 是否已經有老師評語
+            has_review = bool(a.get("review"))
+            needs_review = (not has_review) and cfg["review_all_existing"]
 
+            # 是否需要在啟動時為所有學生給分（即使已評語）
+            needs_score_on_start = cfg["score_all_on_start"] and (str(receiver_id) not in smap)
+
+            # 如果既沒有新提交，也不需要補評語/給分，就跳過
+            should_process = (not already) or needs_review or needs_score_on_start
+            if not should_process:
+                continue
+
+            # 準備文本（正文+附件）
             sub_text = extract_submission_text(sub)
             attach_texts = []
             attach_notes = []
@@ -881,6 +906,7 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
                         try: _os.remove(tmp_path)
                         except Exception: pass
 
+            # AI 打分（一次生成，供評語與打分共用）
             prompt = build_prompt(task_obj, assignee, sub_text, attach_texts, perq, overall_max)
             logging.info(f"[AI] prompt_len={len(prompt)} task={task_obj.get('title','')} receiver_id={receiver_id}")
             try:
@@ -889,6 +915,7 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
                 logging.error(f"[AI] call failed: {e}", exc_info=True)
                 result = {"per_question": [], "overall": {"score": 0, "comment": f"AI调用失败: {repr(e)}"}}
 
+            # 夾緊分數
             if result.get("per_question") and perq:
                 maxima = {str(q["id"]): float(q["max"]) for q in perq}
                 clamped = []; total = 0.0
@@ -904,76 +931,64 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
                 result["per_question"] = []
                 result["overall"] = {"score": sc, "comment": (result.get("overall",{}).get("comment") or "")[:200]}
 
-            lines = []
-            lines.append(f"【自动评阅】{task_obj.get('title','')}")
-            lines.append(f"学生：{assignee.get('name','')}（ID {receiver_id}）")
-            if result["per_question"]:
-                lines.append("—— 逐题：")
-                for row in result["per_question"]:
-                    lines.append(f" · {row['id']}: {int(row['score'])} 分；评语：{row.get('comment','')}")
-            lines.append(f"—— 总分：{int(round(result['overall']['score']))}/{int(round(overall_max))}")
-            if result["overall"].get("comment"): lines.append(f"—— 总评：{result['overall']['comment']}")
-            if attach_notes: lines.append("\n【附件處理說明】\n" + "\n".join(attach_notes[:10]))
-            if sub_text:
-                lines.append(""); lines.append("【正文摘录】"); lines.append(sub_text[:1200])
-            review_text = "\n".join(lines)
+            # 若需要評語：組裝文本並發送 review
+            if needs_review:
+                lines = []
+                lines.append(f"【自动评阅】{task_obj.get('title','')}")
+                lines.append(f"学生：{assignee.get('name','')}（ID {receiver_id}）")
+                if result["per_question"]:
+                    lines.append("—— 逐题：")
+                    for row in result["per_question"]:
+                        lines.append(f" · {row['id']}: {int(row['score'])} 分；评语：{row.get('comment','')}")
+                lines.append(f"—— 总分：{int(round(result['overall']['score']))}/{int(round(overall_max))}")
+                if result["overall"].get("comment"): lines.append(f"—— 总评：{result['overall']['comment']}")
+                if attach_notes: lines.append("\n【附件處理說明】\n" + "\n".join(attach_notes[:10]))
+                if sub_text:
+                    lines.append(""); lines.append("【正文摘录】"); lines.append(sub_text[:1200])
+                review_text = "\n".join(lines)
 
-            try:
-                api.post_review(receiver_id=receiver_id, task_id=task_id, content=review_text, result="approved")
-                review_ok = True
-            except Exception as e:
-                review_ok = False
-                logging.error(f"[API] post_review failed: {e}", exc_info=True)
-
-            if cfg["score_write"] and int(item_id) > 0:
                 try:
-                    code, txt = api.post_item_score(item_id=int(item_id), owner_id=receiver_id, task_id=task_id,
-                                                    score=float(int(round(result['overall']['score']))))
-                    score_status = f"score_write_status={code}"
-                    if code >= 400: logging.error(f"[API] post_item_score HTTP {code}: {txt}")
+                    api.post_review(receiver_id=receiver_id, task_id=task_id, content=review_text, result="approved")
                 except Exception as e:
-                    score_status = f"score_write_failed: {repr(e)}"
+                    logging.error(f"[API] post_review failed: {e}", exc_info=True)
+
+            # 打分（啟動時「全員給分」或剛評完都會走；多端點回退在 seiue_api 內）
+            if cfg["score_write"] and item_id > 0 and (needs_score_on_start or needs_review or (not already)):
+                try:
+                    code, txt = api.post_item_score(item_id=item_id, owner_id=receiver_id, task_id=task_id, score=float(result["overall"]["score"]))
+                    if 200 <= code < 300 or code in (200,201,204):
+                        smap[str(receiver_id)] = True  # 標記此學生已給分
+                except Exception as e:
                     logging.error(f"[API] post_item_score failed: {e}", exc_info=True)
-            else:
-                score_status = "score_write_disabled" if not cfg["score_write"] else "item_id_missing"
 
-            if cfg["tg_token"] and cfg["tg_chat"]:
-                head = (f"📩 作业自动评阅\n题目：{task_obj.get('title','')}\n学生：{assignee.get('name','')} (ID {receiver_id})"
-                        f"\n总分：{int(round(result['overall']['score']))}/{int(round(overall_max))}"
-                        f"\n状态：批语={'OK' if review_ok else 'FAIL'}；{score_status}")
-                body = review_text
-                if cfg["tg_verbose"] and attach_notes:
-                    body += "\n\n【提示】檔案中含有被跳過或錯誤的附件（見上文附件處理說明）。"
-                telegram_notify(cfg["tg_token"], cfg["tg_chat"], head + "\n\n" + body)
-
+            # 標記處理簽名，避免輪詢期間重複噴
             tmap[sub_id] = sig
+            save_state(cfg["state_path"], state)
 
-    return state
 
 def main():
     setup_logging()
     cfg = load_env()
-    os.makedirs(cfg["workdir"], exist_ok=True)
-    state = load_state(cfg["state_path"])
-
-    api = Seiue(
-        cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"],
-        cfg["reflection_id"], username=cfg["username"], password=cfg["password"]
-    )
-
-    if cfg["ai_provider"] == "deepseek":
-        ai_client = AIClient("deepseek", cfg["deepseek_model"], cfg["deepseek_key"])
-    else:
-        ai_client = AIClient("gemini", cfg["gemini_model"], cfg["gemini_key"])
+    if not cfg["task_ids"]:
+        logging.warning("[AGrader] No MONITOR_TASK_IDS; idle.")
+        time.sleep(3); return
+    api = Seiue(cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"], cfg["reflection_id"], cfg["username"], cfg["password"])
+    ai_key = cfg["gemini_key"] if cfg["ai_provider"]=="gemini" else cfg["deepseek_key"]
+    ai_model = cfg["gemini_model"] if cfg["ai_provider"]=="gemini" else cfg["deepseek_model"]
+    ai_client = AIClient(cfg["ai_provider"], ai_model, ai_key)
 
     logging.info("[AGrader] started.")
+    st = load_state(cfg["state_path"])
+
+    # 立即跑一輪（覆蓋式：全員審閱/給分）
+    run_once(cfg, api, st, ai_client)
+
+    # 進入輪詢（新提交才處理；已評/已補分不重複）
+    interval = max(int(cfg["interval"]), 3)
     while True:
-        try:
-            state = run_once(cfg, api, state, ai_client)
-            save_state(cfg["state_path"], state)
-        except Exception as e:
-            logging.error("[LoopERR] %r", e, exc_info=True)
-        time.sleep(cfg["interval"])
+        time.sleep(interval)
+        run_once(cfg, api, st, ai_client)
+
 
 if __name__ == "__main__":
     main()
@@ -992,17 +1007,17 @@ install_service() {
   cat > "/etc/systemd/system/$SERVICE" <<EOF
 [Unit]
 Description=AGrader - Seiue auto-grader
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$APP_DIR
-Environment=ENV_PATH=$ENV_FILE
+EnvironmentFile=$ENV_FILE
+# 啟動即通知：🔔 AGrader 啟動 · <hostname> · 任务: <IDs> · 間隔: <N>s
+ExecStartPre=/bin/bash -lc 'set -a; source "$ENV_FILE" 2>/dev/null || true; set +a; if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" -d chat_id="$TELEGRAM_CHAT_ID" -d text="🔔 AGrader 启动 · %H · 任务: ${MONITOR_TASK_IDS:-} · 间隔: ${POLL_INTERVAL:-10}s" -d parse_mode=HTML >/dev/null || true; fi'
 ExecStart=$VENV_DIR/bin/python $APP_DIR/main.py
 Restart=always
 RestartSec=3
-User=root
-LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1015,13 +1030,24 @@ EOF
 epilogue() {
   echo "[6/9] Service started. Tail logs with:  journalctl -u $SERVICE -f"
   echo "[7/9] Edit config at $ENV_FILE  then:  sudo systemctl restart $SERVICE"
+  # 讀 .env 的值
+  TASKS="$(grep -E '^MONITOR_TASK_IDS=' $ENV_FILE | cut -d= -f2)"
+  INTERVAL="$(grep -E '^POLL_INTERVAL=' $ENV_FILE | cut -d= -f2)"
+  OCR_E="$(grep -E '^ENABLE_PDF_OCR_FALLBACK=' $ENV_FILE | cut -d= -f2)"
+  OCR_P="$(grep -E '^MAX_PDF_OCR_PAGES=' $ENV_FILE | cut -d= -f2)"
+  OCR_S="$(grep -E '^MAX_PDF_OCR_SECONDS=' $ENV_FILE | cut -d= -f2)"
+  KEEPW="$(grep -E '^KEEP_WORK_FILES=' $ENV_FILE | cut -d= -f2)"
+  LGLVL="$(grep -E '^LOG_LEVEL=' $ENV_FILE | cut -d= -f2)"
+  LGFIL="$(grep -E '^LOG_FILE=' $ENV_FILE | cut -d= -f2)"
+  SCWRT="$(grep -E '^SCORE_WRITE=' $ENV_FILE | cut -d= -f2)"
+
   echo "[8/9] Done ✅ 已部署完成。"
-  echo "- 实时监听任务: \$(grep -E '^MONITOR_TASK_IDS=' $ENV_FILE | cut -d= -f2)"
-  echo "- 每次轮询间隔: \$(grep -E '^POLL_INTERVAL=' $ENV_FILE | cut -d= -f2)s"
-  echo "- Heavy OCR: ENABLE=\$(grep -E '^ENABLE_PDF_OCR_FALLBACK=' $ENV_FILE | cut -d= -f2), PAGES=\$(grep -E '^MAX_PDF_OCR_PAGES=' $ENV_FILE | cut -d= -f2), SECONDS=\$(grep -E '^MAX_PDF_OCR_SECONDS=' $ENV_FILE | cut -d= -f2)"
-  echo "- KEEP_WORK_FILES=\$(grep -E '^KEEP_WORK_FILES=' $ENV_FILE | cut -d= -f2)"
-  echo "- LOG_LEVEL=\$(grep -E '^LOG_LEVEL=' $ENV_FILE | cut -d= -f2)  LOG_FILE=\$(grep -E '^LOG_FILE=' $ENV_FILE | cut -d= -f2)"
-  echo "- SCORE_WRITE=\$(grep -E '^SCORE_WRITE=' $ENV_FILE | cut -d= -f2)"
+  echo "- 实时监听任务: $TASKS"
+  echo "- 每次轮询间隔: ${INTERVAL}s"
+  echo "- Heavy OCR: ENABLE=$OCR_E, PAGES=$OCR_P, SECONDS=$OCR_S"
+  echo "- KEEP_WORK_FILES=$KEEPW"
+  echo "- LOG_LEVEL=$LGLVL  LOG_FILE=$LGFIL"
+  echo "- SCORE_WRITE=$SCWRT"
   echo "- 手册: $APP_DIR/AGRADER_DEPLOY.md"
 }
 
