@@ -1,13 +1,13 @@
 cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.4.0
+# v2.4.1
 # 變更：
-# - 單實例強制：安裝/啟動前清場任何歷史 run.sh/殘留 python 進程 + 刪鎖
-# - 服務 ExecStartPre 再次清場，避免重啟時雙實例
-# - Python 端加入 FAST_FORWARD_ON_START/HARD_CUTOFF/SOFT_DUP/考勤摘要抽取/請假卡片
-set -euo pipefail
+# - 單實例強制：安裝/啟動前“三斬”清場（TERM/KILL python.*seiue_notify.py + 砍 run.sh）+ 刪鎖
+# - systemd ExecStartPre 內置“三斬” + 刪鎖，避免重啟時雙實例
+# - Python 端：FAST_FORWARD/HARD_CUTOFF/SOFT_DUP/考勤摘要/請假卡/附件跟隨（與 v2.4.0 一致）
 
+set -euo pipefail
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
 info(){ echo -e "${C_BLUE}INFO:${C_RESET} $1"; }
 success(){ echo -e "${C_GREEN}SUCCESS:${C_RESET} $1"; }
@@ -32,7 +32,6 @@ LOG_DIR="${INSTALL_DIR}/logs"
 OUT_LOG="${LOG_DIR}/notify.out.log"
 ERR_LOG="${LOG_DIR}/notify.err.log"
 UNIT_NAME="seiue-notify"
-
 PROXY_ENV="$(env | grep -i -E '^(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' || true)"
 
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
@@ -43,7 +42,7 @@ preflight(){
   if ! need_cmd python3; then
     warn "未發現 python3，嘗試安裝…"
     if need_cmd apt-get; then apt-get update -y && apt-get install -y python3 python3-venv python3-pip || true; fi
-    if need_cmd yum; then yum install -y python3 python3-pip || true; fi
+    if need_cmd yum;     then yum install -y python3 python3-pip || true; fi
     if [ $IS_DARWIN -eq 1 ] && need_cmd brew; then brew install python || true; fi
   fi
   need_cmd python3 || { error "仍未找到 python3"; exit 1; }
@@ -51,14 +50,15 @@ preflight(){
 }
 
 cleanup_legacy(){
-  info "清理歷史殘留進程/鎖/腳本…"
-  # 停服務，避免搶資源
+  info "清理歷史殘留進程/鎖/腳本（三斬）…"
   if [ $IS_LINUX -eq 1 ] && systemctl list-unit-files | grep -q "^${UNIT_NAME}\.service"; then
     systemctl stop ${UNIT_NAME}.service || true
   fi
-  # 杀掉任何手工跑的 python 舊實例
-  pkill -f '/\.seiue-notify/(venv/)?bin/python(3)? .*/seiue_notify\.py' || true
-  pkill -f 'cd.*/\.seiue-notify.* ./run\.sh' || true
+  # 三斬：TERM → KILL → 砍 run.sh
+  pkill -TERM -f 'python.*seiue_notify\.py' || true
+  sleep 0.2
+  pkill -KILL -f 'python.*seiue_notify\.py' || true
+  pkill -f 'run\.sh' || true
   # 禁用 run.sh（若有）
   if [ -f "${INSTALL_DIR}/run.sh" ]; then
     mv -f "${INSTALL_DIR}/run.sh" "${INSTALL_DIR}/run.sh.disabled.$(date +%s)" || true
@@ -96,10 +96,10 @@ TELEGRAM_MIN_INTERVAL_SECS=1.5
 NOTICE_EXCLUDE_NOISE=0
 SEND_TEST_ON_START=1
 
-# 新增策略（不寫也有默認值）：
-FAST_FORWARD_ON_START=1         # 啟動快進水位到最新
-HARD_CUTOFF_MINUTES=60          # 嚴格丟棄啟動前 N 分鐘之前的消息
-SOFT_DUP_WINDOW_SECS=120        # 軟去重窗口（同標題+同發送者）
+# 反歷史 + 去重策略（可改）：
+FAST_FORWARD_ON_START=1
+HARD_CUTOFF_MINUTES=180
+SOFT_DUP_WINDOW_SECS=900
 EOF
   chmod 600 "$ENV_FILE"; chown "$REAL_USER:$(id -gn "$REAL_USER")" "$ENV_FILE"
 }
@@ -559,7 +559,7 @@ def main_loop():
           if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
           save_state(st); 
           continue
-        # 兩分鐘窗口軟去重：同標題+發送者
+        # 軟去重：同標題+發送者（時間桶）
         sKey = soft_dup_key(it, ts)
         if sKey in st["seen_global"]:
           continue
@@ -597,8 +597,11 @@ Wants=network-online.target
 User=${REAL_USER}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
-# 啟動前再次清場：殺殘留 python、刪鎖
-ExecStartPre=/usr/bin/bash -lc "pkill -f '\\.seiue-notify/(venv/)?bin/python(3)? .*/seiue_notify\\.py' || true"
+# —— 三斬 ——（覆蓋相對/絕對路徑殘留 + 干掉舊 run.sh）
+ExecStartPre=/usr/bin/pkill -TERM -f 'python.*seiue_notify\\.py' || true
+ExecStartPre=/usr/bin/pkill -KILL -f 'python.*seiue_notify\\.py' || true
+ExecStartPre=/usr/bin/pkill -f 'run\\.sh' || true
+# 清鎖防競態
 ExecStartPre=/usr/bin/rm -f ${INSTALL_DIR}/.notify.lock
 ExecStart=${VENV_DIR}/bin/python3 ${PY_SCRIPT}
 Restart=always
@@ -646,7 +649,7 @@ start_service(){
 }
 
 # -------- main --------
-info "Seiue sidecar v2.4.0（單實例＋反歷史回刷＋雙通道＋全局去重＋考勤摘要＋請假卡）"
+info "Seiue sidecar v2.4.1（單實例“三斬”＋反歷史回刷＋雙通道＋全局去重＋考勤摘要＋請假卡）"
 preflight
 ensure_dirs
 cleanup_legacy
