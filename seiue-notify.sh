@@ -1,11 +1,13 @@
 cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.4.1
-# 變更：
-# - 單實例強制：安裝/啟動前“三斬”清場（TERM/KILL python.*seiue_notify.py + 砍 run.sh）+ 刪鎖
-# - systemd ExecStartPre 內置“三斬” + 刪鎖，避免重啟時雙實例
-# - Python 端：FAST_FORWARD/HARD_CUTOFF/SOFT_DUP/考勤摘要/請假卡/附件跟隨（與 v2.4.0 一致）
+# v2.4.2-hotfix
+# 修正：
+# - login() 兼容 /authorize 返回 text/html，兜底抽取 access_token / active_reflection_id
+# - systemd 加 Environment=PYTHONUNBUFFERED=1，日志即时刷新
+# - 保留“三斬”：TERM/KILL python.*seiue_notify.py + 砍 run.sh + 清鎖
+# - 反歷史（FAST_FORWARD + HARD_CUTOFF）+ 軟去重（SOFT_DUP）默認開
+# - 請假卡片化四要素；考勤提取班級/時段/統計 + 10 條聚合摘要；附圖/附件跟隨
 
 set -euo pipefail
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
@@ -54,18 +56,15 @@ cleanup_legacy(){
   if [ $IS_LINUX -eq 1 ] && systemctl list-unit-files | grep -q "^${UNIT_NAME}\.service"; then
     systemctl stop ${UNIT_NAME}.service || true
   fi
-  # 三斬：TERM → KILL → 砍 run.sh
   pkill -TERM -f 'python.*seiue_notify\.py' || true
   sleep 0.2
   pkill -KILL -f 'python.*seiue_notify\.py' || true
   pkill -f 'run\.sh' || true
-  # 禁用 run.sh（若有）
   if [ -f "${INSTALL_DIR}/run.sh" ]; then
     mv -f "${INSTALL_DIR}/run.sh" "${INSTALL_DIR}/run.sh.disabled.$(date +%s)" || true
     printf '#!/usr/bin/env bash\necho "seiue-notify: run.sh disabled; use systemd"\n' > "${INSTALL_DIR}/run.sh"
     chmod +x "${INSTALL_DIR}/run.sh"
   fi
-  # 刪鎖
   rm -f "${INSTALL_DIR}/.notify.lock"
 }
 
@@ -133,7 +132,6 @@ STATE_FILE = os.path.join(BASE, "notify_state.json")
 LOCK_FILE  = os.path.join(BASE, ".notify.lock")
 LOG_FILE   = os.path.join(LOG_DIR, "notify.log")
 
-# 環境變量
 SEIUE_USERNAME = os.getenv("SEIUE_USERNAME","")
 SEIUE_PASSWORD = os.getenv("SEIUE_PASSWORD","")
 X_SCHOOL_ID = os.getenv("X_SCHOOL_ID","3")
@@ -150,7 +148,6 @@ TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS","1.5") or "
 NOTICE_EXCLUDE_NOISE = os.getenv("NOTICE_EXCLUDE_NOISE","0").strip().lower() in ("1","true","yes","on")
 SEND_TEST_ON_START = os.getenv("SEND_TEST_ON_START","1").strip().lower() in ("1","true","yes","on")
 
-# 反歷史回刷策略
 FAST_FORWARD_ON_START = os.getenv("FAST_FORWARD_ON_START","1").strip().lower() in ("1","true","yes","on")
 HARD_CUTOFF_MINUTES  = int(os.getenv("HARD_CUTOFF_MINUTES","60") or "60")
 SOFT_DUP_WINDOW_SECS = int(os.getenv("SOFT_DUP_WINDOW_SECS","120") or "120")
@@ -287,16 +284,30 @@ class Seiue:
       self.s.post("https://passport.seiue.com/login?school_id=3",
                   headers={"Content-Type":"application/x-www-form-urlencoded","Origin":"https://passport.seiue.com"},
                   data={"email":self.u,"password":self.p}, timeout=30)
-      j=self.s.post("https://passport.seiue.com/authorize",
-                    headers={"Content-Type":"application/x-www-form-urlencoded","X-Requested-With":"XMLHttpRequest","Origin":"https://chalk-c3.seiue.com"},
-                    data={"client_id":"GpxvnjhVKt56qTmnPWH1sA","response_type":"token"}, timeout=30).json()
-      tok=j.get("access_token"); rid=str(j.get("active_reflection_id") or "")
-      if not tok or not rid: return False
-      self.reflection=rid
+      r = self.s.post("https://passport.seiue.com/authorize",
+                      headers={"Content-Type":"application/x-www-form-urlencoded",
+                               "X-Requested-With":"XMLHttpRequest",
+                               "Origin":"https://chalk-c3.seiue.com",
+                               "Referer":"https://chalk-c3.seiue.com/"},
+                      data={"client_id":"GpxvnjhVKt56qTmnPWH1sA","response_type":"token"}, timeout=30)
+      try:
+        j = r.json()
+      except Exception:
+        txt = r.text or ""
+        import re as _re
+        m = _re.search(r'"access_token"\s*:\s*"([^"]+)"', txt)
+        n = _re.search(r'"active_reflection_id"\s*:\s*"?(\\d+)"?', txt)
+        j = {"access_token": m.group(1) if m else None,
+             "active_reflection_id": n.group(1) if n else None}
+      tok = j.get("access_token"); rid = str(j.get("active_reflection_id") or "")
+      if not tok or not rid:
+        logging.error("authorize missing token/reflection_id; status=%s body_prefix=%r", r.status_code, (r.text or "")[:180])
+        return False
+      self.reflection = rid
       self.s.headers.update({"Authorization":f"Bearer {tok}","x-school-id":X_SCHOOL_ID,"x-role":X_ROLE,"x-reflection-id":rid})
       logging.info("Auth OK, reflection_id=%s", rid); return True
     except Exception as e:
-      logging.error("login error: %s", e); return False
+      logging.error("login error: %s", e, exc_info=True); return False
 
   def _get_me(self, params:dict):
     url="https://api.seiue.com/chalk/me/received-messages"
@@ -324,7 +335,12 @@ class Seiue:
       q=dict(base, **{"page":str(p),"per_page":"20"})
       r=self._get_me(q)
       if r.status_code!=200: break
-      j=r.json(); arr=j["items"] if isinstance(j,dict) and "items" in j else (j if isinstance(j,list) else [])
+      try:
+        j=r.json()
+      except Exception:
+        logging.error("list decode error; status=%s body_prefix=%r", r.status_code, (r.text or "")[:160])
+        break
+      arr=j["items"] if isinstance(j,dict) and "items" in j else (j if isinstance(j,list) else [])
       if not arr: break
       items.extend(arr)
     return items
@@ -552,14 +568,12 @@ def main_loop():
         gkey = global_key(it)
         if gkey in st["seen_global"]:
           continue
-        # 硬截止：啟動前 N 分鐘以前的消息直接丟棄並推進水位
         if ts < HARD_CUTOFF_TS:
           st["seen_global"][gkey]=ts
           wm=st["watermark"][ch]
           if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
           save_state(st); 
           continue
-        # 軟去重：同標題+發送者（時間桶）
         sKey = soft_dup_key(it, ts)
         if sKey in st["seen_global"]:
           continue
@@ -597,13 +611,13 @@ Wants=network-online.target
 User=${REAL_USER}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
+Environment=PYTHONUNBUFFERED=1
 # —— 三斬 ——（覆蓋相對/絕對路徑殘留 + 干掉舊 run.sh）
 ExecStartPre=/usr/bin/pkill -TERM -f 'python.*seiue_notify\\.py' || true
 ExecStartPre=/usr/bin/pkill -KILL -f 'python.*seiue_notify\\.py' || true
 ExecStartPre=/usr/bin/pkill -f 'run\\.sh' || true
-# 清鎖防競態
 ExecStartPre=/usr/bin/rm -f ${INSTALL_DIR}/.notify.lock
-ExecStart=${VENV_DIR}/bin/python3 ${PY_SCRIPT}
+ExecStart=${VENV_DIR}/bin/python3 -u ${PY_SCRIPT}
 Restart=always
 RestartSec=5s
 StandardOutput=append:${OUT_LOG}
@@ -648,8 +662,7 @@ start_service(){
   fi
 }
 
-# -------- main --------
-info "Seiue sidecar v2.4.1（單實例“三斬”＋反歷史回刷＋雙通道＋全局去重＋考勤摘要＋請假卡）"
+info "Seiue sidecar v2.4.2-hotfix（單實例“三斬”＋反歷史回刷＋雙通道＋全局去重＋考勤摘要＋請假卡）"
 preflight
 ensure_dirs
 cleanup_legacy
@@ -664,7 +677,7 @@ else
 fi
 success "已安裝/升級並啟動。"
 echo "狀態：systemctl status ${UNIT_NAME} --no-pager"
-echo "日誌：journalctl -u ${UNIT_NAME} -n 50 --no-pager"
+echo "日誌：journalctl -u ${UNIT_NAME} -n 80 --no-pager -o cat"
 SH
 
 bash /root/seiue-notify.sh
