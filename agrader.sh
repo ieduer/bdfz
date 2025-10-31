@@ -16,12 +16,6 @@ ask() { local p="$1" var="$2" def="${3:-}"; local ans;
 }
 ask_secret() { local p="$1" var="$2"; local ans; read -r -s -p "$p: " ans || true; echo; printf -v "$var" "%s" "$ans"; }
 
-need_root() {
-  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo "Need root. Re-running with sudo..."; exec sudo -E bash "$0" "$@"
-  fi
-}
-
 install_pkgs() {
   echo "[1/9] Installing system dependencies..."
   if have apt; then
@@ -127,8 +121,16 @@ POLL_INTERVAL=${POLL_INTERVAL}
 
 # Confirmed review endpoint (expect 201)
 SEIUE_REVIEW_POST_TEMPLATE=/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews
-# Default score write endpoint (override if your capture differs)
+
+# Legacy single score endpoint (kept for compatibility; new code also supports multiple fallbacks)
 SEIUE_SCORE_POST_TEMPLATE=/vnas/common/items/{item_id}/scores?type=item_score
+# Optional fine-tune (if you insist a single template first):
+# SEIUE_SCORE_METHOD=POST        # POST or PUT
+# SEIUE_SCORE_BODY=array         # array or object
+
+# New: multiple fallback endpoints (semicolon separated). Format: METHOD:PATH[:BODY]
+# e.g. POST:/vnas/common/items/{item_id}/scores?type=item_score:array;PUT:/common/items/{item_id}/scores?type=item_score:array
+SEIUE_SCORE_ENDPOINTS=
 
 # ---- AI ----
 AI_PROVIDER=${AI_PROVIDER}
@@ -153,6 +155,9 @@ KEEP_WORK_FILES=${KEEP_WORK_FILES}
 # ---- Logging ----
 LOG_LEVEL=${LOG_LEVEL}
 LOG_FILE=${LOG_FILE}
+
+# ---- Scoring toggle ----
+SCORE_WRITE=1
 
 # ---- Paths/State ----
 STATE_PATH=${APP_DIR}/state.json
@@ -191,7 +196,7 @@ Confirmed endpoints:
 - POST review: /chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews  (expect 201)
 - GET assignments: /chalk/task/v2/tasks/{task_id}/assignments?expand=is_excellent,assignee,team,submission,review
 - GET signed file URL: /chalk/netdisk/files/{file_id}/url  (302 Location)
-- Score write: /vnas/common/items/{item_id}/scores?type=item_score
+- Score write: multiple fallbacks; see .env (SCORE_WRITE / SEIUE_SCORE_ENDPOINTS / legacy template)
 
 Attachments to AI: Files are extracted to text (pdftotext/ocr) and MERGED into the prompt. The model names remain exactly as configured.
 
@@ -199,7 +204,6 @@ Logging:
 - File: LOG_FILE (rotating not enabled by default)
 - Level: LOG_LEVEL (DEBUG/INFO/WARN/ERROR)
 - Journald also contains full stdout/stderr.
-
 EOF
 
   # ---- utilx.py ----
@@ -246,7 +250,7 @@ def stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
 PY
 
-  # ---- credentials.py (auto-login using username/password) ----
+  # ---- credentials.py (auto-login) ----
   cat > "$APP_DIR/credentials.py" <<'PY'
 import logging, requests
 from requests.adapters import HTTPAdapter
@@ -264,7 +268,7 @@ def _session_with_retries() -> requests.Session:
     r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "AGrader/1.3 (+login)",
+        "User-Agent": "AGrader/1.4 (+login)",
         "Accept": "application/json, text/plain, */*",
     })
     return s
@@ -275,7 +279,6 @@ def login(username: str, password: str) -> AuthResult:
         login_url = "https://passport.seiue.com/login?school_id=3&type=account&from=null&redirect_url=null"
         auth_url  = "https://passport.seiue.com/authorize"
 
-        # Be generous with field names (capture variability)
         login_form = {"email": username, "login": username, "username": username, "password": password}
         login_headers = {
             "Referer": login_url,
@@ -360,10 +363,7 @@ def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1
         try:
             tmpdir = tempfile.mkdtemp(prefix="pdfocr_")
             prefix = os.path.join(tmpdir, "pg")
-            if shutil.which("timeout"):
-              code, _, err = _run(["timeout", str(max_seconds), "pdftoppm", "-r", "200", path, prefix], timeout=max_seconds+5)
-            else:
-              code, _, err = _run(["pdftoppm", "-r", "200", path, prefix], timeout=max_seconds)
+            code, _, err = _run(["pdftoppm", "-r", "200", path, prefix], timeout=max_seconds)
             text_acc = []
             if code == 0:
                 for f in sorted(os.listdir(tmpdir)):
@@ -490,7 +490,7 @@ class AIClient:
         return {"per_question": [], "overall": {"score": 0, "comment": text[:200]}}
 PY
 
-  # ---- seiue_api.py (auto/refresh auth + retry wrapper) ----
+  # ---- seiue_api.py (with multi-endpoint PUT/POST fallback) ----
   cat > "$APP_DIR/seiue_api.py" <<'PY'
 import os, logging, requests
 from typing import Dict, Any, List, Tuple
@@ -501,7 +501,7 @@ from urllib3.util.retry import Retry
 def _session_with_retries() -> requests.Session:
     s = requests.Session()
     r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504),
-              allowed_methods=frozenset({"GET","POST"}))
+              allowed_methods=frozenset({"GET","POST","PUT"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
     return s
 
@@ -523,7 +523,7 @@ class Seiue:
     def _init_headers(self):
         self.session.headers.update({
             "Accept": "application/json, text/plain, */*",
-            "User-Agent": "AGrader/1.3",
+            "User-Agent": "AGrader/1.4",
         })
         if self.bearer:
             self.session.headers.update({"Authorization": f"Bearer {self.bearer}"})
@@ -615,20 +615,84 @@ class Seiue:
         return r.json()
 
     def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float) -> Tuple[int, str]:
-        path = os.getenv("SEIUE_SCORE_POST_TEMPLATE","/vnas/common/items/{item_id}/scores?type=item_score").format(item_id=item_id)
-        url = self._url(path)
-        body = [{
-            "owner_id": owner_id, "valid": True, "score": str(score),
-            "review": "", "attachments": [], "related_data": {"task_id": task_id},
-            "type": "item_score", "status": "published"
-        }]
-        r = self._with_refresh(lambda: self.session.post(url, json=body, timeout=60))
-        return r.status_code, r.text[:400]
+        """
+        Robust score writer:
+         1) If SEIUE_SCORE_ENDPOINTS is set → try in order (METHOD:PATH[:BODY], BODY=array|object).
+         2) Else if SEIUE_SCORE_POST_TEMPLATE is set → try that first with SEIUE_SCORE_METHOD/SEIUE_SCORE_BODY.
+         3) Then fallback through common permutations:
+            POST/PUT × /vnas/common/... and /common/... × body=array
+        """
+        # Helper to add candidate
+        candidates = []
+        def add(method, path, body="array"):
+            candidates.append({"method": method, "path": path, "body": body})
+
+        # 1) explicit multi endpoints
+        raw = (os.getenv("SEIUE_SCORE_ENDPOINTS","") or "").strip()
+        if raw:
+            for seg in raw.split(";"):
+                seg = seg.strip()
+                if not seg: continue
+                parts = seg.split(":")
+                if len(parts) < 2: continue
+                method = parts[0].strip().upper()
+                body   = "array"
+                if len(parts) >= 3: body = parts[-1].strip().lower()
+                path   = ":".join(parts[1:-1]) if len(parts) > 2 else parts[1]
+                if method not in ("POST","PUT"): method = "POST"
+                if body not in ("array","object"): body = "array"
+                add(method, path.strip(), body)
+
+        # 2) legacy template as preferred try
+        tpl = (os.getenv("SEIUE_SCORE_POST_TEMPLATE","") or "").strip()
+        if tpl:
+            m  = (os.getenv("SEIUE_SCORE_METHOD","POST") or "POST").strip().upper()
+            bd = (os.getenv("SEIUE_SCORE_BODY","array") or "array").strip().lower()
+            if m not in ("POST","PUT"): m = "POST"
+            if bd not in ("array","object"): bd = "array"
+            add(m, tpl, bd)
+
+        # 3) built-in fallbacks if still empty / to try after
+        if not candidates:
+            add("POST", "/vnas/common/items/{item_id}/scores?type=item_score", "array")
+            add("PUT",  "/vnas/common/items/{item_id}/scores?type=item_score", "array")
+            add("POST", "/common/items/{item_id}/scores?type=item_score", "array")
+            add("PUT",  "/common/items/{item_id}/scores?type=item_score", "array")
+
+        last_code, last_text = 0, ""
+        for i, c in enumerate(candidates, 1):
+            path = c["path"].format(item_id=item_id)
+            url  = self._url(path)
+            method = c["method"]
+            if c["body"] == "array":
+                body = [{
+                    "owner_id": owner_id, "valid": True, "score": str(score),
+                    "review": "", "attachments": [], "related_data": {"task_id": task_id},
+                    "type": "item_score", "status": "published"
+                }]
+            else:
+                body = {
+                    "owner_id": owner_id, "valid": True, "score": str(score),
+                    "review": "", "attachments": [], "related_data": {"task_id": task_id},
+                    "type": "item_score", "status": "published"
+                }
+
+            logging.info(f"[API] score try#{i}: {method} {path} body={c['body']}")
+            r = self._with_refresh(lambda: self.session.request(method, url, json=body, timeout=60))
+            last_code, last_text = getattr(r, "status_code", 0), (r.text or "")[:400]
+
+            if 200 <= last_code < 300 or last_code in (200,201,204):
+                logging.info(f"[API] score success: {method} {path} -> {last_code}")
+                return last_code, last_text
+
+            logging.warning(f"[API] score failed: {method} {path} -> {last_code} :: {last_text}")
+
+        return last_code, last_text
 PY
 
-  # ---- main.py ----
+  # ---- main.py (SCORE_WRITE toggle + fixed startswith) ----
   cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, traceback, tempfile, logging
+import os, json, time, logging
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from utilx import draftjs_to_text, scan_question_maxima, clamp, stable_hash
@@ -653,7 +717,7 @@ def setup_logging():
     except Exception:
         logging.warning(f"Cannot open LOG_FILE={log_file} for writing.")
     if log_level == logging.DEBUG:
-      logging.getLogger("urllib3").setLevel(logging.INFO)
+        logging.getLogger("urllib3").setLevel(logging.INFO)
 
 def load_env():
     load_dotenv(os.getenv("ENV_PATH",".env"))
@@ -680,7 +744,8 @@ def load_env():
         "deepseek_model": get("DEEPSEEK_MODEL","deepseek-reasoner"),
         "tg_token": get("TELEGRAM_BOT_TOKEN",""),
         "tg_chat": get("TELEGRAM_CHAT_ID",""),
-        "tg_verbose": get("TELEGRAM_VERBOSE","1") not in ("0","false","False")
+        "tg_verbose": get("TELEGRAM_VERBOSE","1") not in ("0","false","False"),
+        "score_write": get("SCORE_WRITE","1") not in ("0","false","False"),
     }
     return cfg
 
@@ -743,8 +808,10 @@ Rules: Never exceed maxima; use integers where natural; comments concise in Chin
 def extract_submission_text(sub: Dict[str,Any]) -> str:
     t = sub.get("content_text","") or sub.get("content","")
     try:
-        if isinstance(t, str) and t.strip().startswith("{"): return draftjs_to_text(t)
-        if isinstance(t, str): return t
+        if isinstance(t, str) and t.strip().startswith("{"): 
+            return draftjs_to_text(t)
+        if isinstance(t, str): 
+            return t
     except Exception:
         pass
     return ""
@@ -795,8 +862,9 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
                 try:
                     url = api.get_file_signed_url(str(fid))
                     blob = api.download(url)
-                    ext = os.path.splitext(url.split("?")[0])[1]
-                    fp = tempfile.NamedTemporaryFile(delete=False, dir=cfg["workdir"], suffix=ext or ".bin")
+                    import os as _os, tempfile as _tmp
+                    ext = _os.path.splitext(url.split("?")[0])[1]
+                    fp = _tmp.NamedTemporaryFile(delete=False, dir=cfg["workdir"], suffix=ext or ".bin")
                     tmp_path = fp.name
                     fp.write(blob); fp.close()
                     txt = file_to_text(tmp_path, ocr_lang=cfg["ocr_lang"], size_cap=cfg["max_attach"])
@@ -810,7 +878,7 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
                     attach_texts.append(msg); attach_notes.append(msg)
                 finally:
                     if tmp_path and os.getenv("KEEP_WORK_FILES","0") not in ("1","true","True"):
-                        try: os.remove(tmp_path)
+                        try: _os.remove(tmp_path)
                         except Exception: pass
 
             prompt = build_prompt(task_obj, assignee, sub_text, attach_texts, perq, overall_max)
@@ -857,7 +925,7 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
                 review_ok = False
                 logging.error(f"[API] post_review failed: {e}", exc_info=True)
 
-            if int(item_id) > 0:
+            if cfg["score_write"] and int(item_id) > 0:
                 try:
                     code, txt = api.post_item_score(item_id=int(item_id), owner_id=receiver_id, task_id=task_id,
                                                     score=float(int(round(result['overall']['score']))))
@@ -867,7 +935,7 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
                     score_status = f"score_write_failed: {repr(e)}"
                     logging.error(f"[API] post_item_score failed: {e}", exc_info=True)
             else:
-                score_status = "item_id_missing (skipped score write)"
+                score_status = "score_write_disabled" if not cfg["score_write"] else "item_id_missing"
 
             if cfg["tg_token"] and cfg["tg_chat"]:
                 head = (f"📩 作业自动评阅\n题目：{task_obj.get('title','')}\n学生：{assignee.get('name','')} (ID {receiver_id})"
@@ -948,50 +1016,21 @@ epilogue() {
   echo "[6/9] Service started. Tail logs with:  journalctl -u $SERVICE -f"
   echo "[7/9] Edit config at $ENV_FILE  then:  sudo systemctl restart $SERVICE"
   echo "[8/9] Done ✅ 已部署完成。"
-  echo "- 实时监听任务: $(grep MONITOR_TASK_IDS $ENV_FILE | cut -d= -f2)"
-  echo "- 每次轮询间隔: $(grep POLL_INTERVAL $ENV_FILE | cut -d= -f2)s"
-  echo "- Heavy OCR: ENABLE=$(grep ENABLE_PDF_OCR_FALLBACK $ENV_FILE | cut -d= -f2), PAGES=$(grep MAX_PDF_OCR_PAGES $ENV_FILE | cut -d= -f2), SECONDS=$(grep MAX_PDF_OCR_SECONDS $ENV_FILE | cut -d= -f2)"
-  echo "- KEEP_WORK_FILES=$(grep KEEP_WORK_FILES $ENV_FILE | cut -d= -f2)"
-  echo "- LOG_LEVEL=$(grep LOG_LEVEL $ENV_FILE | cut -d= -f2)  LOG_FILE=$(grep LOG_FILE $ENV_FILE | cut -d= -f2)"
+  echo "- 实时监听任务: \$(grep -E '^MONITOR_TASK_IDS=' $ENV_FILE | cut -d= -f2)"
+  echo "- 每次轮询间隔: \$(grep -E '^POLL_INTERVAL=' $ENV_FILE | cut -d= -f2)s"
+  echo "- Heavy OCR: ENABLE=\$(grep -E '^ENABLE_PDF_OCR_FALLBACK=' $ENV_FILE | cut -d= -f2), PAGES=\$(grep -E '^MAX_PDF_OCR_PAGES=' $ENV_FILE | cut -d= -f2), SECONDS=\$(grep -E '^MAX_PDF_OCR_SECONDS=' $ENV_FILE | cut -d= -f2)"
+  echo "- KEEP_WORK_FILES=\$(grep -E '^KEEP_WORK_FILES=' $ENV_FILE | cut -d= -f2)"
+  echo "- LOG_LEVEL=\$(grep -E '^LOG_LEVEL=' $ENV_FILE | cut -d= -f2)  LOG_FILE=\$(grep -E '^LOG_FILE=' $ENV_FILE | cut -d= -f2)"
+  echo "- SCORE_WRITE=\$(grep -E '^SCORE_WRITE=' $ENV_FILE | cut -d= -f2)"
   echo "- 手册: $APP_DIR/AGRADER_DEPLOY.md"
 }
 
-uninstall() {
-  need_root
-  echo "[UNINSTALL] Stopping & disabling service..."
-  systemctl stop "$SERVICE" || true
-  systemctl disable "$SERVICE" || true
-  rm -f "/etc/systemd/system/$SERVICE"
-  systemctl daemon-reload
-  echo "[UNINSTALL] Removing $APP_DIR ..."
-  rm -rf "$APP_DIR"
-  echo "Uninstalled. ✅"
+main() {
+  install_pkgs
+  write_project
+  setup_venv
+  install_service
+  epilogue
 }
 
-status_cmd() { systemctl status "$SERVICE" || true; }
-logs_cmd() { journalctl -u "$SERVICE" --no-pager -n 200 || true; }
-
-doctor_cmd() {
-  echo "=== Versions ==="
-  (python3 --version || true)
-  (tesseract --version || true | head -n1)
-  (tesseract --list-langs 2>/dev/null | head -n 20 || true)
-  (pdftotext -v 2>&1 || true | head -n1)
-  (pdfinfo -v 2>&1 || true | head -n1)
-  (pdftoppm -v 2>&1 || true | head -n1)
-  echo "=== Paths ==="
-  echo "APP_DIR=$APP_DIR"
-  echo "ENV_FILE=$ENV_FILE"
-  echo "VENV=$VENV_DIR"
-  echo "=== ENV KEYS (masked) ==="
-  [ -f "$ENV_FILE" ] && (grep -E '^(SEIUE_BASE|SEIUE_SCHOOL_ID|SEIUE_ROLE|SEIUE_REFLECTION_ID|SEIUE_USERNAME|MONITOR_TASK_IDS|POLL_INTERVAL|AI_PROVIDER|GEMINI_MODEL|DEEPSEEK_MODEL|ENABLE_PDF_OCR_FALLBACK|MAX_PDF_OCR_PAGES|MAX_PDF_OCR_SECONDS|TELEGRAM_CHAT_ID|KEEP_WORK_FILES|WORKDIR|STATE_PATH|LOG_LEVEL|LOG_FILE)=' "$ENV_FILE" || true)
-}
-
-case "${1:-install}" in
-  install) need_root; install_pkgs; write_project; setup_venv; install_service; epilogue;;
-  uninstall) uninstall;;
-  status) status_cmd;;
-  logs) logs_cmd;;
-  doctor) doctor_cmd;;
-  *) echo "Usage: bash $0 [install|uninstall|status|logs|doctor]"; exit 1;;
-esac
+main "$@"
