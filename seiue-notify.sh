@@ -2,8 +2,12 @@
 cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.2.1  (dual-channel: notice + system; push-all; watermark + global dedup; send test-on-start)
-# Usage: sudo bash ./seiue-notify.sh
+# v2.3.0
+# - Dual channel: notice + system（全量直推）
+# - 全局去重（跨通道 id/內容哈希）
+# - 啟動自測也標記為已讀，不再二次推送
+# - 系統|請假|抄送：自動提取 申請人/時段/事由/狀態，插入摘要卡片
+# 用法：sudo bash ./seiue-notify.sh
 set -euo pipefail
 
 # ---------- pretty ----------
@@ -72,11 +76,11 @@ TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 NOTIFY_POLL_SECONDS=${POLL}
 MAX_LIST_PAGES=10
 READ_FILTER=all           # all|unread
-INCLUDE_CC=false          # 是否包含抄送
+INCLUDE_CC=true           # 是否包含抄送（默認：true）
 SKIP_HISTORY_ON_FIRST_RUN=1
 TELEGRAM_MIN_INTERVAL_SECS=1.5
 NOTICE_EXCLUDE_NOISE=0    # 0=不排除任何類型，通知中心“全量直推”
-SEND_TEST_ON_START=1      # 啟動後各通道自發最新1條作為安裝驗證
+SEND_TEST_ON_START=1      # 啟動後各通道自發最新1條作為安裝驗證（已自動標記為已讀）
 EOF
   chmod 600 "$ENV_FILE"; chown "$REAL_USER:$(id -gn "$REAL_USER")" "$ENV_FILE"
 }
@@ -97,7 +101,7 @@ write_python(){
   cat >"$PY_SCRIPT" <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, time, json, html, fcntl, logging
+import os, sys, time, json, html, fcntl, logging, hashlib, re
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 import requests, pytz
@@ -120,7 +124,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","")
 POLL_SECONDS = int(os.getenv("NOTIFY_POLL_SECONDS","90") or "90")
 MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES","10") or "10"), 20))
 READ_FILTER = (os.getenv("READ_FILTER","all").strip().lower())
-INCLUDE_CC = os.getenv("INCLUDE_CC","false").strip().lower() in ("1","true","yes","on")
+INCLUDE_CC = os.getenv("INCLUDE_CC","true").strip().lower() in ("1","true","yes","on")
 SKIP_HISTORY_ON_FIRST_RUN = os.getenv("SKIP_HISTORY_ON_FIRST_RUN","1").strip().lower() in ("1","true","yes","on")
 TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS","1.5") or "1.5")
 NOTICE_EXCLUDE_NOISE = os.getenv("NOTICE_EXCLUDE_NOISE","0").strip().lower() in ("1","true","yes","on")
@@ -151,14 +155,15 @@ def fmt_time(s:str)->str:
 
 def load_state()->Dict[str,Any]:
   if not os.path.exists(STATE_FILE):
-    return {"seen":{}, "watermark":{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}}}
+    return {"seen_global":{}, "watermark":{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}}}
   try:
     with open(STATE_FILE,"r",encoding="utf-8") as f: st=json.load(f)
-    st.setdefault("seen",{}); st.setdefault("watermark",{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}})
+    st.setdefault("seen_global",{})
+    st.setdefault("watermark",{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}})
     for k in ("system","notice"): st["watermark"].setdefault(k,{"ts":0.0,"id":0})
     return st
   except:
-    return {"seen":{}, "watermark":{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}}}
+    return {"seen_global":{}, "watermark":{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}}}
 
 def save_state(st:Dict[str,Any])->None:
   tmp=STATE_FILE+".tmp"
@@ -172,6 +177,17 @@ def acquire_lock_or_exit():
     fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB); os.ftruncate(fd,0); os.write(fd, str(os.getpid()).encode()); return fd
   except OSError:
     logging.error("已有實例運行，本實例退出。"); sys.exit(0)
+
+def global_key(it: dict) -> str:
+  nid = str(it.get("id") or "")
+  if nid:
+    return f"id:{nid}"
+  title = it.get("title") or ""
+  t = it.get("published_at") or it.get("created_at") or ""
+  src = (it.get("sender_reflection") or {}).get("id") or ""
+  content = it.get("content") or ""
+  h = hashlib.sha1(f"{title}|{t}|{src}|{content}".encode("utf-8", "ignore")).hexdigest()[:16]
+  return f"h:{h}"
 
 class Telegram:
   def __init__(self, token:str, chat_id:str):
@@ -349,15 +365,54 @@ def sender_name(it:Dict[str,Any])->str:
   sr=it.get("sender_reflection") or {}
   return sr.get("name") or sr.get("nickname") or "系統"
 
+def is_leave(title: str, body_html: str) -> bool:
+  z = (title or "") + "\n" + (body_html or "")
+  for k in ("請假","请假","銷假","销假"):
+    if k in z:
+      return True
+  return False
+
+def extract_leave_details(text: str) -> dict:
+  import html as _html
+  tx = _html.unescape(re.sub(r"<[^>]+>", "", text or ""))
+  d = {}
+  m = re.search(r"(?:申請人|申请人|学生|學生|家長|家长)[:：]\s*([^\s，,。]+)", tx)
+  if m: d["applicant"] = m.group(1)
+  m = re.search(r"(?:請假時間|请假时间|時間|时间)[:：]\s*([0-9/\- :]{5,})\s*(?:至|到|—|-)\s*([0-9/\- :]{5,})", tx)
+  if m: d["from"], d["to"] = m.group(1), m.group(2)
+  m = re.search(r"(?:事由|原因|请假事由|請假事由)[:：]\s*(.+?)(?:\n|$)", tx)
+  if m: d["reason"] = m.group(1).strip()
+  m = re.search(r"(?:狀態|状态)[:：]\s*([^\s，,。]+)", tx)
+  if m: d["status"] = m.group(1)
+  return d
+
 def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str="")->bool:
   title=it.get("title") or ""
   content=it.get("content") or ""
   body, atts=render_content(content)
-  _, tag = classify(title, body)   # 只裝飾
+  kind, tag = classify(title, body)   # 只裝飾
   src = sender_name(it)
+
+  # 系統|請假|抄送 → 專用前綴 + 摘要卡片
+  leave = is_leave(title, body)
+  is_cc = bool(it.get("is_cc")) or str(it.get("is_cc")).lower() == "true"
+  summary = ""
+  custom_prefix = ""
+  if ch == "system" and leave and is_cc:
+    det = extract_leave_details(body)
+    lines = []
+    if det.get("applicant"): lines.append(f"申請人：{esc(det['applicant'])}")
+    if det.get("from") and det.get("to"): lines.append(f"時段：{esc(det['from'])} ～ {esc(det['to'])}")
+    if det.get("reason"): lines.append(f"事由：{esc(det['reason'])}")
+    if det.get("status"): lines.append(f"狀態：{esc(det['status'])}")
+    summary = ("\n".join(lines) + "\n\n") if lines else ""
+    custom_prefix = "【請假】收到一条请假抄送\n"
+
   hdr = f"📩 <b>{ '通知中心' if ch=='notice' else '系統消息' }</b>｜<b>{esc(src)}</b>\n"
   t = it.get("published_at") or it.get("created_at") or ""
-  msg=f"{hdr}\n{prefix}{tag}<b>{esc(title)}</b>\n\n{body}\n\n— 發佈於 {fmt_time(t)}"
+  prefix_text = custom_prefix if custom_prefix else (tag)
+  msg=f"{hdr}\n{prefix}{prefix_text}<b>{esc(title)}</b>\n\n{summary}{body}\n\n— 發佈於 {fmt_time(t)}"
+
   ok=tg.send(msg)
   imgs=[a for a in atts if a.get("type")=="image" and a.get("url")]
   fils=[a for a in atts if a.get("type")=="file"  and a.get("url")]
@@ -384,8 +439,10 @@ def ensure_startup_watermark(cli:"Seiue"):
     it=latest_of_channel(cli, ch)
     if it:
       ts=parse_ts(it.get("published_at") or it.get("created_at") or "") or time.time()
-      try: mid=int(str(it.get("id"))); 
-      except: mid=0
+      try:
+        mid=int(str(it.get("id") or "0"))
+      except:
+        mid=0
     else:
       ts=time.time(); mid=0
     st["watermark"][ch]={"ts":ts,"id":mid}
@@ -398,8 +455,10 @@ def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
     arr = cli.list_system(MAX_LIST_PAGES) if ch=="system" else cli.list_notice(MAX_LIST_PAGES)
     for it in arr:
       t=it.get("published_at") or it.get("created_at") or ""; ts=parse_ts(t) if t else 0.0
-      try: nid=int(str(it.get("id"))); 
-      except: nid=0
+      try:
+        nid=int(str(it.get("id") or "0"))
+      except:
+        nid=0
       if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)): continue
       pending.append((ch,it,ts,nid))
   pending.sort(key=lambda x:(x[2], x[3])); return pending
@@ -412,24 +471,40 @@ def main_loop():
   cli=Seiue(SEIUE_USERNAME, SEIUE_PASSWORD)
   if not cli.login(): print("Seiue 登錄失敗", file=sys.stderr); sys.exit(2)
   ensure_startup_watermark(cli)
-  # 安裝/啟動驗證：各通道各發最新1條（不改水位/seen）
+
+  # 安裝/啟動驗證：各通道各發最新1條（並標記為已讀，避免主循環再推）
   if SEND_TEST_ON_START:
+    st = load_state()
     for ch in ("system","notice"):
       it=latest_of_channel(cli, ch)
       if it:
-        try: send_one(tg, cli, it, ch, prefix="🧪 <b>安裝驗證</b>｜")
-        except Exception as e: logging.error("test send error(%s): %s", ch, e)
+        try:
+          send_one(tg, cli, it, ch, prefix="🧪 <b>安裝驗證</b>｜")
+        except Exception as e:
+          logging.error("test send error(%s): %s", ch, e)
+        # 標記為已讀（全局去重）
+        t = it.get("published_at") or it.get("created_at") or ""
+        st["seen_global"][global_key(it)] = parse_ts(t) or time.time()
+    save_state(st)
+
   print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system，全量直推），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}")
   while True:
     try:
       st=load_state()
       pending=list_increment_dual(cli)
       for ch,it,ts,nid in pending:
-        key=f"{ch}:{nid}"
-        if key in st["seen"]: continue
+        gkey = global_key(it)
+        if gkey in st["seen_global"]: 
+          continue
         ok=send_one(tg, cli, it, ch)
         if ok:
-          st["seen"][key]=ts
+          st["seen_global"][gkey]=ts
+          # 滾動清理，防止無限增長
+          if len(st["seen_global"]) > 20000:
+            oldest = sorted(st["seen_global"].items(), key=lambda kv: kv[1])[:5000]
+            for k, _ in oldest:
+              st["seen_global"].pop(k, None)
+          # 更新本通道水位
           wm=st["watermark"][ch]
           if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
           save_state(st)
@@ -448,7 +523,7 @@ PY
 write_service_linux(){
   cat >/etc/systemd/system/${UNIT_NAME}.service <<EOF
 [Unit]
-Description=Seiue → Telegram notifier (dual-channel; no subcommands)
+Description=Seiue → Telegram notifier (dual-channel; global dedup; no subcommands)
 After=network-online.target
 Wants=network-online.target
 
@@ -502,7 +577,7 @@ start_service(){
 }
 
 # -------- main (zero-arg only) --------
-info "Seiue sidecar（零參數版，無子命令；雙通道全量推送）"
+info "Seiue sidecar（零參數版；雙通道全量推送＋全局去重＋請假抄送摘要）"
 preflight
 ensure_dirs
 collect_env_if_needed
