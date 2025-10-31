@@ -1004,6 +1004,10 @@ setup_venv() {
 
 install_service() {
   echo "[5/9] Installing systemd service..."
+  local TG_TOKEN_REF='${TELEGRAM_BOT_TOKEN:-}'
+  local TG_CHAT_REF='${TELEGRAM_CHAT_ID:-}'
+  local TASK_IDS_REF='${MONITOR_TASK_IDS:-}'
+  local POLL_INTERVAL_REF='${POLL_INTERVAL:-10}'
   cat > "/etc/systemd/system/$SERVICE" <<EOF
 [Unit]
 Description=AGrader - Seiue auto-grader
@@ -1014,7 +1018,7 @@ After=network-online.target
 Type=simple
 EnvironmentFile=$ENV_FILE
 # 啟動即通知：🔔 AGrader 啟動 · <hostname> · 任务: <IDs> · 間隔: <N>s
-ExecStartPre=/bin/bash -lc 'set -a; source "$ENV_FILE" 2>/dev/null || true; set +a; if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" -d chat_id="$TELEGRAM_CHAT_ID" -d text="🔔 AGrader 启动 · %H · 任务: ${MONITOR_TASK_IDS:-} · 间隔: ${POLL_INTERVAL:-10}s" -d parse_mode=HTML >/dev/null || true; fi'
+ExecStartPre=/bin/bash -lc 'set -a; source "$ENV_FILE" 2>/dev/null || true; set +a; if [[ -n "${TG_TOKEN_REF}" && -n "${TG_CHAT_REF}" ]]; then curl -s "https://api.telegram.org/bot${TG_TOKEN_REF}/sendMessage" -d chat_id="${TG_CHAT_REF}" -d text="🔔 AGrader 启动 · %H · 任务: ${TASK_IDS_REF} · 间隔: ${POLL_INTERVAL_REF}s" -d parse_mode=HTML >/dev/null || true; fi'
 ExecStart=$VENV_DIR/bin/python $APP_DIR/main.py
 Restart=always
 RestartSec=3
