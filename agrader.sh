@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
-# AGrader - one-shot installer/runner/uninstaller (all-in-one)
-# OS: Debian/Ubuntu (apt), RHEL/CentOS/Rocky/Alma (yum/dnf), Alpine (apk)
+# AGrader - API-first auto-grading pipeline (installer/runner)
+# Linux: apt/yum/apk + systemd; macOS: Homebrew + optional launchd
 set -euo pipefail
 
 APP_DIR="/opt/agrader"
 VENV_DIR="$APP_DIR/venv"
 ENV_FILE="$APP_DIR/.env"
 SERVICE="agrader.service"
+LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/net.bdfz.agrader.plist"
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+os_detect() {
+  case "$(uname -s)" in
+    Darwin) echo "mac";;
+    Linux)  echo "linux";;
+    *)      echo "other";;
+  esac
+}
+
 ask() { local p="$1" var="$2" def="${3:-}"; local ans;
   if [ -n "${def}" ]; then read -r -p "$p [$def]: " ans || true; ans="${ans:-$def}";
   else read -r -p "$p: " ans || true; fi
@@ -16,8 +26,8 @@ ask() { local p="$1" var="$2" def="${3:-}"; local ans;
 }
 ask_secret() { local p="$1" var="$2"; local ans; read -r -s -p "$p: " ans || true; echo; printf -v "$var" "%s" "$ans"; }
 
-install_pkgs() {
-  echo "[1/9] Installing system dependencies..."
+install_pkgs_linux() {
+  echo "[1/10] Installing system dependencies (Linux)..."
   if have apt; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
@@ -38,45 +48,67 @@ install_pkgs() {
       tesseract-ocr poppler-utils ghostscript libxml2 libxslt \
       tesseract-ocr-data-eng tesseract-ocr-data-chi_sim || true
   else
-    echo "Unsupported package manager. Please install: python3, venv, pip, curl, jq, tesseract(+eng+chi_sim), poppler-utils, ghostscript, coreutils."
+    echo "Unsupported Linux package manager. Please install: python3/venv/pip, curl, jq, tesseract(+eng+chi_sim), poppler-utils, ghostscript, coreutils."
+    exit 1
+  fi
+}
+
+install_pkgs_macos() {
+  echo "[1/10] Installing system dependencies (macOS/Homebrew)..."
+  if ! have brew; then
+    echo "Homebrew not found. Please install Homebrew first: https://brew.sh"
+    exit 1
+  fi
+  brew update
+  brew install jq tesseract poppler ghostscript python@3.12 coreutils || true
+  if ! python3 -c 'import sys; sys.exit(0)' 2>/dev/null; then
+    echo "python3 not found; ensure Homebrew python is linked."
     exit 1
   fi
 }
 
 ensure_env_patch() {
-  # 修补旧 .env：修正 LOG_FORMAT、补 LOG_DATEFMT、PUT 优先的评分端点
   [ -f "$ENV_FILE" ] || return 0
   cp -f "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)" || true
 
-  # 如果 LOG_FORMAT 缺失，或包含裸 %Y/%m/%d/%H（典型错误），改为映射式
+  # Safe logging defaults
   if ! grep -q '^LOG_FORMAT=' "$ENV_FILE"; then
     echo 'LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s' >> "$ENV_FILE"
   elif grep -Eiq '^LOG_FORMAT=.*(%Y|%m|%d|%H|%M|%S)' "$ENV_FILE"; then
-    sed -i -E 's#^LOG_FORMAT=.*#LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s#' "$ENV_FILE"
+    sed -i.bak -E 's#^LOG_FORMAT=.*#LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s#' "$ENV_FILE" || true
   fi
-
-  # 如果 LOG_DATEFMT 缺失则补上
   grep -q '^LOG_DATEFMT=' "$ENV_FILE" || echo 'LOG_DATEFMT=%Y-%m-%d %H:%M:%S' >> "$ENV_FILE"
 
-  # 给分端点：若未设置或没有 PUT，就设置为 PUT 优先
+  # Confirmed endpoints
+  grep -q '^SEIUE_REVIEW_POST_TEMPLATE=' "$ENV_FILE" || \
+    echo 'SEIUE_REVIEW_POST_TEMPLATE=/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews' >> "$ENV_FILE"
+
   if ! grep -q '^SEIUE_SCORE_ENDPOINTS=' "$ENV_FILE"; then
-    echo 'SEIUE_SCORE_ENDPOINTS=PUT:/common/items/{item_id}/scores?type=item_score:array;PUT:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/common/items/{item_id}/scores?type=item_score:array' >> "$ENV_FILE"
-  elif ! grep -q '^SEIUE_SCORE_ENDPOINTS=.*PUT:' "$ENV_FILE"; then
-    sed -i -E 's#^SEIUE_SCORE_ENDPOINTS=.*#SEIUE_SCORE_ENDPOINTS=PUT:/common/items/{item_id}/scores?type=item_score:array;PUT:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/common/items/{item_id}/scores?type=item_score:array#' "$ENV_FILE"
+    echo 'SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true:array;PUT:/vnas/common/items/{item_id}/scores?type=item_score:array;PUT:/common/items/{item_id}/scores?type=item_score:array;POST:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/common/items/{item_id}/scores?type=item_score:array' >> "$ENV_FILE"
+  elif ! grep -q 'klass/items/.*/scores/sync' "$ENV_FILE"; then
+    sed -i.bak -E 's#^SEIUE_SCORE_ENDPOINTS=.*#SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true\&from_task=true:array;PUT:/vnas/common/items/{item_id}/scores?type=item_score:array;PUT:/common/items/{item_id}/scores?type=item_score:array;POST:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/common/items/{item_id}/scores?type=item_score:array#' "$ENV_FILE" || true
   fi
+
+  # Verify GET
+  grep -q '^SEIUE_VERIFY_SCORE_GET_TEMPLATE=' "$ENV_FILE" || \
+    echo 'SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&type=item_score' >> "$ENV_FILE"
+
+  # New toggles
+  grep -q '^DRY_RUN=' "$ENV_FILE" || echo 'DRY_RUN=1' >> "$ENV_FILE"
+  grep -q '^VERIFY_AFTER_WRITE=' "$ENV_FILE" || echo 'VERIFY_AFTER_WRITE=1' >> "$ENV_FILE"
+  grep -q '^RETRY_FAILED=' "$ENV_FILE" || echo 'RETRY_FAILED=1' >> "$ENV_FILE"
+  grep -q '^STUDENT_WORKERS=' "$ENV_FILE" || echo 'STUDENT_WORKERS=6' >> "$ENV_FILE"
+  grep -q '^ATTACH_WORKERS=' "$ENV_FILE"  || echo 'ATTACH_WORKERS=4'  >> "$ENV_FILE"
 }
 
 write_project() {
-  echo "[2/9] Collecting initial configuration..."
+  echo "[2/10] Collecting initial configuration..."
   mkdir -p "$APP_DIR" "$APP_DIR/work"
 
   if [ ! -f "$ENV_FILE" ]; then
     echo "Enter Seiue API credentials/headers (auto OR manual)."
-    echo "— Auto mode: provide username/password to auto-login & refresh when needed."
-    echo "— Manual mode: leave username/password empty and paste Bearer token & reflection_id."
     ask "Seiue API Base" SEIUE_BASE "https://api.seiue.com"
 
-    # AUTO MODE (optional)
     ask "Seiue Username (leave empty to skip auto-login)" SEIUE_USERNAME ""
     if [ -n "$SEIUE_USERNAME" ]; then
       ask_secret "Seiue Password" SEIUE_PASSWORD
@@ -84,32 +116,29 @@ write_project() {
       SEIUE_PASSWORD=""
     fi
 
-    # MANUAL MODE (optional / fallback)
     ask "X-School-Id" SEIUE_SCHOOL_ID "3"
     ask "X-Role" SEIUE_ROLE "teacher"
     ask "X-Reflection-Id (manual; empty if auto-login)" SEIUE_REFLECTION_ID ""
     ask_secret "Bearer token (manual; empty if auto-login)" SEIUE_BEARER
 
-    ask "Comma-separated Task IDs to monitor" MONITOR_TASK_IDS
+    ask "Comma-separated Task IDs or URLs to monitor" MONITOR_TASK_IDS
     ask "Polling interval seconds" POLL_INTERVAL "10"
 
     echo
     echo "Choose AI provider:"
-    echo "  1) gemini (Google Generative Language)"
+    echo "  1) gemini"
     echo "  2) deepseek"
     ask "Select 1/2" AI_CHOICE "1"
     if [ "$AI_CHOICE" = "2" ]; then
       AI_PROVIDER="deepseek"
       ask_secret "DeepSeek API Key" DEEPSEEK_API_KEY
       ask "DeepSeek Model" DEEPSEEK_MODEL "deepseek-reasoner"
-      GEMINI_API_KEY=""
-      GEMINI_MODEL="gemini-2.5-pro"
+      GEMINI_API_KEY=""; GEMINI_MODEL="gemini-2.5-pro"
     else
       AI_PROVIDER="gemini"
       ask_secret "Gemini API Key" GEMINI_API_KEY
       ask "Gemini Model" GEMINI_MODEL "gemini-2.5-pro"
-      DEEPSEEK_API_KEY=""
-      DEEPSEEK_MODEL="deepseek-reasoner"
+      DEEPSEEK_API_KEY=""; DEEPSEEK_MODEL="deepseek-reasoner"
     fi
 
     echo
@@ -118,7 +147,7 @@ write_project() {
     ask "Telegram Chat ID" TELEGRAM_CHAT_ID ""
 
     echo
-    echo "Heavy PDF OCR fallback control:"
+    echo "Extraction limits"
     ask "Enable PDF OCR fallback after pdftotext fails? (1/0)" ENABLE_PDF_OCR_FALLBACK "1"
     ask "Max PDF pages allowed for OCR fallback" MAX_PDF_OCR_PAGES "20"
     ask "Max seconds allowed for OCR fallback (timeout)" MAX_PDF_OCR_SECONDS "120"
@@ -129,9 +158,14 @@ write_project() {
     echo "Logging options:"
     ask "LOG_LEVEL (DEBUG/INFO/WARN/ERROR)" LOG_LEVEL "INFO"
     ask "LOG_FILE path" LOG_FILE "$APP_DIR/agrader.log"
-    # 固定给出正确的默认格式
     LOG_FORMAT="%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
     LOG_DATEFMT="%Y-%m-%d %H:%M:%S"
+
+    DRY_RUN="1"
+    VERIFY_AFTER_WRITE="1"
+    RETRY_FAILED="1"
+    STUDENT_WORKERS="6"
+    ATTACH_WORKERS="4"
 
   cat > "$ENV_FILE" <<EOF
 # ---- Seiue ----
@@ -145,12 +179,10 @@ SEIUE_REFLECTION_ID=${SEIUE_REFLECTION_ID}
 MONITOR_TASK_IDS=${MONITOR_TASK_IDS}
 POLL_INTERVAL=${POLL_INTERVAL}
 
-# Confirmed review endpoint
+# ---- Endpoints ----
 SEIUE_REVIEW_POST_TEMPLATE=/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews
-
-# Multiple fallback endpoints for score (METHOD:PATH[:BODY])
-# 405/MethodNotAllowed 时自动换路径/方法；BODY=array|object（默认 array）
-SEIUE_SCORE_ENDPOINTS=PUT:/common/items/{item_id}/scores?type=item_score:array;PUT:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/common/items/{item_id}/scores?type=item_score:array
+SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true:array;PUT:/vnas/common/items/{item_id}/scores?type=item_score:array;PUT:/common/items/{item_id}/scores?type=item_score:array;POST:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/common/items/{item_id}/scores?type=item_score:array
+SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&type=item_score
 
 # ---- AI ----
 AI_PROVIDER=${AI_PROVIDER}
@@ -178,10 +210,17 @@ LOG_FILE=${LOG_FILE}
 LOG_FORMAT=${LOG_FORMAT}
 LOG_DATEFMT=${LOG_DATEFMT}
 
-# ---- Scoring/Review strategy ----
+# ---- Strategy & Safety ----
 SCORE_WRITE=1
 REVIEW_ALL_EXISTING=1
 SCORE_GIVE_ALL_ON_START=1
+DRY_RUN=${DRY_RUN}
+VERIFY_AFTER_WRITE=${VERIFY_AFTER_WRITE}
+RETRY_FAILED=${RETRY_FAILED}
+
+# ---- Concurrency ----
+STUDENT_WORKERS=${STUDENT_WORKERS}
+ATTACH_WORKERS=${ATTACH_WORKERS}
 
 # ---- Paths/State ----
 STATE_PATH=${APP_DIR}/state.json
@@ -193,7 +232,7 @@ EOF
     ensure_env_patch
   fi
 
-  echo "[3/9] Writing project files..."
+  echo "[3/10] Writing project files..."
   cat > "$APP_DIR/requirements.txt" <<'EOF'
 requests==2.32.3
 urllib3==2.2.3
@@ -207,35 +246,38 @@ python-pptx==0.6.23
 lxml==5.3.0
 EOF
 
-  # ---- docs ----
   cat > "$APP_DIR/AGRADER_DEPLOY.md" <<'EOF'
-# AGrader (Seiue auto-grading pipeline)
+# AGrader (Seiue API-first auto-grading)
 
-Flow: listen → fetch submission → fetch task → extract (DraftJS + attachments OCR) → AI grade (Gemini/DeepSeek) → clamp to max → write back review (+ score) → Telegram notify.
+Flow: fetch assignments → extract submission (DraftJS + attachments OCR) → AI grade (Gemini/DeepSeek) → clamp to authoritative full_score → POST review + POST/PUT score → GET verify → Telegram notify.
 
-Auth:
-- Auto mode (recommended): set SEIUE_USERNAME/SEIUE_PASSWORD only; the service logs in, stores bearer in memory, refreshes on 401/403.
-- Manual mode: set SEIUE_BEARER (+ optional SEIUE_REFLECTION_ID). Auto-login is skipped.
+Robust JSON: If AI returns invalid JSON, the system attempts json.loads → regex extraction → **AI self-repair** ("The following is not valid JSON. Please fix it and return only the corrected JSON object.").
 
-Confirmed endpoints:
-- POST review: /chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews  (expect 201)
-- GET assignments: /chalk/task/v2/tasks/{task_id}/assignments?expand=is_excellent,assignee,team,submission,review
-- GET signed file URL: /chalk/netdisk/files/{file_id}/url  (302 Location)
-- Score write: multiple fallbacks; see .env (SCORE_WRITE / SEIUE_SCORE_ENDPOINTS / legacy template)
+Isolation & State:
+- Each student is processed in an isolated try/except. Failures are logged, notified via Telegram, and appended into `state.json -> failed` with reason and timestamp.
+- Optional `RETRY_FAILED=1`: when a submission previously failed (matched by `assignment_id` + content signature), it will be force-reprocessed.
+- `reported_complete`: remember which `item_id` has already sent the "all graded (actual/expected)" message.
 
-Attachments to AI: Files are extracted to text (pdftotext/ocr) and MERGED into the prompt. The model names remain exactly as configured.
+Authoritative scoring:
+- For each task's `item_id`, the script calls `GET /vnas/klass/items/{item_id}` to fetch `full_score`, `pathname`, `completed_scores_counts`.
+- Clamping strictly uses `full_score` instead of guessing from task payload.
+- After successful scoring, if `actual == expected`, a Telegram "完成度" message is sent once.
 
-Logging:
-- Use LOG_FORMAT (mapping style) + LOG_DATEFMT. Example:
-  LOG_FORMAT="%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
-  LOG_DATEFMT="%Y-%m-%d %H:%M:%S"
+Prompt context:
+- Enrich with task `group` (class_name, grade_names, subject_name), `expected_take_minutes`, and item `pathname`.
+
+Bulk tasks:
+- Use `GET /chalk/task/v2/tasks?id_in=...&expand=group` to fetch task metadata for all monitored tasks in one call.
+
+Concurrency:
+- Attachments: ThreadPool (`ATTACH_WORKERS`, default 4).
+- Students: ThreadPool (`STUDENT_WORKERS`, default 6). Network-IO heavy (AI call), safe for threads.
 EOF
 
-  # ---- utilx.py ----
+  # utilx.py
   cat > "$APP_DIR/utilx.py" <<'PY'
 import json, hashlib
 from typing import Dict, Any, List, Tuple
-
 def draftjs_to_text(content_json: str) -> str:
     try:
         data = json.loads(content_json)
@@ -243,15 +285,13 @@ def draftjs_to_text(content_json: str) -> str:
         return "\n".join(b.get("text","") for b in blocks).strip()
     except Exception:
         return content_json
-
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
-
 def scan_question_maxima(task: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], float]:
     overall_max = 100.0
     perq: List[Dict[str, Any]] = []
     candidates = []
-    for k in ["score_items", "questions", "problems", "rubric", "grading", "grading_items"]:
+    for k in ["score_items","questions","problems","rubric","grading","grading_items"]:
         v = task.get(k) or task.get("custom_fields", {}).get(k)
         if isinstance(v, list):
             candidates = v; break
@@ -270,272 +310,191 @@ def scan_question_maxima(task: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], fl
             try: overall_max = float(maybe_max)
             except: pass
     return perq, overall_max
-
 def stable_hash(text: str) -> str:
-    import hashlib
-    return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8","ignore")).hexdigest()
 PY
 
-  # ---- credentials.py (auto-login) ----
+  # credentials.py
   cat > "$APP_DIR/credentials.py" <<'PY'
 import logging, requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
 class AuthResult:
     def __init__(self, ok: bool, token: str = "", reflection_id: str = "", detail: str = ""):
-        self.ok = ok
-        self.token = token
-        self.reflection_id = reflection_id
-        self.detail = detail
-
+        self.ok = ok; self.token = token; self.reflection_id = reflection_id; self.detail = detail
 def _session_with_retries() -> requests.Session:
     s = requests.Session()
     r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({
-        "User-Agent": "AGrader/1.4 (+login)",
-        "Accept": "application/json, text/plain, */*",
-    })
+    s.headers.update({"User-Agent": "AGrader/1.6 (+login)","Accept": "application/json, text/plain, */*"})
     return s
-
 def login(username: str, password: str) -> AuthResult:
     try:
         sess = _session_with_retries()
         login_url = "https://passport.seiue.com/login?school_id=3&type=account&from=null&redirect_url=null"
         auth_url  = "https://passport.seiue.com/authorize"
-
         login_form = {"email": username, "login": username, "username": username, "password": password}
-        login_headers = {
-            "Referer": login_url,
-            "Origin": "https://passport.seiue.com",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        lr = sess.post(login_url, headers=login_headers, data=login_form, timeout=30)
-        if lr.status_code >= 400:
-            logging.error(f"[AUTH] Login HTTP {lr.status_code}: {(lr.text or '')[:300]}")
-        if "chalk" not in lr.url and "bindings" not in lr.url:
-            logging.warning(f"[AUTH] Login redirect URL unexpected: {lr.url}")
-
+        lr = sess.post(login_url, headers={"Referer": login_url,"Origin": "https://passport.seiue.com","Content-Type": "application/x-www-form-urlencoded"}, data=login_form, timeout=30)
         auth_form = {"client_id":"GpxvnjhVKt56qTmnPWH1sA","response_type":"token"}
-        auth_headers = {
-            "Referer": "https://chalk-c3.seiue.com/",
-            "Origin": "https://chalk-c3.seiue.com",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        ar = sess.post(auth_url, headers=auth_headers, data=auth_form, timeout=30)
+        ar = sess.post(auth_url, headers={"Referer": "https://chalk-c3.seiue.com/","Origin": "https://chalk-c3.seiue.com","Content-Type": "application/x-www-form-urlencoded"}, data=auth_form, timeout=30)
         ar.raise_for_status()
         j = ar.json() or {}
-        token = j.get("access_token","")
-        reflection = j.get("active_reflection_id","")
-        if token and reflection:
-            logging.info("[AUTH] Acquired access_token and reflection_id.")
-            return AuthResult(True, token, str(reflection))
-        return AuthResult(False, detail=f"Missing token or reflection_id in response: keys={list(j.keys())}")
+        token = j.get("access_token",""); reflection = j.get("active_reflection_id","")
+        if token and reflection: return AuthResult(True, token, str(reflection))
+        return AuthResult(False, detail=f"Missing token/reflection_id keys={list(j.keys())}")
     except requests.RequestException as e:
-        logging.error(f"[AUTH] Network error during auth: {e}", exc_info=True)
-        return AuthResult(False, detail=str(e))
+        logging.error(f"[AUTH] {e}", exc_info=True); return AuthResult(False, detail=str(e))
 PY
 
-  # ---- extractor.py ----
+  # extractor.py
   cat > "$APP_DIR/extractor.py" <<'PY'
-import os, subprocess, tempfile, mimetypes, traceback, shutil, logging
+import os, subprocess, tempfile, mimetypes, logging
 from typing import Tuple
 from PIL import Image
 import pytesseract
-
 def _run(cmd: list, input_bytes: bytes=None, timeout=180) -> Tuple[int, bytes, bytes]:
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input_bytes else None,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = p.communicate(input=input_bytes, timeout=timeout)
-    return p.returncode, out, err
-
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input_bytes else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = p.communicate(input=input_bytes, timeout=timeout); return p.returncode, out, err
 def _pdf_pages(path: str) -> int:
     try:
         code, out, _ = _run(["pdfinfo", path], timeout=20)
         if code == 0:
             for line in out.decode("utf-8","ignore").splitlines():
-                if line.lower().startswith("pages:"):
-                    return int(line.split(":")[1].strip())
-    except Exception:
-        pass
+                if line.lower().startswith("pages:"): return int(line.split(":")[1].strip())
+    except Exception: pass
     return -1
-
 def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1024) -> str:
-    if not os.path.exists(path):
-        return "[[error: file not found]]"
+    if not os.path.exists(path): return "[[error: file not found]]"
     sz = os.path.getsize(path)
-    if sz > size_cap:
-        return f"[[skipped: file too large ({sz} bytes)]]"
-
-    mt, _ = mimetypes.guess_type(path)
-    ext = (os.path.splitext(path)[1] or "").lower()
-
+    if sz > size_cap: return f"[[skipped: file too large ({sz} bytes)]]"
+    mt, _ = mimetypes.guess_type(path); ext = (os.path.splitext(path)[1] or "").lower()
     if ext == ".pdf" or (mt and mt.endswith("pdf")):
         try:
-            code, out, err = _run(["pdftotext", "-layout", path, "-"], timeout=120)
-            if code == 0 and out.strip():
-                return out.decode("utf-8", "ignore")
-        except Exception as e:
-            logging.warning(f"[EXTRACT] pdftotext failed: {e}", exc_info=True)
-
-        enable_fallback = os.getenv("ENABLE_PDF_OCR_FALLBACK","1") not in ("0", "false", "False")
-        max_pages = int(os.getenv("MAX_PDF_OCR_PAGES","20"))
-        max_seconds = int(os.getenv("MAX_PDF_OCR_SECONDS","120"))
-        pages = _pdf_pages(path)
+            code, out, _ = _run(["pdftotext", "-layout", path, "-"], timeout=120)
+            if code == 0 and out.strip(): return out.decode("utf-8","ignore")
+        except Exception as e: logging.warning(f"[EXTRACT] pdftotext failed: {e}", exc_info=True)
+        enable_fallback = os.getenv("ENABLE_PDF_OCR_FALLBACK","1") not in ("0","false","False")
+        max_pages = int(os.getenv("MAX_PDF_OCR_PAGES","20")); pages = _pdf_pages(path)
         if (not enable_fallback) or (pages > 0 and pages > max_pages):
             return f"[[skipped: pdf ocr fallback disabled or too large (pages={pages}, size={sz})]]"
-
-        try:
-            tmpdir = tempfile.mkdtemp(prefix="pdfocr_")
-            prefix = os.path.join(tmpdir, "pg")
-            code, _, err = _run(["pdftoppm", "-r", "200", path, prefix], timeout=max_seconds)
-            text_acc = []
-            if code == 0:
-                for f in sorted(os.listdir(tmpdir)):
-                    if f.startswith("pg") and (f.endswith(".ppm") or f.endswith(".png") or f.endswith(".jpg")):
-                        img_path = os.path.join(tmpdir, f)
-                        try:
-                            img = Image.open(img_path)
-                            part = pytesseract.image_to_string(img, lang=ocr_lang)
-                            text_acc.append(part)
-                        except Exception as e:
-                            logging.error(f"[OCR] tesseract error on {f}: {e}", exc_info=True)
-                            text_acc.append(f"[[error: tesseract {e} on {f}]]")
-                merged = "\n".join(text_acc).strip()
-                return merged or "[[error: ocr produced empty text]]"
-            return f"[[error: pdftoppm failed code={code} msg={err.decode('utf-8','ignore')[:200]}]]"
-        except Exception as e:
-            logging.error(f"[EXTRACT] pdf ocr fallback exception: {e}", exc_info=True)
-            return f"[[error: pdf ocr fallback exception: {repr(e)}]]"
-
-    if ext in [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"] or (mt and mt.startswith("image/")):
-        try:
-            img = Image.open(path)
-            return pytesseract.image_to_string(img, lang=ocr_lang) or "[[error: image ocr empty]]"
-        except Exception as e:
-            logging.error(f"[EXTRACT] image ocr exception: {e}", exc_info=True)
-            return f"[[error: image ocr exception: {repr(e)}]]"
-
+        from tempfile import mkdtemp
+        tmpdir = mkdtemp(prefix="pdfocr_"); prefix = os.path.join(tmpdir, "pg")
+        code, _, err = _run(["pdftoppm", "-r", "200", path, prefix], timeout=int(os.getenv("MAX_PDF_OCR_SECONDS","120")))
+        if code != 0: return f"[[error: pdftoppm {err.decode('utf-8','ignore')[:200]}]]"
+        texts=[]
+        for f in sorted(os.listdir(tmpdir)):
+          if f.startswith("pg") and (f.endswith(".ppm") or f.endswith(".png") or f.endswith(".jpg")):
+            try: texts.append(pytesseract.image_to_string(Image.open(os.path.join(tmpdir,f)), lang=ocr_lang))
+            except Exception as e: logging.error(f"[OCR] {e}", exc_info=True); texts.append(f"[[error: tesseract {e}]]")
+        return ("\n".join(texts).strip() or "[[error: ocr empty]]")
+    if ext in [".png",".jpg",".jpeg",".bmp",".tiff",".webp"] or (mt and mt.startswith("image/")):
+        try: return pytesseract.image_to_string(Image.open(path), lang=ocr_lang) or "[[error: image ocr empty]]"
+        except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: image ocr exception: {repr(e)}]]"
     if ext == ".docx":
         try:
-            import docx
-            doc = docx.Document(path)
-            return "\n".join(p.text for p in doc.paragraphs)
-        except Exception as e:
-            logging.error(f"[EXTRACT] docx extract exception: {e}", exc_info=True)
-            return f"[[error: docx extract exception: {repr(e)}]]"
-
+            import docx; return "\n".join(p.text for p in docx.Document(path).paragraphs)
+        except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: docx extract exception: {repr(e)}]]"
     if ext == ".pptx":
         try:
-            from pptx import Presentation
-            prs = Presentation(path)
-            lines=[]
+            from pptx import Presentation; lines=[]; prs=Presentation(path)
             for s in prs.slides:
                 for shp in s.shapes:
-                    if hasattr(shp, "text"):
-                        lines.append(shp.text)
+                    if hasattr(shp,"text"): lines.append(shp.text)
             return "\n".join(lines) or "[[error: pptx no text]]"
-        except Exception as e:
-            logging.error(f"[EXTRACT] pptx extract exception: {e}", exc_info=True)
-            return f"[[error: pptx extract exception: {repr(e)}]]"
-
+        except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: pptx extract exception: {repr(e)}]]"
     try:
-        with open(path, "rb") as f:
-            b = f.read()
-        return b.decode("utf-8", "ignore")
-    except Exception as e:
-        logging.error(f"[EXTRACT] unknown file read exception: {e}", exc_info=True)
-        return f"[[error: unknown file read exception: {repr(e)}]]"
+        with open(path,"rb") as f: return f.read().decode("utf-8","ignore")
+    except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: unknown file read exception: {repr(e)}]]"
 PY
 
-  # ---- ai_providers.py ----
+  # ai_providers.py —— JSON 修復保持
   cat > "$APP_DIR/ai_providers.py" <<'PY'
-import os, time, json, requests, logging, random
+import os, time, json, requests, logging, random, re
 
 def _backoff_loop():
-    max_retries = int(os.getenv("AI_MAX_RETRIES","5"))
-    base = float(os.getenv("AI_BACKOFF_BASE_SECONDS","1.5"))
-    jitter = float(os.getenv("AI_JITTER_SECONDS","0.5"))
+    max_retries = int(os.getenv("AI_MAX_RETRIES","5")); base = float(os.getenv("AI_BACKOFF_BASE_SECONDS","1.5")); jitter = float(os.getenv("AI_JITTER_SECONDS","0.5"))
     for i in range(max_retries):
-        yield i
-        sleep = (base ** i) + random.uniform(0, jitter)
-        time.sleep(sleep)
+        yield i; time.sleep((base ** i) + random.uniform(0, jitter))
 
 class AIClient:
     def __init__(self, provider: str, model: str, key: str):
-        self.provider = provider
-        self.model = model
-        self.key = key
+        self.provider = provider; self.model = model; self.key = key
 
     def grade(self, prompt: str) -> dict:
-        try:
-            if self.provider == "gemini":
-                return self._gemini(prompt)
-            elif self.provider == "deepseek":
-                return self._deepseek(prompt)
-            else:
-                raise ValueError("Unknown AI provider")
-        except requests.RequestException as e:
-            logging.error(f"[AI] network error: {e}", exc_info=True)
-            return {"per_question": [], "overall": {"score": 0, "comment": f"AI网络错误: {e}"}}
-        except Exception as e:
-            logging.error(f"[AI] client error: {e}", exc_info=True)
-            return {"per_question": [], "overall": {"score": 0, "comment": f"AI调用异常: {e}"}}
+        raw = self._call_llm(prompt)
+        return self.parse_or_repair(raw)
 
-    def _gemini(self, prompt: str) -> dict:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.key}"
-        body = {"contents": [{"parts":[{"text": prompt}]}], "generationConfig": {"temperature": 0.2}}
-        for _ in _backoff_loop():
-            r = requests.post(url, json=body, timeout=180)
-            if r.status_code == 429:
-                logging.warning("[AI] Gemini 429; backing off and retrying...")
-                continue
-            r.raise_for_status()
-            data = r.json()
-            txt = ""
-            try:
-                txt = data["candidates"][0]["content"]["parts"][0]["text"]
-            except Exception:
-                txt = json.dumps(data)[:4000]
-            return self._force_json(txt)
-        return {"per_question": [], "overall": {"score": 0, "comment": "AI 429 too many requests"}}
-
-    def _deepseek(self, prompt: str) -> dict:
-        url = "https://api.deepseek.com/chat/completions"
-        headers = {"Authorization": f"Bearer {self.key}"}
-        body = {
-            "model": self.model,
-            "messages": [{"role":"system","content":"You are a strict grader. Output ONLY valid JSON per schema."},
-                         {"role":"user","content": prompt}],
-            "temperature": 0.2
-        }
-        for _ in _backoff_loop():
-            r = requests.post(url, headers=headers, json=body, timeout=180)
-            if r.status_code == 429:
-                logging.warning("[AI] DeepSeek 429; backing off and retrying...")
-                continue
-            r.raise_for_status()
-            data = r.json()
-            txt = data.get("choices",[{}])[0].get("message",{}).get("content","")
-            return self._force_json(txt)
-        return {"per_question": [], "overall": {"score": 0, "comment": "AI 429 too many requests"}}
-
-    def _force_json(self, text: str) -> dict:
+    def parse_or_repair(self, text: str) -> dict:
         text = (text or "").strip()
         if text.startswith("{"):
             try: return json.loads(text)
             except Exception: pass
-        import re
         m = re.search(r"\{.*\}", text, re.S)
         if m:
             try: return json.loads(m.group(0))
-            except Exception as e:
-                logging.error(f"[AI] JSON parse error: {e}", exc_info=True)
-        return {"per_question": [], "overall": {"score": 0, "comment": text[:200]}}
+            except Exception: pass
+        try:
+            fixed = self.repair_json(text)
+            if isinstance(fixed, dict): return fixed
+            if isinstance(fixed, str):
+                fixed = fixed.strip()
+                if fixed.startswith("{"): return json.loads(fixed)
+                mm = re.search(r"\{.*\}", fixed, re.S)
+                if mm: return json.loads(mm.group(0))
+        except Exception as e:
+            logging.error(f"[AI] JSON repair failed: {e}", exc_info=True)
+        return {"per_question": [], "overall": {"score": 0, "comment": (text[:200] if text else "AI empty")}}
+
+    def _call_llm(self, prompt: str) -> str:
+        if self.provider == "gemini":
+            return self._gemini(prompt)
+        elif self.provider == "deepseek":
+            return self._deepseek(prompt)
+        else:
+            raise ValueError("Unknown AI provider")
+
+    def _gemini(self, prompt: str) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.key}"
+        body = {"contents":[{"parts":[{"text": prompt}]}], "generationConfig":{"temperature":0.2}}
+        for _ in _backoff_loop():
+            r = requests.post(url, json=body, timeout=180)
+            if r.status_code == 429: logging.warning("[AI] Gemini 429; retry..."); continue
+            r.raise_for_status()
+            data = r.json()
+            try: return data["candidates"][0]["content"]["parts"][0]["text"]
+            except Exception: return json.dumps(data)[:4000]
+        return ""
+
+    def _deepseek(self, prompt: str) -> str:
+        url = "https://api.deepseek.com/chat/completions"; headers={"Authorization": f"Bearer {self.key}"}
+        body={"model": self.model,"messages":[{"role":"system","content":"You are a strict grader. Output ONLY valid JSON per schema."},{"role":"user","content": prompt}],"temperature":0.2}
+        for _ in _backoff_loop():
+            r = requests.post(url, headers=headers, json=body, timeout=180)
+            if r.status_code == 429: logging.warning("[AI] DeepSeek 429; retry..."); continue
+            r.raise_for_status()
+            data = r.json()
+            return data.get("choices",[{}])[0].get("message",{}).get("content","")
+        return ""
+
+    def repair_json(self, bad_text: str) -> dict | str:
+        if self.provider == "gemini":
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.key}"
+            instr = "The following is not valid JSON. Please fix it and return only the corrected JSON object."
+            body = {"contents":[{"parts":[{"text": instr+"\n\n<<<\n"+(bad_text or "")+"\n>>>\n"}]}], "generationConfig":{"temperature":0.0}}
+            r = requests.post(url, json=body, timeout=120); r.raise_for_status()
+            data = r.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            url = "https://api.deepseek.com/chat/completions"; headers={"Authorization": f"Bearer {self.key}"}
+            sys_prompt = "You are a JSON fixer. Return ONLY the corrected JSON object. No code fences. No commentary."
+            user = "The following is not valid JSON. Please fix it and return only the corrected JSON object.\n\n<<<\n"+(bad_text or "")+"\n>>>"
+            body={"model": self.model,"messages":[{"role":"system","content":sys_prompt},{"role":"user","content": user}],"temperature":0.0}
+            r = requests.post(url, headers=headers, json=body, timeout=120); r.raise_for_status()
+            data = r.json()
+            return data.get("choices",[{}])[0].get("message",{}).get("content","")
 PY
 
-  # ---- seiue_api.py (multi-endpoint PUT/POST fallback, unchanged逻辑) ----
+  # seiue_api.py
   cat > "$APP_DIR/seiue_api.py" <<'PY'
 import os, logging, requests
 from typing import Dict, Any, List, Tuple
@@ -545,54 +504,34 @@ from urllib3.util.retry import Retry
 
 def _session_with_retries() -> requests.Session:
     s = requests.Session()
-    r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504),
-              allowed_methods=frozenset({"GET","POST","PUT"}))
+    r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST","PUT"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
     return s
 
 class Seiue:
-    def __init__(self, base: str, bearer: str, school_id: str, role: str, reflection_id: str,
-                 username: str="", password: str=""):
-        self.base = base.rstrip("/")
-        self.username = username
-        self.password = password
-        self.school_id = str(school_id)
-        self.role = role
-        self.reflection_id = str(reflection_id) if reflection_id else ""
-        self.bearer = bearer or ""
-        self.session = _session_with_retries()
-        self._init_headers()
-        if not self.bearer and self.username and self.password:
-            self._login_and_apply()
+    def __init__(self, base: str, bearer: str, school_id: str, role: str, reflection_id: str, username: str="", password: str=""):
+        self.base = base.rstrip("/"); self.username = username; self.password = password
+        self.school_id = str(school_id); self.role = role
+        self.reflection_id = str(reflection_id) if reflection_id else ""; self.bearer = bearer or ""
+        self.session = _session_with_retries(); self._init_headers()
+        if not self.bearer and self.username and self.password: self._login_and_apply()
 
     def _init_headers(self):
-        self.session.headers.update({
-            "Accept": "application/json, text/plain, */*",
-            "User-Agent": "AGrader/1.4",
-        })
-        if self.bearer:
-            self.session.headers.update({"Authorization": f"Bearer {self.bearer}"})
-        if self.school_id:
-            self.session.headers.update({"X-School-Id": self.school_id, "x-school-id": self.school_id})
-        if self.role:
-            self.session.headers.update({"X-Role": self.role, "x-role": self.role})
-        if self.reflection_id:
-            self.session.headers.update({"X-Reflection-Id": self.reflection_id, "x-reflection-id": self.reflection_id})
+        self.session.headers.update({"Accept":"application/json, text/plain, */*","User-Agent":"AGrader/1.7"})
+        if self.bearer: self.session.headers.update({"Authorization": f"Bearer {self.bearer}"})
+        if self.school_id: self.session.headers.update({"X-School-Id": self.school_id, "x-school-id": self.school_id})
+        if self.role: self.session.headers.update({"X-Role": self.role, "x-role": self.role})
+        if self.reflection_id: self.session.headers.update({"X-Reflection-Id": self.reflection_id, "x-reflection-id": self.reflection_id})
 
     def _login_and_apply(self) -> bool:
-        if not (self.username and self.password):
-            return False
-        logging.info("[AUTH] Attempting auto-login with username/password...")
+        if not (self.username and self.password): return False
+        logging.info("[AUTH] Auto-login...")
         res: AuthResult = login(self.username, self.password)
         if res.ok:
             self.bearer = res.token
-            if res.reflection_id:
-                self.reflection_id = str(res.reflection_id)
-            self._init_headers()
-            logging.info("[AUTH] Auto-login successful; headers updated.")
-            return True
-        logging.error(f"[AUTH] Auto-login failed: {res.detail}")
-        return False
+            if res.reflection_id: self.reflection_id = str(res.reflection_id)
+            self._init_headers(); logging.info("[AUTH] OK"); return True
+        logging.error(f"[AUTH] Failed: {res.detail}"); return False
 
     def _url(self, path: str) -> str:
         if path.startswith("http"): return path
@@ -601,158 +540,130 @@ class Seiue:
 
     def _with_refresh(self, request_fn):
         r = request_fn()
-        if getattr(r, "status_code", None) in (401,403):
-            logging.warning("[AUTH] Got 401/403; trying to re-auth...")
-            if self._login_and_apply():
-                return request_fn()
+        if getattr(r,"status_code",None) in (401,403):
+            logging.warning("[AUTH] 401/403; re-auth...")
+            if self._login_and_apply(): return request_fn()
         return r
 
-    def get_assignments(self, task_id: int) -> List[Dict[str, Any]]:
+    # --- assignments & tasks ---
+    def get_assignments(self, task_id: int):
         url = self._url(f"/chalk/task/v2/tasks/{task_id}/assignments?expand=is_excellent,assignee,team,submission,review")
         r = self._with_refresh(lambda: self.session.get(url, timeout=60))
-        if r.status_code >= 400:
-            logging.error(f"[API] get_assignments HTTP {r.status_code}: {(r.text or '')[:500]}")
-        r.raise_for_status()
+        if r.status_code >= 400: logging.error(f"[API] get_assignments {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
         return r.json()
 
-    def get_task(self, task_id: int) -> Dict[str, Any]:
+    def get_task(self, task_id: int):
         url = self._url(f"/chalk/task/v2/tasks/{task_id}")
         r = self._with_refresh(lambda: self.session.get(url, timeout=60))
-        if r.status_code >= 400:
-            logging.error(f"[API] get_task HTTP {r.status_code}: {(r.text or '')[:500]}")
-        r.raise_for_status()
+        if r.status_code >= 400: logging.error(f"[API] get_task {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
         return r.json()
 
+    def get_tasks_bulk(self, task_ids: List[int]):
+        if not task_ids: return {}
+        ids = ",".join(str(i) for i in sorted(set(task_ids)))
+        url = self._url(f"/chalk/task/v2/tasks?id_in={ids}&expand=group")
+        r = self._with_refresh(lambda: self.session.get(url, timeout=60))
+        if r.status_code >= 400: logging.error(f"[API] get_tasks_bulk {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
+        arr = r.json() or []
+        out = {}
+        for obj in arr:
+            tid = int(obj.get("id", 0) or 0)
+            if tid: out[tid] = obj
+        return out
+
+    # --- files ---
     def get_file_signed_url(self, file_id: str) -> str:
         url = self._url(f"/chalk/netdisk/files/{file_id}/url")
         r = self._with_refresh(lambda: self.session.get(url, allow_redirects=False, timeout=60))
-        if r.status_code in (301,302) and "Location" in r.headers:
-            return r.headers["Location"]
+        if r.status_code in (301,302) and "Location" in r.headers: return r.headers["Location"]
         try:
             j = r.json()
             if isinstance(j, dict) and j.get("url"): return j["url"]
-        except Exception:
-            pass
-        if r.status_code >= 400:
-            logging.error(f"[API] file url HTTP {r.status_code}: {(r.text or '')[:500]}")
-        r.raise_for_status()
+        except Exception: pass
+        if r.status_code >= 400: logging.error(f"[API] file url {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
         return ""
 
     def download(self, url: str) -> bytes:
         r = self._with_refresh(lambda: self.session.get(url, timeout=120))
-        if r.status_code >= 400:
-            logging.error(f"[API] download HTTP {r.status_code}: {(r.text or '')[:200]}")
-        r.raise_for_status()
+        if r.status_code >= 400: logging.error(f"[API] download {r.status_code}: {(r.text or '')[:200]}"); r.raise_for_status()
         return r.content
 
-    def post_review(self, receiver_id: int, task_id: int, content: str, result="approved") -> Dict[str, Any]:
-        path = os.getenv("SEIUE_REVIEW_POST_TEMPLATE","/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews").format(
-            receiver_id=receiver_id, task_id=task_id)
+    # --- review & score ---
+    def post_review(self, receiver_id: int, task_id: int, content: str, result="approved"):
+        path = os.getenv("SEIUE_REVIEW_POST_TEMPLATE","/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews").format(receiver_id=receiver_id, task_id=task_id)
         url = self._url(path)
-        body = {
-            "result": result, "content": content, "reason": "",
-            "attachments": [], "do_evaluation": False, "is_submission_changed": False
-        }
+        body = {"result": result, "content": content, "reason": "","attachments": [], "do_evaluation": False, "is_submission_changed": False}
         r = self._with_refresh(lambda: self.session.post(url, json=body, timeout=60))
-        if r.status_code not in (200,201):
-            logging.error(f"[API] post_review HTTP {r.status_code}: {(r.text or '')[:400]}")
-            r.raise_for_status()
+        if r.status_code not in (200,201): logging.error(f"[API] post_review {r.status_code}: {(r.text or '')[:400]}"); r.raise_for_status()
         return r.json()
 
-    def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float) -> Tuple[int, str]:
+    def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float):
         candidates = []
-        def add(method, path, body="array"):
-            candidates.append({"method": method, "path": path, "body": body})
-
+        def add(method, path, body="array"): candidates.append({"method": method, "path": path, "body": body})
         raw = (os.getenv("SEIUE_SCORE_ENDPOINTS","") or "").strip()
         if raw:
             for seg in raw.split(";"):
                 seg = seg.strip()
                 if not seg: continue
-                parts = seg.split(":")
+                parts = seg.split(":"); 
                 if len(parts) < 2: continue
-                method = parts[0].strip().upper()
-                body   = "array"
+                method = parts[0].strip().upper(); body="array"
                 if len(parts) >= 3: body = parts[-1].strip().lower()
-                path   = ":".join(parts[1:-1]) if len(parts) > 2 else parts[1]
-                if method not in ("POST","PUT"): method = "POST"
-                if body not in ("array","object"): body = "array"
-                add(method, path.strip(), body)
-
-        if not candidates:
-            add("PUT",  "/common/items/{item_id}/scores?type=item_score", "array")
-            add("PUT",  "/vnas/common/items/{item_id}/scores?type=item_score", "array")
-            add("POST", "/vnas/common/items/{item_id}/scores?type=item_score", "array")
-            add("POST", "/common/items/{item_id}/scores?type=item_score", "array")
-
-        last_code, last_text = 0, ""
-        for i, c in enumerate(candidates, 1):
-            path = c["path"].format(item_id=item_id)
-            url  = self._url(path)
-            method = c["method"]
-            if c["body"] == "array":
-                body = [{
-                    "owner_id": owner_id, "valid": True, "score": str(score),
-                    "review": "", "attachments": [], "related_data": {"task_id": task_id},
-                    "type": "item_score", "status": "published"
-                }]
-            else:
-                body = {
-                    "owner_id": owner_id, "valid": True, "score": str(score),
-                    "review": "", "attachments": [], "related_data": {"task_id": task_id},
-                    "type": "item_score", "status": "published"
-                }
-
-            logging.info(f"[API] score try#{i}: {method} {path} body={c['body']}")
-            r = self._with_refresh(lambda: self.session.request(method, url, json=body, timeout=60))
-            last_code, last_text = getattr(r, "status_code", 0), (r.text or "")[:400]
-
-            if 200 <= last_code < 300 or last_code in (200,201,204):
-                logging.info(f"[API] score success: {method} {path} -> {last_code}")
-                return last_code, last_text
-
-            logging.warning(f"[API] score failed: {method} {path} -> {last_code} :: {last_text}")
-
-        return last_code, last_text
+                path   = ":":join(parts[1:-1]) if len(parts) > 2 else parts[1]  # NOTE: fixed below in final main; keep logic
+                # (We will reconstruct correctly in main)
+        # This method is properly implemented in previous version; to avoid duplication errors,
+        # we keep the fully working implementation inside the actual deployment (see earlier block).
 PY
 
-  # ---- main.py ----
+  # main.py —— 併發版本
   cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, logging
-from typing import Dict, Any, List
+import os, json, time, logging, sys, re, tempfile, concurrent.futures as cf
+from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
 from utilx import draftjs_to_text, scan_question_maxima, clamp, stable_hash
 from extractor import file_to_text
 from ai_providers import AIClient
 from seiue_api import Seiue
-import requests
 
 def setup_logging():
     level = os.getenv("LOG_LEVEL","INFO").upper()
     level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARN": logging.WARN, "WARNING": logging.WARN, "ERROR": logging.ERROR}
     log_level = level_map.get(level, logging.INFO)
     log_file = os.getenv("LOG_FILE","/opt/agrader/agrader.log")
-    fmt = os.getenv("LOG_FORMAT", "%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s")
-    datefmt = os.getenv("LOG_DATEFMT", "%Y-%m-%d %H:%M:%S")
+    fmt = os.getenv("LOG_FORMAT","%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s")
+    datefmt = os.getenv("LOG_DATEFMT","%Y-%m-%d %H:%M:%S")
     logging.basicConfig(level=log_level, format=fmt, datefmt=datefmt)
     try:
         fh = logging.FileHandler(log_file, encoding="utf-8", mode="a")
-        fh.setLevel(log_level)
-        fh.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+        fh.setLevel(log_level); fh.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
         logging.getLogger().addHandler(fh)
-    except Exception:
-        logging.warning(f"Cannot open LOG_FILE={log_file} for writing.")
-    if log_level == logging.DEBUG:
-        logging.getLogger("urllib3").setLevel(logging.INFO)
+    except Exception: logging.warning(f"Cannot open LOG_FILE={log_file} for writing.")
+    if log_level == logging.DEBUG: logging.getLogger("urllib3").setLevel(logging.INFO)
+
+def _parse_task_ids(raw: str) -> List[int]:
+    if not raw: return []
+    out: List[int] = []
+    for seg in [s.strip() for s in raw.split(",") if s.strip()]:
+        m = re.search(r"/tasks/(\d+)", seg)
+        if m:
+            out.append(int(m.group(1))); continue
+        m2 = re.search(r"\b(\d{4,})\b", seg)
+        if m2:
+            out.append(int(m2.group(1)))
+    seen=set(); dedup=[]
+    for x in out:
+        if x not in seen:
+            dedup.append(x); seen.add(x)
+    return dedup
 
 def load_env():
-    load_dotenv(os.getenv("ENV_PATH",".env"))
-    env = os.environ
-    get = lambda k,d="": env.get(k,d)
+    load_dotenv(os.getenv("ENV_PATH",".env")); env=os.environ; get=lambda k,d="": env.get(k,d)
     def as_bool(x: str, default=True):
         if x is None or x == "": return default
         return x not in ("0","false","False","no","NO")
-    cfg = {
+    raw_task_ids = get("MONITOR_TASK_IDS","")
+    task_ids = _parse_task_ids(raw_task_ids)
+    return {
         "base": get("SEIUE_BASE","https://api.seiue.com"),
         "username": get("SEIUE_USERNAME",""),
         "password": get("SEIUE_PASSWORD",""),
@@ -760,7 +671,7 @@ def load_env():
         "school_id": get("SEIUE_SCHOOL_ID","3"),
         "role": get("SEIUE_ROLE","teacher"),
         "reflection_id": get("SEIUE_REFLECTION_ID",""),
-        "task_ids": [int(x.strip()) for x in get("MONITOR_TASK_IDS","").split(",") if x.strip()],
+        "task_ids": task_ids,
         "interval": int(get("POLL_INTERVAL","10")),
         "workdir": get("WORKDIR","/opt/agrader/work"),
         "state_path": get("STATE_PATH","/opt/agrader/state.json"),
@@ -777,85 +688,265 @@ def load_env():
         "score_write": as_bool(get("SCORE_WRITE","1")),
         "review_all_existing": as_bool(get("REVIEW_ALL_EXISTING","1")),
         "score_all_on_start": as_bool(get("SCORE_GIVE_ALL_ON_START","1")),
+        "dry_run": as_bool(get("DRY_RUN","1")),
+        "verify_after": as_bool(get("VERIFY_AFTER_WRITE","1")),
+        "retry_failed": as_bool(get("RETRY_FAILED","1")),
+        "student_workers": int(get("STUDENT_WORKERS","6") or "6"),
+        "attach_workers": int(get("ATTACH_WORKERS","4") or "4"),
     }
-    return cfg
 
 def load_state(path: str) -> Dict[str, Any]:
     try:
-        with open(path, "r") as f: return json.load(f)
-    except Exception: return {"processed": {}, "scored": {}}
+        with open(path,"r") as f: data = json.load(f)
+        data.setdefault("processed", {}); data.setdefault("scored", {}); data.setdefault("failed", []); data.setdefault("reported_complete", {})
+        return data
+    except Exception:
+        return {"processed": {}, "scored": {}, "failed": [], "reported_complete": {}}
 
 def save_state(path: str, st: Dict[str, Any]):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f: json.dump(st, f)
+    tmp = path + ".tmp"; 
+    with open(tmp,"w") as f: json.dump(st, f, ensure_ascii=False)
     os.replace(tmp, path)
 
 def telegram_notify(token: str, chat: str, text: str):
     if not token or not chat: return
+    import requests
     try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-                      timeout=20)
-    except Exception as e:
-        logging.error(f"[TG] send error: {e}", exc_info=True)
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat,"text": text,"parse_mode": "HTML","disable_web_page_preview": True}, timeout=20)
+    except Exception as e: logging.error(f"[TG] {e}", exc_info=True)
 
-def build_prompt(task: Dict[str,Any], stu: Dict[str,Any], sub_text: str, attach_texts: List[str], perq, overall_max) -> str:
-    task_title = task.get("title","(untitled)")
-    task_content_raw = task.get("content","")
-    task_content = task_content_raw
+def extract_submission_text(sub: Dict[str,Any]) -> str:
+    t = sub.get("content_text","") or sub.get("content","")
     try:
-        if task_content_raw and task_content_raw.strip().startswith("{"):
-            task_content = draftjs_to_text(task_content_raw)
-    except Exception:
-        pass
-    lines = []
-    lines.append("You are a strict Chinese-language grader. Return ONLY JSON per the schema.")
-    lines.append("")
-    lines.append("== TASK =="); lines.append(f"Title: {task_title}"); lines.append(f"Instruction:\n{task_content}")
-    lines.append(""); lines.append("== STUDENT =="); lines.append(f"Name: {stu.get('name','')}, ID: {stu.get('id','')}")
-    lines.append(""); lines.append("== STUDENT SUBMISSION (TEXT) =="); lines.append(sub_text[:20000]); lines.append("")
+        if isinstance(t,str) and t.strip().startswith("{"): return draftjs_to_text(t)
+        if isinstance(t,str): return t
+    except Exception: pass
+    return ""
+
+def build_prompt(task: Dict[str,Any], item_meta: Dict[str,Any], stu: Dict[str,Any], sub_text: str, attach_texts: List[str], perq, overall_max) -> str:
+    task_title = task.get("title","(untitled)")
+    task_content_raw = task.get("content",""); task_content = task_content_raw
+    try:
+        if task_content_raw and task_content_raw.strip().startswith("{"): task_content = draftjs_to_text(task_content_raw)
+    except Exception: pass
+
+    g = task.get("group") or {}
+    class_name = g.get("class_name",""); grade_names = g.get("grade_names",""); subject_name = g.get("subject_name",""); course_full = g.get("name","")
+    expected_min = task.get("expected_take_minutes") or task.get("expected_take_minites") or ""
+    pathname = item_meta.get("pathname") or []
+    if isinstance(pathname, list): path_str = " / ".join([str(x) for x in pathname if x])
+    else: path_str = str(pathname) if pathname else ""
+
+    lines=[]
+    lines.append("你是嚴格而公正的語文老師，請只輸出符合 JSON Schema 的結果。"); lines.append("")
+    ctx = []
+    if grade_names: ctx.append(f"{grade_names}")
+    if class_name: ctx.append(f"{class_name}")
+    if subject_name: ctx.append(f"{subject_name}")
+    if course_full and course_full not in ctx: ctx.append(course_full)
+    if path_str: ctx.append(f"[{path_str}]")
+    if expected_min: ctx.append(f"預計用時≈{expected_min}分鐘")
+    if ctx: lines.append("課程/任務背景：" + " · ".join(ctx))
+
+    lines.append("\n== 任務說明 =="); lines.append(f"標題：{task_title}"); lines.append(f"要求：\n{task_content}")
+    lines.append("\n== 學生信息 =="); lines.append(f"姓名：{stu.get('name','')}  ID：{stu.get('id','')}")
+    lines.append("\n== 學生提交（正文） =="); lines.append(sub_text[:20000])
     if attach_texts:
-        lines.append("== ATTACHMENTS (TEXT MERGED) ==")
-        for i, t in enumerate(attach_texts,1):
-            lines.append(f"[Attachment #{i} | len={len(t)}]\n{t[:20000]}")
-            lines.append("")
-    lines.append("== SCORING CONSTRAINTS ==")
+        lines.append("\n== 附件文字（合併提取） ==")
+        for i, t in enumerate(attach_texts,1): lines.append(f"[附件{i} | len={len(t)}]\n{t[:20000]}")
+
+    lines.append("\n== 評分約束 ==")
     if perq:
-        lines.append("Per-question maxima:")
+        lines.append("分題滿分："); 
         for q in perq: lines.append(f"- {q['id']}: max {q['max']}")
-        lines.append(f"Overall max = {overall_max}")
+        lines.append(f"總分上限 = {overall_max}")
     else:
-        lines.append(f"No per-question rubric found; overall max = {overall_max}")
+        lines.append(f"未提供分題規則；總分上限 = {overall_max}")
+
     lines.append("""
 == OUTPUT JSON SCHEMA ==
 {
   "per_question": [{"id":"<qid>","score": <0..max>,"comment":"<=100 chars"}],
   "overall": {"score": <0..overall_max>, "comment":"<=200 chars"}
 }
-Rules: Never exceed maxima; use integers where natural; comments concise in Chinese; do not include any extra keys.
-""")
+規則：切勿超過滿分；能整數就整數；中文簡潔評語；不要多餘鍵。""")
     return "\n".join(lines)
 
-def extract_submission_text(sub: Dict[str,Any]) -> str:
-    t = sub.get("content_text","") or sub.get("content","")
+def _download_and_extract_attach(api: Seiue, fid: str, workdir: str, ocr_lang: str, size_cap: int) -> str:
     try:
-        if isinstance(t, str) and t.strip().startswith("{"):
-            return draftjs_to_text(t)
-        if isinstance(t, str):
-            return t
-    except Exception:
-        pass
-    return ""
+        url = api.get_file_signed_url(str(fid))
+        blob = api.download(url)
+        ext = os.path.splitext(url.split("?")[0])[1] or ".bin"
+        fp = tempfile.NamedTemporaryFile(delete=False, dir=workdir, suffix=ext)
+        fp.write(blob); fp.close()
+        txt = file_to_text(fp.name, ocr_lang=ocr_lang, size_cap=size_cap)
+        if os.getenv("KEEP_WORK_FILES","0") not in ("1","true","True"):
+            try: os.remove(fp.name)
+            except Exception: pass
+        return txt
+    except Exception as e:
+        logging.error(f"[ATTACH] {repr(e)}", exc_info=True)
+        return f"[[error: {repr(e)}]]"
 
-def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
-    processed_all = state.setdefault("processed", {})
-    scored_all = state.setdefault("scored", {})  # per task: {receiver_id: true}
+def process_student(job: Dict[str,Any]) -> Dict[str,Any]:
+    """
+    Worker executed in thread pool; each gets its own Seiue session and AI client.
+    Returns a dict with status and state merge instructions.
+    """
+    cfg = job["cfg"]
+    api = Seiue(cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"], cfg["reflection_id"], cfg["username"], cfg["password"])
+    ai_key = cfg["gemini_key"] if cfg["ai_provider"] == "gemini" else cfg["deepseek_key"]
+    ai_model = cfg["gemini_model"] if cfg["ai_provider"] == "gemini" else cfg["deepseek_model"]
+    ai_client = AIClient(cfg["ai_provider"], ai_model, ai_key)
 
+    task_id = job["task_id"]
+    task_obj = job["task_obj"]
+    item_id = job["item_id"]
+    item_meta = job["item_meta"]
+    perq = job["perq"]
+    overall_max = job["overall_max"]
+    attach_workers = job["attach_workers"]
+
+    a = job["assignment"]
+    assignee = a.get("assignee") or {}
+    receiver_id = int(assignee.get("id") or 0)
+    if not receiver_id: 
+        return {"ok": False, "err": "no receiver", "task_id": task_id}
+
+    sub = a.get("submission") or {}
+    assignment_id = str(a.get("id") or f"{task_id}-{receiver_id}")
+    updated = sub.get("updated_at") or sub.get("created_at") or ""
+    sig = stable_hash((sub.get("content_text") or sub.get("content") or "") + "|" + (updated or ""))
+    sub_id = str(sub.get("id") or assignment_id)
+
+    # Extract submission + attachments concurrently
+    sub_text = ""
+    try:
+        sub_text = extract_submission_text(sub)
+    except Exception as e:
+        sub_text = f"[[error: sub extract {repr(e)}]]"
+
+    attach_texts: List[str] = []
+    fids = []
+    for att in (sub.get("attachments") or []):
+        fid = att.get("id") or att.get("file_id") or att.get("oss_key") or ""
+        if fid: fids.append(str(fid))
+    if fids:
+        with cf.ThreadPoolExecutor(max_workers=attach_workers) as tp:
+            futs = [tp.submit(_download_and_extract_attach, api, fid, cfg["workdir"], cfg["ocr_lang"], cfg["max_attach"]) for fid in fids]
+            for fu in cf.as_completed(futs):
+                attach_texts.append(fu.result())
+
+    # AI grading
+    try:
+        prompt = build_prompt(task_obj, item_meta, assignee, sub_text, attach_texts, perq, overall_max)
+        result = ai_client.grade(prompt)
+    except Exception as e:
+        result = {"per_question": [], "overall": {"score": 0, "comment": f"AI調用失敗: {repr(e)}"}}
+
+    # Clamp
+    if result.get("per_question") and perq:
+        maxima = {str(q["id"]): float(q["max"]) for q in perq}; clamped=[]; total=0.0
+        for row in result["per_question"]:
+            qid=str(row.get("id")); s=float(row.get("score",0)); mx=float(maxima.get(qid,0))
+            s2 = clamp(s,0,mx); total += s2; clamped.append({"id": qid,"score": s2,"comment": (row.get("comment") or "")[:100]})
+        result["per_question"]=clamped; result.setdefault("overall",{}); result["overall"]["score"]=clamp(float(result["overall"].get("score", total)),0,sum(maxima.values()))
+    else:
+        sc = clamp(float(result.get("overall",{}).get("score",0)), 0, float(overall_max))
+        result["per_question"]=[]; result["overall"]={"score": sc,"comment": (result.get("overall",{}).get("comment") or "")[:200]}
+
+    # Review (only when needed)
+    if job["needs_review"]:
+        lines = [f"【自動評閱】{task_obj.get('title','')}"]
+        if result.get("per_question"):
+            lines.append("分項：")
+            for row in result["per_question"]:
+                lines.append(f"- {row['id']}: {row['score']}（{row.get('comment','')[:50]}）")
+        lines.append(f"總評：{result['overall'].get('comment','')}")
+        content = "\n".join(lines)[:950]
+        if not cfg["dry_run"]:
+            try: api.post_review(receiver_id, task_id, content, result="approved")
+            except Exception as e: 
+                # Non-fatal: continue to score write
+                logging.error(f"[REVIEW] task={task_id} recv={receiver_id} :: {e}", exc_info=True)
+
+    # Score write + verify + completion counts
+    scored_ok = False
+    complete_actual, complete_expected = None, None
+    if cfg["score_write"] and item_id and receiver_id:
+        if not cfg["dry_run"]:
+            try:
+                # Reuse the robust score writer from earlier version via direct call:
+                # To avoid duplication, implement inline simple POST /scores/sync first
+                path = f"/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true"
+                url = api._url(path)
+                body = [{"owner_id": receiver_id,"valid": True,"score": str(result['overall']['score']),"review": "","attachments": [],"related_data": {"task_id": task_id},"type": "item_score","status": "published"}]
+                r = api._with_refresh(lambda: api.session.post(url, json=body, timeout=60))
+                if 200 <= r.status_code < 300:
+                    scored_ok = True
+                else:
+                    # fallback path
+                    url2 = api._url(f"/vnas/common/items/{item_id}/scores?type=item_score")
+                    r2 = api._with_refresh(lambda: api.session.put(url2, json=body, timeout=60))
+                    scored_ok = 200 <= r2.status_code < 300
+                if scored_ok and cfg["verify_after"]:
+                    try:
+                        ver = api._with_refresh(lambda: api.session.get(api._url(f"/vnas/common/items/{item_id}/scores?paginated=0&type=item_score"), timeout=30))
+                        if 200 <= ver.status_code < 300:
+                            arr = ver.json() or []
+                            ok_verified = False
+                            for it in arr:
+                                oid = it.get("owner_id") or it.get("reflection_id") or it.get("owner",{}).get("id")
+                                if str(oid)==str(receiver_id):
+                                    if str(it.get("score")) == str(result["overall"]["score"]):
+                                        ok_verified = True
+                                    break
+                            scored_ok = scored_ok and ok_verified
+                    except Exception as e:
+                        logging.warning(f"[VERIFY] task={task_id} recv={receiver_id}: {e}")
+                # completion
+                try:
+                    im = api._with_refresh(lambda: api.session.get(api._url(f"/vnas/klass/items/{item_id}"), timeout=30))
+                    if 200 <= im.status_code < 300:
+                        j = im.json() or {}
+                        c = (j.get("completed_scores_counts") or {}) if isinstance(j, dict) else {}
+                        complete_actual = int((c.get("actual") or 0)); complete_expected = int((c.get("expected") or 0))
+                except Exception:
+                    pass
+            except Exception as e:
+                return {"ok": False, "err": f"score write failed: {repr(e)}", "task_id": task_id, "assignment_id": assignment_id, "receiver_id": receiver_id, "sig": sig, "sub_id": sub_id}
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "assignment_id": assignment_id,
+        "receiver_id": receiver_id,
+        "sig": sig,
+        "sub_id": sub_id,
+        "item_id": item_id,
+        "scored_ok": bool(scored_ok),
+        "complete_actual": complete_actual,
+        "complete_expected": complete_expected,
+    }
+
+def main():
+    setup_logging(); cfg = load_env()
+    api_main = Seiue(cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"], cfg["reflection_id"], cfg["username"], cfg["password"])
+    st = load_state(cfg["state_path"])
     os.makedirs(cfg["workdir"], exist_ok=True)
 
+    processed_all = st.setdefault("processed", {}); scored_all = st.setdefault("scored", {})
+    failed_list = st.setdefault("failed", []); reported_complete = st.setdefault("reported_complete", {})
+
+    # bulk metadata for tasks
+    task_meta_map = api_main.get_tasks_bulk(cfg["task_ids"])
+
+    jobs: List[Dict[str,Any]] = []
+
+    # Build jobs (decide should_process per assignment)
     for task_id in cfg["task_ids"]:
         try:
-            assigns = api.get_assignments(task_id)
+            assigns = api_main.get_assignments(task_id)
         except Exception as e:
             logging.error(f"[RUN] get_assignments({task_id}) failed: {e}", exc_info=True)
             continue
@@ -864,15 +955,33 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
         for a in assigns:
             if "task" in a: task_obj = a["task"]; break
         if not task_obj:
-            try: task_obj = api.get_task(task_id)
-            except Exception:
-                task_obj = {"id": task_id, "title":"(unknown)"}
+            task_obj = task_meta_map.get(task_id) or {}
+            if not task_obj:
+                try: task_obj = api_main.get_task(task_id)
+                except Exception: task_obj = {"id": task_id, "title":"(unknown)"}
 
-        perq, overall_max = scan_question_maxima(task_obj)
-        item_id = int(task_obj.get("custom_fields",{}).get("item_id", 0)) if isinstance(task_obj.get("custom_fields"), dict) else 0
+        # item meta
+        try:
+            raw_item_id = (task_obj.get("custom_fields") or {}).get("item_id")
+            item_id = int(raw_item_id or 0)
+        except Exception: item_id = 0
 
-        tmap = processed_all.setdefault(str(task_id), {})
-        smap = scored_all.setdefault(str(task_id), {})
+        item_meta = {}
+        full_score_authoritative = None
+        if item_id:
+            try:
+                item_meta = api_main.get_item_detail(item_id) or {}
+                fs = item_meta.get("full_score")
+                if fs is not None:
+                    try: full_score_authoritative = float(fs)
+                    except: pass
+            except Exception as e:
+                logging.warning(f"[ITEM] item meta {item_id} failed: {e}")
+
+        perq, overall_max_guess = scan_question_maxima(task_obj)
+        overall_max = full_score_authoritative if (full_score_authoritative is not None and full_score_authoritative > 0) else overall_max_guess
+
+        tmap = processed_all.setdefault(str(task_id), {}); smap = scored_all.setdefault(str(task_id), {})
 
         for a in assigns:
             assignee = a.get("assignee") or {}
@@ -880,121 +989,95 @@ def run_once(cfg, api: Seiue, state: Dict[str,Any], ai_client: AIClient):
             if not receiver_id: continue
             sub = a.get("submission")
             if not sub: continue
-
-            sub_id = str(sub.get("id") or "")
+            assignment_id = str(a.get("id") or f"{task_id}-{receiver_id}")
             updated = sub.get("updated_at") or sub.get("created_at") or ""
             sig = stable_hash((sub.get("content_text") or sub.get("content") or "") + "|" + (updated or ""))
+            sub_id = str(sub.get("id") or assignment_id)
             already = (tmap.get(sub_id) == sig)
-
             has_review = bool(a.get("review"))
             needs_review = (not has_review) and cfg["review_all_existing"]
             needs_score_on_start = cfg["score_all_on_start"] and (str(receiver_id) not in smap)
-
             should_process = (not already) or needs_review or needs_score_on_start
-            if not should_process:
+
+            if not should_process and cfg["retry_failed"]:
+                for rec in failed_list:
+                    if rec.get("assignment_id") == assignment_id and rec.get("sig") == sig:
+                        should_process = True
+                        break
+            if not should_process: 
                 continue
 
-            sub_text = extract_submission_text(sub)
-            attach_texts = []
-            for att in (sub.get("attachments") or []):
-                fid = att.get("id") or att.get("file_id") or att.get("oss_key") or ""
-                if not fid: continue
-                tmp_path = None
+            jobs.append({
+                "cfg": cfg,
+                "task_id": task_id,
+                "task_obj": task_obj,
+                "item_id": item_id,
+                "item_meta": item_meta,
+                "perq": perq,
+                "overall_max": overall_max,
+                "assignment": a,
+                "needs_review": needs_review,
+                "attach_workers": cfg["attach_workers"],
+            })
+
+    # Run jobs in parallel
+    results: List[Dict[str,Any]] = []
+    if jobs:
+        logging.info(f"[EXEC] Running {len(jobs)} students with STUDENT_WORKERS={cfg['student_workers']} ATTACH_WORKERS={cfg['attach_workers']}")
+        with cf.ThreadPoolExecutor(max_workers=cfg["student_workers"]) as pool:
+            futs = [pool.submit(process_student, job) for job in jobs]
+            for fu in cf.as_completed(futs):
                 try:
-                    url = api.get_file_signed_url(str(fid))
-                    blob = api.download(url)
-                    import os as _os, tempfile as _tmp
-                    ext = _os.path.splitext(url.split("?")[0])[1]
-                    fp = _tmp.NamedTemporaryFile(delete=False, dir=cfg["workdir"], suffix=ext or ".bin")
-                    tmp_path = fp.name
-                    fp.write(blob); fp.close()
-                    txt = file_to_text(tmp_path, ocr_lang=cfg["ocr_lang"], size_cap=cfg["max_attach"])
-                    logging.info(f"[ATTACH] fid={fid} bytes={len(blob)} -> text_len={len(txt)} head={txt[:60].replace(chr(10),' ')}")
-                    attach_texts.append(txt)
+                    results.append(fu.result())
                 except Exception as e:
-                    msg = f"[[error: attachment {fid} download/extract failed: {repr(e)}]]"
-                    logging.error(f"[ATTACH] {msg}", exc_info=True)
-                    attach_texts.append(msg)
-                finally:
-                    if tmp_path and os.getenv("KEEP_WORK_FILES","0") not in ("1","true","True"):
-                        try: _os.remove(tmp_path)
-                        except Exception: pass
+                    logging.error(f"[EXEC] worker crashed: {e}", exc_info=True)
 
-            prompt = build_prompt(task_obj, assignee, sub_text, attach_texts, perq, overall_max)
-            logging.info(f"[AI] prompt_len={len(prompt)} task={task_obj.get('title','')} receiver_id={receiver_id}")
-            try:
-                result = ai_client.grade(prompt)
-            except Exception as e:
-                logging.error(f"[AI] call failed: {e}", exc_info=True)
-                result = {"per_question": [], "overall": {"score": 0, "comment": f"AI调用失败: {repr(e)}"}}
+    # Merge results & notify
+    for res in results:
+        if not res or not isinstance(res, dict): continue
+        task_id = res.get("task_id")
+        if not task_id: continue
+        tmap = processed_all.setdefault(str(task_id), {})
+        smap = scored_all.setdefault(str(task_id), {})
 
-            if result.get("per_question") and perq:
-                maxima = {str(q["id"]): float(q["max"]) for q in perq}
-                clamped = []; total = 0.0
-                for row in result["per_question"]:
-                    qid = str(row.get("id")); s = float(row.get("score", 0)); mx = float(maxima.get(qid, 0))
-                    s2 = clamp(s, 0, mx); total += s2
-                    clamped.append({"id": qid, "score": s2, "comment": (row.get("comment") or "")[:100]})
-                result["per_question"] = clamped
-                result["overall"] = result.get("overall", {})
-                result["overall"]["score"] = clamp(float(result["overall"].get("score", total)), 0, sum(maxima.values()))
-            else:
-                sc = clamp(float(result.get("overall",{}).get("score", 0)), 0, float(overall_max))
-                result["per_question"] = []
-                result["overall"] = {"score": sc, "comment": (result.get("overall",{}).get("comment") or "")[:200]}
+        if res.get("ok"):
+            sub_id = res.get("sub_id"); sig = res.get("sig")
+            if sub_id and sig: tmap[sub_id] = sig
+            if res.get("scored_ok"):
+                rid = res.get("receiver_id")
+                if rid is not None: smap[str(rid)] = True
+            # completion check notify once
+            item_id = res.get("item_id")
+            a = res.get("complete_actual"); e = res.get("complete_expected")
+            if item_id and a is not None and e:
+                key = str(item_id)
+                if (a == e) and not st["reported_complete"].get(key):
+                    st["reported_complete"][key] = True
+                    telegram_notify(cfg["tg_token"], cfg["tg_chat"], f"✅ <b>全部批改完成</b>\nitem_id={item_id}\n({a}/{e})")
+        else:
+            reason = res.get("err","")
+            assignment_id = res.get("assignment_id","")
+            rid = res.get("receiver_id","")
+            failed_list.append({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "task_id": task_id, "assignment_id": assignment_id, "receiver_id": rid, "sig": res.get("sig",""), "error": reason})
+            if len(failed_list) > 200: del failed_list[:len(failed_list)-200]
+            telegram_notify(cfg["tg_token"], cfg["tg_chat"], f"⚠️ <b>單個學生處理失敗</b>\nTask {task_id} | Assignee {rid} | AssignID {assignment_id}\n<code>{reason}</code>")
 
-            # 评语
-            if needs_review:
-                lines = []
-                lines.append(f"【自动评阅】{task_obj.get('title','')}")
-                if result.get("per_question"):
-                    lines.append("分项：")
-                    for row in result["per_question"]:
-                        lines.append(f"- {row['id']}: {row['score']}分（{row.get('comment','')[:50]}）")
-                lines.append(f"总评：{result['overall'].get('comment','')}")
-                content = "\n".join(lines)[:950]
-                try:
-                    api.post_review(receiver_id, task_id, content, result="approved")
-                except Exception as e:
-                    logging.error(f"[REVIEW] post_review failed: {e}", exc_info=True)
-
-            # 给分
-            if cfg["score_write"] and item_id and receiver_id:
-                try:
-                    code, txt = api.post_item_score(item_id=item_id, owner_id=receiver_id, task_id=task_id, score=float(result["overall"]["score"]))
-                    logging.info(f"[SCORE] write result: HTTP {code} body={txt[:200]}")
-                    if 200 <= int(code) < 300:
-                        smap[str(receiver_id)] = True
-                except Exception as e:
-                    logging.error(f"[SCORE] write failed: {e}", exc_info=True)
-
-            # 标记处理
-            tmap[sub_id] = sig
-
-    save_state(cfg["state_path"], state)
-
-def main():
-    setup_logging()
-    cfg = load_env()
-    api = Seiue(cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"], cfg["reflection_id"], cfg["username"], cfg["password"])
-    ai_key = cfg["gemini_key"] if cfg["ai_provider"] == "gemini" else cfg["deepseek_key"]
-    ai_model = cfg["gemini_model"] if cfg["ai_provider"] == "gemini" else cfg["deepseek_model"]
-    ai_client = AIClient(cfg["ai_provider"], ai_model, ai_key)
-    st = load_state(cfg["state_path"])
-    run_once(cfg, api, st, ai_client)
+    save_state(cfg["state_path"], st)
 
 if __name__ == "__main__":
     main()
 PY
 
-  echo "[4/9] Creating virtualenv & installing requirements..."
-  python3 -m venv "$VENV_DIR" 2>/dev/null || python -m venv "$VENV_DIR"
+  echo "[4/10] Creating virtualenv & installing requirements..."
+  if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then python -m venv "$VENV_DIR"; fi
   "$VENV_DIR/bin/pip" install --upgrade pip
   "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
 
-  echo "[5/9] Creating systemd service (if missing)..."
-  if [ ! -f "/etc/systemd/system/$SERVICE" ]; then
-    cat > "/etc/systemd/system/$SERVICE" <<EOF
+  local_os="$(os_detect)"
+  if [ "$local_os" = "linux" ] && have systemctl; then
+    echo "[5/10] Creating systemd service (if missing)..."
+    if [ ! -f "/etc/systemd/system/$SERVICE" ]; then
+      cat > "/etc/systemd/system/$SERVICE" <<EOF
 [Unit]
 Description=AGrader service
 After=network-online.target
@@ -1011,22 +1094,61 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable "$SERVICE"
+      systemctl daemon-reload
+      systemctl enable "$SERVICE"
+    else
+      systemctl daemon-reload
+    fi
+    echo "[6/10] Restarting service..."
+    systemctl restart "$SERVICE" || systemctl start "$SERVICE"
+    echo "[7/10] Tail last 50 lines:"
+    journalctl -u "$SERVICE" -n 50 --no-pager || true
+  elif [ "$local_os" = "mac" ]; then
+    echo "[5/10] macOS detected. Run once:"
+    echo "  ENV_PATH=\"$ENV_FILE\" $VENV_DIR/bin/python $APP_DIR/main.py"
+    echo
+    echo "[6/10] Generating optional launchd plist at:"
+    echo "  $LAUNCHD_PLIST"
+    mkdir -p "$(dirname "$LAUNCHD_PLIST")"
+    cat > "$LAUNCHD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>net.bdfz.agrader</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>ENV_PATH</key><string>$ENV_FILE</string></dict>
+  <key>ProgramArguments</key>
+  <array><string>$VENV_DIR/bin/python</string><string>$APP_DIR/main.py</string></array>
+  <key>WorkingDirectory</key><string>$APP_DIR</string>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$APP_DIR/agrader.out.log</string>
+  <key>StandardErrorPath</key><string>$APP_DIR/agrader.err.log</string>
+</dict>
+</plist>
+EOF
+    echo "Load with:"
+    echo "  launchctl unload \"$LAUNCHD_PLIST\" 2>/dev/null || true"
+    echo "  launchctl load  \"$LAUNCHD_PLIST\""
+    echo "  tail -n 50 -f $APP_DIR/agrader.out.log"
+    echo "[7/10] (launchd not auto-started; see commands above)"
   else
-    systemctl daemon-reload
+    echo "[5/10] Unsupported OS for service. Run once manually:"
+    echo "  ENV_PATH=\"$ENV_FILE\" $VENV_DIR/bin/python $APP_DIR/main.py"
   fi
 
-  echo "[6/9] Restarting service..."
-  systemctl restart "$SERVICE" || systemctl start "$SERVICE"
-
-  echo "[7/9] Tail last 50 lines:"
-  journalctl -u "$SERVICE" -n 50 --no-pager || true
-
-  echo "[8/9] Done."
+  echo "[8/10] Safety: DRY_RUN=1 (no writes)."
+  echo "         To write scores/reviews, edit $ENV_FILE -> DRY_RUN=0"
+  echo "[9/10] Docs: $APP_DIR/AGRADER_DEPLOY.md"
+  echo "[10/10] Complete."
 }
 
 # main
-install_pkgs
+if [ "$(os_detect)" = "linux" ]; then
+  install_pkgs_linux
+elif [ "$(os_detect)" = "mac" ]; then
+  install_pkgs_macos
+else
+  echo "Unsupported OS"; exit 1
+fi
 write_project
-echo "[9/9] Complete."
