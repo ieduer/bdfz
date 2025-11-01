@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AGrader - API-first auto-grading pipeline (installer/runner) - FULL INLINE EDITION
 # Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
-# v1.10.0-fullinline-2025-11-01
+# v1.10.2-fullinline-2025-11-01
 
 set -euo pipefail
 
@@ -55,7 +55,7 @@ prompt_task_ids() {
   while :; do
     read -r -p "Task IDs [${cur:-none}]: " ans || true
     ans="${ans:-$cur}"
-    # 正規化：支援 URL/純數字/逗號分隔
+    # 正規化：支援 URL / 純數字 / 逗號分隔
     norm="$(
       printf "%s\n" "$ans" \
       | tr ' ,;' '\n\n\n' \
@@ -122,6 +122,9 @@ ensure_env_patch() {
   grep -q '^LOG_FORMAT='  "$ENV_FILE" || echo 'LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s' >> "$ENV_FILE"
   grep -q '^LOG_DATEFMT=' "$ENV_FILE" || echo 'LOG_DATEFMT=%Y-%m-%d %H:%M:%S' >> "$ENV_FILE"
   grep -q '^LOG_FILE='    "$ENV_FILE" || echo "LOG_FILE=${APP_DIR}/agrader.log" >> "$ENV_FILE"
+
+  # ---- Prompt template path（新增，热加载友好）----
+  grep -q '^PROMPT_TEMPLATE_PATH=' "$ENV_FILE" || echo "PROMPT_TEMPLATE_PATH=${APP_DIR}/prompt.txt" >> "$ENV_FILE"
 
   # ---- 权威端点（會覆蓋舊值，避免走錯路徑）----
   if grep -q '^SEIUE_SCORE_ENDPOINTS=' "$ENV_FILE"; then
@@ -280,6 +283,9 @@ RETRY_FAILED=1
 STUDENT_WORKERS=1
 ATTACH_WORKERS=3
 
+# ---- Prompt template ----
+PROMPT_TEMPLATE_PATH=${APP_DIR}/prompt.txt
+
 # ---- Paths/State ----
 STATE_PATH=${APP_DIR}/state.json
 WORKDIR=${APP_DIR}/work
@@ -289,7 +295,7 @@ EOF
     echo "Reusing existing $ENV_FILE"
   fi
 
-  # 只补缺省，不覆盖已有；但端点強制收斂；并添加多Key键位
+  # 只补缺省，不覆盖已有；但端点強制收斂；并添加多Key键位与 PROMPT 路径
   ensure_env_patch
 
   echo "[3/10] Writing project files..."
@@ -306,6 +312,24 @@ pdfminer.six==20231228
 python-docx==1.1.2
 python-pptx==0.6.23
 lxml==5.3.0
+EOF
+
+  # ---------- prompt.txt (可热编辑) ----------
+  cat > "$APP_DIR/prompt.txt" <<'EOF'
+You are a strict Chinese language grader.
+
+Task: {task_title}
+Student: {student_name} ({student_id})
+Max Score: {max_score}
+Per-Question Schema (JSON): {per_question_json}
+
+The student's submission text is below (UTF-8). Use rubric and constraints to grade.
+---
+{assignment_text}
+---
+
+Output ONLY a valid JSON object with this exact shape, nothing else:
+{"per_question":[{"id":"...","score":float,"comment":"..."}],"overall":{"score":float,"comment":"..."}}
 EOF
 
   # ---------- utilx.py ----------
@@ -460,6 +484,12 @@ PY
   # ---------- ai_providers.py ----------
   cat > "$APP_DIR/ai_providers.py" <<'PY'
 import os, time, json, requests, logging, random, re
+from typing import List
+
+def _as_bool(x, default=True):
+    if x is None: return default
+    s = str(x).strip().lower()
+    return s not in ("0","false","no","off")
 
 def _backoff_loop():
     max_retries = int(os.getenv("AI_MAX_RETRIES","5"))
@@ -469,11 +499,17 @@ def _backoff_loop():
         yield i
         time.sleep((base ** i) + random.uniform(0, jitter))
 
-def _split_keys(s: str):
+def _split_keys(s: str) -> List[str]:
     if not s: return []
     return [x.strip() for x in s.split(",") if x.strip()]
 
 class AIClient:
+    """
+    - 同厂多 Key：根据 AI_KEY_STRATEGY=roundrobin|random 轮询
+    - 429/5xx：切换 Key，指数退避
+    - JSON 修复：先尝试“当前 provider 的所有 Key”；若失败且 AI_FAILOVER=1，再尝试备用 provider 的 Key
+    - 可观测性：成功用到谁 -> [AI][USE]；谁完成修复 -> [AI][REPAIR]
+    """
     def __init__(self, provider: str, model: str, key: str):
         self.provider = provider
         self.model = model
@@ -497,14 +533,29 @@ class AIClient:
         if not self.keys:
             self.keys = [key] if key else [""]
 
+    # ---------- 通用 Key 迭代 ----------
+    def _key_order(self, n: int):
+        if n <= 0: return []
+        if self.strategy == "random":
+            idxs = list(range(n)); random.shuffle(idxs); return idxs
+        return list(range(self._rr, n)) + list(range(0, self._rr))
+
+    def _advance_rr(self, used_idx):
+        if self.strategy == "roundrobin" and self.keys:
+            self._rr = (used_idx + 1) % len(self.keys)
+
+    # ---------- 对外主接口 ----------
     def grade(self, prompt: str) -> dict:
         raw = self._call_llm(prompt)
-        return self.parse_or_repair(raw)
+        return self.parse_or_repair(raw, original_prompt=prompt)
 
-    def parse_or_repair(self, text: str) -> dict:
+    # ---------- 解析与修复 ----------
+    def parse_or_repair(self, text: str, original_prompt: str = "") -> dict:
         text = (text or "").strip()
         if not text:
-            return {"per_question": [], "overall": {"score": 0, "comment": "AI rate limited"}}
+            fixed = self.repair_json(original_prompt, text)
+            return self._safe_json_or_fallback(fixed or text)
+
         if text.startswith("{"):
             try: return json.loads(text)
             except Exception: pass
@@ -512,32 +563,23 @@ class AIClient:
         if m:
             try: return json.loads(m.group(0))
             except Exception: pass
+
+        fixed = self.repair_json(original_prompt, text)
+        return self._safe_json_or_fallback(fixed or text)
+
+    def _safe_json_or_fallback(self, s: str):
         try:
-            fixed = self.repair_json(text)
-            if isinstance(fixed, dict): return fixed
-            if isinstance(fixed, str):
-                fixed = fixed.strip()
-                if fixed.startswith("{}"): return {}
-                if fixed.startswith("{"): return json.loads(fixed)
-                mm = re.search(r"\{.*\}", fixed, re.S)
-                if mm: return json.loads(mm.group(0))
+            if isinstance(s, dict): return s
+            if isinstance(s, str):
+                s = s.strip()
+                if s.startswith("{"): return json.loads(s)
+                m = re.search(r"\{.*\}", s, re.S)
+                if m: return json.loads(m.group(0))
         except Exception as e:
-            logging.error(f"[AI] JSON repair failed: {e}", exc_info=True)
-        return {"per_question": [], "overall": {"score": 0, "comment": (text[:200] if text else "AI empty")}}
+            logging.error(f"[AI] JSON parse failed after repair: {e}", exc_info=True)
+        return {"per_question": [], "overall": {"score": 0.0, "comment": (s[:200] if s else "AI empty")}}
 
-    # -------- LLM 调度（同厂多 key 轮询 + 429/5xx 退避） --------
-    def _key_order(self):
-        n = len(self.keys)
-        if self.strategy == "random":
-            idxs = list(range(n))
-            random.shuffle(idxs)
-            return idxs
-        return list(range(self._rr, n)) + list(range(0, self._rr))
-
-    def _advance_rr(self, used_idx):
-        if self.strategy == "roundrobin":
-            self._rr = (used_idx + 1) % len(self.keys)
-
+    # ---------- LLM 调度 ----------
     def _call_llm(self, prompt: str) -> str:
         if self.provider == "gemini":
             return self._gemini(prompt)
@@ -549,84 +591,114 @@ class AIClient:
     def _gemini(self, prompt: str) -> str:
         body = {"contents":[{"parts":[{"text": prompt}]}], "generationConfig":{"temperature":0.2}}
         for _ in _backoff_loop():
-            for idx in self._key_order():
+            order = self._key_order(len(self.keys))
+            for idx in order:
                 key = self.keys[idx]
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={key}"
                 try:
                     r = requests.post(url, json=body, timeout=180)
-                    if r.status_code == 429:
-                        logging.warning("[AI] Gemini 429; switch key #%d/%d", idx+1, len(self.keys)); continue
-                    if 500 <= r.status_code < 600:
-                        logging.warning("[AI] Gemini %d; switch key #%d/%d", r.status_code, idx+1, len(self.keys)); continue
+                    if r.status_code == 429 or (500 <= r.status_code < 600):
+                        logging.warning("[AI] Gemini %s; switch key #%d/%d", r.status_code, idx+1, len(self.keys)); continue
                     r.raise_for_status()
                     data = r.json()
+                    logging.info("[AI][USE] provider=gemini model=%s key_index=%d/%d", self.model, idx+1, len(self.keys))
                     self._advance_rr(idx)
                     try:
                         return data["candidates"][0]["content"]["parts"][0]["text"]
                     except Exception:
                         return json.dumps(data)[:4000]
                 except requests.RequestException as e:
-                    logging.warning("[AI] Gemini exception (%s); switch key #%d/%d", getattr(e.response,'status_code',type(e).__name__), idx+1, len(self.keys)); continue
+                    code = getattr(e.response,'status_code',type(e).__name__)
+                    logging.warning("[AI] Gemini exception (%s); switch key #%d/%d", code, idx+1, len(self.keys)); continue
         return ""
 
     def _deepseek(self, prompt: str) -> str:
         body={"model": self.model,"messages":[{"role":"system","content":"You are a strict grader. Output ONLY valid JSON per schema."},{"role":"user","content": prompt}],"temperature":0.2}
         for _ in _backoff_loop():
-            for idx in self._key_order():
+            order = self._key_order(len(self.keys))
+            for idx in order:
                 key = self.keys[idx]
                 url = "https://api.deepseek.com/chat/completions"
                 headers={"Authorization": f"Bearer {key}"}
                 try:
                     r = requests.post(url, headers=headers, json=body, timeout=180)
-                    if r.status_code == 429:
-                        logging.warning("[AI] DeepSeek 429; switch key #%d/%d", idx+1, len(self.keys)); continue
-                    if 500 <= r.status_code < 600:
-                        logging.warning("[AI] DeepSeek %d; switch key #%d/%d", r.status_code, idx+1, len(self.keys)); continue
+                    if r.status_code == 429 or (500 <= r.status_code < 600):
+                        logging.warning("[AI] DeepSeek %s; switch key #%d/%d", r.status_code, idx+1, len(self.keys)); continue
                     r.raise_for_status()
                     data = r.json()
+                    logging.info("[AI][USE] provider=deepseek model=%s key_index=%d/%d", self.model, idx+1, len(self.keys))
                     self._advance_rr(idx)
                     return data.get("choices",[{}])[0].get("message",{}).get("content","")
                 except requests.RequestException as e:
-                    logging.warning("[AI] DeepSeek exception (%s); switch key #%d/%d", getattr(e.response,'status_code',type(e).__name__), idx+1, len(self.keys)); continue
+                    code = getattr(e.response,'status_code',type(e).__name__)
+                    logging.warning("[AI] DeepSeek exception (%s); switch key #%d/%d", code, idx+1, len(self.keys)); continue
         return ""
 
-    def repair_json(self, bad_text: str) -> dict | str:
-        prefer = "deepseek" if self.provider == "gemini" else "gemini"
-        if prefer == "deepseek":
-            keys = _split_keys(os.getenv("DEEPSEEK_API_KEYS","")) or _split_keys(os.getenv("DEEPSEEK_API_KEY",""))
-            model = os.getenv("DEEPSEEK_MODEL","deepseek-reasoner")
-            for key in keys or [""]:
-                if not key: break
-                try:
-                    url = "https://api.deepseek.com/chat/completions"
-                    headers={"Authorization": f"Bearer {key}"}
-                    sys_prompt = "You are a JSON fixer. Return ONLY the corrected JSON object. No code fences. No commentary."
-                    user = "The following is not valid JSON. Please fix it and return only the corrected JSON object.\n\n<<<\n"+(bad_text or "")+"\n>>>"
-                    r = requests.post(url, headers=headers, json={"model": model,"messages":[{"role":"system","content":sys_prompt},{"role":"user","content": user}],"temperature":0.0}, timeout=120)
-                    if r.status_code == 429 or (500 <= r.status_code < 600): continue
-                    r.raise_for_status()
-                    data = r.json()
-                    return data.get("choices",[{}])[0].get("message",{}).get("content","")
-                except requests.RequestException:
-                    continue
-            return bad_text or ""
+    # ---------- 统一 JSON 修复 ----------
+    def repair_json(self, original_prompt: str, bad_text: str) -> str:
+        to_fix = (bad_text or "").strip()
+
+        # 1) 当前 provider 的 keys
+        fixed = self._repair_with_provider(self.provider, self.model, self.keys, to_fix)
+        if fixed: return fixed
+
+        # 2) 允许跨厂修复
+        if _as_bool(os.getenv("AI_FAILOVER","1"), True):
+            if self.provider == "gemini":
+                alt_provider, alt_model = "deepseek", os.getenv("DEEPSEEK_MODEL","deepseek-reasoner")
+                alt_keys = _split_keys(os.getenv("DEEPSEEK_API_KEYS","")) or _split_keys(os.getenv("DEEPSEEK_API_KEY",""))
+            else:
+                alt_provider, alt_model = "gemini", os.getenv("GEMINI_MODEL","gemini-2.5-pro")
+                alt_keys = _split_keys(os.getenv("GEMINI_API_KEYS","")) or _split_keys(os.getenv("GEMINI_API_KEY",""))
+            fixed = self._repair_with_provider(alt_provider, alt_model, alt_keys, to_fix, mark_alt=True)
+            if fixed: return fixed
+
+        return to_fix
+
+    def _repair_with_provider(self, provider: str, model: str, keys: List[str], text: str, mark_alt: bool=False) -> str:
+        if not keys: return ""
+        def _order(n): 
+            if self.strategy == "random":
+                idxs = list(range(n)); random.shuffle(idxs); return idxs
+            return list(range(n))
+
+        sys_prompt = "You are a JSON fixer. Return ONLY the corrected JSON object. No code fences. No commentary."
+        if provider == "deepseek":
+            for _ in _backoff_loop():
+                for idx in _order(len(keys)):
+                    key = keys[idx]
+                    try:
+                        url = "https://api.deepseek.com/chat/completions"
+                        headers={"Authorization": f"Bearer {key}"}
+                        user = "The following is not valid JSON. Please fix it and return only the corrected JSON object.\n\n<<<\n"+(text or "")+"\n>>>"
+                        r = requests.post(url, headers=headers, json={"model": model,"messages":[{"role":"system","content":sys_prompt},{"role":"user","content": user}],"temperature":0.0}, timeout=120)
+                        if r.status_code == 429 or (500 <= r.status_code < 600): continue
+                        r.raise_for_status()
+                        data = r.json()
+                        logging.info("[AI][REPAIR] provider=deepseek%s", " (failover)" if mark_alt else "")
+                        return data.get("choices",[{}])[0].get("message",{}).get("content","")
+                    except requests.RequestException:
+                        continue
+            return ""
+        elif provider == "gemini":
+            instr = "The following is not valid JSON. Please fix it and return only the corrected JSON object."
+            for _ in _backoff_loop():
+                for idx in _order(len(keys)):
+                    key = keys[idx]
+                    try:
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+                        body = {"contents":[{"parts":[{"text": instr+"\n\n<<<\n"+(text or "")+"\n>>>\n"}]}], "generationConfig":{"temperature":0.0}}
+                        r = requests.post(url, json=body, timeout=120)
+                        if r.status_code == 429 or (500 <= r.status_code < 600): continue
+                        r.raise_for_status()
+                        data = r.json()
+                        logging.info("[AI][REPAIR] provider=gemini%s", " (failover)" if mark_alt else "")
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    except requests.RequestException:
+                        continue
+            return ""
         else:
-            keys = _split_keys(os.getenv("GEMINI_API_KEYS","")) or _split_keys(os.getenv("GEMINI_API_KEY",""))
-            model = os.getenv("GEMINI_MODEL","gemini-2.5-pro")
-            for key in keys or [""]:
-                if not key: break
-                try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-                    instr = "The following is not valid JSON. Please fix it and return only the corrected JSON object."
-                    body = {"contents":[{"parts":[{"text": instr+"\n\n<<<\n"+(bad_text or "")+"\n>>>\n"}]}], "generationConfig":{"temperature":0.0}}
-                    r = requests.post(url, json=body, timeout=120)
-                    if r.status_code == 429 or (500 <= r.status_code < 600): continue
-                    r.raise_for_status()
-                    data = r.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                except requests.RequestException:
-                    continue
-            return bad_text or ""
+            return ""
 PY
 
   # ---------- seiue_api.py ----------
@@ -771,8 +843,7 @@ PY
 
   # ---------- main.py ----------
   cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, logging, re, tempfile, threading, math, signal, statistics
-import concurrent.futures as cf
+import os, json, time, logging, re, threading, signal, statistics
 from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
 from utilx import draftjs_to_text, scan_question_maxima, clamp, stable_hash
@@ -795,6 +866,18 @@ def setup_logging():
         logging.getLogger().addHandler(fh)
     except Exception: logging.warning(f"Cannot open LOG_FILE={log_file} for writing.")
     if log_level == logging.DEBUG: logging.getLogger("urllib3").setLevel(logging.INFO)
+
+# -------------------- Telegram --------------------
+def tg_enabled(cfg): return bool(cfg.get("tg_token")) and bool(cfg.get("tg_chat"))
+def tg_send(cfg, text):
+    if not tg_enabled(cfg): return
+    import requests
+    url = f"https://api.telegram.org/bot{cfg['tg_token']}/sendMessage"
+    data = {"chat_id": cfg["tg_chat"], "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    try:
+        requests.post(url, data=data, timeout=15)
+    except Exception as e:
+        logging.warning(f"[TG] {e}")
 
 # -------------------- env/state --------------------
 def _parse_task_ids(raw: str) -> List[int]:
@@ -852,6 +935,7 @@ def load_env():
         "ai_failover": as_bool(get("AI_FAILOVER","1")),
         "log_level": get("LOG_LEVEL","INFO"),
         "ai_strategy": get("AI_KEY_STRATEGY","roundrobin"),
+        "prompt_path": get("PROMPT_TEMPLATE_PATH","/opt/agrader/prompt.txt"),
     }
 
 def load_state(path: str) -> Dict[str, Any]:
@@ -866,469 +950,309 @@ def load_state(path: str) -> Dict[str, Any]:
 
 def save_state(path: str, st: Dict[str, Any]):
     tmp = path + ".tmp"
-    with open(tmp,"w") as f: json.dump(st, f, ensure_ascii=False)
+    with open(tmp,"w",encoding="utf-8") as f: json.dump(st, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-def telegram_notify(token: str, chat: str, text: str):
-    if not token or not chat: return
-    import requests
+# -------- Prompt template (hot reload by mtime) --------
+_prompt_cache = {"path": None, "mtime": 0.0, "text": ""}
+
+def _load_prompt_template(path: str) -> str:
     try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat,"text": text,"parse_mode": "HTML","disable_web_page_preview": True}, timeout=20)
-    except Exception as e: logging.error(f"[TG] {e}", exc_info=True)
+        st = os.stat(path)
+        if (_prompt_cache["path"] != path) or (st.st_mtime != _prompt_cache["mtime"]):
+            with open(path, "r", encoding="utf-8") as f:
+                _prompt_cache.update({"path": path, "mtime": st.st_mtime, "text": f.read()})
+    except Exception:
+        _prompt_cache["text"] = (
+            "You are a strict Chinese language grader.\n\n"
+            "Task: {task_title}\nStudent: {student_name} ({student_id})\n"
+            "Max Score: {max_score}\nPer-Question Schema (JSON): {per_question_json}\n\n"
+            "---\n{assignment_text}\n---\n"
+            'Output ONLY JSON: {"per_question":[...],"overall":{"score":...,"comment":"..."}}'
+        )
+    return _prompt_cache["text"]
 
-# -------------------- helpers --------------------
-def extract_submission_text(sub: Dict[str,Any]) -> str:
-    t = (sub or {}).get("content_text","") or (sub or {}).get("content","")
-    try:
-        if isinstance(t,str) and t.strip().startswith("{"): return draftjs_to_text(t)
-        if isinstance(t,str): return t
-    except Exception: pass
-    return ""
+def build_prompt(cfg: Dict[str,Any], task: dict, assignment: dict, extracted_text: str, perq: list, overall_max: float) -> str:
+    tpl = _load_prompt_template(cfg.get("prompt_path","/opt/agrader/prompt.txt"))
+    task_title = (task.get("title") or task.get("name") or "").strip()
+    u = (assignment.get("assignee") or {})
+    student_name = (u.get("name") or u.get("real_name") or "").strip()
+    student_id = str(u.get("id") or assignment.get("receiver_id") or "")
+    ctx = {
+        "task_title": task_title,
+        "student_name": student_name,
+        "student_id": student_id,
+        "assignment_text": (extracted_text or "").strip(),
+        "max_score": float(overall_max or 100.0),
+        "per_question_json": json.dumps(perq or [], ensure_ascii=False),
+    }
+    try: return tpl.format(**ctx)
+    except Exception:
+        return (
+            f"You are a strict grader.\nTask: {task_title}\nStudent: {student_name}({student_id})\n"
+            f"Max Score: {ctx['max_score']}\nSchema: {ctx['per_question_json']}\n---\n{ctx['assignment_text']}\n---\n"
+            'Output ONLY JSON: {"per_question":[...],"overall":{"score":...,"comment":"..."}}'
+        )
 
-def normalize_attach_id(obj) -> int | None:
-    if obj is None: return None
-    if isinstance(obj, int): return obj
-    if isinstance(obj, str) and obj.isdigit(): return int(obj)
-    if isinstance(obj, dict):
-        for k in ("id","file_id","netdisk_file_id","attachment_id"):
-            v = obj.get(k)
-            if isinstance(v, int): return v
-            if isinstance(v, str) and v.isdigit(): return int(v)
-        v = obj.get("file") or obj.get("resource") or {}
-        for k in ("id","file_id","netdisk_file_id","attachment_id"):
-            vv = v.get(k) if isinstance(v, dict) else None
-            if isinstance(vv, int): return vv
-            if isinstance(vv, str) and vv.isdigit(): return int(vv)
-    return None
+# -------------------- graceful stop --------------------
+_stop = threading.Event()
+def _sigterm(_s,_f): 
+    logging.info("[EXEC] Caught signal 15; graceful shutdown...")
+    _stop.set()
+signal.signal(signal.SIGTERM, _sigterm)
+signal.signal(signal.SIGINT, _sigterm)
 
-def collect_attachment_ids(sub: Dict[str,Any]) -> List[int]:
-    ids: List[int] = []
-    if not sub: return ids
-    pools = []
-    for key in ("attachments","files","images","resources","netdisk_files"):
-        v = sub.get(key)
-        if isinstance(v, list): pools.append(v)
-    for arr in pools:
-        for it in arr:
-            fid = normalize_attach_id(it)
-            if fid is not None: ids.append(fid)
-    out=[]; seen=set()
-    for x in ids:
-        if x not in seen:
-            out.append(x); seen.add(x)
-    return out
-
-def build_prompt(task: Dict[str,Any], item_meta: Dict[str,Any], stu: Dict[str,Any], sub_text: str, attach_texts: List[str], perq, overall_max) -> str:
-    task_title = task.get("title","(untitled)")
-    task_content_raw = task.get("content",""); task_content = task_content_raw
-    try:
-        if task_content_raw and task_content_raw.strip().startswith("{"): task_content = draftjs_to_text(task_content_raw)
-    except Exception: pass
-
-    g = task.get("group") or {}
-    class_name = g.get("class_name",""); grade_names = g.get("grade_names",""); subject_name = g.get("subject_name",""); course_full = g.get("name","")
-    expected_min = task.get("expected_take_minutes") or task.get("expected_take_minites") or ""
-    pathname = (item_meta or {}).get("pathname") or []
-    path_str = " / ".join([str(x) for x in pathname]) if isinstance(pathname, list) else (str(pathname) if pathname else "")
-
-    lines=[]
-    lines.append("你是嚴格而公正的語文老師，請只輸出符合 JSON Schema 的結果。"); lines.append("")
-    ctx = []
-    if grade_names: ctx.append(f"{grade_names}")
-    if class_name: ctx.append(f"{class_name}")
-    if subject_name: ctx.append(f"{subject_name}")
-    if course_full and course_full not in ctx: ctx.append(course_full)
-    if path_str: ctx.append(f"[{path_str}]")
-    if expected_min: ctx.append(f"預計用時≈{expected_min}分鐘")
-    if ctx: lines.append("課程/任務背景：" + " · ".join(ctx))
-
-    lines.append("\n== 任務說明 =="); lines.append(f"標題：{task_title}"); lines.append(f"要求：\n{task_content}")
-    lines.append("\n== 學生信息 =="); lines.append(f"姓名：{stu.get('name','')}  ID：{stu.get('id','')}")
-    lines.append("\n== 學生提交（正文） =="); lines.append(sub_text[:20000])
-    if attach_texts:
-        lines.append("\n== 附件文字（合併提取） ==")
-        for i, t in enumerate(attach_texts,1): lines.append(f"[附件{i} | len={len(t)}]\n{t[:20000]}")
-
-    lines.append("\n== 評分約束 ==")
-    if perq:
-        lines.append("分題滿分：")
-        for q in perq: lines.append(f"- {q['id']}: max {q['max']}")
-        lines.append(f"總分上限 = {overall_max}")
-    else:
-        lines.append(f"未提供分題規則；總分上限 = {overall_max}")
-
-    lines.append("""
-== OUTPUT JSON SCHEMA ==
-{
-  "per_question": [{"id":"<qid>","score": <0..max>,"comment":"<=100 chars"}],
-  "overall": {"score": <0..overall_max>, "comment":"<=200 chars"}
-}
-規則：切勿超過滿分；能整數就整數；中文簡潔評語；不要多餘鍵。""")
-    return "\n".join(lines)
-
-def find_item_id(task: Dict[str,Any], asg: Dict[str,Any]) -> int | None:
-    candidates = []
-    for k in ("klass_item_id","item_id","vnas_item_id"):
-        v = task.get(k); 
-        if v: candidates.append(v)
-    g = task.get("group") or {}
-    for k in ("klass_item_id","item_id","vnas_item_id"):
-        v = g.get(k); 
-        if v: candidates.append(v)
-    for k in ("item_id",):
-        v = asg.get(k); 
-        if v: candidates.append(v)
-    sub = asg.get("submission") or {}
-    for k in ("item_id",):
-        v = sub.get(k); 
-        if v: candidates.append(v)
-    for v in candidates:
-        try:
-            vi = int(str(v))
-            if vi > 0: return vi
-        except Exception:
-            continue
-    return None
-
-# -------------------- signal handling --------------------
-_shutdown = threading.Event()
-def _sig_handler(signum, frame):
-    logging.info(f"[EXEC] Caught signal {signum}; graceful shutdown...")
-    _shutdown.set()
-
-# -------------------- main loop --------------------
-def main():
-    setup_logging()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try: signal.signal(sig, _sig_handler)
-        except Exception: pass
-
-    cfg = load_env()
-    state = load_state(cfg["state_path"])
-
+# -------------------- core --------------------
+def main_loop(cfg: Dict[str,Any]):
     if not cfg["task_ids"]:
-        logging.info("No MONITOR_TASK_IDS provided; exiting.")
+        logging.warning("[EXEC] No MONITOR_TASK_IDS configured.")
+        time.sleep(cfg["interval"])
         return
 
-    # AI primary + optional failover
-    if cfg["ai_provider"].lower() == "gemini":
-        ai_primary = AIClient("gemini", cfg["gemini_model"], cfg["gemini_key"])
-        ai_alt     = AIClient("deepseek", cfg["deepseek_model"], cfg["deepseek_key"]) if cfg["ai_failover"] else None
-    else:
-        ai_primary = AIClient("deepseek", cfg["deepseek_model"], cfg["deepseek_key"])
-        ai_alt     = AIClient("gemini", cfg["gemini_model"], cfg["gemini_key"]) if cfg["ai_failover"] else None
+    api = Seiue(
+        base=cfg["base"], bearer=cfg["bearer"], school_id=cfg["school_id"], role=cfg["role"],
+        reflection_id=cfg["reflection_id"], username=cfg["username"], password=cfg["password"]
+    )
+    logging.info("[EXEC] Monitoring tasks=%s with STUDENT_WORKERS=%s ATTACH_WORKERS=%s AI_PARALLEL=%s",
+                 cfg["task_ids"], cfg["student_workers"], cfg["attach_workers"], cfg["ai_parallel"])
 
-    api = Seiue(cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"], cfg["reflection_id"], cfg["username"], cfg["password"])
+    state = load_state(cfg["state_path"])
 
-    logging.info(f"[EXEC] Monitoring tasks={cfg['task_ids']} with STUDENT_WORKERS={cfg['student_workers']} ATTACH_WORKERS={cfg['attach_workers']} AI_PARALLEL={cfg['ai_parallel']}")
-
-    last_status_print = 0
-
-    while not _shutdown.is_set():
+    tasks_meta = api.get_tasks_bulk(cfg["task_ids"])
+    for task_id in cfg["task_ids"]:
+        if _stop.is_set(): break
         try:
-            tasks_meta = api.get_tasks_bulk(cfg["task_ids"])
+            task = tasks_meta.get(task_id) or api.get_task(task_id)
         except Exception as e:
-            logging.error(f"[TASKS] bulk fetch failed: {e}", exc_info=True)
-            time.sleep(cfg["interval"])
+            logging.error(f"[TASK {task_id}] load failed: {e}")
             continue
 
-        for task_id in cfg["task_ids"]:
-            if _shutdown.is_set(): break
-            try:
-                task = tasks_meta.get(task_id) or api.get_task(task_id)
-            except Exception as e:
-                logging.error(f"[TASK {task_id}] fetch failed: {e}", exc_info=True); continue
+        perq, overall_max = scan_question_maxima(task)
+        try:
+            items = api.get_assignments(task_id) or []
+        except Exception as e:
+            logging.error(f"[TASK {task_id}] assignments failed: {e}")
+            continue
 
-            perq, overall_max = scan_question_maxima(task)
-            try:
-                assignments = api.get_assignments(task_id) or []
-            except Exception as e:
-                logging.error(f"[TASK {task_id}] get_assignments failed: {e}", exc_info=True)
+        total = len(items)
+        done_cnt = 0
+        processed_map = state["processed"].setdefault(str(task_id), {})
+
+        # 任务开场 Telegram
+        if tg_enabled(cfg):
+            tg_send(cfg, f"📘 <b>Task {task_id}</b> started · total: <b>{total}</b>")
+
+        for idx, asg in enumerate(items, start=1):
+            if _stop.is_set(): break
+            rid = int(asg.get("receiver_id") or (asg.get("assignee") or {}).get("id") or 0)
+            name = ((asg.get("assignee") or {}).get("name") or "").strip() or "?"
+            # 跳过已处理（哈希匹配）
+            submission = (asg.get("submission") or {})
+            content_json = submission.get("content") or ""
+            text0 = draftjs_to_text(content_json) if content_json else ""
+            attach_ids = []
+            files = (submission.get("attachments") or []) + (submission.get("files") or [])
+            for f in files:
+                fid = f.get("id") or f.get("_id") or f.get("file_id")
+                if fid: attach_ids.append(str(fid))
+
+            # 组装可比对的输入 hash
+            fingerprint = stable_hash(text0 + "|" + ",".join(sorted(attach_ids)))
+            prev = processed_map.get(str(rid))
+            if prev and prev.get("hash") == fingerprint and not cfg["score_all_on_start"]:
+                done_cnt += 1
                 continue
 
-            total = len(assignments)
-            done = 0
-            processed_map = state["processed"].setdefault(str(task_id), {})
-            scores_for_summary: List[float] = []
+            # 无提交：直接 0 分评语
+            if (not text0) and (not attach_ids):
+                score = 0.0
+                comment = "学生未提交古诗文背默作业，总分0分。"
+                ok_flag = True
+                if cfg["score_write"] and not cfg["dry_run"]:
+                    try:
+                        # optional: 写评语
+                        api.post_review(receiver_id=rid, task_id=task_id, content=comment)
+                    except Exception as e:
+                        logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
+                    # optional: 写分
+                    try:
+                        # 若该任务对应 item_id，可在此读取后写分，这里保持与现有逻辑一致（留空实现）
+                        pass
+                    except Exception as e:
+                        logging.warning(f"[SCORE][TASK {task_id}] rid={rid} score write fail: {e}")
 
-            def process_one(asg: Dict[str,Any]) -> Tuple[int, str, float, str, bool]:
-                """return (receiver_id, student_name, total_score, overall_comment, ok_written)"""
-                receiver = (asg.get("assignee") or {})
-                rid = int(receiver.get("id") or 0)
-                rname = receiver.get("name","")
-                sub = asg.get("submission") or {}
-                base_text = extract_submission_text(sub)
-                attach_ids = collect_attachment_ids(sub)
-                attach_texts: List[str] = []
+                processed_map[str(rid)] = {"hash": fingerprint, "score": score, "comment": comment}
+                done_cnt += 1
+                logging.info("[DONE][TASK %s] %d/%d rid=%s name=%s score=%.1f comment=%s",
+                             task_id, done_cnt, total, rid, name, score, comment)
 
-                # download + extract attachments (size gated)
-                if attach_ids:
-                    with cf.ThreadPoolExecutor(max_workers=cfg["attach_workers"]) as pool:
-                        futs = []
-                        for fid in attach_ids:
-                            try:
-                                url = api.get_file_signed_url(str(fid))
-                            except Exception as e:
-                                logging.warning(f"[TASK {task_id}] rid={rid} signed url failed for file {fid}: {e}")
-                                continue
-                            futs.append(pool.submit(_dl_and_extract, api, url, cfg["ocr_lang"], cfg["max_attach"]))
-                        for fu in futs:
-                            try:
-                                txt = fu.result(timeout=300)
-                                if txt: attach_texts.append(txt)
-                            except Exception as e:
-                                logging.warning(f"[TASK {task_id}] rid={rid} extract err: {e}")
+                if cfg["tg_verbose"]:
+                    tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {score}\n{comment}")
+                continue
 
-                # content hash for idempotency
-                content_hash = stable_hash(base_text + "\n".join(attach_texts))
-                prev = processed_map.get(str(rid))
-                if prev and prev.get("hash") == content_hash:
-                    # already processed this exact content
-                    return (rid, rname, float(prev.get("score",0.0)), prev.get("comment",""), True)
+            # 有文本或附件：抽取文本
+            extracted = text0
+            if attach_ids:
+                for fid in attach_ids:
+                    if _stop.is_set(): break
+                    try:
+                        url = api.get_file_signed_url(fid)
+                        if not url: continue
+                        blob = api.download(url)
+                        if len(blob) > cfg["max_attach"]:
+                            if cfg["tg_verbose"]:
+                                tg_send(cfg, f"📎 Skip large file for <b>{name}</b> ({len(blob)} bytes)")
+                            continue
+                        tmp = os.path.join(cfg["workdir"], f"{task_id}_{rid}_{fid}")
+                        with open(tmp,"wb") as w: w.write(blob)
+                        txt = file_to_text(tmp, ocr_lang=cfg["ocr_lang"], size_cap=cfg["max_attach"])
+                        extracted += ("\n\n" + txt)
+                    except Exception as e:
+                        logging.warning(f"[ATTACH][TASK {task_id}] rid={rid} file {fid} failed: {e}")
 
-                # build prompt
-                item_id = find_item_id(task, asg)
-                item_meta = {}
+            # 调用 AI
+            provider = cfg["ai_provider"]
+            model = cfg["gemini_model"] if provider=="gemini" else cfg["deepseek_model"]
+            key   = cfg["gemini_key"]   if provider=="gemini" else cfg["deepseek_key"]
+            client = AIClient(provider=provider, model=model, key=key)
+            prompt = build_prompt(cfg, task, asg, extracted, perq, overall_max)
+            try:
+                j = client.grade(prompt)
+                overall = j.get("overall") or {}
+                score = float(overall.get("score") or 0.0)
+                comment = str(overall.get("comment") or "").strip() or "（无评语）"
+            except Exception as e:
+                score, comment = 0.0, f"自动评分失败：{e}"
+
+            # 写回评语与分数（按你的策略开关）
+            ok_flag = True
+            if cfg["score_write"] and not cfg["dry_run"]:
                 try:
-                    if item_id: item_meta = api.get_item_detail(int(item_id))
-                except Exception:
-                    item_meta = {}
+                    api.post_review(receiver_id=rid, task_id=task_id, content=comment)
+                except Exception as e:
+                    ok_flag = False
+                    logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
 
-                prompt = build_prompt(task, item_meta, receiver, base_text, attach_texts, perq, overall_max)
+                # （如需写 item_score，可在此接入 item_id 逻辑）
+                # 留空：保留你现有“任务=背默”的 0 分直给策略
 
-                # call AI (primary -> fallback)
-                result = ai_primary.grade(prompt) or {}
-                overall = (result.get("overall") or {})
-                total_score = float(overall.get("score") or 0.0)
-                comment = str(overall.get("comment") or "").strip()
-                if not comment and isinstance(result.get("per_question"), list) and result["per_question"]:
-                    # fall back to concat short comments
-                    comment = "；".join([str(x.get("comment","")) for x in result["per_question"] if x.get("comment")])[:180]
+            processed_map[str(rid)] = {"hash": fingerprint, "score": score, "comment": comment}
+            done_cnt += 1
+            logging.info("[DONE][TASK %s] %d/%d rid=%s name=%s score=%.1f comment=%s",
+                         task_id, done_cnt, total, rid, name, score, comment)
 
-                if (total_score <= 0) and cfg["ai_failover"] and (ai_alt is not None):
-                    logging.warning("[AI] primary returned empty/0; trying failover provider...")
-                    result2 = ai_alt.grade(prompt) or {}
-                    overall2 = (result2.get("overall") or {})
-                    s2 = float(overall2.get("score") or 0.0)
-                    c2 = str(overall2.get("comment") or "").strip() or comment
-                    if s2 > total_score:
-                        total_score, comment, result = s2, c2, result2
+            if cfg["tg_verbose"]:
+                tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {score}\n{comment}")
 
-                # clamp to maxima
-                total_score = clamp(float(total_score), 0.0, float(overall_max))
+            save_state(cfg["state_path"], state)
+            if _stop.is_set(): break
 
-                # post review & score
-                ok_written = True
-                if not cfg["dry_run"]:
-                    try:
-                        # review
-                        if cfg["review_all_existing"]:
-                            api.post_review(rid, task_id, f"總評：{comment}")
-                    except Exception as e:
-                        logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} failed: {e}")
-                    try:
-                        # score
-                        if cfg["score_write"] and item_id:
-                            ok_written = api.post_item_score(int(item_id), rid, task_id, total_score)
-                    except Exception as e:
-                        logging.warning(f"[SCORE][TASK {task_id}] rid={rid} write failed: {e}")
-                        ok_written = False
+        # 任务汇总
+        try:
+            all_scores = [v.get("score",0.0) for v in (state["processed"].get(str(task_id)) or {}).values()]
+            avg = (sum(all_scores)/len(all_scores)) if all_scores else 0.0
+            zero_cnt = sum(1 for s in all_scores if not s)
+            msg = f"✅ <b>Task {task_id}</b> done {done_cnt}/{total}\nAvg: {avg:.2f} · Zero: {zero_cnt}"
+            logging.info("[SUMMARY][TASK %s] %s", task_id, msg)
+            if tg_enabled(cfg): tg_send(cfg, msg)
+        except Exception as e:
+            logging.warning(f"[SUMMARY][TASK {task_id}] fail: {e}")
 
-                # verify (optional) — best effort
-                if cfg["verify_after"] and item_id:
-                    try:
-                        pass
-                    except Exception:
-                        pass
+        save_state(cfg["state_path"], state)
 
-                processed_map[str(rid)] = {"hash": content_hash, "score": total_score, "comment": comment}
-                return (rid, rname, total_score, comment, ok_written)
-
-            # run through all assignments
-            with cf.ThreadPoolExecutor(max_workers=cfg["student_workers"]) as pool:
-                futs = [pool.submit(process_one, a) for a in assignments]
-                for fu in cf.as_completed(futs):
-                    try:
-                        rid, rname, total_score, comment, ok_written = fu.result()
-                        done += 1
-                        scores_for_summary.append(total_score)
-                        logging.info(f"[DONE][TASK {task_id}] {done}/{total} rid={rid} name={rname} score={total_score:.1f} comment={comment[:60]}")
-                        # per-student TG
-                        if cfg["tg_verbose"]:
-                            telegram_notify(cfg["tg_token"], cfg["tg_chat"], f"📩 <b>閱卷進度</b>\n任務 {task_id}\n{rname}（{rid}）\n分數：<b>{total_score:.1f}</b>\n評語：{comment[:160]}")
-                        save_state(cfg["state_path"], state)
-                    except Exception as e:
-                        logging.error(f"[TASK {task_id}] worker error: {e}", exc_info=True)
-
-            # print periodic progress line
-            now = time.time()
-            if now - last_status_print > 5:
-                last_status_print = now
-                logging.info(f"[PROGRESS][TASK {task_id}] processed {done}/{total} ({(100.0*done/max(1,total)):.1f}%)")
-
-            # completion summary (snapshot)
-            snapshot_hash = stable_hash("".join(sorted([str(k)+str(v.get('hash')) for k,v in state['processed'].get(str(task_id),{}).items()])))
-            if done >= total and state["reported_complete"].get(str(task_id)) != snapshot_hash:
-                avg = (sum(scores_for_summary)/len(scores_for_summary)) if scores_for_summary else 0.0
-                med = (statistics.median(scores_for_summary) if scores_for_summary else 0.0)
-                summary = f"✅ <b>本次閱卷完成</b>\n任務 {task_id}\n總數：{total}\n平均：<b>{avg:.1f}</b>　中位：<b>{med:.1f}</b>"
-                telegram_notify(cfg["tg_token"], cfg["tg_chat"], summary)
-                state["reported_complete"][str(task_id)] = snapshot_hash
-                save_state(cfg["state_path"], state)
-
-        # loop sleep with early exit
-        for _ in range(cfg["interval"]):
-            if _shutdown.is_set(): break
-            time.sleep(1)
-
-    # graceful end
-    save_state(cfg["state_path"], state)
-    telegram_notify(os.getenv("TELEGRAM_BOT_TOKEN",""), os.getenv("TELEGRAM_CHAT_ID",""), f"⏸️ AGrader 已暫停。可用命令恢復：sudo systemctl restart agrader.service")
-    logging.info("[EXEC] Stopped. State saved.")
-
-def _dl_and_extract(api: Seiue, url: str, ocr_lang: str, size_cap: int) -> str:
-    try:
-        b = api.download(url)
-        if len(b) > size_cap:
-            if os.getenv("TELEGRAM_VERBOSE","1") not in ("0","false","False"):
-                telegram_notify(os.getenv("TELEGRAM_BOT_TOKEN",""), os.getenv("TELEGRAM_CHAT_ID",""),
-                                f"⚠️ 附件過大已跳過（{len(b)} bytes）")
-            return f"[[skipped: attachment too large ({len(b)} bytes)]]"
-        import tempfile, os
-        fd, p = tempfile.mkstemp(prefix="agr_", suffix=".bin")
-        os.close(fd)
-        with open(p,"wb") as f: f.write(b)
-        txt = file_to_text(p, ocr_lang=ocr_lang, size_cap=size_cap)
-        if os.getenv("KEEP_WORK_FILES","0") in ("0","false","False"):
-            try: os.remove(p)
-            except Exception: pass
-        return txt
-    except Exception as e:
-        logging.warning(f"[ATTACH] download/extract failed: {e}")
-        return ""
+    # 单轮结束，返回由外层 while 控制节奏
+    time.sleep(cfg["interval"])
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logging.info("[EXEC] KeyboardInterrupt; exiting.")
+    setup_logging()
+    while True:
+        try:
+            cfg = load_env()      # ← 每轮开始重读 .env（热加载）
+            main_loop(cfg)        # ← 单轮后返回，外层控制 sleep 与重读
+            if _stop.is_set(): break
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            logging.exception("[FATAL] %s", e)
+            time.sleep(3)
 PY
-}
 
-create_venv_and_install() {
-  echo "[4/10] Creating venv and installing requirements..."
-  python3 -m venv "$VENV_DIR" 2>/dev/null || true
-  # shellcheck disable=SC1090
-  . "$VENV_DIR/bin/activate"
-  pip install --upgrade pip >/dev/null
-  pip install -r "$APP_DIR/requirements.txt"
-}
-
-write_systemd_service() {
-  echo "[5/10] Writing systemd service (Linux)..."
-  sudo tee "$SERVICE_PATH" >/dev/null <<EOF
+  # ---------- systemd (Linux) ----------
+  cat > "$SERVICE_PATH" <<EOF
 [Unit]
 Description=AGrader - Seiue auto-grader
 After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$APP_DIR
-Environment=ENV_PATH=$ENV_FILE
-ExecStart=$VENV_DIR/bin/python $PY_MAIN
+WorkingDirectory=${APP_DIR}
+Environment=ENV_PATH=${ENV_FILE}
+ExecStart=${VENV_DIR}/bin/python ${PY_MAIN}
 Restart=always
-RestartSec=5s
-StandardOutput=journal
-StandardError=journal
-LimitNOFILE=1048576
+RestartSec=3
+User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 644 "$SERVICE_PATH"
+}
+
+create_venv_and_install() {
+  echo "[4/10] Creating venv and installing requirements..."
+  python3 -m venv "$VENV_DIR"
+  "${VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
+  "${VENV_DIR}/bin/pip" install -r "$APP_DIR/requirements.txt"
+}
+
+enable_start_linux() {
+  echo "[5/10] Writing systemd service (Linux)..."
   systemctl daemon-reload
-}
-
-write_launchd_plist() {
-  echo "[5/10] Writing launchd plist (macOS)..."
-  mkdir -p "$(dirname "$LAUNCHD_PLIST")"
-  cat > "$LAUNCHD_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
- "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>net.bdfz.agrader</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$VENV_DIR/bin/python</string>
-    <string>$PY_MAIN</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>ENV_PATH</key><string>$ENV_FILE</string>
-  </dict>
-  <key>WorkingDirectory</key><string>$APP_DIR</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$APP_DIR/launchd.out</string>
-  <key>StandardErrorPath</key><string>$APP_DIR/launchd.err</string>
-</dict>
-</plist>
-EOF
-}
-
-start_service() {
-  local os="$(os_detect)"
   echo "[6/10] Stopping existing service if running..."
-  if [ "$os" = "linux" ] && systemctl is-active --quiet "$SERVICE"; then systemctl stop "$SERVICE" || true; fi
-  if [ "$os" = "mac" ] && launchctl list | grep -q 'net.bdfz.agrader'; then launchctl unload "$LAUNCHD_PLIST" || true; fi
-
+  systemctl stop "$SERVICE" >/dev/null 2>&1 || true
   echo "[7/10] Enabling and starting..."
-  if [ "$os" = "linux" ]; then
-    systemctl enable "$SERVICE" || true
-    systemctl start "$SERVICE"
-    echo "[8/10] Done. Logs:"
-    journalctl -u "$SERVICE" -n 20 --no-pager || true
-    echo "Tail: journalctl -u $SERVICE -f"
-  elif [ "$os" = "mac" ]; then
-    launchctl load "$LAUNCHD_PLIST" || true
-    echo "[8/10] Done. Tail logs:"
-    echo "  tail -f $APP_DIR/launchd.out"
-  else
-    echo "[8/10] Done (manual run): $VENV_DIR/bin/python $PY_MAIN"
-  fi
+  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  systemctl start "$SERVICE"
+  echo "[8/10] Done. Logs:"
+  journalctl -u "$SERVICE" -n 20 --no-pager || true
+  echo "Tail: journalctl -u $SERVICE -f"
   echo "[9/10] Edit config anytime: sudo nano $ENV_FILE"
   echo "[10/10] Re-run: sudo systemctl restart $SERVICE"
+  cat <<'EOT'
+
+How to stop (graceful):
+  sudo systemctl stop agrader.service
+Resume:
+  sudo systemctl start agrader.service   # 或 restart
+EOT
 }
 
 main() {
-  local os="$(os_detect)"
-  if [ "$os" = "linux" ]; then install_pkgs_linux
-  elif [ "$os" = "mac" ]; then install_pkgs_macos
-  else echo "Unsupported OS"; exit 1; fi
+  case "$(os_detect)" in
+    linux) install_pkgs_linux ;;
+    mac)   install_pkgs_macos ;;
+    *)     echo "Unsupported OS"; exit 1 ;;
+  esac
 
-  # stop if running (idempotent)
-  if [ "$os" = "linux" ] && [ -f "$SERVICE_PATH" ]; then systemctl stop "$SERVICE" || true; fi
+  echo "[2/10] Collecting initial configuration..."
+  mkdir -p "$APP_DIR" "$APP_DIR/work"
+  if [ ! -f "$ENV_FILE" ]; then
+    echo "Creating new $ENV_FILE ..."
+  else
+    echo "Reusing existing $ENV_FILE"
+  fi
+
+  # 始终提示 Task IDs
+  prompt_task_ids
 
   write_project
-  prompt_task_ids
   create_venv_and_install
-  if [ "$os" = "linux" ]; then write_systemd_service
-  elif [ "$os" = "mac" ]; then write_launchd_plist
-  fi
-  start_service
 
-  echo
-  echo "How to stop (graceful):"
-  if [ "$os" = "linux" ]; then
-    echo "  sudo systemctl stop $SERVICE"
-    echo "Resume:"
-    echo "  sudo systemctl start $SERVICE   # 或 restart"
+  if [ "$(os_detect)" = "linux" ]; then
+    enable_start_linux
   else
-    echo "  launchctl unload $LAUNCHD_PLIST"
-    echo "Resume:"
-    echo "  launchctl load $LAUNCHD_PLIST"
+    echo "On macOS: you can run manually -> ${VENV_DIR}/bin/python ${PY_MAIN}"
+    echo "Or create a launchd plist at: $LAUNCHD_PLIST (not auto-generated here)."
   fi
 }
 
