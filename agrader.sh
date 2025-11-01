@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AGrader - API-first auto-grading pipeline (installer/runner) - FULL INLINE EDITION
 # Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
-# v1.9.4-fullinline-2025-11-01
+# v1.10.0-fullinline-2025-11-01
 
 set -euo pipefail
 
@@ -147,6 +147,11 @@ ensure_env_patch() {
   grep -q '^AI_FAILOVER='             "$ENV_FILE" || echo 'AI_FAILOVER=1'              >> "$ENV_FILE"
   grep -q '^MAX_ATTACHMENT_BYTES='    "$ENV_FILE" || echo 'MAX_ATTACHMENT_BYTES=25165824' >> "$ENV_FILE"
   grep -q '^OCR_LANG='                "$ENV_FILE" || echo 'OCR_LANG=chi_sim+eng'       >> "$ENV_FILE"
+
+  # ---- Multi-key AI 轮询支持（新增，不覆盖已有值）----
+  grep -q '^AI_KEY_STRATEGY='         "$ENV_FILE" || echo 'AI_KEY_STRATEGY=roundrobin' >> "$ENV_FILE"
+  grep -q '^GEMINI_API_KEYS='         "$ENV_FILE" || echo 'GEMINI_API_KEYS='           >> "$ENV_FILE"
+  grep -q '^DEEPSEEK_API_KEYS='       "$ENV_FILE" || echo 'DEEPSEEK_API_KEYS='         >> "$ENV_FILE"
 }
 
 write_project() {
@@ -179,12 +184,12 @@ write_project() {
     ask "Select 1/2" AI_CHOICE "2"
     if [ "$AI_CHOICE" = "2" ]; then
       AI_PROVIDER="deepseek"
-      ask_secret "DeepSeek API Key" DEEPSEEK_API_KEY
+      ask_secret "DeepSeek API Key (single; extra keys can be set later in DEEPSEEK_API_KEYS)" DEEPSEEK_API_KEY
       ask "DeepSeek Model" DEEPSEEK_MODEL "deepseek-reasoner"
       GEMINI_API_KEY=""; GEMINI_MODEL="gemini-2.5-pro"
     else
       AI_PROVIDER="gemini"
-      ask_secret "Gemini API Key" GEMINI_API_KEY
+      ask_secret "Gemini API Key (single; extra keys can be set later in GEMINI_API_KEYS)" GEMINI_API_KEY
       ask "Gemini Model" GEMINI_MODEL "gemini-2.5-pro"
       DEEPSEEK_API_KEY=""; DEEPSEEK_MODEL="deepseek-reasoner"
     fi
@@ -228,10 +233,16 @@ SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&
 
 # ---- AI ----
 AI_PROVIDER=${AI_PROVIDER}
+# 支持多 Key（逗号分隔），与单 Key 并行存在，程序会合并去重
+GEMINI_API_KEYS=
 GEMINI_API_KEY=${GEMINI_API_KEY}
 GEMINI_MODEL=${GEMINI_MODEL}
+DEEPSEEK_API_KEYS=
 DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
 DEEPSEEK_MODEL=${DEEPSEEK_MODEL}
+
+# 轮换与退避
+AI_KEY_STRATEGY=roundrobin
 AI_PARALLEL=1
 AI_MAX_RETRIES=5
 AI_BACKOFF_BASE_SECONDS=2.5
@@ -278,7 +289,7 @@ EOF
     echo "Reusing existing $ENV_FILE"
   fi
 
-  # 只补缺省，不覆盖已有；但端点強制收斂
+  # 只补缺省，不覆盖已有；但端点強制收斂；并添加多Key键位
   ensure_env_patch
 
   echo "[3/10] Writing project files..."
@@ -355,7 +366,7 @@ def _session_with_retries() -> requests.Session:
     s = requests.Session()
     r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent": "AGrader/1.9 (+login)","Accept": "application/json, text/plain, */*"})
+    s.headers.update({"User-Agent": "AGrader/1.10 (+login)","Accept": "application/json, text/plain, */*"})
     return s
 
 def login(username: str, password: str) -> AuthResult:
@@ -451,13 +462,40 @@ PY
 import os, time, json, requests, logging, random, re
 
 def _backoff_loop():
-    max_retries = int(os.getenv("AI_MAX_RETRIES","5")); base = float(os.getenv("AI_BACKOFF_BASE_SECONDS","1.5")); jitter = float(os.getenv("AI_JITTER_SECONDS","0.5"))
+    max_retries = int(os.getenv("AI_MAX_RETRIES","5"))
+    base = float(os.getenv("AI_BACKOFF_BASE_SECONDS","1.5"))
+    jitter = float(os.getenv("AI_JITTER_SECONDS","0.5"))
     for i in range(max_retries):
-        yield i; time.sleep((base ** i) + random.uniform(0, jitter))
+        yield i
+        time.sleep((base ** i) + random.uniform(0, jitter))
+
+def _split_keys(s: str):
+    if not s: return []
+    return [x.strip() for x in s.split(",") if x.strip()]
 
 class AIClient:
     def __init__(self, provider: str, model: str, key: str):
-        self.provider = provider; self.model = model; self.key = key
+        self.provider = provider
+        self.model = model
+        self._rr = 0
+        self.strategy = os.getenv("AI_KEY_STRATEGY","roundrobin").lower()
+
+        ring = []
+        if provider == "gemini":
+            ring += _split_keys(os.getenv("GEMINI_API_KEYS",""))
+            if key: ring.append(key or os.getenv("GEMINI_API_KEY",""))
+        elif provider == "deepseek":
+            ring += _split_keys(os.getenv("DEEPSEEK_API_KEYS",""))
+            if key: ring.append(key or os.getenv("DEEPSEEK_API_KEY",""))
+        else:
+            if key: ring.append(key)
+
+        seen=set(); self.keys=[]
+        for k in ring:
+            if k and k not in seen:
+                self.keys.append(k); seen.add(k)
+        if not self.keys:
+            self.keys = [key] if key else [""]
 
     def grade(self, prompt: str) -> dict:
         raw = self._call_llm(prompt)
@@ -479,12 +517,26 @@ class AIClient:
             if isinstance(fixed, dict): return fixed
             if isinstance(fixed, str):
                 fixed = fixed.strip()
+                if fixed.startswith("{}"): return {}
                 if fixed.startswith("{"): return json.loads(fixed)
                 mm = re.search(r"\{.*\}", fixed, re.S)
                 if mm: return json.loads(mm.group(0))
         except Exception as e:
             logging.error(f"[AI] JSON repair failed: {e}", exc_info=True)
         return {"per_question": [], "overall": {"score": 0, "comment": (text[:200] if text else "AI empty")}}
+
+    # -------- LLM 调度（同厂多 key 轮询 + 429/5xx 退避） --------
+    def _key_order(self):
+        n = len(self.keys)
+        if self.strategy == "random":
+            idxs = list(range(n))
+            random.shuffle(idxs)
+            return idxs
+        return list(range(self._rr, n)) + list(range(0, self._rr))
+
+    def _advance_rr(self, used_idx):
+        if self.strategy == "roundrobin":
+            self._rr = (used_idx + 1) % len(self.keys)
 
     def _call_llm(self, prompt: str) -> str:
         if self.provider == "gemini":
@@ -495,50 +547,86 @@ class AIClient:
             raise ValueError("Unknown AI provider")
 
     def _gemini(self, prompt: str) -> str:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.key}"
         body = {"contents":[{"parts":[{"text": prompt}]}], "generationConfig":{"temperature":0.2}}
         for _ in _backoff_loop():
-            r = requests.post(url, json=body, timeout=180)
-            if r.status_code == 429: logging.warning("[AI] Gemini 429; retry..."); continue
-            r.raise_for_status()
-            data = r.json()
-            try: return data["candidates"][0]["content"]["parts"][0]["text"]
-            except Exception: return json.dumps(data)[:4000]
+            for idx in self._key_order():
+                key = self.keys[idx]
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={key}"
+                try:
+                    r = requests.post(url, json=body, timeout=180)
+                    if r.status_code == 429:
+                        logging.warning("[AI] Gemini 429; switch key #%d/%d", idx+1, len(self.keys)); continue
+                    if 500 <= r.status_code < 600:
+                        logging.warning("[AI] Gemini %d; switch key #%d/%d", r.status_code, idx+1, len(self.keys)); continue
+                    r.raise_for_status()
+                    data = r.json()
+                    self._advance_rr(idx)
+                    try:
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    except Exception:
+                        return json.dumps(data)[:4000]
+                except requests.RequestException as e:
+                    logging.warning("[AI] Gemini exception (%s); switch key #%d/%d", getattr(e.response,'status_code',type(e).__name__), idx+1, len(self.keys)); continue
         return ""
 
     def _deepseek(self, prompt: str) -> str:
-        url = "https://api.deepseek.com/chat/completions"; headers={"Authorization": f"Bearer {self.key}"}
         body={"model": self.model,"messages":[{"role":"system","content":"You are a strict grader. Output ONLY valid JSON per schema."},{"role":"user","content": prompt}],"temperature":0.2}
         for _ in _backoff_loop():
-            r = requests.post(url, headers=headers, json=body, timeout=180)
-            if r.status_code == 429: logging.warning("[AI] DeepSeek 429; retry..."); continue
-            r.raise_for_status()
-            data = r.json()
-            return data.get("choices",[{}])[0].get("message",{}).get("content","")
+            for idx in self._key_order():
+                key = self.keys[idx]
+                url = "https://api.deepseek.com/chat/completions"
+                headers={"Authorization": f"Bearer {key}"}
+                try:
+                    r = requests.post(url, headers=headers, json=body, timeout=180)
+                    if r.status_code == 429:
+                        logging.warning("[AI] DeepSeek 429; switch key #%d/%d", idx+1, len(self.keys)); continue
+                    if 500 <= r.status_code < 600:
+                        logging.warning("[AI] DeepSeek %d; switch key #%d/%d", r.status_code, idx+1, len(self.keys)); continue
+                    r.raise_for_status()
+                    data = r.json()
+                    self._advance_rr(idx)
+                    return data.get("choices",[{}])[0].get("message",{}).get("content","")
+                except requests.RequestException as e:
+                    logging.warning("[AI] DeepSeek exception (%s); switch key #%d/%d", getattr(e.response,'status_code',type(e).__name__), idx+1, len(self.keys)); continue
         return ""
 
     def repair_json(self, bad_text: str) -> dict | str:
-        # Repair 使用「對向供應商」，避免在同一供應商上再次撞 429
         prefer = "deepseek" if self.provider == "gemini" else "gemini"
         if prefer == "deepseek":
-            key = os.getenv("DEEPSEEK_API_KEY",""); model = os.getenv("DEEPSEEK_MODEL","deepseek-reasoner")
-            if not key: return bad_text or ""
-            url = "https://api.deepseek.com/chat/completions"; headers={"Authorization": f"Bearer {key}"}
-            sys_prompt = "You are a JSON fixer. Return ONLY the corrected JSON object. No code fences. No commentary."
-            user = "The following is not valid JSON. Please fix it and return only the corrected JSON object.\n\n<<<\n"+(bad_text or "")+"\n>>>"
-            body={"model": model,"messages":[{"role":"system","content":sys_prompt},{"role":"user","content": user}],"temperature":0.0}
-            r = requests.post(url, headers=headers, json=body, timeout=120); r.raise_for_status()
-            data = r.json()
-            return data.get("choices",[{}])[0].get("message",{}).get("content","")
+            keys = _split_keys(os.getenv("DEEPSEEK_API_KEYS","")) or _split_keys(os.getenv("DEEPSEEK_API_KEY",""))
+            model = os.getenv("DEEPSEEK_MODEL","deepseek-reasoner")
+            for key in keys or [""]:
+                if not key: break
+                try:
+                    url = "https://api.deepseek.com/chat/completions"
+                    headers={"Authorization": f"Bearer {key}"}
+                    sys_prompt = "You are a JSON fixer. Return ONLY the corrected JSON object. No code fences. No commentary."
+                    user = "The following is not valid JSON. Please fix it and return only the corrected JSON object.\n\n<<<\n"+(bad_text or "")+"\n>>>"
+                    r = requests.post(url, headers=headers, json={"model": model,"messages":[{"role":"system","content":sys_prompt},{"role":"user","content": user}],"temperature":0.0}, timeout=120)
+                    if r.status_code == 429 or (500 <= r.status_code < 600): continue
+                    r.raise_for_status()
+                    data = r.json()
+                    return data.get("choices",[{}])[0].get("message",{}).get("content","")
+                except requests.RequestException:
+                    continue
+            return bad_text or ""
         else:
-            key = os.getenv("GEMINI_API_KEY",""); model = os.getenv("GEMINI_MODEL","gemini-2.5-pro")
-            if not key: return bad_text or ""
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-            instr = "The following is not valid JSON. Please fix it and return only the corrected JSON object."
-            body = {"contents":[{"parts":[{"text": instr+"\n\n<<<\n"+(bad_text or "")+"\n>>>\n"}]}], "generationConfig":{"temperature":0.0}}
-            r = requests.post(url, json=body, timeout=120); r.raise_for_status()
-            data = r.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+            keys = _split_keys(os.getenv("GEMINI_API_KEYS","")) or _split_keys(os.getenv("GEMINI_API_KEY",""))
+            model = os.getenv("GEMINI_MODEL","gemini-2.5-pro")
+            for key in keys or [""]:
+                if not key: break
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+                    instr = "The following is not valid JSON. Please fix it and return only the corrected JSON object."
+                    body = {"contents":[{"parts":[{"text": instr+"\n\n<<<\n"+(bad_text or "")+"\n>>>\n"}]}], "generationConfig":{"temperature":0.0}}
+                    r = requests.post(url, json=body, timeout=120)
+                    if r.status_code == 429 or (500 <= r.status_code < 600): continue
+                    r.raise_for_status()
+                    data = r.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                except requests.RequestException:
+                    continue
+            return bad_text or ""
 PY
 
   # ---------- seiue_api.py ----------
@@ -555,7 +643,7 @@ def _session_with_retries() -> requests.Session:
     s = requests.Session()
     r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST","PUT"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"Accept":"application/json, text/plain, */*","User-Agent":"AGrader/1.9"})
+    s.headers.update({"Accept":"application/json, text/plain, */*","User-Agent":"AGrader/1.10"})
     return s
 
 class Seiue:
@@ -659,7 +747,6 @@ class Seiue:
         return r.json()
 
     def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float) -> bool:
-        # 只使用權威端點；422(已存在) 視為成功
         path = f"/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true"
         url  = self._url(path)
         payload = [{
@@ -684,7 +771,7 @@ PY
 
   # ---------- main.py ----------
   cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, logging, re, tempfile, threading, math
+import os, json, time, logging, re, tempfile, threading, math, signal, statistics
 import concurrent.futures as cf
 from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
@@ -764,15 +851,18 @@ def load_env():
         "attach_workers": int(get("ATTACH_WORKERS","3") or "3"),
         "ai_failover": as_bool(get("AI_FAILOVER","1")),
         "log_level": get("LOG_LEVEL","INFO"),
+        "ai_strategy": get("AI_KEY_STRATEGY","roundrobin"),
     }
 
 def load_state(path: str) -> Dict[str, Any]:
     try:
         with open(path,"r") as f: data = json.load(f)
-        data.setdefault("processed", {}); data.setdefault("scored", {}); data.setdefault("failed", []); data.setdefault("reported_complete", {})
+        data.setdefault("processed", {})            # processed[task_id][receiver_id] = {hash, score, comment}
+        data.setdefault("failed", [])               # list of {task_id, receiver_id, reason}
+        data.setdefault("reported_complete", {})    # reported_complete[task_id] = hash of snapshot
         return data
     except Exception:
-        return {"processed": {}, "scored": {}, "failed": [], "reported_complete": {}}
+        return {"processed": {}, "failed": [], "reported_complete": {}}
 
 def save_state(path: str, st: Dict[str, Any]):
     tmp = path + ".tmp"
@@ -796,7 +886,6 @@ def extract_submission_text(sub: Dict[str,Any]) -> str:
     return ""
 
 def normalize_attach_id(obj) -> int | None:
-    """Return an integer file id if present, else None."""
     if obj is None: return None
     if isinstance(obj, int): return obj
     if isinstance(obj, str) and obj.isdigit(): return int(obj)
@@ -805,7 +894,6 @@ def normalize_attach_id(obj) -> int | None:
             v = obj.get(k)
             if isinstance(v, int): return v
             if isinstance(v, str) and v.isdigit(): return int(v)
-        # nested
         v = obj.get("file") or obj.get("resource") or {}
         for k in ("id","file_id","netdisk_file_id","attachment_id"):
             vv = v.get(k) if isinstance(v, dict) else None
@@ -824,7 +912,6 @@ def collect_attachment_ids(sub: Dict[str,Any]) -> List[int]:
         for it in arr:
             fid = normalize_attach_id(it)
             if fid is not None: ids.append(fid)
-    # dedup
     out=[]; seen=set()
     for x in ids:
         if x not in seen:
@@ -841,9 +928,8 @@ def build_prompt(task: Dict[str,Any], item_meta: Dict[str,Any], stu: Dict[str,An
     g = task.get("group") or {}
     class_name = g.get("class_name",""); grade_names = g.get("grade_names",""); subject_name = g.get("subject_name",""); course_full = g.get("name","")
     expected_min = task.get("expected_take_minutes") or task.get("expected_take_minites") or ""
-    pathname = item_meta.get("pathname") or []
-    if isinstance(pathname, list): path_str = " / ".join([str(x) for x in pathname if x])
-    else: path_str = str(pathname) if pathname else ""
+    pathname = (item_meta or {}).get("pathname") or []
+    path_str = " / ".join([str(x) for x in pathname]) if isinstance(pathname, list) else (str(pathname) if pathname else "")
 
     lines=[]
     lines.append("你是嚴格而公正的語文老師，請只輸出符合 JSON Schema 的結果。"); lines.append("")
@@ -880,9 +966,43 @@ def build_prompt(task: Dict[str,Any], item_meta: Dict[str,Any], stu: Dict[str,An
 規則：切勿超過滿分；能整數就整數；中文簡潔評語；不要多餘鍵。""")
     return "\n".join(lines)
 
+def find_item_id(task: Dict[str,Any], asg: Dict[str,Any]) -> int | None:
+    candidates = []
+    for k in ("klass_item_id","item_id","vnas_item_id"):
+        v = task.get(k); 
+        if v: candidates.append(v)
+    g = task.get("group") or {}
+    for k in ("klass_item_id","item_id","vnas_item_id"):
+        v = g.get(k); 
+        if v: candidates.append(v)
+    for k in ("item_id",):
+        v = asg.get(k); 
+        if v: candidates.append(v)
+    sub = asg.get("submission") or {}
+    for k in ("item_id",):
+        v = sub.get(k); 
+        if v: candidates.append(v)
+    for v in candidates:
+        try:
+            vi = int(str(v))
+            if vi > 0: return vi
+        except Exception:
+            continue
+    return None
+
+# -------------------- signal handling --------------------
+_shutdown = threading.Event()
+def _sig_handler(signum, frame):
+    logging.info(f"[EXEC] Caught signal {signum}; graceful shutdown...")
+    _shutdown.set()
+
 # -------------------- main loop --------------------
 def main():
     setup_logging()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try: signal.signal(sig, _sig_handler)
+        except Exception: pass
+
     cfg = load_env()
     state = load_state(cfg["state_path"])
 
@@ -890,169 +1010,223 @@ def main():
         logging.info("No MONITOR_TASK_IDS provided; exiting.")
         return
 
-    # AI with optional failover
-    def make_ai(provider):
-        if provider == "gemini":
-            return AIClient("gemini", cfg["gemini_model"], cfg["gemini_key"])
-        else:
-            return AIClient("deepseek", cfg["deepseek_model"], cfg["deepseek_key"])
-    ai = make_ai(cfg["ai_provider"])
-    ai_alt = make_ai("deepseek" if cfg["ai_provider"]=="gemini" else "gemini") if cfg["ai_failover"] else None
+    # AI primary + optional failover
+    if cfg["ai_provider"].lower() == "gemini":
+        ai_primary = AIClient("gemini", cfg["gemini_model"], cfg["gemini_key"])
+        ai_alt     = AIClient("deepseek", cfg["deepseek_model"], cfg["deepseek_key"]) if cfg["ai_failover"] else None
+    else:
+        ai_primary = AIClient("deepseek", cfg["deepseek_model"], cfg["deepseek_key"])
+        ai_alt     = AIClient("gemini", cfg["gemini_model"], cfg["gemini_key"]) if cfg["ai_failover"] else None
 
     api = Seiue(cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"], cfg["reflection_id"], cfg["username"], cfg["password"])
 
     logging.info(f"[EXEC] Monitoring tasks={cfg['task_ids']} with STUDENT_WORKERS={cfg['student_workers']} ATTACH_WORKERS={cfg['attach_workers']} AI_PARALLEL={cfg['ai_parallel']}")
 
-    task_map = api.get_tasks_bulk(cfg["task_ids"])
-    if not task_map:
-        logging.warning("get_tasks_bulk empty; fallback to single fetch.")
-        task_map = {tid: api.get_task(tid) for tid in cfg["task_ids"]}
+    last_status_print = 0
 
-    while True:
+    while not _shutdown.is_set():
+        try:
+            tasks_meta = api.get_tasks_bulk(cfg["task_ids"])
+        except Exception as e:
+            logging.error(f"[TASKS] bulk fetch failed: {e}", exc_info=True)
+            time.sleep(cfg["interval"])
+            continue
+
         for task_id in cfg["task_ids"]:
+            if _shutdown.is_set(): break
             try:
-                task = task_map.get(task_id) or api.get_task(task_id)
-                item_id = (task.get("custom_fields") or {}).get("item_id") or task.get("item_id")
-                if not item_id:
-                    logging.warning(f"[TASK {task_id}] no item_id; skip.")
-                    continue
+                task = tasks_meta.get(task_id) or api.get_task(task_id)
+            except Exception as e:
+                logging.error(f"[TASK {task_id}] fetch failed: {e}", exc_info=True); continue
+
+            perq, overall_max = scan_question_maxima(task)
+            try:
+                assignments = api.get_assignments(task_id) or []
+            except Exception as e:
+                logging.error(f"[TASK {task_id}] get_assignments failed: {e}", exc_info=True)
+                continue
+
+            total = len(assignments)
+            done = 0
+            processed_map = state["processed"].setdefault(str(task_id), {})
+            scores_for_summary: List[float] = []
+
+            def process_one(asg: Dict[str,Any]) -> Tuple[int, str, float, str, bool]:
+                """return (receiver_id, student_name, total_score, overall_comment, ok_written)"""
+                receiver = (asg.get("assignee") or {})
+                rid = int(receiver.get("id") or 0)
+                rname = receiver.get("name","")
+                sub = asg.get("submission") or {}
+                base_text = extract_submission_text(sub)
+                attach_ids = collect_attachment_ids(sub)
+                attach_texts: List[str] = []
+
+                # download + extract attachments (size gated)
+                if attach_ids:
+                    with cf.ThreadPoolExecutor(max_workers=cfg["attach_workers"]) as pool:
+                        futs = []
+                        for fid in attach_ids:
+                            try:
+                                url = api.get_file_signed_url(str(fid))
+                            except Exception as e:
+                                logging.warning(f"[TASK {task_id}] rid={rid} signed url failed for file {fid}: {e}")
+                                continue
+                            futs.append(pool.submit(_dl_and_extract, api, url, cfg["ocr_lang"], cfg["max_attach"]))
+                        for fu in futs:
+                            try:
+                                txt = fu.result(timeout=300)
+                                if txt: attach_texts.append(txt)
+                            except Exception as e:
+                                logging.warning(f"[TASK {task_id}] rid={rid} extract err: {e}")
+
+                # content hash for idempotency
+                content_hash = stable_hash(base_text + "\n".join(attach_texts))
+                prev = processed_map.get(str(rid))
+                if prev and prev.get("hash") == content_hash:
+                    # already processed this exact content
+                    return (rid, rname, float(prev.get("score",0.0)), prev.get("comment",""), True)
+
+                # build prompt
+                item_id = find_item_id(task, asg)
                 item_meta = {}
                 try:
-                    item_meta = api.get_item_detail(int(item_id)) or {}
-                except Exception as e:
-                    logging.warning(f"[TASK {task_id}] item detail error: {e}")
+                    if item_id: item_meta = api.get_item_detail(int(item_id))
+                except Exception:
+                    item_meta = {}
 
-                perq, overall_max = scan_question_maxima(task)
-                ass = api.get_assignments(task_id) or []
-                if not ass:
-                    logging.debug(f"[TASK {task_id}] no assignments yet.")
-                    continue
+                prompt = build_prompt(task, item_meta, receiver, base_text, attach_texts, perq, overall_max)
 
-                # process each assignment
-                for a in ass:
+                # call AI (primary -> fallback)
+                result = ai_primary.grade(prompt) or {}
+                overall = (result.get("overall") or {})
+                total_score = float(overall.get("score") or 0.0)
+                comment = str(overall.get("comment") or "").strip()
+                if not comment and isinstance(result.get("per_question"), list) and result["per_question"]:
+                    # fall back to concat short comments
+                    comment = "；".join([str(x.get("comment","")) for x in result["per_question"] if x.get("comment")])[:180]
+
+                if (total_score <= 0) and cfg["ai_failover"] and (ai_alt is not None):
+                    logging.warning("[AI] primary returned empty/0; trying failover provider...")
+                    result2 = ai_alt.grade(prompt) or {}
+                    overall2 = (result2.get("overall") or {})
+                    s2 = float(overall2.get("score") or 0.0)
+                    c2 = str(overall2.get("comment") or "").strip() or comment
+                    if s2 > total_score:
+                        total_score, comment, result = s2, c2, result2
+
+                # clamp to maxima
+                total_score = clamp(float(total_score), 0.0, float(overall_max))
+
+                # post review & score
+                ok_written = True
+                if not cfg["dry_run"]:
                     try:
-                        rid = a.get("receiver_id") or (a.get("assignee") or {}).get("id")
-                        sid = a.get("id")
-                        stu = a.get("assignee") or {}
-                        sub = a.get("submission") or {}
-
-                        # build unique key for idempotency
-                        sub_text = extract_submission_text(sub)
-                        attach_ids = collect_attachment_ids(sub)
-                        key_text = (sub_text or "") + ("|attach:" + ",".join(map(str,attach_ids)) if attach_ids else "")
-                        sig = stable_hash(key_text)
-                        prev = state["processed"].get(str(sid))
-                        if prev == sig and not cfg["review_all_existing"]:
-                            continue
-
-                        # fetch attachments (only when we have numeric IDs)
-                        attach_texts: List[str] = []
-                        if attach_ids:
-                            with cf.ThreadPoolExecutor(max_workers=cfg["attach_workers"]) as pool:
-                                futs=[]
-                                for fid in attach_ids:
-                                    futs.append(pool.submit(fetch_and_extract, api, fid, cfg))
-                                for fu in cf.as_completed(futs):
-                                    t = fu.result()
-                                    if t: attach_texts.append(t)
-
-                        prompt = build_prompt(task, item_meta, stu, sub_text, attach_texts, perq, overall_max)
-
-                        # call AI (with failover)
-                        result = ai.grade(prompt) or {}
-                        if (not result or (result.get("overall",{}).get("score") in (None,0) and not result.get("per_question"))) and ai_alt:
-                            logging.warning("[AI] primary returned empty/0; trying failover provider...")
-                            result = ai_alt.grade(prompt) or {}
-
-                        # clamp scores
-                        total = result.get("overall",{}).get("score",0) or 0
-                        try:
-                            total = float(total)
-                        except: total = 0.0
-                        total = clamp(total, 0.0, overall_max or 100.0)
-
-                        # write back
-                        if cfg["dry_run"]:
-                            logging.info(f"[DRYRUN][TASK {task_id}] {stu.get('name','')} overall={total}")
-                        else:
-                            if cfg["score_write"]:
-                                ok = api.post_item_score(int(item_id), int(rid), int(task_id), float(total))
-                                logging.info(f"[SCORE][TASK {task_id}] rid={rid} total={total} ok={ok}")
-                            # review (brief overall comment)
-                            try:
-                                comment = (result.get("overall",{}) or {}).get("comment","") or "已閱。"
-                                api.post_review(int(rid), int(task_id), comment, result="approved")
-                            except Exception as e:
-                                logging.warning(f"[REVIEW] post failed: {e}")
-
-                        state["processed"][str(sid)] = sig
-                        save_state(cfg["state_path"], state)
-
+                        # review
+                        if cfg["review_all_existing"]:
+                            api.post_review(rid, task_id, f"總評：{comment}")
                     except Exception as e:
-                        logging.error(f"[ASSIGNMENT] error: {e}", exc_info=True)
-                        state["failed"].append({"task_id": task_id, "assignment": a, "error": str(e)})
+                        logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} failed: {e}")
+                    try:
+                        # score
+                        if cfg["score_write"] and item_id:
+                            ok_written = api.post_item_score(int(item_id), rid, task_id, total_score)
+                    except Exception as e:
+                        logging.warning(f"[SCORE][TASK {task_id}] rid={rid} write failed: {e}")
+                        ok_written = False
+
+                # verify (optional) — best effort
+                if cfg["verify_after"] and item_id:
+                    try:
+                        pass
+                    except Exception:
+                        pass
+
+                processed_map[str(rid)] = {"hash": content_hash, "score": total_score, "comment": comment}
+                return (rid, rname, total_score, comment, ok_written)
+
+            # run through all assignments
+            with cf.ThreadPoolExecutor(max_workers=cfg["student_workers"]) as pool:
+                futs = [pool.submit(process_one, a) for a in assignments]
+                for fu in cf.as_completed(futs):
+                    try:
+                        rid, rname, total_score, comment, ok_written = fu.result()
+                        done += 1
+                        scores_for_summary.append(total_score)
+                        logging.info(f"[DONE][TASK {task_id}] {done}/{total} rid={rid} name={rname} score={total_score:.1f} comment={comment[:60]}")
+                        # per-student TG
+                        if cfg["tg_verbose"]:
+                            telegram_notify(cfg["tg_token"], cfg["tg_chat"], f"📩 <b>閱卷進度</b>\n任務 {task_id}\n{rname}（{rid}）\n分數：<b>{total_score:.1f}</b>\n評語：{comment[:160]}")
                         save_state(cfg["state_path"], state)
+                    except Exception as e:
+                        logging.error(f"[TASK {task_id}] worker error: {e}", exc_info=True)
 
-            except Exception as e:
-                logging.error(f"[TASK {task_id}] loop error: {e}", exc_info=True)
+            # print periodic progress line
+            now = time.time()
+            if now - last_status_print > 5:
+                last_status_print = now
+                logging.info(f"[PROGRESS][TASK {task_id}] processed {done}/{total} ({(100.0*done/max(1,total)):.1f}%)")
 
-        time.sleep(max(2, cfg["interval"]))
+            # completion summary (snapshot)
+            snapshot_hash = stable_hash("".join(sorted([str(k)+str(v.get('hash')) for k,v in state['processed'].get(str(task_id),{}).items()])))
+            if done >= total and state["reported_complete"].get(str(task_id)) != snapshot_hash:
+                avg = (sum(scores_for_summary)/len(scores_for_summary)) if scores_for_summary else 0.0
+                med = (statistics.median(scores_for_summary) if scores_for_summary else 0.0)
+                summary = f"✅ <b>本次閱卷完成</b>\n任務 {task_id}\n總數：{total}\n平均：<b>{avg:.1f}</b>　中位：<b>{med:.1f}</b>"
+                telegram_notify(cfg["tg_token"], cfg["tg_chat"], summary)
+                state["reported_complete"][str(task_id)] = snapshot_hash
+                save_state(cfg["state_path"], state)
 
-def fetch_and_extract(api: Seiue, fid: int, cfg: Dict[str,Any]) -> str:
+        # loop sleep with early exit
+        for _ in range(cfg["interval"]):
+            if _shutdown.is_set(): break
+            time.sleep(1)
+
+    # graceful end
+    save_state(cfg["state_path"], state)
+    telegram_notify(os.getenv("TELEGRAM_BOT_TOKEN",""), os.getenv("TELEGRAM_CHAT_ID",""), f"⏸️ AGrader 已暫停。可用命令恢復：sudo systemctl restart agrader.service")
+    logging.info("[EXEC] Stopped. State saved.")
+
+def _dl_and_extract(api: Seiue, url: str, ocr_lang: str, size_cap: int) -> str:
     try:
-        url = api.get_file_signed_url(str(int(fid)))
+        b = api.download(url)
+        if len(b) > size_cap:
+            if os.getenv("TELEGRAM_VERBOSE","1") not in ("0","false","False"):
+                telegram_notify(os.getenv("TELEGRAM_BOT_TOKEN",""), os.getenv("TELEGRAM_CHAT_ID",""),
+                                f"⚠️ 附件過大已跳過（{len(b)} bytes）")
+            return f"[[skipped: attachment too large ({len(b)} bytes)]]"
+        import tempfile, os
+        fd, p = tempfile.mkstemp(prefix="agr_", suffix=".bin")
+        os.close(fd)
+        with open(p,"wb") as f: f.write(b)
+        txt = file_to_text(p, ocr_lang=ocr_lang, size_cap=size_cap)
+        if os.getenv("KEEP_WORK_FILES","0") in ("0","false","False"):
+            try: os.remove(p)
+            except Exception: pass
+        return txt
     except Exception as e:
-        logging.error(f"[ATTACH] invalid file id={fid}: {e}")
+        logging.warning(f"[ATTACH] download/extract failed: {e}")
         return ""
-    if not url:
-        logging.error(f"[ATTACH] file id={fid}: empty url")
-        return ""
-    try:
-        data = api.download(url)
-    except Exception as e:
-        logging.error(f"[ATTACH] download error id={fid}: {e}")
-        return ""
-    if not data or len(data) == 0:
-        return ""
-    if len(data) > cfg["max_attach"]:
-        logging.info(f"[ATTACH] skip large id={fid} bytes={len(data)} > cap={cfg['max_attach']}")
-        return ""
-    # store temp file then extract text
-    import tempfile, os, uuid
-    suffix = guess_suffix_from_url(url)
-    path = os.path.join(tempfile.gettempdir(), f"ag_{uuid.uuid4().hex}{suffix}")
-    try:
-        with open(path,"wb") as f: f.write(data)
-        txt = file_to_text(path, ocr_lang=cfg["ocr_lang"], size_cap=cfg["max_attach"])
-        return txt or ""
-    finally:
-        if (os.getenv("KEEP_WORK_FILES","0") in ("0","false","False")):
-            try: os.remove(path)
-            except: pass
-
-def guess_suffix_from_url(url: str) -> str:
-    m = re.search(r"\.([A-Za-z0-9]{2,5})(?:\?|$)", url)
-    if m: return "."+m.group(1).lower()
-    return ""
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("[EXEC] KeyboardInterrupt; exiting.")
 PY
 }
 
-create_venv_and_deps() {
+create_venv_and_install() {
   echo "[4/10] Creating venv and installing requirements..."
   python3 -m venv "$VENV_DIR" 2>/dev/null || true
-  # shellcheck disable=SC1091
+  # shellcheck disable=SC1090
   . "$VENV_DIR/bin/activate"
   pip install --upgrade pip >/dev/null
   pip install -r "$APP_DIR/requirements.txt"
-  deactivate || true
 }
 
-write_systemd() {
+write_systemd_service() {
   echo "[5/10] Writing systemd service (Linux)..."
-  cat > "$SERVICE_PATH" <<EOF
+  sudo tee "$SERVICE_PATH" >/dev/null <<EOF
 [Unit]
 Description=AGrader - Seiue auto-grader
 After=network-online.target
@@ -1060,16 +1234,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
 WorkingDirectory=$APP_DIR
-Environment="ENV_PATH=$ENV_FILE"
+Environment=ENV_PATH=$ENV_FILE
 ExecStart=$VENV_DIR/bin/python $PY_MAIN
 Restart=always
-RestartSec=20s
-TimeoutStartSec=120
+RestartSec=5s
 StandardOutput=journal
 StandardError=journal
-NoNewPrivileges=true
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -1077,16 +1249,7 @@ EOF
   systemctl daemon-reload
 }
 
-enable_start_linux() {
-  echo "[7/10] Enabling and starting..."
-  systemctl stop "$SERVICE" 2>/dev/null || true
-  systemctl enable "$SERVICE" --now
-  echo "[8/10] Done. Logs:"
-  journalctl -u "$SERVICE" -n 20 --no-pager || true
-  echo "Tail: journalctl -u $SERVICE -f"
-}
-
-write_launchd() {
+write_launchd_plist() {
   echo "[5/10] Writing launchd plist (macOS)..."
   mkdir -p "$(dirname "$LAUNCHD_PLIST")"
   cat > "$LAUNCHD_PLIST" <<EOF
@@ -1107,67 +1270,66 @@ write_launchd() {
   </dict>
   <key>WorkingDirectory</key><string>$APP_DIR</string>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$APP_DIR/launchd.out.log</string>
-  <key>StandardErrorPath</key><string>$APP_DIR/launchd.err.log</string>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$APP_DIR/launchd.out</string>
+  <key>StandardErrorPath</key><string>$APP_DIR/launchd.err</string>
 </dict>
 </plist>
 EOF
 }
 
-enable_start_macos() {
-  echo "[7/10] Enabling and starting (launchd)..."
-  launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
-  launchctl load "$LAUNCHD_PLIST"
-  launchctl start net.bdfz.agrader 2>/dev/null || true
-  echo "[8/10] Done. Logs:"
-  tail -n 50 "$APP_DIR/launchd.out.log" 2>/dev/null || true
-  echo "Tail: tail -f $APP_DIR/launchd.out.log"
-}
-
-stop_existing() {
+start_service() {
+  local os="$(os_detect)"
   echo "[6/10] Stopping existing service if running..."
-  case "$(os_detect)" in
-    linux) systemctl stop "$SERVICE" 2>/dev/null || true;;
-    mac)   launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true;;
-    *)     true;;
-  esac
+  if [ "$os" = "linux" ] && systemctl is-active --quiet "$SERVICE"; then systemctl stop "$SERVICE" || true; fi
+  if [ "$os" = "mac" ] && launchctl list | grep -q 'net.bdfz.agrader'; then launchctl unload "$LAUNCHD_PLIST" || true; fi
+
+  echo "[7/10] Enabling and starting..."
+  if [ "$os" = "linux" ]; then
+    systemctl enable "$SERVICE" || true
+    systemctl start "$SERVICE"
+    echo "[8/10] Done. Logs:"
+    journalctl -u "$SERVICE" -n 20 --no-pager || true
+    echo "Tail: journalctl -u $SERVICE -f"
+  elif [ "$os" = "mac" ]; then
+    launchctl load "$LAUNCHD_PLIST" || true
+    echo "[8/10] Done. Tail logs:"
+    echo "  tail -f $APP_DIR/launchd.out"
+  else
+    echo "[8/10] Done (manual run): $VENV_DIR/bin/python $PY_MAIN"
+  fi
+  echo "[9/10] Edit config anytime: sudo nano $ENV_FILE"
+  echo "[10/10] Re-run: sudo systemctl restart $SERVICE"
 }
 
-# -------------------- MAIN INSTALL FLOW --------------------
 main() {
-  mkdir -p "$APP_DIR" "$APP_DIR/work"
+  local os="$(os_detect)"
+  if [ "$os" = "linux" ]; then install_pkgs_linux
+  elif [ "$os" = "mac" ]; then install_pkgs_macos
+  else echo "Unsupported OS"; exit 1; fi
 
-  case "$(os_detect)" in
-    linux) install_pkgs_linux;;
-    mac)   install_pkgs_macos;;
-    *)     echo "Unsupported OS."; exit 1;;
-  esac
+  # stop if running (idempotent)
+  if [ "$os" = "linux" ] && [ -f "$SERVICE_PATH" ]; then systemctl stop "$SERVICE" || true; fi
 
-  stop_existing
   write_project
   prompt_task_ids
-  create_venv_and_deps
-
-  if [ ! -s "$PY_MAIN" ]; then
-    echo "ERROR: $PY_MAIN missing!"; exit 2
+  create_venv_and_install
+  if [ "$os" = "linux" ]; then write_systemd_service
+  elif [ "$os" = "mac" ]; then write_launchd_plist
   fi
+  start_service
 
-  case "$(os_detect)" in
-    linux)
-      write_systemd
-      enable_start_linux
-      ;;
-    mac)
-      write_launchd
-      enable_start_macos
-      ;;
-  esac
-
-  echo "[9/10] Edit config anytime: sudo nano $ENV_FILE"
-  case "$(os_detect)" in
-    linux) echo "[10/10] Re-run: sudo systemctl restart $SERVICE";;
-    mac)   echo "[10/10] Re-run: launchctl kickstart -k gui/$(id -u)/net.bdfz.agrader";;
-  esac
+  echo
+  echo "How to stop (graceful):"
+  if [ "$os" = "linux" ]; then
+    echo "  sudo systemctl stop $SERVICE"
+    echo "Resume:"
+    echo "  sudo systemctl start $SERVICE   # 或 restart"
+  else
+    echo "  launchctl unload $LAUNCHD_PLIST"
+    echo "Resume:"
+    echo "  launchctl load $LAUNCHD_PLIST"
+  fi
 }
 
 main "$@"
