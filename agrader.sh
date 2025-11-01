@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# AGrader - API-first auto-grading pipeline (installer/runner)
+# AGrader - API-first auto-grading pipeline (installer/runner) - FULL INLINE EDITION
 # Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
+# v1.9.4-fullinline-2025-11-01
+
 set -euo pipefail
 
 APP_DIR="/opt/agrader"
@@ -9,6 +11,7 @@ ENV_FILE="$APP_DIR/.env"
 SERVICE="agrader.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE}"
 LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/net.bdfz.agrader.plist"
+PY_MAIN="$APP_DIR/main.py"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -52,11 +55,14 @@ prompt_task_ids() {
   while :; do
     read -r -p "Task IDs [${cur:-none}]: " ans || true
     ans="${ans:-$cur}"
+    # 正規化：支援 URL/純數字/逗號分隔
     norm="$(
       printf "%s\n" "$ans" \
-      | tr ' ' '\n' \
-      | sed -nE 's#.*/tasks/([0-9]+).*#\1#p; t; s#[^0-9,]##gp' \
-      | tr '\n' ',' | sed -E 's#,+#,#g; s#^,##; s#,$##'
+      | tr ' ,;' '\n\n\n' \
+      | sed -E 's#.*(/tasks/([0-9]+)).*#\2#; t; s#[^0-9]##g' \
+      | awk 'length>0' \
+      | paste -sd, - \
+      | sed -E 's#,+#,#g; s#^,##; s#,$##'
     )"
     if [ -n "$norm" ]; then
       set_env_kv "MONITOR_TASK_IDS" "$norm"
@@ -117,7 +123,7 @@ ensure_env_patch() {
   grep -q '^LOG_DATEFMT=' "$ENV_FILE" || echo 'LOG_DATEFMT=%Y-%m-%d %H:%M:%S' >> "$ENV_FILE"
   grep -q '^LOG_FILE='    "$ENV_FILE" || echo "LOG_FILE=${APP_DIR}/agrader.log" >> "$ENV_FILE"
 
-  # ---- 权威端点：强制收敛到确认过的接口（会覆盖旧值）----
+  # ---- 权威端点（會覆蓋舊值，避免走錯路徑）----
   if grep -q '^SEIUE_SCORE_ENDPOINTS=' "$ENV_FILE"; then
     sed -i.bak -E 's#^SEIUE_SCORE_ENDPOINTS=.*#SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true\&from_task=true:array#' "$ENV_FILE" || true
   else
@@ -128,7 +134,7 @@ ensure_env_patch() {
   grep -q '^SEIUE_VERIFY_SCORE_GET_TEMPLATE=' "$ENV_FILE" || \
     echo 'SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&type=item_score' >> "$ENV_FILE"
 
-  # ---- Strategy / concurrency：缺失才填（不覆盖用户已有值）----
+  # ---- Strategy / concurrency：缺失才填（不覆盖已有值）----
   grep -q '^DRY_RUN='                 "$ENV_FILE" || echo 'DRY_RUN=0'                  >> "$ENV_FILE"
   grep -q '^VERIFY_AFTER_WRITE='      "$ENV_FILE" || echo 'VERIFY_AFTER_WRITE=1'       >> "$ENV_FILE"
   grep -q '^RETRY_FAILED='            "$ENV_FILE" || echo 'RETRY_FAILED=1'             >> "$ENV_FILE"
@@ -251,7 +257,7 @@ LOG_FILE=${LOG_FILE}
 LOG_FORMAT=${LOG_FORMAT}
 LOG_DATEFMT=${LOG_DATEFMT}
 
-# ---- Strategy & Safety ----
+# ---- Strategy ----
 SCORE_WRITE=1
 REVIEW_ALL_EXISTING=1
 SCORE_GIVE_ALL_ON_START=1
@@ -272,10 +278,12 @@ EOF
     echo "Reusing existing $ENV_FILE"
   fi
 
-  # 只补缺省，不覆盖已有；但端点强制收敛
+  # 只补缺省，不覆盖已有；但端点強制收斂
   ensure_env_patch
 
   echo "[3/10] Writing project files..."
+
+  # ---------- requirements ----------
   cat > "$APP_DIR/requirements.txt" <<'EOF'
 requests==2.32.3
 urllib3==2.2.3
@@ -289,9 +297,11 @@ python-pptx==0.6.23
 lxml==5.3.0
 EOF
 
+  # ---------- utilx.py ----------
   cat > "$APP_DIR/utilx.py" <<'PY'
 import json, hashlib
 from typing import Dict, Any, List, Tuple
+
 def draftjs_to_text(content_json: str) -> str:
     try:
         data = json.loads(content_json)
@@ -299,8 +309,10 @@ def draftjs_to_text(content_json: str) -> str:
         return "\n".join(b.get("text","") for b in blocks).strip()
     except Exception:
         return content_json
+
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
 def scan_question_maxima(task: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], float]:
     overall_max = 100.0
     perq: List[Dict[str, Any]] = []
@@ -324,23 +336,28 @@ def scan_question_maxima(task: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], fl
             try: overall_max = float(maybe_max)
             except: pass
     return perq, overall_max
+
 def stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8","ignore")).hexdigest()
 PY
 
+  # ---------- credentials.py ----------
   cat > "$APP_DIR/credentials.py" <<'PY'
 import logging, requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
 class AuthResult:
     def __init__(self, ok: bool, token: str = "", reflection_id: str = "", detail: str = ""):
         self.ok = ok; self.token = token; self.reflection_id = reflection_id; self.detail = detail
+
 def _session_with_retries() -> requests.Session:
     s = requests.Session()
     r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent": "AGrader/1.8 (+login)","Accept": "application/json, text/plain, */*"})
+    s.headers.update({"User-Agent": "AGrader/1.9 (+login)","Accept": "application/json, text/plain, */*"})
     return s
+
 def login(username: str, password: str) -> AuthResult:
     try:
         sess = _session_with_retries()
@@ -359,9 +376,10 @@ def login(username: str, password: str) -> AuthResult:
         logging.error(f"[AUTH] {e}", exc_info=True); return AuthResult(False, detail=str(e))
 PY
 
+  # ---------- extractor.py ----------
   cat > "$APP_DIR/extractor.py" <<'PY'
 import os, subprocess, mimetypes, logging
-from typing import Tuple
+from typing import Tuple, List
 from PIL import Image
 import pytesseract
 
@@ -428,6 +446,7 @@ def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1
     except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: unknown file read exception: {repr(e)}]]"
 PY
 
+  # ---------- ai_providers.py ----------
   cat > "$APP_DIR/ai_providers.py" <<'PY'
 import os, time, json, requests, logging, random, re
 
@@ -522,6 +541,7 @@ class AIClient:
             return data["candidates"][0]["content"]["parts"][0]["text"]
 PY
 
+  # ---------- seiue_api.py ----------
   cat > "$APP_DIR/seiue_api.py" <<'PY'
 import os, logging, requests, threading
 from typing import Dict, Any, List
@@ -662,8 +682,9 @@ class Seiue:
         return False
 PY
 
+  # ---------- main.py ----------
   cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, logging, re, tempfile, threading
+import os, json, time, logging, re, tempfile, threading, math
 import concurrent.futures as cf
 from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
@@ -672,6 +693,7 @@ from extractor import file_to_text
 from ai_providers import AIClient
 from seiue_api import Seiue
 
+# -------------------- logging --------------------
 def setup_logging():
     level = os.getenv("LOG_LEVEL","INFO").upper()
     level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARN": logging.WARN, "WARNING": logging.WARN, "ERROR": logging.ERROR}
@@ -687,6 +709,7 @@ def setup_logging():
     except Exception: logging.warning(f"Cannot open LOG_FILE={log_file} for writing.")
     if log_level == logging.DEBUG: logging.getLogger("urllib3").setLevel(logging.INFO)
 
+# -------------------- env/state --------------------
 def _parse_task_ids(raw: str) -> List[int]:
     if not raw: return []
     out: List[int] = []
@@ -763,8 +786,9 @@ def telegram_notify(token: str, chat: str, text: str):
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat,"text": text,"parse_mode": "HTML","disable_web_page_preview": True}, timeout=20)
     except Exception as e: logging.error(f"[TG] {e}", exc_info=True)
 
+# -------------------- helpers --------------------
 def extract_submission_text(sub: Dict[str,Any]) -> str:
-    t = sub.get("content_text","") or sub.get("content","")
+    t = (sub or {}).get("content_text","") or (sub or {}).get("content","")
     try:
         if isinstance(t,str) and t.strip().startswith("{"): return draftjs_to_text(t)
         if isinstance(t,str): return t
@@ -772,21 +796,40 @@ def extract_submission_text(sub: Dict[str,Any]) -> str:
     return ""
 
 def normalize_attach_id(obj) -> int | None:
-    # allow int/str-id or dict with various id keys
+    """Return an integer file id if present, else None."""
+    if obj is None: return None
     if isinstance(obj, int): return obj
     if isinstance(obj, str) and obj.isdigit(): return int(obj)
     if isinstance(obj, dict):
-        keys = ["id","file_id","netdisk_file_id","fileId","fid","attachment_id","uid"]
-        for k in keys:
-            if k in obj:
-                v = obj[k]
-                if isinstance(v, int): return v
-                if isinstance(v, str) and v.isdigit(): return int(v)
-                if isinstance(v, dict):
-                    vv = v.get("id") or v.get("file_id")
-                    if isinstance(vv, int): return vv
-                    if isinstance(vv, str) and vv.isdigit(): return int(vv)
+        for k in ("id","file_id","netdisk_file_id","attachment_id"):
+            v = obj.get(k)
+            if isinstance(v, int): return v
+            if isinstance(v, str) and v.isdigit(): return int(v)
+        # nested
+        v = obj.get("file") or obj.get("resource") or {}
+        for k in ("id","file_id","netdisk_file_id","attachment_id"):
+            vv = v.get(k) if isinstance(v, dict) else None
+            if isinstance(vv, int): return vv
+            if isinstance(vv, str) and vv.isdigit(): return int(vv)
     return None
+
+def collect_attachment_ids(sub: Dict[str,Any]) -> List[int]:
+    ids: List[int] = []
+    if not sub: return ids
+    pools = []
+    for key in ("attachments","files","images","resources","netdisk_files"):
+        v = sub.get(key)
+        if isinstance(v, list): pools.append(v)
+    for arr in pools:
+        for it in arr:
+            fid = normalize_attach_id(it)
+            if fid is not None: ids.append(fid)
+    # dedup
+    out=[]; seen=set()
+    for x in ids:
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out
 
 def build_prompt(task: Dict[str,Any], item_meta: Dict[str,Any], stu: Dict[str,Any], sub_text: str, attach_texts: List[str], perq, overall_max) -> str:
     task_title = task.get("title","(untitled)")
@@ -822,7 +865,7 @@ def build_prompt(task: Dict[str,Any], item_meta: Dict[str,Any], stu: Dict[str,An
 
     lines.append("\n== 評分約束 ==")
     if perq:
-        lines.append("分題滿分："); 
+        lines.append("分題滿分：")
         for q in perq: lines.append(f"- {q['id']}: max {q['max']}")
         lines.append(f"總分上限 = {overall_max}")
     else:
@@ -837,6 +880,7 @@ def build_prompt(task: Dict[str,Any], item_meta: Dict[str,Any], stu: Dict[str,An
 規則：切勿超過滿分；能整數就整數；中文簡潔評語；不要多餘鍵。""")
     return "\n".join(lines)
 
+# -------------------- main loop --------------------
 def main():
     setup_logging()
     cfg = load_env()
@@ -864,200 +908,266 @@ def main():
         logging.warning("get_tasks_bulk empty; fallback to single fetch.")
         task_map = {tid: api.get_task(tid) for tid in cfg["task_ids"]}
 
-    for task_id in cfg["task_ids"]:
-        try:
-            task = task_map.get(task_id) or api.get_task(task_id)
-            item_id = (task.get("custom_fields") or {}).get("item_id") or task.get("item_id")
-            if not item_id:
-                logging.warning(f"[TASK {task_id}] no item_id; skip.")
-                continue
-            item_meta = api.get_item_detail(int(item_id)) or {}
-            try: full_score = float(item_meta.get("full_score") or 100)
-            except Exception: full_score = 100.0
-            perq, overall_max_guess = scan_question_maxima(task)
-            overall_max = full_score if full_score else overall_max_guess
+    while True:
+        for task_id in cfg["task_ids"]:
+            try:
+                task = task_map.get(task_id) or api.get_task(task_id)
+                item_id = (task.get("custom_fields") or {}).get("item_id") or task.get("item_id")
+                if not item_id:
+                    logging.warning(f"[TASK {task_id}] no item_id; skip.")
+                    continue
+                item_meta = {}
+                try:
+                    item_meta = api.get_item_detail(int(item_id)) or {}
+                except Exception as e:
+                    logging.warning(f"[TASK {task_id}] item detail error: {e}")
 
-            assigns = api.get_assignments(task_id) or []
-            sem = threading.Semaphore(cfg["ai_parallel"])
+                perq, overall_max = scan_question_maxima(task)
+                ass = api.get_assignments(task_id) or []
+                if not ass:
+                    logging.debug(f"[TASK {task_id}] no assignments yet.")
+                    continue
 
-            def handle_one(a):
-                with sem:
-                    assignee = (a.get("assignee") or {})
-                    assignee_id = int(assignee.get("id") or 0)
-                    stu_name = assignee.get("name","")
-                    sub = a.get("submission") or {}
-                    sub_text = extract_submission_text(sub)
+                # process each assignment
+                for a in ass:
+                    try:
+                        rid = a.get("receiver_id") or (a.get("assignee") or {}).get("id")
+                        sid = a.get("id")
+                        stu = a.get("assignee") or {}
+                        sub = a.get("submission") or {}
 
-                    # attachments normalize + text extraction
-                    attach_texts: List[str] = []
-                    atts = sub.get("attachments") or []
-                    if atts:
-                        def one_attach(raw):
-                            fid = normalize_attach_id(raw)
-                            if not fid:
-                                logging.error(f"[ATTACH] no resolvable file id: {raw}")
-                                return None
+                        # build unique key for idempotency
+                        sub_text = extract_submission_text(sub)
+                        attach_ids = collect_attachment_ids(sub)
+                        key_text = (sub_text or "") + ("|attach:" + ",".join(map(str,attach_ids)) if attach_ids else "")
+                        sig = stable_hash(key_text)
+                        prev = state["processed"].get(str(sid))
+                        if prev == sig and not cfg["review_all_existing"]:
+                            continue
+
+                        # fetch attachments (only when we have numeric IDs)
+                        attach_texts: List[str] = []
+                        if attach_ids:
+                            with cf.ThreadPoolExecutor(max_workers=cfg["attach_workers"]) as pool:
+                                futs=[]
+                                for fid in attach_ids:
+                                    futs.append(pool.submit(fetch_and_extract, api, fid, cfg))
+                                for fu in cf.as_completed(futs):
+                                    t = fu.result()
+                                    if t: attach_texts.append(t)
+
+                        prompt = build_prompt(task, item_meta, stu, sub_text, attach_texts, perq, overall_max)
+
+                        # call AI (with failover)
+                        result = ai.grade(prompt) or {}
+                        if (not result or (result.get("overall",{}).get("score") in (None,0) and not result.get("per_question"))) and ai_alt:
+                            logging.warning("[AI] primary returned empty/0; trying failover provider...")
+                            result = ai_alt.grade(prompt) or {}
+
+                        # clamp scores
+                        total = result.get("overall",{}).get("score",0) or 0
+                        try:
+                            total = float(total)
+                        except: total = 0.0
+                        total = clamp(total, 0.0, overall_max or 100.0)
+
+                        # write back
+                        if cfg["dry_run"]:
+                            logging.info(f"[DRYRUN][TASK {task_id}] {stu.get('name','')} overall={total}")
+                        else:
+                            if cfg["score_write"]:
+                                ok = api.post_item_score(int(item_id), int(rid), int(task_id), float(total))
+                                logging.info(f"[SCORE][TASK {task_id}] rid={rid} total={total} ok={ok}")
+                            # review (brief overall comment)
                             try:
-                                url = api.get_file_signed_url(str(fid))
-                                blob = api.download(url)
-                                if len(blob) > cfg["max_attach"]:
-                                    logging.warning(f"[ATTACH] skip large file (bytes={len(blob)}) id={fid}")
-                                    return f"[[skipped: file too large ({len(blob)} bytes)]]"
-                                import tempfile, os
-                                fd, p = tempfile.mkstemp(prefix="attach_", suffix=".bin")
-                                try:
-                                    with os.fdopen(fd,"wb") as f: f.write(blob)
-                                    return file_to_text(p, cfg["ocr_lang"], cfg["max_attach"])
-                                finally:
-                                    os.unlink(p)
+                                comment = (result.get("overall",{}) or {}).get("comment","") or "已閱。"
+                                api.post_review(int(rid), int(task_id), comment, result="approved")
                             except Exception as e:
-                                logging.error(f"[ATTACH] {raw} {e}", exc_info=False)
-                                return f"[[error: attach {e}]]"
+                                logging.warning(f"[REVIEW] post failed: {e}")
 
-                        maxw = max(1, cfg["attach_workers"])
-                        with cf.ThreadPoolExecutor(max_workers=maxw) as pool:
-                            for txt in pool.map(one_attach, atts):
-                                if txt: attach_texts.append(txt)
+                        state["processed"][str(sid)] = sig
+                        save_state(cfg["state_path"], state)
 
-                    prompt = build_prompt(task, item_meta, assignee, sub_text, attach_texts, perq, overall_max)
-                    result = ai.grade(prompt) or {}
-                    ov = (result.get("overall") or {})
-                    score = ov.get("score", 0)
-                    try: score = float(score)
-                    except Exception: score = 0.0
+                    except Exception as e:
+                        logging.error(f"[ASSIGNMENT] error: {e}", exc_info=True)
+                        state["failed"].append({"task_id": task_id, "assignment": a, "error": str(e)})
+                        save_state(cfg["state_path"], state)
 
-                    if (not score or score == 0.0) and cfg["ai_failover"] and ai_alt:
-                        logging.warning("[AI] primary returned empty/0; trying failover provider...")
-                        result = ai_alt.grade(prompt) or {}
-                        ov = (result.get("overall") or {})
-                        score = ov.get("score", 0)
-                        try: score = float(score)
-                        except Exception: score = 0.0
+            except Exception as e:
+                logging.error(f"[TASK {task_id}] loop error: {e}", exc_info=True)
 
-                    score = clamp(score, 0.0, float(overall_max))
+        time.sleep(max(2, cfg["interval"]))
 
-                    # write score
-                    ok = True
-                    if cfg["score_write"] and not cfg["dry_run"] and assignee_id:
-                        ok = api.post_item_score(int(item_id), assignee_id, int(task_id), score)
+def fetch_and_extract(api: Seiue, fid: int, cfg: Dict[str,Any]) -> str:
+    try:
+        url = api.get_file_signed_url(str(int(fid)))
+    except Exception as e:
+        logging.error(f"[ATTACH] invalid file id={fid}: {e}")
+        return ""
+    if not url:
+        logging.error(f"[ATTACH] file id={fid}: empty url")
+        return ""
+    try:
+        data = api.download(url)
+    except Exception as e:
+        logging.error(f"[ATTACH] download error id={fid}: {e}")
+        return ""
+    if not data or len(data) == 0:
+        return ""
+    if len(data) > cfg["max_attach"]:
+        logging.info(f"[ATTACH] skip large id={fid} bytes={len(data)} > cap={cfg['max_attach']}")
+        return ""
+    # store temp file then extract text
+    import tempfile, os, uuid
+    suffix = guess_suffix_from_url(url)
+    path = os.path.join(tempfile.gettempdir(), f"ag_{uuid.uuid4().hex}{suffix}")
+    try:
+        with open(path,"wb") as f: f.write(data)
+        txt = file_to_text(path, ocr_lang=cfg["ocr_lang"], size_cap=cfg["max_attach"])
+        return txt or ""
+    finally:
+        if (os.getenv("KEEP_WORK_FILES","0") in ("0","false","False")):
+            try: os.remove(path)
+            except: pass
 
-                    state["processed"].setdefault(str(task_id), {})[str(assignee_id)] = {"name": stu_name, "ts": time.time(), "score": score}
-                    if ok:
-                        state["scored"].setdefault(str(task_id), {})[str(assignee_id)] = score
-                    else:
-                        state["failed"].append({"task": task_id, "assignee": assignee_id, "score": score, "ts": time.time()})
-                    save_state(cfg["state_path"], state)
-
-            # process students
-            for a in assigns:
-                handle_one(a)
-
-        except Exception as e:
-            logging.error(f"[TASK {task_id}] {e}", exc_info=True)
-
-    logging.info("[EXEC] Done.")
+def guess_suffix_from_url(url: str) -> str:
+    m = re.search(r"\.([A-Za-z0-9]{2,5})(?:\?|$)", url)
+    if m: return "."+m.group(1).lower()
+    return ""
 
 if __name__ == "__main__":
     main()
 PY
 }
 
-write_service_linux() {
+create_venv_and_deps() {
+  echo "[4/10] Creating venv and installing requirements..."
+  python3 -m venv "$VENV_DIR" 2>/dev/null || true
+  # shellcheck disable=SC1091
+  . "$VENV_DIR/bin/activate"
+  pip install --upgrade pip >/dev/null
+  pip install -r "$APP_DIR/requirements.txt"
+  deactivate || true
+}
+
+write_systemd() {
   echo "[5/10] Writing systemd service (Linux)..."
-  mkdir -p "$(dirname "$SERVICE_PATH")"
   cat > "$SERVICE_PATH" <<EOF
 [Unit]
 Description=AGrader - Seiue auto-grader
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=${APP_DIR}
-ExecStart=${VENV_DIR}/bin/python ${APP_DIR}/main.py
-Environment=PYTHONUNBUFFERED=1
+User=root
+WorkingDirectory=$APP_DIR
+Environment="ENV_PATH=$ENV_FILE"
+ExecStart=$VENV_DIR/bin/python $PY_MAIN
 Restart=always
-RestartSec=10
+RestartSec=20s
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  systemctl daemon-reload
 }
 
-write_launchd_macos() {
-  echo "[5/10] Writing launchd plist (macOS, optional)..."
+enable_start_linux() {
+  echo "[7/10] Enabling and starting..."
+  systemctl stop "$SERVICE" 2>/dev/null || true
+  systemctl enable "$SERVICE" --now
+  echo "[8/10] Done. Logs:"
+  journalctl -u "$SERVICE" -n 20 --no-pager || true
+  echo "Tail: journalctl -u $SERVICE -f"
+}
+
+write_launchd() {
+  echo "[5/10] Writing launchd plist (macOS)..."
   mkdir -p "$(dirname "$LAUNCHD_PLIST")"
   cat > "$LAUNCHD_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>net.bdfz.agrader</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${VENV_DIR}/bin/python</string>
-    <string>${APP_DIR}/main.py</string>
+    <string>$VENV_DIR/bin/python</string>
+    <string>$PY_MAIN</string>
   </array>
-  <key>WorkingDirectory</key><string>${APP_DIR}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ENV_PATH</key><string>$ENV_FILE</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$APP_DIR</string>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${APP_DIR}/launchd.out.log</string>
-  <key>StandardErrorPath</key><string>${APP_DIR}/launchd.err.log</string>
+  <key>StandardOutPath</key><string>$APP_DIR/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>$APP_DIR/launchd.err.log</string>
 </dict>
 </plist>
 EOF
 }
 
+enable_start_macos() {
+  echo "[7/10] Enabling and starting (launchd)..."
+  launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+  launchctl load "$LAUNCHD_PLIST"
+  launchctl start net.bdfz.agrader 2>/dev/null || true
+  echo "[8/10] Done. Logs:"
+  tail -n 50 "$APP_DIR/launchd.out.log" 2>/dev/null || true
+  echo "Tail: tail -f $APP_DIR/launchd.out.log"
+}
+
+stop_existing() {
+  echo "[6/10] Stopping existing service if running..."
+  case "$(os_detect)" in
+    linux) systemctl stop "$SERVICE" 2>/dev/null || true;;
+    mac)   launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true;;
+    *)     true;;
+  esac
+}
+
+# -------------------- MAIN INSTALL FLOW --------------------
 main() {
-  local OS=$(os_detect)
-  case "$OS" in
+  mkdir -p "$APP_DIR" "$APP_DIR/work"
+
+  case "$(os_detect)" in
     linux) install_pkgs_linux;;
     mac)   install_pkgs_macos;;
-    *) echo "Unsupported OS"; exit 1;;
+    *)     echo "Unsupported OS."; exit 1;;
   esac
 
-  echo "[6/10] Stopping existing service if running..."
-  if [ "$OS" = "linux" ] && have systemctl; then
-    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-  elif [ "$OS" = "mac" ]; then
-    launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
-  fi
-
+  stop_existing
   write_project
-
-  # ★ 每次安装都强制询问 Task IDs（其它 .env 保持不变）
-  [ -f "$ENV_FILE" ] || { echo "ERROR: $ENV_FILE missing"; exit 1; }
   prompt_task_ids
+  create_venv_and_deps
 
-  echo "[4/10] Creating venv and installing requirements..."
-  python3 -m venv "$VENV_DIR"
-  "$VENV_DIR/bin/pip" install -U pip wheel >/dev/null
-  "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
-
-  if [ "$OS" = "linux" ]; then
-    write_service_linux
-    echo "[7/10] Enabling and starting..."
-    systemctl daemon-reload
-    systemctl enable "$SERVICE"
-    systemctl restart "$SERVICE"
-    echo "[8/10] Done. Logs:"
-    journalctl -u "$SERVICE" -n 30 --no-pager || true
-    echo "Tail: journalctl -u ${SERVICE} -f"
-  else
-    write_launchd_macos
-    echo "[7/10] Loading launchd (macOS)..."
-    launchctl load -w "$LAUNCHD_PLIST"
-    echo "[8/10] Done. Tail log: tail -f ${APP_DIR}/launchd.out.log"
+  if [ ! -s "$PY_MAIN" ]; then
+    echo "ERROR: $PY_MAIN missing!"; exit 2
   fi
 
-  echo "[9/10] Edit config anytime: sudo nano ${ENV_FILE}"
-  if [ "$OS" = "linux" ]; then
-    echo "[10/10] Re-run: sudo systemctl restart ${SERVICE}"
-  else
-    echo "[10/10] Re-run: launchctl unload ${LAUNCHD_PLIST} && launchctl load -w ${LAUNCHD_PLIST}"
-  fi
+  case "$(os_detect)" in
+    linux)
+      write_systemd
+      enable_start_linux
+      ;;
+    mac)
+      write_launchd
+      enable_start_macos
+      ;;
+  esac
+
+  echo "[9/10] Edit config anytime: sudo nano $ENV_FILE"
+  case "$(os_detect)" in
+    linux) echo "[10/10] Re-run: sudo systemctl restart $SERVICE";;
+    mac)   echo "[10/10] Re-run: launchctl kickstart -k gui/$(id -u)/net.bdfz.agrader";;
+  esac
 }
 
 main "$@"
