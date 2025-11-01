@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AGrader - API-first auto-grading pipeline (installer/runner)
-# Linux: apt/yum/apk + systemd; macOS: Homebrew + optional launchd
+# Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
 set -euo pipefail
 
 APP_DIR="/opt/agrader"
@@ -26,6 +26,46 @@ ask() { local p="$1" var="$2" def="${3:-}"; local ans;
   printf -v "$var" "%s" "$ans"
 }
 ask_secret() { local p="$1" var="$2"; local ans; read -r -s -p "$p: " ans || true; echo; printf -v "$var" "%s" "$ans"; }
+
+# --- safe key=val updater (only touch the target key) ---
+set_env_kv() {
+  local key="$1"; shift
+  local val="$*"
+  [ -f "$ENV_FILE" ] || { echo "ERROR: $ENV_FILE not found"; return 1; }
+  local esc="${val//\//\\/}"
+  if grep -qE "^${key}=" "$ENV_FILE"; then
+    sed -i.bak -E "s#^${key}=.*#${key}=${esc}#" "$ENV_FILE"
+  else
+    echo "${key}=${val}" >> "$ENV_FILE"
+  fi
+}
+
+# --- always prompt for MONITOR_TASK_IDS (every run) ---
+prompt_task_ids() {
+  echo "[2.5/10] Configure Task IDs..."
+  local cur=""
+  if [ -f "$ENV_FILE" ]; then
+    cur="$(grep -E '^MONITOR_TASK_IDS=' "$ENV_FILE" | cut -d= -f2- || true)"
+  fi
+  echo "Enter Task IDs (comma-separated), or paste URLs that contain /tasks/<id>."
+  local ans norm
+  while :; do
+    read -r -p "Task IDs [${cur:-none}]: " ans || true
+    ans="${ans:-$cur}"
+    norm="$(
+      printf "%s\n" "$ans" \
+      | tr ' ' '\n' \
+      | sed -nE 's#.*/tasks/([0-9]+).*#\1#p; t; s#[^0-9,]##gp' \
+      | tr '\n' ',' | sed -E 's#,+#,#g; s#^,##; s#,$##'
+    )"
+    if [ -n "$norm" ]; then
+      set_env_kv "MONITOR_TASK_IDS" "$norm"
+      echo "→ MONITOR_TASK_IDS=${norm}"
+      break
+    fi
+    echo "Empty. Please enter at least one ID."
+  done
+}
 
 install_pkgs_linux() {
   echo "[1/10] Installing system dependencies (Linux)..."
@@ -72,15 +112,12 @@ ensure_env_patch() {
   [ -f "$ENV_FILE" ] || return 0
   cp -f "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)" || true
 
-  # Logging defaults
-  if ! grep -q '^LOG_FORMAT=' "$ENV_FILE"; then
-    echo 'LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s' >> "$ENV_FILE"
-  elif grep -Eiq '^LOG_FORMAT=.*(%Y|%m|%d|%H|%M|%S)' "$ENV_FILE"; then
-    sed -i.bak -E 's#^LOG_FORMAT=.*#LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s#' "$ENV_FILE" || true
-  fi
+  # ---- Logging defaults（不覆盖用户已有值）----
+  grep -q '^LOG_FORMAT='  "$ENV_FILE" || echo 'LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s' >> "$ENV_FILE"
   grep -q '^LOG_DATEFMT=' "$ENV_FILE" || echo 'LOG_DATEFMT=%Y-%m-%d %H:%M:%S' >> "$ENV_FILE"
+  grep -q '^LOG_FILE='    "$ENV_FILE" || echo "LOG_FILE=${APP_DIR}/agrader.log" >> "$ENV_FILE"
 
-  # Confirmed endpoints (只保留權威端點；清掉多餘回退)
+  # ---- 权威端点：强制收敛到确认过的接口（会覆盖旧值）----
   if grep -q '^SEIUE_SCORE_ENDPOINTS=' "$ENV_FILE"; then
     sed -i.bak -E 's#^SEIUE_SCORE_ENDPOINTS=.*#SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true\&from_task=true:array#' "$ENV_FILE" || true
   else
@@ -91,28 +128,19 @@ ensure_env_patch() {
   grep -q '^SEIUE_VERIFY_SCORE_GET_TEMPLATE=' "$ENV_FILE" || \
     echo 'SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&type=item_score' >> "$ENV_FILE"
 
-  # Strategy toggles / concurrency / AI backoff（降到安全基線）
-  grep -q '^DRY_RUN=' "$ENV_FILE" || echo 'DRY_RUN=0' >> "$ENV_FILE"
-  grep -q '^VERIFY_AFTER_WRITE=' "$ENV_FILE" || echo 'VERIFY_AFTER_WRITE=1' >> "$ENV_FILE"
-  grep -q '^RETRY_FAILED=' "$ENV_FILE" || echo 'RETRY_FAILED=1' >> "$ENV_FILE"
-  if grep -q '^STUDENT_WORKERS=' "$ENV_FILE"; then
-    sed -i.bak -E 's#^STUDENT_WORKERS=.*#STUDENT_WORKERS=1#' "$ENV_FILE" || true
-  else
-    echo 'STUDENT_WORKERS=1' >> "$ENV_FILE"
-  fi
-  if grep -q '^ATTACH_WORKERS=' "$ENV_FILE"; then
-    sed -i.bak -E 's#^ATTACH_WORKERS=.*#ATTACH_WORKERS=3#' "$ENV_FILE" || true
-  else
-    echo 'ATTACH_WORKERS=3'  >> "$ENV_FILE"
-  fi
-  if grep -q '^AI_PARALLEL=' "$ENV_FILE"; then
-    sed -i.bak -E 's#^AI_PARALLEL=.*#AI_PARALLEL=1#' "$ENV_FILE" || true
-  else
-    echo 'AI_PARALLEL=1'     >> "$ENV_FILE"
-  fi
-  grep -q '^AI_MAX_RETRIES=' "$ENV_FILE"  || echo 'AI_MAX_RETRIES=5'  >> "$ENV_FILE"
-  grep -q '^AI_BACKOFF_BASE_SECONDS=' "$ENV_FILE" || echo 'AI_BACKOFF_BASE_SECONDS=2.5' >> "$ENV_FILE"
-  grep -q '^AI_JITTER_SECONDS=' "$ENV_FILE" || echo 'AI_JITTER_SECONDS=0.8' >> "$ENV_FILE"
+  # ---- Strategy / concurrency：缺失才填（不覆盖用户已有值）----
+  grep -q '^DRY_RUN='                 "$ENV_FILE" || echo 'DRY_RUN=0'                  >> "$ENV_FILE"
+  grep -q '^VERIFY_AFTER_WRITE='      "$ENV_FILE" || echo 'VERIFY_AFTER_WRITE=1'       >> "$ENV_FILE"
+  grep -q '^RETRY_FAILED='            "$ENV_FILE" || echo 'RETRY_FAILED=1'             >> "$ENV_FILE"
+  grep -q '^STUDENT_WORKERS='         "$ENV_FILE" || echo 'STUDENT_WORKERS=1'          >> "$ENV_FILE"
+  grep -q '^ATTACH_WORKERS='          "$ENV_FILE" || echo 'ATTACH_WORKERS=3'           >> "$ENV_FILE"
+  grep -q '^AI_PARALLEL='             "$ENV_FILE" || echo 'AI_PARALLEL=1'              >> "$ENV_FILE"
+  grep -q '^AI_MAX_RETRIES='          "$ENV_FILE" || echo 'AI_MAX_RETRIES=5'           >> "$ENV_FILE"
+  grep -q '^AI_BACKOFF_BASE_SECONDS=' "$ENV_FILE" || echo 'AI_BACKOFF_BASE_SECONDS=2.5'>> "$ENV_FILE"
+  grep -q '^AI_JITTER_SECONDS='       "$ENV_FILE" || echo 'AI_JITTER_SECONDS=0.8'      >> "$ENV_FILE"
+  grep -q '^AI_FAILOVER='             "$ENV_FILE" || echo 'AI_FAILOVER=1'              >> "$ENV_FILE"
+  grep -q '^MAX_ATTACHMENT_BYTES='    "$ENV_FILE" || echo 'MAX_ATTACHMENT_BYTES=25165824' >> "$ENV_FILE"
+  grep -q '^OCR_LANG='                "$ENV_FILE" || echo 'OCR_LANG=chi_sim+eng'       >> "$ENV_FILE"
 }
 
 write_project() {
@@ -135,7 +163,7 @@ write_project() {
     ask "X-Reflection-Id (manual; empty if auto-login)" SEIUE_REFLECTION_ID ""
     ask_secret "Bearer token (manual; empty if auto-login)" SEIUE_BEARER
 
-    ask "Comma-separated Task IDs or URLs to monitor" MONITOR_TASK_IDS
+    ask "Comma-separated Task IDs or URLs to monitor" MONITOR_TASK_IDS ""
     ask "Polling interval seconds" POLL_INTERVAL "10"
 
     echo
@@ -175,16 +203,6 @@ write_project() {
     LOG_FORMAT="%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
     LOG_DATEFMT="%Y-%m-%d %H:%M:%S"
 
-    DRY_RUN="0"
-    VERIFY_AFTER_WRITE="1"
-    RETRY_FAILED="1"
-    STUDENT_WORKERS="1"
-    ATTACH_WORKERS="3"
-    AI_PARALLEL="1"
-    AI_MAX_RETRIES="5"
-    AI_BACKOFF_BASE_SECONDS="2.5"
-    AI_JITTER_SECONDS="0.8"
-
   cat > "$ENV_FILE" <<EOF
 # ---- Seiue ----
 SEIUE_BASE=${SEIUE_BASE}
@@ -208,16 +226,16 @@ GEMINI_API_KEY=${GEMINI_API_KEY}
 GEMINI_MODEL=${GEMINI_MODEL}
 DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
 DEEPSEEK_MODEL=${DEEPSEEK_MODEL}
-AI_PARALLEL=${AI_PARALLEL}
-AI_MAX_RETRIES=${AI_MAX_RETRIES}
-AI_BACKOFF_BASE_SECONDS=${AI_BACKOFF_BASE_SECONDS}
-AI_JITTER_SECONDS=${AI_JITTER_SECONDS}
+AI_PARALLEL=1
+AI_MAX_RETRIES=5
+AI_BACKOFF_BASE_SECONDS=2.5
+AI_JITTER_SECONDS=0.8
 AI_FAILOVER=1
 
 # ---- Telegram ----
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-TELEGRAM_VERBOSE=${TELEGRAM_VERBOSE}
+TELEGRAM_VERBOSE=1
 
 # ---- Extractor & resource limits ----
 MAX_ATTACHMENT_BYTES=25165824
@@ -237,13 +255,13 @@ LOG_DATEFMT=${LOG_DATEFMT}
 SCORE_WRITE=1
 REVIEW_ALL_EXISTING=1
 SCORE_GIVE_ALL_ON_START=1
-DRY_RUN=${DRY_RUN}
-VERIFY_AFTER_WRITE=${VERIFY_AFTER_WRITE}
-RETRY_FAILED=${RETRY_FAILED}
+DRY_RUN=0
+VERIFY_AFTER_WRITE=1
+RETRY_FAILED=1
 
 # ---- Concurrency ----
-STUDENT_WORKERS=${STUDENT_WORKERS}
-ATTACH_WORKERS=${ATTACH_WORKERS}
+STUDENT_WORKERS=1
+ATTACH_WORKERS=3
 
 # ---- Paths/State ----
 STATE_PATH=${APP_DIR}/state.json
@@ -252,8 +270,10 @@ EOF
     chmod 600 "$ENV_FILE"
   else
     echo "Reusing existing $ENV_FILE"
-    ensure_env_patch
   fi
+
+  # 只补缺省，不覆盖已有；但端点强制收敛
+  ensure_env_patch
 
   echo "[3/10] Writing project files..."
   cat > "$APP_DIR/requirements.txt" <<'EOF'
@@ -408,7 +428,6 @@ def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1
     except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: unknown file read exception: {repr(e)}]]"
 PY
 
-  # ---- ai_providers.py：修正：空輸出不再修，JSON 修復改走對向供應商 ----
   cat > "$APP_DIR/ai_providers.py" <<'PY'
 import os, time, json, requests, logging, random, re
 
@@ -503,7 +522,6 @@ class AIClient:
             return data["candidates"][0]["content"]["parts"][0]["text"]
 PY
 
-  # ---- seiue_api.py：登入單例鎖 + 422 視為成功 + 刪回退噪音 ----
   cat > "$APP_DIR/seiue_api.py" <<'PY'
 import os, logging, requests, threading
 from typing import Dict, Any, List
@@ -538,7 +556,6 @@ class Seiue:
     def _login_and_apply(self) -> bool:
         if not (self.username and self.password): return False
         with _login_lock:
-            # 可能其他執行緒已成功
             if self.bearer:
                 self._init_headers(); return True
             logging.info("[AUTH] Auto-login...")
@@ -646,7 +663,8 @@ class Seiue:
 PY
 
   cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, logging, re, tempfile, threading, concurrent.futures as cf
+import os, json, time, logging, re, tempfile, threading
+import concurrent.futures as cf
 from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
 from utilx import draftjs_to_text, scan_question_maxima, clamp, stable_hash
@@ -699,11 +717,11 @@ def load_env():
         "role": get("SEIUE_ROLE","teacher"),
         "reflection_id": get("SEIUE_REFLECTION_ID",""),
         "task_ids": _parse_task_ids(get("MONITOR_TASK_IDS","")),
-        "interval": int(get("POLL_INTERVAL","10")),
+        "interval": int(get("POLL_INTERVAL","10") or "10"),
         "workdir": get("WORKDIR","/opt/agrader/work"),
         "state_path": get("STATE_PATH","/opt/agrader/state.json"),
         "ocr_lang": get("OCR_LANG","chi_sim+eng"),
-        "max_attach": int(get("MAX_ATTACHMENT_BYTES","25165824")),
+        "max_attach": int(get("MAX_ATTACHMENT_BYTES","25165824") or "25165824"),
         "ai_provider": get("AI_PROVIDER","deepseek"),
         "gemini_key": get("GEMINI_API_KEY",""),
         "gemini_model": get("GEMINI_MODEL","gemini-2.5-pro"),
@@ -722,6 +740,7 @@ def load_env():
         "student_workers": int(get("STUDENT_WORKERS","1") or "1"),
         "attach_workers": int(get("ATTACH_WORKERS","3") or "3"),
         "ai_failover": as_bool(get("AI_FAILOVER","1")),
+        "log_level": get("LOG_LEVEL","INFO"),
     }
 
 def load_state(path: str) -> Dict[str, Any]:
@@ -751,6 +770,23 @@ def extract_submission_text(sub: Dict[str,Any]) -> str:
         if isinstance(t,str): return t
     except Exception: pass
     return ""
+
+def normalize_attach_id(obj) -> int | None:
+    # allow int/str-id or dict with various id keys
+    if isinstance(obj, int): return obj
+    if isinstance(obj, str) and obj.isdigit(): return int(obj)
+    if isinstance(obj, dict):
+        keys = ["id","file_id","netdisk_file_id","fileId","fid","attachment_id","uid"]
+        for k in keys:
+            if k in obj:
+                v = obj[k]
+                if isinstance(v, int): return v
+                if isinstance(v, str) and v.isdigit(): return int(v)
+                if isinstance(v, dict):
+                    vv = v.get("id") or v.get("file_id")
+                    if isinstance(vv, int): return vv
+                    if isinstance(vv, str) and vv.isdigit(): return int(vv)
+    return None
 
 def build_prompt(task: Dict[str,Any], item_meta: Dict[str,Any], stu: Dict[str,Any], sub_text: str, attach_texts: List[str], perq, overall_max) -> str:
     task_title = task.get("title","(untitled)")
@@ -806,7 +842,11 @@ def main():
     cfg = load_env()
     state = load_state(cfg["state_path"])
 
-    # 實例化 AI（允許 failover）
+    if not cfg["task_ids"]:
+        logging.info("No MONITOR_TASK_IDS provided; exiting.")
+        return
+
+    # AI with optional failover
     def make_ai(provider):
         if provider == "gemini":
             return AIClient("gemini", cfg["gemini_model"], cfg["gemini_key"])
@@ -815,22 +855,15 @@ def main():
     ai = make_ai(cfg["ai_provider"])
     ai_alt = make_ai("deepseek" if cfg["ai_provider"]=="gemini" else "gemini") if cfg["ai_failover"] else None
 
-    # API client
     api = Seiue(cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"], cfg["reflection_id"], cfg["username"], cfg["password"])
-
-    if not cfg["task_ids"]:
-        logging.info("No MONITOR_TASK_IDS provided; exiting.")
-        return
 
     logging.info(f"[EXEC] Monitoring tasks={cfg['task_ids']} with STUDENT_WORKERS={cfg['student_workers']} ATTACH_WORKERS={cfg['attach_workers']} AI_PARALLEL={cfg['ai_parallel']}")
 
-    # 批量取 task 元資料
     task_map = api.get_tasks_bulk(cfg["task_ids"])
     if not task_map:
-        logging.warning("get_tasks_bulk returned empty; will fallback to single fetch per task.")
+        logging.warning("get_tasks_bulk empty; fallback to single fetch.")
         task_map = {tid: api.get_task(tid) for tid in cfg["task_ids"]}
 
-    # 主循環（單次跑一輪即可；若做 daemon，外層 systemd 負責重啟/定時）
     for task_id in cfg["task_ids"]:
         try:
             task = task_map.get(task_id) or api.get_task(task_id)
@@ -838,19 +871,13 @@ def main():
             if not item_id:
                 logging.warning(f"[TASK {task_id}] no item_id; skip.")
                 continue
-
             item_meta = api.get_item_detail(int(item_id)) or {}
-            # 權威滿分與路徑
-            try:
-                full_score = float(item_meta.get("full_score") or 100)
-            except Exception:
-                full_score = 100.0
-
+            try: full_score = float(item_meta.get("full_score") or 100)
+            except Exception: full_score = 100.0
             perq, overall_max_guess = scan_question_maxima(task)
             overall_max = full_score if full_score else overall_max_guess
 
             assigns = api.get_assignments(task_id) or []
-            # 學生並發處理（保守）
             sem = threading.Semaphore(cfg["ai_parallel"])
 
             def handle_one(a):
@@ -861,108 +888,106 @@ def main():
                     sub = a.get("submission") or {}
                     sub_text = extract_submission_text(sub)
 
-                    # 附件抽取（串列小量，ATTACH_WORKERS 控制）
-                    attach_texts=[]
+                    # attachments normalize + text extraction
+                    attach_texts: List[str] = []
                     atts = sub.get("attachments") or []
                     if atts:
-                        def one_attach(fid):
+                        def one_attach(raw):
+                            fid = normalize_attach_id(raw)
+                            if not fid:
+                                logging.error(f"[ATTACH] no resolvable file id: {raw}")
+                                return None
                             try:
                                 url = api.get_file_signed_url(str(fid))
-                                import tempfile, os
                                 blob = api.download(url)
-                                fd, p = tempfile.mkstemp(prefix="attach_", suffix=os.path.splitext(url.split("?")[0])[1])
-                                with os.fdopen(fd,"wb") as f: f.write(blob)
-                                txt = file_to_text(p, cfg["ocr_lang"], cfg["max_attach"])
+                                if len(blob) > cfg["max_attach"]:
+                                    logging.warning(f"[ATTACH] skip large file (bytes={len(blob)}) id={fid}")
+                                    return f"[[skipped: file too large ({len(blob)} bytes)]]"
+                                import tempfile, os
+                                fd, p = tempfile.mkstemp(prefix="attach_", suffix=".bin")
                                 try:
-                                    if os.getenv("KEEP_WORK_FILES","0") in ("0","false","False"): os.remove(p)
-                                except Exception: pass
-                                return txt
+                                    with os.fdopen(fd,"wb") as f: f.write(blob)
+                                    return file_to_text(p, cfg["ocr_lang"], cfg["max_attach"])
+                                finally:
+                                    os.unlink(p)
                             except Exception as e:
-                                logging.error(f"[ATTACH] {fid} {e}", exc_info=True); return f"[[error: attach {fid}]]"
-                        with cf.ThreadPoolExecutor(max_workers=cfg["attach_workers"]) as tp:
-                            futures=[tp.submit(one_attach, (x.get('id') or x)) for x in atts]
-                            for fut in cf.as_completed(futures):
-                                attach_texts.append(fut.result() or "")
+                                logging.error(f"[ATTACH] {raw} {e}", exc_info=False)
+                                return f"[[error: attach {e}]]"
 
-                    # 構建 Prompt 並評分
-                    prompt = build_prompt(task, item_meta, {"id": assignee_id, "name": stu_name}, sub_text, attach_texts, perq, overall_max)
-                    try:
-                        result = ai.grade(prompt)
-                        if cfg["ai_failover"] and not result.get("per_question") and (result.get("overall",{}).get("score",0) == 0) and ai_alt:
-                            logging.warning("[AI] primary returned empty/0; trying failover provider...")
-                            result = ai_alt.grade(prompt)
-                    except Exception as e:
-                        logging.error(f"[AI] grade error: {e}", exc_info=True)
-                        result = {"per_question": [], "overall": {"score": 0, "comment": "AI exception"}}
+                        maxw = max(1, cfg["attach_workers"])
+                        with cf.ThreadPoolExecutor(max_workers=maxw) as pool:
+                            for txt in pool.map(one_attach, atts):
+                                if txt: attach_texts.append(txt)
 
-                    try:
-                        overall_score = float(result.get("overall",{}).get("score",0) or 0.0)
-                    except Exception:
-                        overall_score = 0.0
-                    overall_score = clamp(overall_score, 0.0, overall_max or 100.0)
+                    prompt = build_prompt(task, item_meta, assignee, sub_text, attach_texts, perq, overall_max)
+                    result = ai.grade(prompt) or {}
+                    ov = (result.get("overall") or {})
+                    score = ov.get("score", 0)
+                    try: score = float(score)
+                    except Exception: score = 0.0
 
-                    # 寫入：review + score
-                    if os.getenv("SCORE_WRITE","1") not in ("0","false","False"):
-                        try:
-                            api.post_review(assignee_id, task_id, result.get("overall",{}).get("comment",""))
-                        except Exception as e:
-                            logging.error(f"[REVIEW] {assignee_id} {e}", exc_info=True)
-                        try:
-                            ok = api.post_item_score(int(item_id), assignee_id, task_id, overall_score)
-                            if not ok:
-                                logging.warning(f"[SCORE] not ok for owner={assignee_id}")
-                        except Exception as e:
-                            logging.error(f"[SCORE] {assignee_id} {e}", exc_info=True)
+                    if (not score or score == 0.0) and cfg["ai_failover"] and ai_alt:
+                        logging.warning("[AI] primary returned empty/0; trying failover provider...")
+                        result = ai_alt.grade(prompt) or {}
+                        ov = (result.get("overall") or {})
+                        score = ov.get("score", 0)
+                        try: score = float(score)
+                        except Exception: score = 0.0
 
+                    score = clamp(score, 0.0, float(overall_max))
+
+                    # write score
+                    ok = True
+                    if cfg["score_write"] and not cfg["dry_run"] and assignee_id:
+                        ok = api.post_item_score(int(item_id), assignee_id, int(task_id), score)
+
+                    state["processed"].setdefault(str(task_id), {})[str(assignee_id)] = {"name": stu_name, "ts": time.time(), "score": score}
+                    if ok:
+                        state["scored"].setdefault(str(task_id), {})[str(assignee_id)] = score
+                    else:
+                        state["failed"].append({"task": task_id, "assignee": assignee_id, "score": score, "ts": time.time()})
+                    save_state(cfg["state_path"], state)
+
+            # process students
             for a in assigns:
-                try:
-                    handle_one(a)
-                except Exception as e:
-                    logging.error(f"[STUDENT] handle error: {e}", exc_info=True)
+                handle_one(a)
 
         except Exception as e:
-            logging.error(f"[TASK {task_id}] fatal: {e}", exc_info=True)
+            logging.error(f"[TASK {task_id}] {e}", exc_info=True)
+
+    logging.info("[EXEC] Done.")
 
 if __name__ == "__main__":
     main()
 PY
 }
 
-create_venv() {
-  echo "[4/10] Creating venv and installing requirements..."
-  python3 -m venv "$VENV_DIR"
-  "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
-  "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt" >/dev/null
-}
-
 write_service_linux() {
   echo "[5/10] Writing systemd service (Linux)..."
+  mkdir -p "$(dirname "$SERVICE_PATH")"
   cat > "$SERVICE_PATH" <<EOF
 [Unit]
 Description=AGrader - Seiue auto-grader
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-Environment=ENV_PATH=$ENV_FILE
-ExecStart=$VENV_DIR/bin/python $APP_DIR/main.py
+WorkingDirectory=${APP_DIR}
+ExecStart=${VENV_DIR}/bin/python ${APP_DIR}/main.py
+Environment=PYTHONUNBUFFERED=1
 Restart=always
-RestartSec=20s
-StartLimitIntervalSec=300
-StartLimitBurst=3
-WorkingDirectory=$APP_DIR
-# 日誌交給 journalctl；檔案路徑由 LOG_FILE 控制
-LimitNOFILE=65535
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
 }
 
 write_launchd_macos() {
-  echo "[5/10] Writing launchd plist (macOS)..."
+  echo "[5/10] Writing launchd plist (macOS, optional)..."
   mkdir -p "$(dirname "$LAUNCHD_PLIST")"
   cat > "$LAUNCHD_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -972,75 +997,67 @@ write_launchd_macos() {
   <key>Label</key><string>net.bdfz.agrader</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$VENV_DIR/bin/python</string>
-    <string>$APP_DIR/main.py</string>
+    <string>${VENV_DIR}/bin/python</string>
+    <string>${APP_DIR}/main.py</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>ENV_PATH</key><string>$ENV_FILE</string>
-  </dict>
+  <key>WorkingDirectory</key><string>${APP_DIR}</string>
   <key>RunAtLoad</key><true/>
-  <key>WorkingDirectory</key><string>$APP_DIR</string>
-  <key>StandardOutPath</key><string>$APP_DIR/launchd.out.log</string>
-  <key>StandardErrorPath</key><string>$APP_DIR/launchd.err.log</string>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${APP_DIR}/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>${APP_DIR}/launchd.err.log</string>
 </dict>
 </plist>
 EOF
 }
 
-stop_existing() {
-  echo "[6/10] Stopping existing service if running..."
-  if [ "$(os_detect)" = "linux" ] && systemctl is-active --quiet "$SERVICE"; then
-    systemctl stop "$SERVICE" || true
-  fi
-  if [ "$(os_detect)" = "mac" ] && launchctl list | grep -q "net.bdfz.agrader"; then
-    launchctl unload "$LAUNCHD_PLIST" || true
-  fi
-}
-
-start_service() {
-  echo "[7/10] Enabling and starting..."
-  if [ "$(os_detect)" = "linux" ]; then
-    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-    systemctl restart "$SERVICE"
-    sleep 1
-    systemctl status --no-pager "$SERVICE" || true
-  elif [ "$(os_detect)" = "mac" ]; then
-    launchctl load -w "$LAUNCHD_PLIST"
-    sleep 1
-    launchctl list | grep net.bdfz.agrader || true
-  fi
-}
-
-post_notes() {
-  echo "[8/10] Done. Logs:"
-  if [ "$(os_detect)" = "linux" ]; then
-    journalctl -u "$SERVICE" -n 50 --no-pager || true
-    echo
-    echo "Tail: journalctl -u $SERVICE -f"
-  else
-    echo "Tail: tail -f $APP_DIR/launchd.err.log $APP_DIR/launchd.out.log"
-  fi
-  echo "[9/10] Edit config: sudo nano $ENV_FILE"
-  echo "[10/10] Re-run: sudo systemctl restart $SERVICE   (macOS: launchctl unload/load)"
-}
-
 main() {
-  case "$(os_detect)" in
+  local OS=$(os_detect)
+  case "$OS" in
     linux) install_pkgs_linux;;
     mac)   install_pkgs_macos;;
     *) echo "Unsupported OS"; exit 1;;
   esac
-  stop_existing
+
+  echo "[6/10] Stopping existing service if running..."
+  if [ "$OS" = "linux" ] && have systemctl; then
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+  elif [ "$OS" = "mac" ]; then
+    launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+  fi
+
   write_project
-  create_venv
-  if [ "$(os_detect)" = "linux" ]; then
+
+  # ★ 每次安装都强制询问 Task IDs（其它 .env 保持不变）
+  [ -f "$ENV_FILE" ] || { echo "ERROR: $ENV_FILE missing"; exit 1; }
+  prompt_task_ids
+
+  echo "[4/10] Creating venv and installing requirements..."
+  python3 -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/pip" install -U pip wheel >/dev/null
+  "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
+
+  if [ "$OS" = "linux" ]; then
     write_service_linux
+    echo "[7/10] Enabling and starting..."
+    systemctl daemon-reload
+    systemctl enable "$SERVICE"
+    systemctl restart "$SERVICE"
+    echo "[8/10] Done. Logs:"
+    journalctl -u "$SERVICE" -n 30 --no-pager || true
+    echo "Tail: journalctl -u ${SERVICE} -f"
   else
     write_launchd_macos
+    echo "[7/10] Loading launchd (macOS)..."
+    launchctl load -w "$LAUNCHD_PLIST"
+    echo "[8/10] Done. Tail log: tail -f ${APP_DIR}/launchd.out.log"
   fi
-  start_service
-  post_notes
+
+  echo "[9/10] Edit config anytime: sudo nano ${ENV_FILE}"
+  if [ "$OS" = "linux" ]; then
+    echo "[10/10] Re-run: sudo systemctl restart ${SERVICE}"
+  else
+    echo "[10/10] Re-run: launchctl unload ${LAUNCHD_PLIST} && launchctl load -w ${LAUNCHD_PLIST}"
+  fi
 }
 
 main "$@"
