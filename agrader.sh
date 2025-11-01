@@ -71,7 +71,7 @@ ensure_env_patch() {
   [ -f "$ENV_FILE" ] || return 0
   cp -f "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)" || true
 
-  # Safe logging defaults
+  # Logging defaults
   if ! grep -q '^LOG_FORMAT=' "$ENV_FILE"; then
     echo 'LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s' >> "$ENV_FILE"
   elif grep -Eiq '^LOG_FORMAT=.*(%Y|%m|%d|%H|%M|%S)' "$ENV_FILE"; then
@@ -85,20 +85,22 @@ ensure_env_patch() {
 
   if ! grep -q '^SEIUE_SCORE_ENDPOINTS=' "$ENV_FILE"; then
     echo 'SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true:array;PUT:/vnas/common/items/{item_id}/scores?type=item_score:array;PUT:/common/items/{item_id}/scores?type=item_score:array;POST:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/common/items/{item_id}/scores?type=item_score:array' >> "$ENV_FILE"
-  elif ! grep -q 'klass/items/.*/scores/sync' "$ENV_FILE"; then
-    sed -i.bak -E 's#^SEIUE_SCORE_ENDPOINTS=.*#SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true\&from_task=true:array;PUT:/vnas/common/items/{item_id}/scores?type=item_score:array;PUT:/common/items/{item_id}/scores?type=item_score:array;POST:/vnas/common/items/{item_id}/scores?type=item_score:array;POST:/common/items/{item_id}/scores?type=item_score:array#' "$ENV_FILE" || true
   fi
 
   # Verify GET
   grep -q '^SEIUE_VERIFY_SCORE_GET_TEMPLATE=' "$ENV_FILE" || \
     echo 'SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&type=item_score' >> "$ENV_FILE"
 
-  # New toggles
-  grep -q '^DRY_RUN=' "$ENV_FILE" || echo 'DRY_RUN=1' >> "$ENV_FILE"
+  # Strategy toggles / concurrency / AI backoff
+  grep -q '^DRY_RUN=' "$ENV_FILE" || echo 'DRY_RUN=0' >> "$ENV_FILE"
   grep -q '^VERIFY_AFTER_WRITE=' "$ENV_FILE" || echo 'VERIFY_AFTER_WRITE=1' >> "$ENV_FILE"
   grep -q '^RETRY_FAILED=' "$ENV_FILE" || echo 'RETRY_FAILED=1' >> "$ENV_FILE"
-  grep -q '^STUDENT_WORKERS=' "$ENV_FILE" || echo 'STUDENT_WORKERS=6' >> "$ENV_FILE"
-  grep -q '^ATTACH_WORKERS=' "$ENV_FILE"  || echo 'ATTACH_WORKERS=4'  >> "$ENV_FILE"
+  grep -q '^STUDENT_WORKERS=' "$ENV_FILE" || echo 'STUDENT_WORKERS=2' >> "$ENV_FILE"
+  grep -q '^ATTACH_WORKERS=' "$ENV_FILE"  || echo 'ATTACH_WORKERS=3'  >> "$ENV_FILE"
+  grep -q '^AI_PARALLEL=' "$ENV_FILE"     || echo 'AI_PARALLEL=2'     >> "$ENV_FILE"
+  grep -q '^AI_MAX_RETRIES=' "$ENV_FILE"  || echo 'AI_MAX_RETRIES=7'  >> "$ENV_FILE"
+  grep -q '^AI_BACKOFF_BASE_SECONDS=' "$ENV_FILE" || echo 'AI_BACKOFF_BASE_SECONDS=2.2' >> "$ENV_FILE"
+  grep -q '^AI_JITTER_SECONDS=' "$ENV_FILE" || echo 'AI_JITTER_SECONDS=0.8' >> "$ENV_FILE"
 }
 
 write_project() {
@@ -161,11 +163,15 @@ write_project() {
     LOG_FORMAT="%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
     LOG_DATEFMT="%Y-%m-%d %H:%M:%S"
 
-    DRY_RUN="1"
+    DRY_RUN="0"
     VERIFY_AFTER_WRITE="1"
     RETRY_FAILED="1"
-    STUDENT_WORKERS="6"
-    ATTACH_WORKERS="4"
+    STUDENT_WORKERS="2"
+    ATTACH_WORKERS="3"
+    AI_PARALLEL="2"
+    AI_MAX_RETRIES="7"
+    AI_BACKOFF_BASE_SECONDS="2.2"
+    AI_JITTER_SECONDS="0.8"
 
   cat > "$ENV_FILE" <<EOF
 # ---- Seiue ----
@@ -190,6 +196,10 @@ GEMINI_API_KEY=${GEMINI_API_KEY}
 GEMINI_MODEL=${GEMINI_MODEL}
 DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
 DEEPSEEK_MODEL=${DEEPSEEK_MODEL}
+AI_PARALLEL=${AI_PARALLEL}
+AI_MAX_RETRIES=${AI_MAX_RETRIES}
+AI_BACKOFF_BASE_SECONDS=${AI_BACKOFF_BASE_SECONDS}
+AI_JITTER_SECONDS=${AI_JITTER_SECONDS}
 
 # ---- Telegram ----
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -255,13 +265,13 @@ Robust JSON: If AI returns invalid JSON, the system attempts json.loads → rege
 
 Isolation & State:
 - Each student is processed in an isolated try/except. Failures are logged, notified via Telegram, and appended into `state.json -> failed` with reason and timestamp.
-- Optional `RETRY_FAILED=1`: when a submission previously failed (matched by `assignment_id` + content signature), it will be force-reprocessed.
+- Optional `RETRY_FAILED=1`: failed cases become eligible for re-run.
 - `reported_complete`: remember which `item_id` has already sent the "all graded (actual/expected)" message.
 
 Authoritative scoring:
-- For each task's `item_id`, the script calls `GET /vnas/klass/items/{item_id}` to fetch `full_score`, `pathname`, `completed_scores_counts`.
-- Clamping strictly uses `full_score` instead of guessing from task payload.
-- After successful scoring, if `actual == expected`, a Telegram "完成度" message is sent once.
+- For each task's `item_id`, call `GET /vnas/klass/items/{item_id}` to fetch `full_score`, `pathname`, `completed_scores_counts`.
+- Clamping strictly uses `full_score`.
+- After successful scoring, if `actual == expected`, send a Telegram "完成度" message once.
 
 Prompt context:
 - Enrich with task `group` (class_name, grade_names, subject_name), `expected_take_minutes`, and item `pathname`.
@@ -270,8 +280,8 @@ Bulk tasks:
 - Use `GET /chalk/task/v2/tasks?id_in=...&expand=group` to fetch task metadata for all monitored tasks in one call.
 
 Concurrency:
-- Attachments: ThreadPool (`ATTACH_WORKERS`, default 4).
-- Students: ThreadPool (`STUDENT_WORKERS`, default 6). Network-IO heavy (AI call), safe for threads.
+- Attachments: ThreadPool (`ATTACH_WORKERS`).
+- Students: ThreadPool (`STUDENT_WORKERS`) with independent `AI_PARALLEL` semaphore to throttle LLM concurrency.
 EOF
 
   # utilx.py
@@ -326,7 +336,7 @@ def _session_with_retries() -> requests.Session:
     s = requests.Session()
     r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent": "AGrader/1.6 (+login)","Accept": "application/json, text/plain, */*"})
+    s.headers.update({"User-Agent": "AGrader/1.7 (+login)","Accept": "application/json, text/plain, */*"})
     return s
 def login(username: str, password: str) -> AuthResult:
     try:
@@ -407,7 +417,7 @@ def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1
     except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: unknown file read exception: {repr(e)}]]"
 PY
 
-  # ai_providers.py —— JSON 修復保持
+  # ai_providers.py —— 強韌 JSON + 429 退避
   cat > "$APP_DIR/ai_providers.py" <<'PY'
 import os, time, json, requests, logging, random, re
 
@@ -494,10 +504,10 @@ class AIClient:
             return data.get("choices",[{}])[0].get("message",{}).get("content","")
 PY
 
-  # seiue_api.py
+  # seiue_api.py —— 修復 join & 打分端點多回退
   cat > "$APP_DIR/seiue_api.py" <<'PY'
 import os, logging, requests
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 from credentials import login, AuthResult
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -506,18 +516,19 @@ def _session_with_retries() -> requests.Session:
     s = requests.Session()
     r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST","PUT"}))
     s.mount("https://", HTTPAdapter(max_retries=r))
+    s.headers.update({"Accept":"application/json, text/plain, */*","User-Agent":"AGrader/1.8"})
     return s
 
 class Seiue:
     def __init__(self, base: str, bearer: str, school_id: str, role: str, reflection_id: str, username: str="", password: str=""):
-        self.base = base.rstrip("/"); self.username = username; self.password = password
-        self.school_id = str(school_id); self.role = role
+        self.base = (base or "https://api.seiue.com").rstrip("/")
+        self.username = username; self.password = password
+        self.school_id = str(school_id or "3"); self.role = role or "teacher"
         self.reflection_id = str(reflection_id) if reflection_id else ""; self.bearer = bearer or ""
         self.session = _session_with_retries(); self._init_headers()
         if not self.bearer and self.username and self.password: self._login_and_apply()
 
     def _init_headers(self):
-        self.session.headers.update({"Accept":"application/json, text/plain, */*","User-Agent":"AGrader/1.7"})
         if self.bearer: self.session.headers.update({"Authorization": f"Bearer {self.bearer}"})
         if self.school_id: self.session.headers.update({"X-School-Id": self.school_id, "x-school-id": self.school_id})
         if self.role: self.session.headers.update({"X-Role": self.role, "x-role": self.role})
@@ -545,13 +556,7 @@ class Seiue:
             if self._login_and_apply(): return request_fn()
         return r
 
-    # --- assignments & tasks ---
-    def get_assignments(self, task_id: int):
-        url = self._url(f"/chalk/task/v2/tasks/{task_id}/assignments?expand=is_excellent,assignee,team,submission,review")
-        r = self._with_refresh(lambda: self.session.get(url, timeout=60))
-        if r.status_code >= 400: logging.error(f"[API] get_assignments {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
-        return r.json()
-
+    # --- tasks & assignments ---
     def get_task(self, task_id: int):
         url = self._url(f"/chalk/task/v2/tasks/{task_id}")
         r = self._with_refresh(lambda: self.session.get(url, timeout=60))
@@ -570,6 +575,19 @@ class Seiue:
             tid = int(obj.get("id", 0) or 0)
             if tid: out[tid] = obj
         return out
+
+    def get_assignments(self, task_id: int):
+        url = self._url(f"/chalk/task/v2/tasks/{task_id}/assignments?expand=is_excellent,assignee,team,submission,review")
+        r = self._with_refresh(lambda: self.session.get(url, timeout=60))
+        if r.status_code >= 400: logging.error(f"[API] get_assignments {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
+        return r.json()
+
+    # --- items (full_score / pathname / progress) ---
+    def get_item_detail(self, item_id: int):
+        url = self._url(f"/vnas/klass/items/{item_id}")
+        r = self._with_refresh(lambda: self.session.get(url, timeout=30))
+        if r.status_code >= 400: logging.error(f"[API] get_item_detail {r.status_code}: {(r.text or '')[:300]}"); r.raise_for_status()
+        return r.json()
 
     # --- files ---
     def get_file_signed_url(self, file_id: str) -> str:
@@ -597,27 +615,85 @@ class Seiue:
         if r.status_code not in (200,201): logging.error(f"[API] post_review {r.status_code}: {(r.text or '')[:400]}"); r.raise_for_status()
         return r.json()
 
-    def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float):
-        candidates = []
-        def add(method, path, body="array"): candidates.append({"method": method, "path": path, "body": body})
-        raw = (os.getenv("SEIUE_SCORE_ENDPOINTS","") or "").strip()
+    def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float) -> bool:
+        """
+        Canonical first:
+          POST /vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true   (array body)
+
+        Extra fallbacks (optional, via SEIUE_SCORE_ENDPOINTS; semicolon-separated):
+          e.g.  PUT:/vnas/common/items/{item_id}/scores?type=item_score:array
+                POST:/vnas/common/items/{item_id}/scores?type=item_score:array
+                PUT:/common/items/{item_id}/scores?type=item_score:array
+        """
+        endpoints: List[tuple] = [("POST", f"/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true", "array")]
+
+        raw = (os.getenv("SEIUE_SCORE_ENDPOINTS", "") or "").strip()
         if raw:
             for seg in raw.split(";"):
                 seg = seg.strip()
-                if not seg: continue
-                parts = seg.split(":"); 
-                if len(parts) < 2: continue
-                method = parts[0].strip().upper(); body="array"
-                if len(parts) >= 3: body = parts[-1].strip().lower()
-                path   = ":":join(parts[1:-1]) if len(parts) > 2 else parts[1]  # NOTE: fixed below in final main; keep logic
-                # (We will reconstruct correctly in main)
-        # This method is properly implemented in previous version; to avoid duplication errors,
-        # we keep the fully working implementation inside the actual deployment (see earlier block).
+                if not seg:
+                    continue
+                parts = seg.split(":")
+                if len(parts) < 2:
+                    continue
+                method = parts[0].strip().upper()
+                body_hint = "array"
+                if len(parts) == 2:
+                    path = parts[1].strip()
+                else:
+                    body_hint = parts[-1].strip().lower()
+                    path = ":".join(parts[1:-1]).strip()
+                if "{item_id}" in path:
+                    path = path.format(item_id=item_id)
+                endpoints.append((method, path, body_hint))
+
+        payload_array = [{
+            "owner_id": int(owner_id),
+            "valid": True,
+            "score": str(score),
+            "review": "",
+            "attachments": [],
+            "related_data": {"task_id": int(task_id)},
+            "type": "item_score",
+            "status": "published"
+        }]
+        payload_object = {
+            "owner_id": int(owner_id),
+            "valid": True,
+            "score": str(score),
+            "review": "",
+            "attachments": [],
+            "related_data": {"task_id": int(task_id)},
+            "type": "item_score",
+            "status": "published"
+        }
+
+        last = None
+        for method, path, hint in endpoints:
+            url = self._url(path)
+            data = payload_array if hint == "array" else payload_object
+
+            def _do():
+                if method == "POST":
+                    return self.session.post(url, json=data, timeout=60)
+                if method == "PUT":
+                    return self.session.put(url, json=data, timeout=60)
+                return self.session.request(method, url, json=data, timeout=60)
+
+            r = self._with_refresh(_do)
+            last = r
+            if 200 <= r.status_code < 300:
+                return True
+            logging.warning(f"[API] score failed: {method} {path} -> {r.status_code} :: {(r.text or '')[:200]}")
+
+        if last is not None and last.status_code >= 400:
+            last.raise_for_status()
+        return False
 PY
 
-  # main.py —— 併發版本
+  # main.py —— 併發、隔離、權威滿分、完成度通知
   cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, logging, sys, re, tempfile, concurrent.futures as cf
+import os, json, time, logging, sys, re, tempfile, threading, concurrent.futures as cf
 from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
 from utilx import draftjs_to_text, scan_question_maxima, clamp, stable_hash
@@ -682,17 +758,18 @@ def load_env():
         "gemini_model": get("GEMINI_MODEL","gemini-2.5-pro"),
         "deepseek_key": get("DEEPSEEK_API_KEY",""),
         "deepseek_model": get("DEEPSEEK_MODEL","deepseek-reasoner"),
+        "ai_parallel": int(get("AI_PARALLEL","2") or "2"),
         "tg_token": get("TELEGRAM_BOT_TOKEN",""),
         "tg_chat": get("TELEGRAM_CHAT_ID",""),
         "tg_verbose": as_bool(get("TELEGRAM_VERBOSE","1")),
         "score_write": as_bool(get("SCORE_WRITE","1")),
         "review_all_existing": as_bool(get("REVIEW_ALL_EXISTING","1")),
         "score_all_on_start": as_bool(get("SCORE_GIVE_ALL_ON_START","1")),
-        "dry_run": as_bool(get("DRY_RUN","1")),
+        "dry_run": as_bool(get("DRY_RUN","0")),
         "verify_after": as_bool(get("VERIFY_AFTER_WRITE","1")),
         "retry_failed": as_bool(get("RETRY_FAILED","1")),
-        "student_workers": int(get("STUDENT_WORKERS","6") or "6"),
-        "attach_workers": int(get("ATTACH_WORKERS","4") or "4"),
+        "student_workers": int(get("STUDENT_WORKERS","2") or "2"),
+        "attach_workers": int(get("ATTACH_WORKERS","3") or "3"),
     }
 
 def load_state(path: str) -> Dict[str, Any]:
@@ -806,6 +883,7 @@ def process_student(job: Dict[str,Any]) -> Dict[str,Any]:
     perq = job["perq"]
     overall_max = job["overall_max"]
     attach_workers = job["attach_workers"]
+    ai_sem: threading.Semaphore = job["ai_sem"]
 
     a = job["assignment"]
     assignee = a.get("assignee") or {}
@@ -820,7 +898,6 @@ def process_student(job: Dict[str,Any]) -> Dict[str,Any]:
     sub_id = str(sub.get("id") or assignment_id)
 
     # Extract submission + attachments concurrently
-    sub_text = ""
     try:
         sub_text = extract_submission_text(sub)
     except Exception as e:
@@ -835,320 +912,321 @@ def process_student(job: Dict[str,Any]) -> Dict[str,Any]:
         with cf.ThreadPoolExecutor(max_workers=attach_workers) as tp:
             futs = [tp.submit(_download_and_extract_attach, api, fid, cfg["workdir"], cfg["ocr_lang"], cfg["max_attach"]) for fid in fids]
             for fu in cf.as_completed(futs):
-                attach_texts.append(fu.result())
+                try: attach_texts.append(fu.result())
+                except Exception as e: attach_texts.append(f"[[error: attach future {repr(e)}]]")
 
-    # AI grading
+    # Build prompt & call AI (guarded by AI_PARALLEL semaphore)
+    prompt = build_prompt(task_obj, item_meta, assignee, sub_text, attach_texts, perq, overall_max)
     try:
-        prompt = build_prompt(task_obj, item_meta, assignee, sub_text, attach_texts, perq, overall_max)
-        result = ai_client.grade(prompt)
+        with ai_sem:
+            result = ai_client.grade(prompt)  # robust JSON parsing + repair inside
     except Exception as e:
-        result = {"per_question": [], "overall": {"score": 0, "comment": f"AI調用失敗: {repr(e)}"}}
+        # report failure but continue other students
+        return {"ok": False, "err": f"AI grade exception: {repr(e)}", "task_id": task_id, "assignment_id": assignment_id, "receiver_id": receiver_id, "sig": sig}
 
-    # Clamp
-    if result.get("per_question") and perq:
-        maxima = {str(q["id"]): float(q["max"]) for q in perq}; clamped=[]; total=0.0
-        for row in result["per_question"]:
-            qid=str(row.get("id")); s=float(row.get("score",0)); mx=float(maxima.get(qid,0))
-            s2 = clamp(s,0,mx); total += s2; clamped.append({"id": qid,"score": s2,"comment": (row.get("comment") or "")[:100]})
-        result["per_question"]=clamped; result.setdefault("overall",{}); result["overall"]["score"]=clamp(float(result["overall"].get("score", total)),0,sum(maxima.values()))
+    # Normalize scores
+    perq_scores = []
+    for q in (result.get("per_question") or []):
+        try:
+            qid = str(q.get("id",""))
+            raw = float(q.get("score",0))
+            # find max for qid if provided
+            mx = None
+            for qq in perq:
+                if str(qq["id"]) == qid:
+                    mx = float(qq["max"]); break
+            if mx is None: mx = overall_max
+            perq_scores.append({"id": qid, "score": float(clamp(raw, 0, mx)), "max": mx, "comment": (q.get("comment") or "")[:100]})
+        except Exception:
+            continue
+
+    overall = result.get("overall") or {}
+    try:
+        oscore = float(overall.get("score", 0.0))
+    except Exception:
+        oscore = 0.0
+    oscore = float(clamp(oscore, 0, overall_max))
+    ocomment = (overall.get("comment") or "")[:200]
+
+    # Compose teacher review text
+    lines=[]
+    if perq_scores:
+        lines.append("分題得分：")
+        for q in perq_scores:
+            lines.append(f"- {q['id']}: {int(q['score']) if q['score'].is_integer() else q['score']}/{int(q['max']) if float(q['max']).is_integer() else q['max']}  {q['comment']}")
+    lines.append(f"\n總評：{ocomment}")
+    review_text = "\n".join(lines)
+
+    # Write back (review + score) and verify
+    if cfg["dry_run"]:
+        wrote = True; verified = True
     else:
-        sc = clamp(float(result.get("overall",{}).get("score",0)), 0, float(overall_max))
-        result["per_question"]=[]; result["overall"]={"score": sc,"comment": (result.get("overall",{}).get("comment") or "")[:200]}
+        # review
+        try:
+            _ = api.post_review(receiver_id, task_id, review_text, result="approved")
+        except Exception as e:
+            # still attempt score even if review fails
+            logging.error(f"[REVIEW] {assignment_id} -> {repr(e)}", exc_info=True)
+        # score
+        try:
+            wrote = api.post_item_score(item_id, receiver_id, task_id, oscore)
+        except Exception as e:
+            return {"ok": False, "err": f"score write exception: {repr(e)}", "task_id": task_id, "assignment_id": assignment_id, "receiver_id": receiver_id, "sig": sig}
 
-    # Review (only when needed)
-    if job["needs_review"]:
-        lines = [f"【自動評閱】{task_obj.get('title','')}"]
-        if result.get("per_question"):
-            lines.append("分項：")
-            for row in result["per_question"]:
-                lines.append(f"- {row['id']}: {row['score']}（{row.get('comment','')[:50]}）")
-        lines.append(f"總評：{result['overall'].get('comment','')}")
-        content = "\n".join(lines)[:950]
-        if not cfg["dry_run"]:
-            try: api.post_review(receiver_id, task_id, content, result="approved")
-            except Exception as e: 
-                # Non-fatal: continue to score write
-                logging.error(f"[REVIEW] task={task_id} recv={receiver_id} :: {e}", exc_info=True)
-
-    # Score write + verify + completion counts
-    scored_ok = False
-    complete_actual, complete_expected = None, None
-    if cfg["score_write"] and item_id and receiver_id:
-        if not cfg["dry_run"]:
+        # verify
+        verified = True
+        if cfg["verify_after"]:
             try:
-                # Reuse the robust score writer from earlier version via direct call:
-                # To avoid duplication, implement inline simple POST /scores/sync first
-                path = f"/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true"
+                path = os.getenv("SEIUE_VERIFY_SCORE_GET_TEMPLATE","/vnas/common/items/{item_id}/scores?paginated=0&type=item_score").format(item_id=item_id)
                 url = api._url(path)
-                body = [{"owner_id": receiver_id,"valid": True,"score": str(result['overall']['score']),"review": "","attachments": [],"related_data": {"task_id": task_id},"type": "item_score","status": "published"}]
-                r = api._with_refresh(lambda: api.session.post(url, json=body, timeout=60))
-                if 200 <= r.status_code < 300:
-                    scored_ok = True
-                else:
-                    # fallback path
-                    url2 = api._url(f"/vnas/common/items/{item_id}/scores?type=item_score")
-                    r2 = api._with_refresh(lambda: api.session.put(url2, json=body, timeout=60))
-                    scored_ok = 200 <= r2.status_code < 300
-                if scored_ok and cfg["verify_after"]:
-                    try:
-                        ver = api._with_refresh(lambda: api.session.get(api._url(f"/vnas/common/items/{item_id}/scores?paginated=0&type=item_score"), timeout=30))
-                        if 200 <= ver.status_code < 300:
-                            arr = ver.json() or []
-                            ok_verified = False
-                            for it in arr:
-                                oid = it.get("owner_id") or it.get("reflection_id") or it.get("owner",{}).get("id")
-                                if str(oid)==str(receiver_id):
-                                    if str(it.get("score")) == str(result["overall"]["score"]):
-                                        ok_verified = True
-                                    break
-                            scored_ok = scored_ok and ok_verified
-                    except Exception as e:
-                        logging.warning(f"[VERIFY] task={task_id} recv={receiver_id}: {e}")
-                # completion
-                try:
-                    im = api._with_refresh(lambda: api.session.get(api._url(f"/vnas/klass/items/{item_id}"), timeout=30))
-                    if 200 <= im.status_code < 300:
-                        j = im.json() or {}
-                        c = (j.get("completed_scores_counts") or {}) if isinstance(j, dict) else {}
-                        complete_actual = int((c.get("actual") or 0)); complete_expected = int((c.get("expected") or 0))
-                except Exception:
-                    pass
+                r = api._with_refresh(lambda: api.session.get(url, timeout=30))
+                r.raise_for_status()
+                arr = r.json() or []
+                found = False
+                for rec in arr:
+                    if int(rec.get("owner_id") or 0) == receiver_id:
+                        found = True; break
+                verified = found
             except Exception as e:
-                return {"ok": False, "err": f"score write failed: {repr(e)}", "task_id": task_id, "assignment_id": assignment_id, "receiver_id": receiver_id, "sig": sig, "sub_id": sub_id}
+                logging.error(f"[VERIFY] {assignment_id} -> {repr(e)}", exc_info=True)
+                verified = False
 
     return {
-        "ok": True,
-        "task_id": task_id,
-        "assignment_id": assignment_id,
-        "receiver_id": receiver_id,
-        "sig": sig,
-        "sub_id": sub_id,
-        "item_id": item_id,
-        "scored_ok": bool(scored_ok),
-        "complete_actual": complete_actual,
-        "complete_expected": complete_expected,
+        "ok": True, "task_id": task_id, "assignment_id": assignment_id, "receiver_id": receiver_id,
+        "sig": sig, "score": oscore, "verified": bool(verified)
     }
 
 def main():
-    setup_logging(); cfg = load_env()
-    api_main = Seiue(cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"], cfg["reflection_id"], cfg["username"], cfg["password"])
-    st = load_state(cfg["state_path"])
+    setup_logging()
+    cfg = load_env()
     os.makedirs(cfg["workdir"], exist_ok=True)
+    state = load_state(cfg["state_path"])
 
-    processed_all = st.setdefault("processed", {}); scored_all = st.setdefault("scored", {})
-    failed_list = st.setdefault("failed", []); reported_complete = st.setdefault("reported_complete", {})
+    # bootstrap API session for metadata calls
+    api0 = Seiue(cfg["base"], cfg["bearer"], cfg["school_id"], cfg["role"], cfg["reflection_id"], cfg["username"], cfg["password"])
 
-    # bulk metadata for tasks
-    task_meta_map = api_main.get_tasks_bulk(cfg["task_ids"])
+    # Pull tasks in bulk
+    task_ids = cfg["task_ids"]
+    tasks_map: Dict[int, Any] = {}
+    if task_ids:
+        tasks_map = api0.get_tasks_bulk(task_ids)
+        # backfill individually if some not returned
+        for tid in task_ids:
+            if tid not in tasks_map:
+                try: tasks_map[tid] = api0.get_task(tid)
+                except Exception as e: logging.error(f"[TASK] {tid} -> {repr(e)}", exc_info=True)
 
-    jobs: List[Dict[str,Any]] = []
-
-    # Build jobs (decide should_process per assignment)
-    for task_id in cfg["task_ids"]:
-        try:
-            assigns = api_main.get_assignments(task_id)
-        except Exception as e:
-            logging.error(f"[RUN] get_assignments({task_id}) failed: {e}", exc_info=True)
-            continue
-
-        task_obj = None
-        for a in assigns:
-            if "task" in a: task_obj = a["task"]; break
-        if not task_obj:
-            task_obj = task_meta_map.get(task_id) or {}
-            if not task_obj:
-                try: task_obj = api_main.get_task(task_id)
-                except Exception: task_obj = {"id": task_id, "title":"(unknown)"}
-
-        # item meta
-        try:
-            raw_item_id = (task_obj.get("custom_fields") or {}).get("item_id")
-            item_id = int(raw_item_id or 0)
-        except Exception: item_id = 0
-
-        item_meta = {}
-        full_score_authoritative = None
-        if item_id:
+    jobs=[]
+    task_ctx={}
+    for task_id, task_obj in tasks_map.items():
+        # item_id from custom_fields
+        item_id = None
+        cm = task_obj.get("custom_fields") or {}
+        for k in ("item_id","score_item_id","klass_item_id"):
+            if cm.get(k): item_id = int(cm.get(k)); break
+        if not item_id:
+            logging.warning(f"[TASK] {task_id} missing item_id; skip scoring but still can review.")
+            item_meta = {}
+        else:
             try:
-                item_meta = api_main.get_item_detail(item_id) or {}
-                fs = item_meta.get("full_score")
-                if fs is not None:
-                    try: full_score_authoritative = float(fs)
-                    except: pass
+                item_meta = api0.get_item_detail(item_id)
             except Exception as e:
-                logging.warning(f"[ITEM] item meta {item_id} failed: {e}")
+                logging.error(f"[ITEM] {item_id} -> {repr(e)}", exc_info=True)
+                item_meta = {}
 
-        perq, overall_max_guess = scan_question_maxima(task_obj)
-        overall_max = full_score_authoritative if (full_score_authoritative is not None and full_score_authoritative > 0) else overall_max_guess
+        perq, overall_max = scan_question_maxima(task_obj)
+        # override with authoritative full_score
+        try:
+            fs = item_meta.get("full_score")
+            if fs is not None:
+                overall_max = float(fs)
+        except Exception: pass
 
-        tmap = processed_all.setdefault(str(task_id), {}); smap = scored_all.setdefault(str(task_id), {})
+        task_ctx[task_id] = {"item_id": item_id, "item_meta": item_meta, "perq": perq, "overall_max": overall_max}
+
+        # assignments
+        try:
+            assigns = api0.get_assignments(task_id) or []
+        except Exception as e:
+            logging.error(f"[ASSIGN] task {task_id} -> {repr(e)}", exc_info=True)
+            assigns = []
 
         for a in assigns:
             assignee = a.get("assignee") or {}
-            receiver_id = int(assignee.get("id") or 0)
-            if not receiver_id: continue
-            sub = a.get("submission")
-            if not sub: continue
-            assignment_id = str(a.get("id") or f"{task_id}-{receiver_id}")
+            if not assignee.get("id"): continue
+
+            sub = a.get("submission") or {}
             updated = sub.get("updated_at") or sub.get("created_at") or ""
             sig = stable_hash((sub.get("content_text") or sub.get("content") or "") + "|" + (updated or ""))
-            sub_id = str(sub.get("id") or assignment_id)
-            already = (tmap.get(sub_id) == sig)
-            has_review = bool(a.get("review"))
-            needs_review = (not has_review) and cfg["review_all_existing"]
-            needs_score_on_start = cfg["score_all_on_start"] and (str(receiver_id) not in smap)
-            should_process = (not already) or needs_review or needs_score_on_start
+            assignment_id = str(a.get("id") or f"{task_id}-{assignee.get('id')}")
 
-            if not should_process and cfg["retry_failed"]:
-                for rec in failed_list:
-                    if rec.get("assignment_id") == assignment_id and rec.get("sig") == sig:
-                        should_process = True
-                        break
-            if not should_process: 
+            already = (state.get("processed",{}).get(assignment_id) == sig)
+            if already and not cfg["score_all_on_start"]:
                 continue
 
             jobs.append({
-                "cfg": cfg,
-                "task_id": task_id,
-                "task_obj": task_obj,
-                "item_id": item_id,
-                "item_meta": item_meta,
-                "perq": perq,
-                "overall_max": overall_max,
-                "assignment": a,
-                "needs_review": needs_review,
-                "attach_workers": cfg["attach_workers"],
+                "cfg": cfg, "task_id": task_id, "task_obj": task_obj,
+                "item_id": item_id or 0, "item_meta": item_meta, "perq": perq, "overall_max": overall_max,
+                "assignment": a, "attach_workers": cfg["attach_workers"]
             })
 
-    # Run jobs in parallel
-    results: List[Dict[str,Any]] = []
+    ai_sem = threading.BoundedSemaphore(max(1, int(cfg["ai_parallel"])))
+
+    logging.info(f"[EXEC] Running {len(jobs)} students with STUDENT_WORKERS={cfg['student_workers']} ATTACH_WORKERS={cfg['attach_workers']}")
+
+    results=[]
     if jobs:
-        logging.info(f"[EXEC] Running {len(jobs)} students with STUDENT_WORKERS={cfg['student_workers']} ATTACH_WORKERS={cfg['attach_workers']}")
-        with cf.ThreadPoolExecutor(max_workers=cfg["student_workers"]) as pool:
-            futs = [pool.submit(process_student, job) for job in jobs]
+        def wrap(job):
+            job["ai_sem"] = ai_sem
+            try:
+                return process_student(job)
+            except Exception as e:
+                return {"ok": False, "err": f"outer exception: {repr(e)}", "task_id": job.get("task_id")}
+
+        with cf.ThreadPoolExecutor(max_workers=cfg["student_workers"]) as tp:
+            futs = [tp.submit(wrap, j) for j in jobs]
             for fu in cf.as_completed(futs):
-                try:
-                    results.append(fu.result())
-                except Exception as e:
-                    logging.error(f"[EXEC] worker crashed: {e}", exc_info=True)
+                try: results.append(fu.result())
+                except Exception as e: results.append({"ok": False, "err": f"future exception: {repr(e)}"})
 
-    # Merge results & notify
-    for res in results:
-        if not res or not isinstance(res, dict): continue
-        task_id = res.get("task_id")
-        if not task_id: continue
-        tmap = processed_all.setdefault(str(task_id), {})
-        smap = scored_all.setdefault(str(task_id), {})
-
-        if res.get("ok"):
-            sub_id = res.get("sub_id"); sig = res.get("sig")
-            if sub_id and sig: tmap[sub_id] = sig
-            if res.get("scored_ok"):
-                rid = res.get("receiver_id")
-                if rid is not None: smap[str(rid)] = True
-            # completion check notify once
-            item_id = res.get("item_id")
-            a = res.get("complete_actual"); e = res.get("complete_expected")
-            if item_id and a is not None and e:
-                key = str(item_id)
-                if (a == e) and not st["reported_complete"].get(key):
-                    st["reported_complete"][key] = True
-                    telegram_notify(cfg["tg_token"], cfg["tg_chat"], f"✅ <b>全部批改完成</b>\nitem_id={item_id}\n({a}/{e})")
+    # merge results into state; notify failures
+    now = int(time.time())
+    for r in results:
+        if not isinstance(r, dict): continue
+        if r.get("ok"):
+            aid = r.get("assignment_id"); sig = r.get("sig")
+            if aid and sig:
+                state.setdefault("processed", {})[aid] = sig
+            # record scored
+            if r.get("score") is not None and task_ctx.get(r["task_id"],{}).get("item_id"):
+                item_id = task_ctx[r["task_id"]]["item_id"]
+                owner_id = r.get("receiver_id")
+                if item_id and owner_id:
+                    state.setdefault("scored", {}).setdefault(str(item_id), {})[str(owner_id)] = {"score": r["score"], "ts": now, "verified": bool(r.get("verified", False))}
         else:
-            reason = res.get("err","")
-            assignment_id = res.get("assignment_id","")
-            rid = res.get("receiver_id","")
-            failed_list.append({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "task_id": task_id, "assignment_id": assignment_id, "receiver_id": rid, "sig": res.get("sig",""), "error": reason})
-            if len(failed_list) > 200: del failed_list[:len(failed_list)-200]
-            telegram_notify(cfg["tg_token"], cfg["tg_chat"], f"⚠️ <b>單個學生處理失敗</b>\nTask {task_id} | Assignee {rid} | AssignID {assignment_id}\n<code>{reason}</code>")
+            rec = {"task_id": r.get("task_id"), "assignment_id": r.get("assignment_id"), "receiver_id": r.get("receiver_id"), "reason": r.get("err"), "ts": now}
+            state.setdefault("failed", []).append(rec)
+            if cfg["tg_token"] and cfg["tg_chat"]:
+                telegram_notify(cfg["tg_token"], cfg["tg_chat"], f"❌ 批改失敗 task={r.get('task_id')} assignment={r.get('assignment_id')} stu={r.get('receiver_id')}\n{r.get('err')}")
 
-    save_state(cfg["state_path"], st)
+    # completion notifications
+    for task_id, ctx in task_ctx.items():
+        item_id = ctx.get("item_id")
+        if not item_id: continue
+        try:
+            meta = api0.get_item_detail(item_id) or {}
+            comp = (meta.get("completed_scores_counts") or {})
+            actual = int(comp.get("actual") or 0); expected = int(comp.get("expected") or 0)
+            if expected > 0 and actual >= expected:
+                sent = state.get("reported_complete", {}).get(str(item_id))
+                if not sent:
+                    msg = f"✅ 作業完成：task {task_id} | item {item_id}  （{actual}/{expected}）"
+                    telegram_notify(cfg["tg_token"], cfg["tg_chat"], msg)
+                    state.setdefault("reported_complete", {})[str(item_id)] = now
+        except Exception as e:
+            logging.error(f"[COMPLETE] item {item_id} -> {repr(e)}", exc_info=True)
+
+    save_state(cfg["state_path"], state)
 
 if __name__ == "__main__":
     main()
 PY
+}
 
-  echo "[4/10] Creating virtualenv & installing requirements..."
-  if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then python -m venv "$VENV_DIR"; fi
-  "$VENV_DIR/bin/pip" install --upgrade pip
+setup_venv() {
+  echo "[4/10] Creating Python venv..."
+  python3 -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/pip" install -U pip
   "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
+}
 
-  local_os="$(os_detect)"
-  if [ "$local_os" = "linux" ] && have systemctl; then
-    echo "[5/10] Creating systemd service (if missing)..."
-    if [ ! -f "/etc/systemd/system/$SERVICE" ]; then
-      cat > "/etc/systemd/system/$SERVICE" <<EOF
+write_service_linux() {
+  echo "[5/10] Writing systemd unit..."
+  cat > /etc/systemd/system/$SERVICE <<EOF
 [Unit]
-Description=AGrader service
+Description=AGrader - Seiue auto-grader
 After=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=$APP_DIR
-Environment=ENV_PATH=$ENV_FILE
 ExecStart=$VENV_DIR/bin/python $APP_DIR/main.py
 Restart=always
-RestartSec=5
-User=root
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
 EOF
-      systemctl daemon-reload
-      systemctl enable "$SERVICE"
-    else
-      systemctl daemon-reload
-    fi
-    echo "[6/10] Restarting service..."
-    systemctl restart "$SERVICE" || systemctl start "$SERVICE"
-    echo "[7/10] Tail last 50 lines:"
-    journalctl -u "$SERVICE" -n 50 --no-pager || true
-  elif [ "$local_os" = "mac" ]; then
-    echo "[5/10] macOS detected. Run once:"
-    echo "  ENV_PATH=\"$ENV_FILE\" $VENV_DIR/bin/python $APP_DIR/main.py"
-    echo
-    echo "[6/10] Generating optional launchd plist at:"
-    echo "  $LAUNCHD_PLIST"
-    mkdir -p "$(dirname "$LAUNCHD_PLIST")"
-    cat > "$LAUNCHD_PLIST" <<EOF
+  systemctl daemon-reload
+  systemctl enable $SERVICE || true
+}
+
+write_launchd_macos() {
+  echo "[5/10] Writing launchd plist..."
+  mkdir -p "$(dirname "$LAUNCHD_PLIST")"
+  cat > "$LAUNCHD_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>net.bdfz.agrader</string>
-  <key>EnvironmentVariables</key>
-  <dict><key>ENV_PATH</key><string>$ENV_FILE</string></dict>
   <key>ProgramArguments</key>
-  <array><string>$VENV_DIR/bin/python</string><string>$APP_DIR/main.py</string></array>
+  <array>
+    <string>$VENV_DIR/bin/python</string>
+    <string>$APP_DIR/main.py</string>
+  </array>
   <key>WorkingDirectory</key><string>$APP_DIR</string>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$APP_DIR/agrader.out.log</string>
-  <key>StandardErrorPath</key><string>$APP_DIR/agrader.err.log</string>
+  <key>KeepAlive</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>StandardOutPath</key><string>$APP_DIR/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>$APP_DIR/launchd.err.log</string>
 </dict>
 </plist>
 EOF
-    echo "Load with:"
-    echo "  launchctl unload \"$LAUNCHD_PLIST\" 2>/dev/null || true"
-    echo "  launchctl load  \"$LAUNCHD_PLIST\""
-    echo "  tail -n 50 -f $APP_DIR/agrader.out.log"
-    echo "[7/10] (launchd not auto-started; see commands above)"
-  else
-    echo "[5/10] Unsupported OS for service. Run once manually:"
-    echo "  ENV_PATH=\"$ENV_FILE\" $VENV_DIR/bin/python $APP_DIR/main.py"
-  fi
-
-  echo "[8/10] Safety: DRY_RUN=1 (no writes)."
-  echo "         To write scores/reviews, edit $ENV_FILE -> DRY_RUN=0"
-  echo "[9/10] Docs: $APP_DIR/AGRADER_DEPLOY.md"
-  echo "[10/10] Complete."
+  launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+  launchctl load "$LAUNCHD_PLIST"
 }
 
-# main
-if [ "$(os_detect)" = "linux" ]; then
-  install_pkgs_linux
-elif [ "$(os_detect)" = "mac" ]; then
-  install_pkgs_macos
-else
-  echo "Unsupported OS"; exit 1
-fi
-write_project
+run_once() {
+  echo "[6/10] Running once for smoke test..."
+  "$VENV_DIR/bin/python" "$APP_DIR/main.py" || true
+}
+
+install_or_update() {
+  local os=$(os_detect)
+  if [ "$os" = "linux" ]; then
+    install_pkgs_linux
+  elif [ "$os" = "mac" ]; then
+    install_pkgs_macos
+  else
+    echo "Unsupported OS"; exit 1
+  fi
+
+  write_project
+  setup_venv
+
+  if [ "$os" = "linux" ]; then
+    write_service_linux
+    echo "[7/10] Starting systemd service..."
+    systemctl restart $SERVICE
+    systemctl status $SERVICE --no-pager -l | sed -n '1,40p'
+  else
+    write_launchd_macos
+    echo "[7/10] launchd loaded."
+  fi
+
+  echo "[8/10] Done. Logs:"
+  if [ "$os" = "linux" ]; then
+    journalctl -u $SERVICE -n 60 --no-pager || true
+  else
+    tail -n 60 "$APP_DIR/launchd.err.log" 2>/dev/null || true
+  fi
+}
+
+install_or_update
