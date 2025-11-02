@@ -1,21 +1,7 @@
 #!/usr/bin/env bash
 # AGrader - API-first auto-grading pipeline (installer/runner) - FULL INLINE EDITION
 # Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
-# v1.10.8-hotfix-fullinline-2025-11-02
-#
-# What this script does:
-# 1) Installs prerequisites (Python3 + venv, curl, jq).
-# 2) Creates /opt/agrader (or updates it) with a Python venv.
-# 3) Writes ALL required project files (main.py, seiue_api.py, ai_providers.py, utilx.py, credentials.py).
-# 4) Creates/updates .env and (re)prompts for MONITOR_TASK_IDS, RUN_MODE, FULL_SCORE_MODE, STOP_CRITERIA.
-# 5) Installs/updates a systemd service on Linux (optional launchd on macOS).
-# 6) Starts the service if RUN_MODE=watch, or runs once if RUN_MODE=oneshot.
-#
-# Your persistent config lives at: /opt/agrader/.env
-#
-# Notes:
-# - No numeric fake IDs are used. Replace placeholders like <TASK_ID> after install.
-# - .env is hot-reloaded by the app on every loop; edits take effect without restart in watch mode.
+# v1.10.9-hotfix2-fullinline-2025-11-02
 
 set -euo pipefail
 
@@ -44,7 +30,6 @@ os_detect() {
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 ask() {
-  # ask "Prompt" VAR [default]
   local prompt="$1"; local var="$2"; local def="${3:-}"; local ans=""
   if [ -n "${def}" ]; then
     read -r -p "$prompt [$def]: " ans || true
@@ -55,16 +40,11 @@ ask() {
   printf -v "$var" "%s" "$ans"
 }
 yn() {
-  # yn "question?" VAR [default_y|default_n]
   local q="$1"; local var="$2"; local def="${3:-default_n}"; local ans=""
   local hint="[y/N]"; [ "$def" = "default_y" ] && hint="[Y/n]"
   read -r -p "$q $hint " ans || true
   ans="${ans:-$([ "$def" = "default_y" ] && echo y || echo n)}"
-  case "$ans" in
-    y|Y) printf -v "$var" "y" ;;
-    n|N) printf -v "$var" "n" ;;
-    *)   printf -v "$var" "n" ;;
-  esac
+  case "$ans" in y|Y) printf -v "$var" "y";; *) printf -v "$var" "n";; esac
 }
 
 ensure_root() {
@@ -93,26 +73,17 @@ install_pkgs_linux() {
 
 install_pkgs_mac() {
   echo "Installing prerequisites on macOS..."
-  if ! have brew; then
-    die "Homebrew is required on macOS. Install from https://brew.sh and re-run."
-  fi
+  if ! have brew; then die "Homebrew is required on macOS. Install from https://brew.sh and re-run."; fi
   brew update
   brew install python@3.12 jq coreutils || true
-  # Ensure 'python3' points to brewed python
-  if ! python3 --version >/dev/null 2>&1; then
-    brew link --overwrite python@3.12
-  fi
+  if ! python3 --version >/dev/null 2>&1; then brew link --overwrite python@3.12; fi
 }
 
-ensure_dirs() {
-  mkdir -p "$APP_DIR"
-  chmod 755 "$APP_DIR"
-}
+ensure_dirs() { mkdir -p "$APP_DIR"; chmod 755 "$APP_DIR"; }
 
 ensure_venv() {
   if [ ! -x "$VENV_DIR/bin/python" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv "$VENV_DIR"
+    echo "Creating virtual environment..."; python3 -m venv "$VENV_DIR"
   fi
   echo "Upgrading pip and installing Python deps..."
   "$VENV_DIR/bin/pip" install --upgrade pip
@@ -123,19 +94,12 @@ write_env_if_missing() {
   if [ ! -f "$ENV_FILE" ]; then
     cat >"$ENV_FILE" <<'ENV'
 # ========== AGrader .env ==========
-# Core run behaviour
-RUN_MODE=oneshot            # oneshot | watch
-POLL_INTERVAL=10            # seconds for watch mode
-STOP_CRITERIA=score_and_review  # score_and_review | score_only
-
-# Tasks to grade (comma separated)
+RUN_MODE=oneshot
+POLL_INTERVAL=10
+STOP_CRITERIA=score_and_review
 MONITOR_TASK_IDS=<TASK_ID>
-
-# Grading mode
-FULL_SCORE_MODE=off         # off=AI normal grading | all=force full marks
+FULL_SCORE_MODE=off
 FULL_SCORE_COMMENT=記得看高考真題。
-
-# SEIUE auth (prefer bearer; auto-login is best-effort)
 SEIUE_BASE=https://api.seiue.com
 SEIUE_SCHOOL_ID=3
 SEIUE_ROLE=teacher
@@ -143,17 +107,12 @@ SEIUE_REFLECTION_ID=
 SEIUE_BEARER=
 SEIUE_USERNAME=
 SEIUE_PASSWORD=
-
-# AI provider (choose one)
-AI_PROVIDER=deepseek        # deepseek | gemini | endpoint
+AI_PROVIDER=deepseek
 DEEPSEEK_MODEL=deepseek-reasoner
 DEEPSEEK_API_KEY=
 # GEMINI_MODEL=gemini-2.5-pro
 # GEMINI_API_KEY=
-# Custom endpoint (POST JSON {"prompt": "..."} -> {"answer": "..."}), e.g. ai.bdfz.net
 # AI_ENDPOINT=https://ai.bdfz.net/
-
-# Safety nets
 VERIFY_AFTER_WRITE=1
 RETRY_ON_422_ONCE=1
 MAX_SCORE_CACHE_TTL=600
@@ -166,30 +125,36 @@ ENV
   fi
 }
 
+append_if_missing() { # append_if_missing KEY VALUE
+  local k="$1" v="$2"
+  grep -q -E "^${k}=" "$ENV_FILE" || echo "${k}=${v}" >> "$ENV_FILE"
+}
+
 prompt_core_vars() {
-  echo
-  echo "=== Configure core options ==="
+  echo; echo "=== Configure core options ==="
   local cur_tasks cur_run cur_full cur_stop
-  # --- PATCHED LINES START ---
-  # Robustly read current values from .env without failing if keys are missing
   cur_tasks="$(sed -nE 's/^MONITOR_TASK_IDS=(.*)/\1/p' "$ENV_FILE" | head -n1)"
   cur_run="$(sed -nE 's/^RUN_MODE=(.*)/\1/p' "$ENV_FILE" | head -n1)"
   cur_full="$(sed -nE 's/^FULL_SCORE_MODE=(.*)/\1/p' "$ENV_FILE" | head -n1)"
   cur_stop="$(sed -nE 's/^STOP_CRITERIA=(.*)/\1/p' "$ENV_FILE" | head -n1)"
-  # --- PATCHED LINES END ---
 
   ask "Task IDs (comma separated, e.g. <TASK_ID>,<TASK_ID>)" NEW_TASKS "${cur_tasks:-<TASK_ID>}"
   ask "Run mode (oneshot/watch)" NEW_RUN "${cur_run:-oneshot}"
   ask "Full score mode (off/all)" NEW_FULL "${cur_full:-off}"
   ask "Stop criteria (score_and_review/score_only)" NEW_STOP "${cur_stop:-score_and_review}"
 
-  # in-place update (.env always contains these keys)
+  # replace-or-append
   tmp="$(mktemp)"; cp "$ENV_FILE" "$tmp"
   sed -E -e "s|^MONITOR_TASK_IDS=.*|MONITOR_TASK_IDS=${NEW_TASKS}|" \
          -e "s|^RUN_MODE=.*|RUN_MODE=${NEW_RUN}|" \
          -e "s|^FULL_SCORE_MODE=.*|FULL_SCORE_MODE=${NEW_FULL}|" \
          -e "s|^STOP_CRITERIA=.*|STOP_CRITERIA=${NEW_STOP}|" "$tmp" > "$ENV_FILE"
   rm -f "$tmp"
+
+  append_if_missing MONITOR_TASK_IDS "${NEW_TASKS}"
+  append_if_missing RUN_MODE "${NEW_RUN}"
+  append_if_missing FULL_SCORE_MODE "${NEW_FULL}"
+  append_if_missing STOP_CRITERIA "${NEW_STOP}"
 }
 
 write_systemd_linux() {
@@ -206,7 +171,6 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=$VENV_DIR/bin/python $PY_MAIN
 Restart=always
 RestartSec=3
-# Hardening (optional)
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
@@ -214,7 +178,7 @@ ProtectSystem=full
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
+  systemctl daemon-reload || true
 }
 
 write_launchd_mac() {
@@ -222,38 +186,34 @@ write_launchd_mac() {
   cat >"$LAUNCHD_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-  <dict>
-    <key>Label</key><string>net.bdfz.agrader</string>
-    <key>ProgramArguments</key>
-    <array>
-      <string>$VENV_DIR/bin/python</string>
-      <string>$PY_MAIN</string>
-    </array>
-    <key>WorkingDirectory</key><string>$APP_DIR</string>
-    <key>StandardOutPath</key><string>$APP_DIR/agrader.out.log</string>
-    <key>StandardErrorPath</key><string>$APP_DIR/agrader.err.log</string>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-  </dict>
-</plist>
+<plist version="1.0"><dict>
+  <key>Label</key><string>net.bdfz.agrader</string>
+  <key>ProgramArguments</key><array>
+    <string>$VENV_DIR/bin/python</string><string>$PY_MAIN</string>
+  </array>
+  <key>WorkingDirectory</key><string>$APP_DIR</string>
+  <key>StandardOutPath</key><string>$APP_DIR/agrader.out.log</string>
+  <key>StandardErrorPath</key><string>$APP_DIR/agrader.err.log</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+</dict></plist>
 EOF
 }
 
 start_by_mode() {
   local mode
-  mode="$(grep -E '^RUN_MODE=' "$ENV_FILE" | sed -E 's/^RUN_MODE=//')"
+  mode="$(sed -nE 's/^RUN_MODE=(.*)/\1/p' "$ENV_FILE" | head -n1)"
+  [ -z "$mode" ] && mode="oneshot"
   case "$mode" in
     watch)
       if [ "$(os_detect)" = "linux" ]; then
-        systemctl enable --now "$SERVICE"
+        systemctl enable --now "$SERVICE" || true
         systemctl status "$SERVICE" --no-pager -l || true
       elif [ "$(os_detect)" = "mac" ]; then
         launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
         launchctl load -w "$LAUNCHD_PLIST"
         echo "launchd loaded. Logs: tail -f $APP_DIR/agrader.err.log"
       else
-        echo "Unknown OS; start the app manually: $VENV_DIR/bin/python $PY_MAIN"
+        echo "Unknown OS; start manually: $VENV_DIR/bin/python $PY_MAIN"
       fi
       ;;
     *)
@@ -1026,9 +986,7 @@ PY
 
 # ---------- main flow ----------
 ensure_root
-
-OS="$(os_detect)"
-case "$OS" in
+OS="$(os_detect)"; case "$OS" in
   linux) install_pkgs_linux ;;
   mac)   install_pkgs_mac ;;
   *)     die "Unsupported OS: $(uname -s)" ;;
@@ -1037,34 +995,24 @@ esac
 ensure_dirs
 ensure_venv
 write_env_if_missing
-
-# Always (re)write code to ensure you get the fixed version
 write_main_py
 write_seiue_api_py
 write_ai_providers_py
 write_utilx_py
 write_credentials_py
-
-# Prompt core params on every run (fixes the “upgrade cannot change values” complaint)
 prompt_core_vars
 
-# Services
 if [ "$OS" = "linux" ]; then
   write_systemd_linux
 elif [ "$OS" = "mac" ]; then
   yn "Install launchd agent (keeps it running)?" DO_LAUNCHD default_n
-  if [ "$DO_LAUNCHD" = "y" ]; then
-    write_launchd_mac
-  fi
+  [ "$DO_LAUNCHD" = "y" ] && write_launchd_mac
 fi
 
 start_by_mode
 
-echo
-echo "=== DONE ==="
+echo; echo "=== DONE ==="
 echo "App dir: $APP_DIR"
 echo "Venv:    $VENV_DIR"
 echo "Config:  $ENV_FILE (hot-reloaded)"
-if [ "$OS" = "linux" ]; then
-  echo "Service: $SERVICE_PATH  (journalctl -u $SERVICE -f)"
-fi
+[ "$OS" = "linux" ] && echo "Service: $SERVICE_PATH  (journalctl -u $SERVICE -f)"
