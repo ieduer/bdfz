@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # AGrader - API-first auto-grading pipeline (installer/runner) - FULL INLINE EDITION
 # Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
-# v1.10.6-fullinline-2025-11-01
-# Changes vs 1.10.5:
-# - Unify .env creation in main() only; remove duplicate creation from prompts.
-# - Introduce IS_FRESH_INSTALL flag: fresh install asks full credentials; upgrades skip.
-# - Preflight cleanup: stop existing systemd/launchd service & pkill old python runner to avoid duplicates.
-# - Keep “Full-score mode” (all/off) with comment “記得看高考真題。” and distinct summary tag FULL-SCORED.
-# - No functional change to rating/AI logic.
+# v1.10.7-fullinline-2025-11-02
+# Changes vs 1.10.6:
+# - Fetch real per-item max before scoring (full_score/max_score), cache with TTL.
+# - Clamp desired score in FULL & Normal mode before POST.
+# - Parse 422 message (e.g. “评价项满分40.00”) to auto-downgrade once and retry.
+# - Pre-verify existing scores to avoid re-post & treat as success.
+# - Success accounting fixed: only confirmed writes or “already exists” count as success.
 
 set -euo pipefail
 
@@ -136,6 +136,12 @@ ensure_env_patch() {
   grep -q '^AI_FAILOVER='             "$ENV_FILE" || echo 'AI_FAILOVER=1'              >> "$ENV_FILE"
   grep -q '^MAX_ATTACHMENT_BYTES='    "$ENV_FILE" || echo 'MAX_ATTACHMENT_BYTES=25165824' >> "$ENV_FILE"
   grep -q '^OCR_LANG='                "$ENV_FILE" || echo 'OCR_LANG=chi_sim+eng'       >> "$ENV_FILE"
+
+  # New scoring safeguards
+  grep -q '^MAX_SCORE_CACHE_TTL='     "$ENV_FILE" || echo 'MAX_SCORE_CACHE_TTL=600'    >> "$ENV_FILE"
+  grep -q '^SCORE_CLAMP_ON_MAX='      "$ENV_FILE" || echo 'SCORE_CLAMP_ON_MAX=1'       >> "$ENV_FILE"
+  grep -q '^RETRY_ON_422_ONCE='       "$ENV_FILE" || echo 'RETRY_ON_422_ONCE=1'        >> "$ENV_FILE"
+  grep -q '^REVERIFY_BEFORE_WRITE='   "$ENV_FILE" || echo 'REVERIFY_BEFORE_WRITE=1'    >> "$ENV_FILE"
 
   # Multi-key AI
   grep -q '^AI_KEY_STRATEGY='         "$ENV_FILE" || echo 'AI_KEY_STRATEGY=roundrobin' >> "$ENV_FILE"
@@ -319,6 +325,7 @@ REVIEW_ALL_EXISTING=1
 SCORE_GIVE_ALL_ON_START=1
 DRY_RUN=0
 VERIFY_AFTER_WRITE=1
+REVERIFY_BEFORE_WRITE=1
 RETRY_FAILED=1
 STUDENT_WORKERS=1
 ATTACH_WORKERS=3
@@ -329,6 +336,11 @@ PROMPT_TEMPLATE_PATH=${APP_DIR}/prompt.txt
 # ---- Full-score mode ----
 FULL_SCORE_MODE=${_FSMODE:-off}
 FULL_SCORE_COMMENT=${_FSCMT:-記得看高考真題。}
+
+# ---- Safeguards ----
+MAX_SCORE_CACHE_TTL=600
+SCORE_CLAMP_ON_MAX=1
+RETRY_ON_422_ONCE=1
 
 # ---- Paths/State ----
 STATE_PATH=${APP_DIR}/state.json
@@ -390,19 +402,19 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 def scan_question_maxima(task: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], float]:
-    overall_max = 100.0
+    overall_max = 0.0
     perq: List[Dict[str, Any]] = []
     candidates = []
     for k in ["score_items","questions","problems","rubric","grading","grading_items"]:
       v = task.get(k) or task.get("custom_fields", {}).get(k)
-      if isinstance(v, list):
+      if isinstance(v, list) and v:
         candidates = v; break
     if candidates:
         for idx, it in enumerate(candidates):
             qid = str(it.get("id", f"q{idx+1}"))
-            mx = it.get("max") or it.get("max_score") or it.get("full") or 100
+            mx = it.get("max") or it.get("max_score") or it.get("full") or 0
             try: mx = float(mx)
-            except: mx = 100.0
+            except: mx = 0.0
             perq.append({"id": qid, "max": mx})
         overall_max = sum(q["max"] for q in perq)
     else:
@@ -478,45 +490,46 @@ def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1
     mt, _ = mimetypes.guess_type(path); ext = (os.path.splitext(path)[1] or "").lower()
 
     if ext == ".pdf" or (mt and mt.endswith("pdf")):
-        try:
-            code, out, _ = _run(["pdftotext", "-layout", path, "-"], timeout=120)
-            if code == 0 and out.strip(): return out.decode("utf-8","ignore")
-        except Exception as e: logging.warning(f"[EXTRACT] pdftotext failed: {e}", exc_info=True)
-        enable_fallback = os.getenv("ENABLE_PDF_OCR_FALLBACK","1") not in ("0","false","False")
-        max_pages = int(os.getenv("MAX_PDF_OCR_PAGES","20")); pages = _pdf_pages(path)
-        if (not enable_fallback) or (pages > 0 and pages > max_pages):
-            return f"[[skipped: pdf ocr fallback disabled or too large (pages={pages}, size={sz})]]"
-        import tempfile
-        tmpdir = tempfile.mkdtemp(prefix="pdfocr_"); prefix = os.path.join(tmpdir, "pg")
-        code, _, err = _run(["pdftoppm", "-r", "200", path, prefix], timeout=int(os.getenv("MAX_PDF_OCR_SECONDS","120")))
-        if code != 0: return f"[[error: pdftoppm {err.decode('utf-8','ignore')[:200]}]]"
-        texts=[]
-        for f in sorted(os.listdir(tmpdir)):
-          if f.startswith("pg") and (f.endswith(".ppm") or f.endswith(".png") or f.endswith(".jpg")):
-            try: texts.append(pytesseract.image_to_string(Image.open(os.path.join(tmpdir,f)), lang=ocr_lang))
-            except Exception as e: logging.error(f"[OCR] {e}", exc_info=True); texts.append(f"[[error: tesseract {e}]]")
-        return ("\n".join(texts).strip() or "[[error: ocr empty]]")
+      # pdftotext first
+      try:
+        code, out, _ = _run(["pdftotext", "-layout", path, "-"], timeout=120)
+        if code == 0 and out.strip(): return out.decode("utf-8","ignore")
+      except Exception as e: logging.warning(f"[EXTRACT] pdftotext failed: {e}", exc_info=True)
+      enable_fallback = os.getenv("ENABLE_PDF_OCR_FALLBACK","1") not in ("0","false","False")
+      max_pages = int(os.getenv("MAX_PDF_OCR_PAGES","20")); pages = _pdf_pages(path)
+      if (not enable_fallback) or (pages > 0 and pages > max_pages):
+        return f"[[skipped: pdf ocr fallback disabled or too large (pages={pages}, size={sz})]]"
+      import tempfile
+      tmpdir = tempfile.mkdtemp(prefix="pdfocr_"); prefix = os.path.join(tmpdir, "pg")
+      code, _, err = _run(["pdftoppm", "-r", "200", path, prefix], timeout=int(os.getenv("MAX_PDF_OCR_SECONDS","120")))
+      if code != 0: return f"[[error: pdftoppm {err.decode('utf-8','ignore')[:200]}]]"
+      texts=[]
+      for f in sorted(os.listdir(tmpdir)):
+        if f.startswith("pg") and (f.endswith(".ppm") or f.endswith(".png") or f.endswith(".jpg")):
+          try: texts.append(pytesseract.image_to_string(Image.open(os.path.join(tmpdir,f)), lang=ocr_lang))
+          except Exception as e: logging.error(f"[OCR] {e}", exc_info=True); texts.append(f"[[error: tesseract {e}]]")
+      return ("\n".join(texts).strip() or "[[error: ocr empty]]")
 
     if ext in [".png",".jpg",".jpeg",".bmp",".tiff",".webp"] or (mt and mt.startswith("image/")):
-        try: return pytesseract.image_to_string(Image.open(path), lang=ocr_lang) or "[[error: image ocr empty]]"
-        except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: image ocr exception: {repr(e)}]]"
+      try: return pytesseract.image_to_string(Image.open(path), lang=ocr_lang) or "[[error: image ocr empty]]"
+      except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: image ocr exception: {repr(e)}]]"
 
     if ext == ".docx":
-        try:
-            import docx; return "\n".join(p.text for p in docx.Document(path).paragraphs)
-        except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: docx extract exception: {repr(e)}]]"
+      try:
+        import docx; return "\n".join(p.text for p in docx.Document(path).paragraphs)
+      except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: docx extract exception: {repr(e)}]]"
 
     if ext == ".pptx":
-        try:
-            from pptx import Presentation; lines=[]; prs=Presentation(path)
-            for s in prs.slides:
-                for shp in s.shapes:
-                    if hasattr(shp,"text"): lines.append(shp.text)
-            return "\n".join(lines) or "[[error: pptx no text]]"
-        except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: pptx extract exception: {repr(e)}]]"
+      try:
+        from pptx import Presentation; lines=[]; prs=Presentation(path)
+        for s in prs.slides:
+          for shp in s.shapes:
+            if hasattr(shp,"text"): lines.append(shp.text)
+        return "\n".join(lines) or "[[error: pptx no text]]"
+      except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: pptx extract exception: {repr(e)}]]"
 
     try:
-        with open(path,"rb") as f: return f.read().decode("utf-8","ignore")
+      with open(path,"rb") as f: return f.read().decode("utf-8","ignore")
     except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: unknown file read exception: {repr(e)}]]"
 PY
 
@@ -727,8 +740,8 @@ class AIClient:
 PY
 
   cat > "$APP_DIR/seiue_api.py" <<'PY'
-import os, logging, requests, threading
-from typing import Dict, Any, List, Union
+import os, logging, requests, threading, re, time
+from typing import Dict, Any, List, Union, Optional, Tuple
 from credentials import login, AuthResult
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -827,36 +840,77 @@ class Seiue:
         return r.json()
 
     def get_item_detail(self, item_id: int):
-        url = self._url(f"/vnas/klass/items/{item_id}")
+        # include expand to expose full_score consistently
+        url = self._url(f"/vnas/klass/items/{item_id}?expand=assessment%2Cassessment_stage%2Cstage")
         r = self._with_refresh(lambda: self.session.get(url, timeout=30))
         if r.status_code >= 400: logging.error(f"[API] get_item_detail {r.status_code}: {(r.text or '')[:300]}"); r.raise_for_status()
         return r.json()
 
-    def get_file_signed_url(self, file_id: str) -> str:
-        url = self._url(f"/chalk/netdisk/files/{file_id}/url")
-        r = self._with_refresh(lambda: self.session.get(url, allow_redirects=False, timeout=60))
-        if r.status_code in (301,302) and "Location" in r.headers: return r.headers["Location"]
+    def get_item_max_score(self, item_id: int) -> Optional[float]:
         try:
-            j = r.json()
-            if isinstance(j, dict) and j.get("url"): return j["url"]
-        except Exception: pass
-        if r.status_code >= 400: logging.error(f"[API] file url {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
-        return ""
+            d = self.get_item_detail(item_id) or {}
+            for k in ("full_score","max_score","score_upper","full","max"):
+                v = d.get(k)
+                if v is not None:
+                    try: return float(v)
+                    except: pass
+            # fallbacks via structured payloads
+            for arrk in ("score_items","scoring_items","rules"):
+                arr = d.get(arrk)
+                if isinstance(arr, list) and arr:
+                    tot = 0.0
+                    for it in arr:
+                        mx = it.get("full") or it.get("max") or it.get("max_score")
+                        try: tot += float(mx or 0)
+                        except: pass
+                    if tot > 0: return tot
+            # assessment level (less preferred)
+            asses = d.get("assessment") or {}
+            for k in ("total_item_score","full_score","max_score"):
+                v = asses.get(k)
+                if v is not None:
+                    try: return float(v)
+                    except: pass
+        except Exception as e:
+            logging.debug(f"[ITEM] get_item_max_score fail: {e}")
+        return None
 
-    def download(self, url: str) -> bytes:
-        r = self._with_refresh(lambda: self.session.get(url, timeout=120))
-        if r.status_code >= 400: logging.error(f"[API] download {r.status_code}: {(r.text or '')[:200]}"); r.raise_for_status()
-        return r.content
-
-    def post_review(self, receiver_id: int, task_id: int, content: str, result="approved"):
-        path = os.getenv("SEIUE_REVIEW_POST_TEMPLATE","/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews").format(receiver_id=receiver_id, task_id=task_id)
+    def verify_existing_score(self, item_id: int, owner_id: int) -> Optional[float]:
+        path_tmpl = os.getenv("SEIUE_VERIFY_SCORE_GET_TEMPLATE","/vnas/common/items/{item_id}/scores?paginated=0&type=item_score")
+        path = path_tmpl.format(item_id=item_id)
         url = self._url(path)
-        body = {"result": result, "content": content, "reason": "","attachments": [], "do_evaluation": False, "is_submission_changed": False}
-        r = self._with_refresh(lambda: self.session.post(url, json=body, timeout=60))
-        if r.status_code not in (200,201): logging.error(f"[API] post_review {r.status_code}: {(r.text or '')[:400]}"); r.raise_for_status()
-        return r.json()
+        r = self._with_refresh(lambda: self.session.get(url, timeout=30))
+        if r.status_code >= 400:
+            return None
+        try:
+            data = r.json()
+            rows = data if isinstance(data,list) else (data.get("data") or data.get("items") or [])
+            for row in rows:
+                try:
+                    if int(row.get("owner_id") or 0) == int(owner_id):
+                        v = row.get("score")
+                        return float(v) if v is not None else None
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
 
-    def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float) -> bool:
+    def parse_max_from_422(self, text: str) -> Optional[float]:
+        if not text: return None
+        # Chinese message like: “必须 ... 小于等于评价项满分40.00。”
+        m = re.search(r"满分\s*([0-9]+(?:\.[0-9]+)?)", text)
+        if m:
+            try: return float(m.group(1))
+            except: pass
+        # English-ish fallback
+        m2 = re.search(r"(?:max(?:imum)?|<=)\s*([0-9]+(?:\.[0-9]+)?)", text, re.I)
+        if m2:
+            try: return float(m2.group(1))
+            except: pass
+        return None
+
+    def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float) -> Tuple[bool,int,str]:
         path = f"/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true"
         url  = self._url(path)
         payload = [{
@@ -870,13 +924,16 @@ class Seiue:
             "status": "published"
         }]
         r = self._with_refresh(lambda: self.session.post(url, json=payload, timeout=60))
+        txt = r.text or ""
         if 200 <= r.status_code < 300:
-            return True
-        if r.status_code == 422 and ("分数已经存在" in (r.text or "") or "already exists" in (r.text or "")):
-            return True
-        logging.warning(f"[API] score failed: POST {path} -> {r.status_code} :: {(r.text or '')[:200]}")
-        if r.status_code >= 400: r.raise_for_status()
-        return False
+            return True, r.status_code, txt
+        if r.status_code == 422 and ("分数已经存在" in txt or "already exists" in txt):
+            return True, r.status_code, txt
+        if r.status_code >= 400:
+            logging.warning(f"[API] score failed: POST {path} -> {r.status_code} :: {txt[:200]}")
+            # do not raise here; let caller decide retry/skip
+            return False, r.status_code, txt
+        return False, r.status_code, txt
 
     def resolve_item_id(self, task_id: int) -> int:
         try:
@@ -937,9 +994,9 @@ PY
 
   cat > "$APP_DIR/main.py" <<'PY'
 import os, json, time, logging, re, threading, signal
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple, Optional
 from dotenv import load_dotenv
-from utilx import draftjs_to_text, scan_question_maxima, stable_hash
+from utilx import draftjs_to_text, scan_question_maxima, stable_hash, clamp
 from extractor import file_to_text
 from ai_providers import AIClient
 from seiue_api import Seiue
@@ -975,11 +1032,9 @@ def _parse_task_ids(raw: str) -> List[int]:
     out: List[int] = []
     for seg in [s.strip() for s in raw.split(",") if s.strip()]:
         m = re.search(r"/tasks/(\d+)", seg)
-        if m:
-            out.append(int(m.group(1))); continue
+        if m: out.append(int(m.group(1))); continue
         m2 = re.search(r"\b(\d{4,})\b", seg)
-        if m2:
-            out.append(int(m2.group(1)))
+        if m2: out.append(int(m2.group(1)))
     dedup=[]; seen=set()
     for x in out:
         if x not in seen:
@@ -1019,7 +1074,10 @@ def load_env():
         "score_all_on_start": True,
         "dry_run": False,
         "verify_after": as_bool(get("VERIFY_AFTER_WRITE","1")),
-        "retry_failed": as_bool(get("RETRY_FAILED","1")),
+        "reverify_before": as_bool(get("REVERIFY_BEFORE_WRITE","1")),
+        "retry_422_once": as_bool(get("RETRY_ON_422_ONCE","1")),
+        "clamp_on_max": as_bool(get("SCORE_CLAMP_ON_MAX","1")),
+        "max_cache_ttl": int(get("MAX_SCORE_CACHE_TTL","600") or "600"),
         "student_workers": int(get("STUDENT_WORKERS","1") or "1"),
         "attach_workers": int(get("ATTACH_WORKERS","3") or "3"),
         "ai_failover": as_bool(get("AI_FAILOVER","1")),
@@ -1093,21 +1151,28 @@ def _sigterm(_s,_f):
 signal.signal(signal.SIGTERM, _sigterm)
 signal.signal(signal.SIGINT, _sigterm)
 
-def _full_score_from(api: Seiue, task: dict, item_id: int, overall_max: float) -> float:
-    score = float(overall_max or 0.0)
-    if score > 0:
-        return score
-    try:
-        if item_id > 0:
-            detail = api.get_item_detail(item_id) or {}
-            for k in ("full_score","max_score","full","max"):
-                v = detail.get(k)
-                if v is not None:
-                    try: return float(v)
-                    except: pass
-    except Exception as e:
-        logging.debug(f"[FULL] item detail fallback failed: {e}")
-    return 100.0
+# --------- Max score cache (memory) ----------
+_item_max_cache: Dict[int, Tuple[float, float]] = {}  # item_id -> (value, ts)
+
+def _get_item_max(api: Seiue, task: dict, item_id: int, fallback: float, ttl: int) -> float:
+    now = time.time()
+    if item_id > 0:
+        if item_id in _item_max_cache:
+            v, ts = _item_max_cache[item_id]
+            if now - ts < ttl:
+                return v
+    # try direct item endpoint
+    ms = None
+    if item_id > 0:
+        ms = api.get_item_max_score(item_id)
+    if ms is None or ms <= 0:
+        # fallback to task-derived maxima if any
+        if fallback and fallback > 0:
+            ms = float(fallback)
+        else:
+            ms = 100.0
+    _item_max_cache[item_id] = (float(ms), now)
+    return float(ms)
 
 def main_loop(cfg: Dict[str,Any]):
     if not cfg["task_ids"]:
@@ -1137,7 +1202,7 @@ def main_loop(cfg: Dict[str,Any]):
             logging.error(f"[TASK {task_id}] load failed: {e}")
             continue
 
-        perq, overall_max = scan_question_maxima(task)
+        perq, overall_max_from_task = scan_question_maxima(task)
         try:
             items = api.get_assignments(task_id) or []
         except Exception as e:
@@ -1157,53 +1222,86 @@ def main_loop(cfg: Dict[str,Any]):
             iid = cached_iid
 
         total = len(items)
-        done_cnt = 0
+        success_cnt = 0
         processed_map = state["processed"].setdefault(str(task_id), {})
 
         if tg_enabled(cfg):
             tg_send(cfg, f"📘 <b>Task {task_id}</b> started · total: <b>{total}</b>")
 
+        # -------- FULL MODE --------
         if (cfg.get("full_score_mode") or "off") == "all":
-            full_score = _full_score_from(api, task, iid, overall_max)
+            max_score = _get_item_max(api, task, iid, overall_max_from_task, cfg["max_cache_ttl"])
             review_comment = cfg.get("full_score_comment") or "記得看高考真題。"
             for idx, asg in enumerate(items, start=1):
                 if _stop.is_set(): break
                 rid = int(asg.get("receiver_id") or (asg.get("assignee") or {}).get("id") or 0)
                 name = ((asg.get("assignee") or {}).get("name") or "").strip() or "?"
-                try:
-                    api.post_review(receiver_id=rid, task_id=task_id, content=review_comment)
-                except Exception as e:
-                    logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
-                if iid > 0:
+
+                # review (best-effort)
+                try: api.post_review(receiver_id=rid, task_id=task_id, content=review_comment)
+                except Exception as e: logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
+
+                desired = float(max_score)
+
+                # pre-verify existing score to avoid re-post
+                if cfg["reverify_before"] and iid > 0:
                     try:
-                        ok = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=full_score)
-                        if not ok:
-                            logging.warning(f"[SCORE][TASK {task_id}] rid={rid} write not confirmed")
-                    except Exception as e:
-                        logging.warning(f"[SCORE][TASK {task_id}] rid={rid} score write fail: {e}")
+                        exist = api.verify_existing_score(iid, rid)
+                        if exist is not None:
+                            processed_map[str(rid)] = {"status":"ok","score":exist,"comment":review_comment}
+                            success_cnt += 1
+                            logging.info("[FULL][OK][TASK %s] %d/%d rid=%s name=%s (already exists: %.2f)", task_id, success_cnt, total, rid, name, exist)
+                            if tg_enabled(cfg) and cfg["tg_verbose"]:
+                                tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {exist}\n{review_comment}")
+                            save_state(cfg["state_path"], state)
+                            continue
+                    except Exception:
+                        pass
+
+                wrote = False
+                if iid > 0:
+                    ok, code, txt = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired)
+                    if not ok and code == 422 and cfg["retry_422_once"]:
+                        parsed = api.parse_max_from_422(txt)
+                        if parsed and parsed > 0:
+                            # update cache & clamp once
+                            _item_max_cache[iid] = (parsed, time.time())
+                            desired = min(desired, parsed)
+                            ok, code2, txt2 = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired)
+                            ok = ok  # final
+                    if ok:
+                        wrote = True
                 else:
                     logging.error(f"[SCORE][TASK {task_id}] rid={rid} skipped (item_id unresolved)")
-                processed_map[str(rid)] = {"hash": "fullscore", "score": full_score, "comment": review_comment}
-                done_cnt += 1
-                logging.info("[FULL][TASK %s] %d/%d rid=%s name=%s score=%.1f", task_id, done_cnt, total, rid, name, full_score)
-                if tg_enabled(cfg) and cfg["tg_verbose"]:
-                    tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {full_score}\n{review_comment}")
+
+                if wrote:
+                    processed_map[str(rid)] = {"status":"ok", "score": desired, "comment": review_comment}
+                    success_cnt += 1
+                    logging.info("[FULL][OK][TASK %s] %d/%d rid=%s name=%s score=%.2f", task_id, success_cnt, total, rid, name, desired)
+                    if tg_enabled(cfg) and cfg["tg_verbose"]:
+                        tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {desired}\n{review_comment}")
+                else:
+                    processed_map[str(rid)] = {"status":"fail", "score_wanted": desired, "comment": review_comment}
+                    logging.info("[FULL][FAIL][TASK %s] rid=%s name=%s score_wanted=%.2f", task_id, rid, name, desired)
+
                 save_state(cfg["state_path"], state)
                 if _stop.is_set(): break
 
             try:
-                all_scores = [v.get("score",0.0) for v in (state["processed"].get(str(task_id)) or {}).values()]
+                succ_rows = [v for v in (state["processed"].get(str(task_id)) or {}).values() if v.get("status")=="ok"]
+                all_scores = [float(v.get("score",0.0)) for v in succ_rows]
                 avg = (sum(all_scores)/len(all_scores)) if all_scores else 0.0
-                zero_cnt = sum(1 for s in all_scores if not s)
-                msg = f"✅ <b>Task {task_id}</b> FULL-SCORED {done_cnt}/{total}\nAvg: {avg:.2f} · Zero: {zero_cnt}"
+                zero_cnt = sum(1 for s in all_scores if s <= 1e-9)
+                msg = f"✅ <b>Task {task_id}</b> FULL-SCORED {success_cnt}/{total}\nAvg: {avg:.2f} · Zero: {zero_cnt}"
                 logging.info("[SUMMARY][TASK %s] %s", task_id, msg)
                 if tg_enabled(cfg): tg_send(cfg, msg)
             except Exception as e:
                 logging.warning(f"[SUMMARY][TASK {task_id}] fail: {e}")
 
             save_state(cfg["state_path"], state)
-            continue
+            continue  # next task
 
+        # -------- NORMAL MODE --------
         for idx, asg in enumerate(items, start=1):
             if _stop.is_set(): break
             rid = int(asg.get("receiver_id") or (asg.get("assignee") or {}).get("id") or 0)
@@ -1238,71 +1336,101 @@ def main_loop(cfg: Dict[str,Any]):
                     except Exception as e:
                         logging.warning(f"[ATTACH][TASK {task_id}] rid={rid} file {fid} failed: {e}")
 
+            # blank submission
             if not (extracted or "").strip():
                 score, comment = 0.0, "学生未提交作业内容。"
-                try:
-                    api.post_review(receiver_id=rid, task_id=task_id, content=comment)
-                except Exception as e:
-                    logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
+                try: api.post_review(receiver_id=rid, task_id=task_id, content=comment)
+                except Exception as e: logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
+
+                wrote = False
                 if iid > 0:
-                    try:
-                        ok = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=score)
-                        if not ok:
-                            logging.warning(f"[SCORE][TASK {task_id}] rid={rid} write not confirmed")
-                    except Exception as e:
-                        logging.warning(f"[SCORE][TASK {task_id}] rid={rid} score write fail: {e}")
+                    ok, code, txt = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=score)
+                    wrote = ok
                 else:
                     logging.error(f"[SCORE][TASK {task_id}] rid={rid} skipped (item_id unresolved)")
-                processed_map[str(rid)] = {"hash": fingerprint, "score": score, "comment": comment}
-                done_cnt += 1
-                if tg_enabled(cfg) and cfg["tg_verbose"]:
-                    tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {score}\n{comment}")
+
+                if wrote:
+                    processed_map[str(rid)] = {"status":"ok","hash": fingerprint, "score": score, "comment": comment}
+                    success_cnt += 1
+                    logging.info("[DONE][TASK %s] %d/%d rid=%s name=%s score=%.1f", task_id, success_cnt, total, rid, name, score)
+                    if tg_enabled(cfg) and cfg["tg_verbose"]:
+                        tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {score}\n{comment}")
+                else:
+                    processed_map[str(rid)] = {"status":"fail","hash": fingerprint, "score_wanted": score, "comment": comment}
+                    logging.info("[FAIL][TASK %s] rid=%s name=%s score_wanted=%.1f", task_id, rid, name, score)
+
                 save_state(cfg["state_path"], state)
                 continue
 
+            # AI grading
             provider = cfg["ai_provider"]
             model = cfg["gemini_model"] if provider=="gemini" else cfg["deepseek_model"]
             key   = cfg["gemini_key"]   if provider=="gemini" else cfg["deepseek_key"]
             client = AIClient(provider=provider, model=model, key=key)
-            prompt = build_prompt(cfg, task, asg, extracted, perq, overall_max)
+            prompt = build_prompt(cfg, task, asg, extracted, perq, overall_max_from_task)
             try:
                 j = client.grade(prompt)
                 overall = j.get("overall") or {}
-                score = float(overall.get("score") or 0.0)
+                ai_score = float(overall.get("score") or 0.0)
                 comment = str(overall.get("comment") or "").strip() or "（无评语）"
             except Exception as e:
-                score, comment = 0.0, f"自动评分失败：{e}"
+                ai_score, comment = 0.0, f"自动评分失败：{e}"
 
-            try:
-                api.post_review(receiver_id=rid, task_id=task_id, content=comment)
-            except Exception as e:
-                logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
+            try: api.post_review(receiver_id=rid, task_id=task_id, content=comment)
+            except Exception as e: logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
 
-            if iid > 0:
+            # get max and clamp before write
+            max_score = _get_item_max(api, task, iid, overall_max_from_task, cfg["max_cache_ttl"])
+            desired = clamp(ai_score, 0.0, max_score) if cfg["clamp_on_max"] else ai_score
+
+            # pre-verify existing
+            if cfg["reverify_before"] and iid > 0:
                 try:
-                    ok = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=score)
-                    if not ok:
-                        logging.warning(f"[SCORE][TASK {task_id}] rid={rid} write not confirmed")
-                except Exception as e:
-                    logging.warning(f"[SCORE][TASK {task_id}] rid={rid} score write fail: {e}")
+                    exist = api.verify_existing_score(iid, rid)
+                    if exist is not None:
+                        processed_map[str(rid)] = {"status":"ok","hash": fingerprint, "score": exist, "comment": comment}
+                        success_cnt += 1
+                        logging.info("[DONE][OK][TASK %s] %d/%d rid=%s name=%s (already exists: %.2f)", task_id, success_cnt, total, rid, name, exist)
+                        if tg_enabled(cfg) and cfg["tg_verbose"]:
+                            tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {exist}\n{comment}")
+                        save_state(cfg["state_path"], state)
+                        continue
+                except Exception:
+                    pass
+
+            wrote = False
+            if iid > 0:
+                ok, code, txt = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired)
+                if not ok and code == 422 and cfg["retry_422_once"]:
+                    parsed = api.parse_max_from_422(txt)
+                    if parsed and parsed > 0:
+                        _item_max_cache[iid] = (parsed, time.time())
+                        desired = min(desired, parsed)
+                        ok, code2, txt2 = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired)
+                        ok = ok
+                if ok: wrote = True
             else:
                 logging.error(f"[SCORE][TASK {task_id}] rid={rid} skipped (item_id unresolved)")
 
-            processed_map[str(rid)] = {"hash": fingerprint, "score": score, "comment": comment}
-            done_cnt += 1
-            logging.info("[DONE][TASK %s] %d/%d rid=%s name=%s score=%.1f", task_id, done_cnt, total, rid, name, score)
-
-            if tg_enabled(cfg) and cfg["tg_verbose"]:
-                tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {score}\n{comment}")
+            if wrote:
+                processed_map[str(rid)] = {"status":"ok","hash": fingerprint, "score": desired, "comment": comment}
+                success_cnt += 1
+                logging.info("[DONE][TASK %s] %d/%d rid=%s name=%s score=%.1f", task_id, success_cnt, total, rid, name, desired)
+                if tg_enabled(cfg) and cfg["tg_verbose"]:
+                    tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {desired}\n{comment}")
+            else:
+                processed_map[str(rid)] = {"status":"fail","hash": fingerprint, "score_wanted": desired, "comment": comment}
+                logging.info("[FAIL][TASK %s] rid=%s name=%s score_wanted=%.1f", task_id, rid, name, desired)
 
             save_state(cfg["state_path"], state)
             if _stop.is_set(): break
 
         try:
-            all_scores = [v.get("score",0.0) for v in (state["processed"].get(str(task_id)) or {}).values()]
+            succ_rows = [v for v in (state["processed"].get(str(task_id)) or {}).values() if v.get("status")=="ok"]
+            all_scores = [float(v.get("score",0.0)) for v in succ_rows]
             avg = (sum(all_scores)/len(all_scores)) if all_scores else 0.0
-            zero_cnt = sum(1 for s in all_scores if not s)
-            msg = f"✅ <b>Task {task_id}</b> done {done_cnt}/{total}\nAvg: {avg:.2f} · Zero: {zero_cnt}"
+            zero_cnt = sum(1 for s in all_scores if s <= 1e-9)
+            msg = f"✅ <b>Task {task_id}</b> done {success_cnt}/{total}\nAvg: {avg:.2f} · Zero: {zero_cnt}"
             logging.info("[SUMMARY][TASK %s] %s", task_id, msg)
             if tg_enabled(cfg): tg_send(cfg, msg)
         except Exception as e:
