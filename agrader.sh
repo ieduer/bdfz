@@ -1501,7 +1501,7 @@ Type=simple
 WorkingDirectory=${APP_DIR}
 Environment=ENV_PATH=${ENV_FILE}
 ExecStart=${VENV_DIR}/bin/python ${PY_MAIN}
-Restart=always
+Restart=on-failure
 RestartSec=3
 User=root
 
