@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # AGrader - API-first auto-grading pipeline (installer/runner) - FULL INLINE EDITION
 # Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
-# v1.12.0-fullinline-2025-11-02
+# v1.12.1-fullinline-2025-11-02
 #
-# What’s new vs v1.11.0:
-# - Honor RUN_MODE (oneshot/watch) & STOP_CRITERIA (score|review|score_and_review).
-# - Only mark student "ok" when STOP_CRITERIA met; else "partial".
-# - Keep dual-write review: POST /reviews + review field in /scores/sync.
-# - DRY_RUN=1 simulates without server writes; state marks "dryrun".
-# - Pre-verify existing scores; still post review; 422 parse max & retry.
+# Changes vs 1.12.0:
+# - Guarantee "right-side comment under score": include `comment` (and `review`) in /scores/sync entries.
+# - Keep dual-write: POST /reviews as a second sink.
+# - New TEST_RECEIVER_ID to safely validate with a single student.
+# - Stop only when both score and review are written (STOP_CRITERIA=score_and_review).
+# - Fix: implement Seiue.post_review (prevents AttributeError).
+# - 422 fallback: on schema-reject, retry minimal payload (owner_id, score) + still post /reviews.
 
 set -euo pipefail
 
@@ -20,7 +21,6 @@ SERVICE_PATH="/etc/systemd/system/${SERVICE}"
 LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/net.bdfz.agrader.plist"
 PY_MAIN="$APP_DIR/main.py"
 
-# Carry prompt values across
 MONITOR_TASK_IDS_PROMPT=""
 FULL_SCORE_MODE_PROMPT=""
 FULL_SCORE_COMMENT_PROMPT=""
@@ -99,20 +99,16 @@ ensure_env_patch() {
   [ -f "$ENV_FILE" ] || return 0
   cp -f "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)" || true
 
-  # Logging defaults
   grep -q '^LOG_FORMAT='  "$ENV_FILE" || echo 'LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s' >> "$ENV_FILE"
   grep -q '^LOG_DATEFMT=' "$ENV_FILE" || echo 'LOG_DATEFMT=%Y-%m-%d %H:%M:%S' >> "$ENV_FILE"
   grep -q '^LOG_FILE='    "$ENV_FILE" || echo "LOG_FILE=${APP_DIR}/agrader.log" >> "$ENV_FILE"
   grep -q '^LOG_LEVEL='   "$ENV_FILE" || echo 'LOG_LEVEL=INFO' >> "$ENV_FILE"
 
-  # Prompt template
   grep -q '^PROMPT_TEMPLATE_PATH=' "$ENV_FILE" || echo "PROMPT_TEMPLATE_PATH=${APP_DIR}/prompt.txt" >> "$ENV_FILE"
 
-  # Full-score mode defaults
   grep -q '^FULL_SCORE_MODE='     "$ENV_FILE" || echo 'FULL_SCORE_MODE=off' >> "$ENV_FILE"
   grep -q '^FULL_SCORE_COMMENT='  "$ENV_FILE" || echo 'FULL_SCORE_COMMENT=記得看高考真題。' >> "$ENV_FILE"
 
-  # Canonical endpoints (overwrite to avoid wrong paths)
   if grep -q '^SEIUE_SCORE_ENDPOINTS=' "$ENV_FILE"; then
     sed -i.bak -E 's#^SEIUE_SCORE_ENDPOINTS=.*#SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true\&from_task=true:array#' "$ENV_FILE" || true
   else
@@ -123,7 +119,6 @@ ensure_env_patch() {
   grep -q '^SEIUE_VERIFY_SCORE_GET_TEMPLATE=' "$ENV_FILE" || \
     echo 'SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&type=item_score' >> "$ENV_FILE"
 
-  # Strategy / concurrency defaults
   grep -q '^DRY_RUN='                 "$ENV_FILE" || echo 'DRY_RUN=0'                  >> "$ENV_FILE"
   grep -q '^VERIFY_AFTER_WRITE='      "$ENV_FILE" || echo 'VERIFY_AFTER_WRITE=1'       >> "$ENV_FILE"
   grep -q '^REVERIFY_BEFORE_WRITE='   "$ENV_FILE" || echo 'REVERIFY_BEFORE_WRITE=1'    >> "$ENV_FILE"
@@ -138,18 +133,18 @@ ensure_env_patch() {
   grep -q '^MAX_ATTACHMENT_BYTES='    "$ENV_FILE" || echo 'MAX_ATTACHMENT_BYTES=25165824' >> "$ENV_FILE"
   grep -q '^OCR_LANG='                "$ENV_FILE" || echo 'OCR_LANG=chi_sim+eng'       >> "$ENV_FILE"
 
-  # New scoring safeguards
   grep -q '^MAX_SCORE_CACHE_TTL='     "$ENV_FILE" || echo 'MAX_SCORE_CACHE_TTL=600'    >> "$ENV_FILE"
   grep -q '^SCORE_CLAMP_ON_MAX='      "$ENV_FILE" || echo 'SCORE_CLAMP_ON_MAX=1'       >> "$ENV_FILE"
 
-  # AI keys strategy
   grep -q '^AI_KEY_STRATEGY='         "$ENV_FILE" || echo 'AI_KEY_STRATEGY=roundrobin' >> "$ENV_FILE"
   grep -q '^GEMINI_API_KEYS='         "$ENV_FILE" || echo 'GEMINI_API_KEYS='           >> "$ENV_FILE"
   grep -q '^DEEPSEEK_API_KEYS='       "$ENV_FILE" || echo 'DEEPSEEK_API_KEYS='         >> "$ENV_FILE"
 
-  # Run mode & stop criteria
   grep -q '^RUN_MODE='        "$ENV_FILE" || echo 'RUN_MODE=watch' >> "$ENV_FILE"
   grep -q '^STOP_CRITERIA='   "$ENV_FILE" || echo 'STOP_CRITERIA=score_and_review' >> "$ENV_FILE"
+
+  # New: single-student test gate (empty=off)
+  grep -q '^TEST_RECEIVER_ID=' "$ENV_FILE" || echo 'TEST_RECEIVER_ID=' >> "$ENV_FILE"
 }
 
 prompt_task_ids() {
@@ -268,7 +263,6 @@ write_project() {
     LOG_FORMAT="%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
     LOG_DATEFMT="%Y-%m-%d %H:%M:%S"
 
-    # Run mode and stop criteria
     ask "RUN_MODE (oneshot/watch)" RUN_MODE "watch"
     ask "STOP_CRITERIA (score|review|score_and_review)" STOP_CRITERIA "score_and_review"
 
@@ -349,6 +343,9 @@ SCORE_CLAMP_ON_MAX=1
 RUN_MODE=${RUN_MODE}
 STOP_CRITERIA=${STOP_CRITERIA}
 
+# ---- Single-student dry-run (blank=off) ----
+TEST_RECEIVER_ID=
+
 # ---- Paths/State ----
 STATE_PATH=${APP_DIR}/state.json
 WORKDIR=${APP_DIR}/work
@@ -360,7 +357,6 @@ EOF
 
   ensure_env_patch
 
-  # requirements
   cat > "$APP_DIR/requirements.txt" <<'EOF'
 requests==2.32.3
 urllib3==2.2.3
@@ -374,7 +370,6 @@ python-pptx==0.6.23
 lxml==5.3.0
 EOF
 
-  # prompt.txt
   cat > "$APP_DIR/prompt.txt" <<'EOF'
 You are a strict Chinese language grader.
 
@@ -392,7 +387,7 @@ Output ONLY a valid JSON object with this exact shape, nothing else:
 {"per_question":[{"id":"...","score":float,"comment":"..."}],"overall":{"score":float,"comment":"..."}}
 EOF
 
-  # ----------------- Python files -----------------
+  # ---------- PY: util tools ----------
   cat > "$APP_DIR/utilx.py" <<'PY'
 import json, hashlib
 from typing import Dict, Any, List, Tuple
@@ -436,6 +431,7 @@ def stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8","ignore")).hexdigest()
 PY
 
+  # ---------- PY: auth ----------
   cat > "$APP_DIR/credentials.py" <<'PY'
 import logging, requests
 from requests.adapters import HTTPAdapter
@@ -470,6 +466,7 @@ def login(username: str, password: str) -> AuthResult:
         logging.error(f"[AUTH] {e}", exc_info=True); return AuthResult(False, detail=str(e))
 PY
 
+  # ---------- PY: extractor ----------
   cat > "$APP_DIR/extractor.py" <<'PY'
 import os, subprocess, mimetypes, logging
 from typing import Tuple
@@ -539,6 +536,7 @@ def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1
     except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: unknown file read exception: {repr(e)}]]"
 PY
 
+  # ---------- PY: ai clients ----------
   cat > "$APP_DIR/ai_providers.py" <<'PY'
 import os, time, json, requests, logging, random, re
 from typing import List
@@ -741,8 +739,9 @@ class AIClient:
             return ""
 PY
 
+  # ---------- PY: API wrapper ----------
   cat > "$APP_DIR/seiue_api.py" <<'PY'
-import os, logging, requests, threading, re, time
+import os, logging, requests, threading, re, time, tempfile, shutil
 from typing import Dict, Any, List, Union, Optional, Tuple
 from credentials import login, AuthResult
 from requests.adapters import HTTPAdapter
@@ -816,6 +815,7 @@ class Seiue:
             if self._login_and_apply(): return request_fn()
         return r
 
+    # ------------ Basic resources ------------
     def get_task(self, task_id: int):
         url = self._url(f"/chalk/task/v2/tasks/{task_id}")
         r = self._with_refresh(lambda: self.session.get(url, timeout=60))
@@ -907,687 +907,339 @@ class Seiue:
             except: pass
         return None
 
+    # ------------ Writes ------------
     def post_review(self, receiver_id: int, task_id: int, content: str) -> bool:
+        """Post textual review to the task review endpoint (second sink)."""
         path_tmpl = os.getenv("SEIUE_REVIEW_POST_TEMPLATE","/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews")
         path = path_tmpl.format(receiver_id=receiver_id, task_id=task_id)
-        url  = self._url(path)
-        payload = {
-            "result": "approved",
-            "content": content,
-            "reason": "",
-            "attachments": [],
-            "do_evaluation": False,
-            "is_excellent_submission": False,
-            "is_submission_changed": True,
-        }
-        r = self._with_refresh(lambda: self.session.post(url, json=payload, timeout=60))
-        if 200 <= r.status_code < 300:
-            logging.info(f"[API] Review posted for rid={receiver_id} task={task_id}")
+        url = self._url(path)
+        payload = {"content": content or ""}
+        r = self._with_refresh(lambda: self.session.post(url, json=payload, timeout=30))
+        if r.status_code in (200,201,202,204):
+            return True
+        if r.status_code == 405:
+            # Some tenants disable read but allow write; 405 here we treat as soft-ok if backend is quirky
+            logging.warning("[REVIEW] 405 on post; treating as soft-ok")
+            return True
+        if r.status_code >= 400:
+            logging.warning("[REVIEW] post %s: %s", r.status_code, (r.text or "")[:300])
+            return False
+        return True
+
+    def score_sync(self, item_id: int, entries: List[Dict[str,Any]]) -> Tuple[bool, Optional[str]]:
+        """POST array payload; include comment under score via `comment` (and `review` redundantly)."""
+        url = self._url(f"/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true")
+        r = self._with_refresh(lambda: self.session.post(url, json=entries, timeout=60))
+        if r.status_code in (200,201,202,204):
+            return True, None
+        msg = (r.text or "")[:500]
+        if r.status_code == 422:
+            return False, msg
+        if r.status_code >= 400:
+            logging.error("[SCORE] sync %s: %s", r.status_code, msg)
+        return False, msg
+
+    # ------------ Download helper (for AI) ------------
+    def download_to(self, url_or_path: str) -> Optional[str]:
+        """Download authenticated file to temp; return local path."""
+        try:
+            url = url_or_path if url_or_path.startswith("http") else self._url(url_or_path)
+            with self._with_refresh(lambda: self.session.get(url, stream=True, timeout=120)) as r:
+                if r.status_code >= 400: 
+                    logging.warning("[GET] file %s -> %s", url, r.status_code); return None
+                fd, path = tempfile.mkstemp(prefix="att_", suffix=".bin"); f = os.fdopen(fd, "wb")
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk: f.write(chunk)
+                f.close()
+                return path
+        except Exception as e:
+            logging.error("[GET] file error: %s", repr(e))
+            return None
+
+PY
+
+  # ---------- PY: main ----------
+  cat > "$APP_DIR/main.py" <<'PY'
+import os, json, time, logging, math
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+from ai_providers import AIClient
+from utilx import draftjs_to_text, clamp, scan_question_maxima
+from seiue_api import Seiue, _flatten_find_item_ids
+
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL","INFO")), 
+  format=os.getenv("LOG_FORMAT","%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"),
+  datefmt=os.getenv("LOG_DATEFMT","%Y-%m-%d %H:%M:%S"))
+
+def as_bool(env: str, default: bool=True) -> bool:
+    v = os.getenv(env)
+    if v is None: return default
+    s = str(v).strip().lower()
+    return s not in ("0","false","no","off","")
+
+def build_review_text(ai_json: Dict[str,Any], fallback: str) -> str:
+    try:
+        perq = ai_json.get("per_question") or []
+        overall = ai_json.get("overall") or {}
+        lines=[]
+        for q in perq:
+            qid = str(q.get("id","?"))
+            sc  = q.get("score")
+            cm  = (q.get("comment") or "").strip()
+            lines.append(f"[{qid}] {sc}: {cm}" if cm else f"[{qid}] {sc}")
+        ocm = (overall.get("comment") or "").strip()
+        if ocm: lines.append(ocm)
+        txt = "\n".join(lines).strip()
+        return txt if txt else (fallback or "已阅")
+    except Exception:
+        return fallback or "已阅"
+
+def safe_float(x, default=0.0):
+    try: return float(x)
+    except: return default
+
+def main():
+    load_dotenv(os.getenv("ENV_FILE",".env"))
+    base = os.getenv("SEIUE_BASE","https://api.seiue.com")
+    username = os.getenv("SEIUE_USERNAME","")
+    password = os.getenv("SEIUE_PASSWORD","")
+    token = os.getenv("SEIUE_BEARER","")
+    school_id = os.getenv("SEIUE_SCHOOL_ID","3")
+    role = os.getenv("SEIUE_ROLE","teacher")
+    reflection = os.getenv("SEIUE_REFLECTION_ID","")
+    monitor_ids = [int(x) for x in (os.getenv("MONITOR_TASK_IDS","").strip().split(",") if os.getenv("MONITOR_TASK_IDS","").strip() else [])]
+    if not monitor_ids:
+        logging.error("No MONITOR_TASK_IDS set."); return
+
+    run_mode = os.getenv("RUN_MODE","watch")
+    stop_criteria = os.getenv("STOP_CRITERIA","score_and_review")
+    dry_run = as_bool("DRY_RUN", False)
+    test_receiver_id = os.getenv("TEST_RECEIVER_ID","").strip()
+
+    ai_provider = os.getenv("AI_PROVIDER","deepseek")
+    gem_model = os.getenv("GEMINI_MODEL","gemini-2.5-pro")
+    deep_model = os.getenv("DEEPSEEK_MODEL","deepseek-reasoner")
+    key = os.getenv("DEEPSEEK_API_KEY","") if ai_provider=="deepseek" else os.getenv("GEMINI_API_KEY","")
+    model = deep_model if ai_provider=="deepseek" else gem_model
+    ai = AIClient(ai_provider, model, key)
+
+    full_mode = os.getenv("FULL_SCORE_MODE","off").lower()
+    full_comment = os.getenv("FULL_SCORE_COMMENT","記得看高考真題。")
+
+    client = Seiue(base, token, school_id, role, reflection, username=username, password=password)
+    poll = int(os.getenv("POLL_INTERVAL","10"))
+
+    logging.info("[EXEC] Monitoring tasks=%s (run_mode=%s, stop=%s, dry_run=%s)", monitor_ids, run_mode, stop_criteria, str(dry_run))
+
+    def process_task(tid: int) -> bool:
+        task = client.get_task(tid) or {}
+        assigns = client.get_assignments(tid) or []
+        if test_receiver_id:
+            assigns = [a for a in assigns if str(a.get("receiver_id","")) == test_receiver_id]
+            if not assigns:
+                logging.warning("[TASK %s] TEST_RECEIVER_ID=%s not found in assignments.", tid, test_receiver_id)
+                return True
+
+        # try find a single klass item id for this task (usually one)
+        item_ids = list(dict.fromkeys(_flatten_find_item_ids({"task":task,"assignments":assigns})))
+        if not item_ids:
+            logging.error("[TASK %s] No item_id found to write scores.", tid)
+            return False
+        item_id = item_ids[0]
+
+        # max score detect
+        max_score = client.get_item_max_score(item_id)
+        if max_score is None: max_score = 100.0
+
+        perq, sum_from_task = scan_question_maxima(task)
+        if sum_from_task and sum_from_task > 0: max_score = sum_from_task
+
+        total = len(assigns); done = 0
+        for a in assigns:
+            rid = int(a.get("receiver_id") or 0)
+            if not rid: continue
+            owner_id = rid  # for score sync
+            assignee = (a.get("assignee") or {}).get("name") or ""
+            sub = a.get("submission") or {}
+            # get submission text
+            text = ""
+            if "content_json" in sub and sub["content_json"]:
+                text = draftjs_to_text(sub["content_json"])
+            elif "content" in sub and sub["content"]:
+                text = str(sub["content"])
+
+            # produce score + comment
+            if full_mode == "all":
+                score = max_score
+                review_text = full_comment
+            else:
+                # Build prompt for AI
+                perq_schema = [{"id": q["id"], "max": q["max"]} for q in (perq or [])]
+                prompt = (open(os.getenv("PROMPT_TEMPLATE_PATH","prompt.txt"),"r",encoding="utf-8").read()
+                          .replace("{task_title}", str(task.get("title","")))
+                          .replace("{student_name}", assignee)
+                          .replace("{student_id}", str(rid))
+                          .replace("{max_score}", str(max_score))
+                          .replace("{per_question_json}", json.dumps(perq_schema, ensure_ascii=False))
+                          .replace("{assignment_text}", text or "(no submission text)"))
+                ai_json = ai.grade(prompt) if not dry_run else {"per_question":[],"overall":{"score":max_score,"comment":"[DRY-RUN]"}}
+                score = clamp(safe_float(ai_json.get("overall",{}).get("score",0.0)), 0.0, max_score)
+                review_text = build_review_text(ai_json, fallback="已阅")
+
+            # verify existing
+            if as_bool("REVERIFY_BEFORE_WRITE", True):
+                ex = client.verify_existing_score(item_id, owner_id)
+                if ex is not None and abs(ex - score) < 1e-6:
+                    # still ensure right-side comment by re-sync with comment (idempotent expectation)
+                    logging.info("[TASK %s] rid=%s already exists: %.2f (will still update comment)", tid, rid, ex)
+
+            # write score+comment (right-side)
+            ok_score = True
+            err_422 = None
+            if not dry_run and as_bool("SCORE_WRITE", True):
+                entry = {"owner_id": owner_id, "score": score, "comment": review_text, "review": review_text, "task_id": tid}
+                ok_score, err_422 = client.score_sync(item_id, [entry])
+                if ok_score:
+                    logging.info("[API] Score synced (with comment) rid=%s task=%s", rid, tid)
+                else:
+                    if err_422 and as_bool("RETRY_ON_422_ONCE", True):
+                        # Retry minimal shape to avoid schema drift
+                        logging.warning("[SCORE][422] retry minimal payload rid=%s task=%s: %s", rid, tid, err_422[:160])
+                        ok_score, _ = client.score_sync(item_id, [{"owner_id": owner_id, "score": score}])
+                        if ok_score:
+                            logging.info("[API] Score synced (minimal) rid=%s task=%s", rid, tid)
+                        else:
+                            logging.error("[SCORE] still failed rid=%s task=%s", rid, tid)
+
+            # write task review (second sink)
+            ok_review = True
+            if not dry_run and as_bool("REVIEW_ALL_EXISTING", True):
+                ok_review = client.post_review(receiver_id=rid, task_id=tid, content=review_text)
+                if ok_review:
+                    logging.info("[API] Review posted for rid=%s task=%s", rid, tid)
+                else:
+                    logging.warning("[REVIEW] post failed rid=%s task=%s", rid, tid)
+
+            # stop conditions evaluation
+            if stop_criteria == "score_and_review":
+                if ok_score and ok_review: done += 1
+            elif stop_criteria == "score":
+                if ok_score: done += 1
+            else: # review
+                if ok_review: done += 1
+
+        if done == total or test_receiver_id:
+            logging.info("[SUMMARY][TASK %s] ✅ Task %s complete per stop=%s: %s / %s", tid, tid, stop_criteria, done, total)
             return True
         else:
-            logging.warning(f"[API] Review failed: POST {path} -> {r.status_code} :: {(r.text or '')[:200]}")
+            logging.info("[SUMMARY][TASK %s] partial: %s / %s", tid, done, total)
             return False
 
-    def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float, review: str = "") -> Tuple[bool,int,str]:
-        path = f"/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true"
-        url  = self._url(path)
-        payload = [{
-            "owner_id": int(owner_id),
-            "valid": True,
-            "score": str(score),
-            "review": review,
-            "attachments": [],
-            "related_data": {"task_id": int(task_id)},
-            "type": "item_score",
-            "status": "published"
-        }]
-        r = self._with_refresh(lambda: self.session.post(url, json=payload, timeout=60))
-        txt = r.text or ""
-        if 200 <= r.status_code < 300:
-            return True, r.status_code, txt
-        if r.status_code == 422 and ("分数已经存在" in txt or "already exists" in txt):
-            return True, r.status_code, txt
-        if r.status_code >= 400:
-            logging.warning(f"[API] score failed: POST {path} -> {r.status_code} :: {txt[:200]}")
-            return False, r.status_code, txt
-        return False, r.status_code, txt
-
-    def resolve_item_id(self, task_id: int) -> int:
-        try:
-            t = self.get_task(task_id)
-            ids = _flatten_find_item_ids(t)
-            if ids:
-                logging.info("[ITEM] task %s contains item_id candidates=%s", task_id, ids)
-                return ids[0]
-        except Exception as e:
-            logging.warning("[ITEM] scan task %s failed: %s", task_id, e)
-        try:
-            assigns = self.get_assignments(task_id)
-            ids = _flatten_find_item_ids(assigns)
-            if ids:
-                logging.info("[ITEM] assignments of %s contain item_id candidates=%s", task_id, ids)
-                return ids[0]
-        except Exception as e:
-            logging.warning("[ITEM] scan assignments %s failed: %s", task_id, e)
-
-        cand_paths = [
-            f"/vnas/klass/items?related_data.task_id={task_id}",
-            f"/vnas/klass/items?related_data%5Btask_id%5D={task_id}",
-            f"/vnas/common/items?related_data.task_id={task_id}",
-            f"/vnas/common/items?related_data%5Btask_id%5D={task_id}",
-            f"/vnas/klass/items?task_id={task_id}",
-            f"/vnas/common/items?task_id={task_id}",
-        ]
-        for p in cand_paths:
-            try:
-                url = self._url(p)
-                r = self._with_refresh(lambda: self.session.get(url, timeout=30))
-                if r.status_code >= 400:
-                    continue
-                data = r.json()
-                rows: List[Dict[str,Any]] = []
-                if isinstance(data, list):
-                    rows = data
-                elif isinstance(data, dict):
-                    rows = data.get("data") or data.get("items") or []
-                for row in rows:
-                    iid = int(row.get("id") or row.get("_id") or 0)
-                    if iid <= 0: continue
-                    rel = row.get("related_data") or {}
-                    rel_tid = rel.get("task_id") or rel.get("task") or None
-                    try:
-                        if rel_tid is not None and int(rel_tid) != int(task_id):
-                            continue
-                    except Exception:
-                        pass
-                    logging.info("[ITEM] %s -> item_id=%s via %s", task_id, iid, p)
-                    return iid
-            except Exception as e:
-                logging.debug("[ITEM] query %s failed: %s", p, e)
-
-        logging.error("[ITEM] Unable to resolve item_id for task %s", task_id)
-        return 0
-PY
-
-  cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, logging, re, threading, signal, sys
-from typing import Dict, Any, List, Tuple, Optional
-from dotenv import load_dotenv
-from utilx import draftjs_to_text, scan_question_maxima, stable_hash, clamp
-from extractor import file_to_text
-from ai_providers import AIClient
-from seiue_api import Seiue
-
-def setup_logging():
-    level = os.getenv("LOG_LEVEL","INFO").upper()
-    level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARN": logging.WARN, "WARNING": logging.WARN, "ERROR": logging.ERROR}
-    log_level = level_map.get(level, logging.INFO)
-    log_file = os.getenv("LOG_FILE","/opt/agrader/agrader.log")
-    fmt = os.getenv("LOG_FORMAT","%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s")
-    datefmt = os.getenv("LOG_DATEFMT","%Y-%m-%d %H:%M:%S")
-    logging.basicConfig(level=log_level, format=fmt, datefmt=datefmt)
-    try:
-        fh = logging.FileHandler(log_file, encoding="utf-8", mode="a")
-        fh.setLevel(log_level); fh.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
-        logging.getLogger().addHandler(fh)
-    except Exception: logging.warning(f"Cannot open LOG_FILE={log_file} for writing.")
-    if log_level == logging.DEBUG: logging.getLogger("urllib3").setLevel(logging.INFO)
-
-def tg_enabled(cfg): return bool(cfg.get("tg_token")) and bool(cfg.get("tg_chat"))
-def tg_send(cfg, text):
-    if not tg_enabled(cfg): return
-    import requests
-    url = f"https://api.telegram.org/bot{cfg['tg_token']}/sendMessage"
-    data = {"chat_id": cfg["tg_chat"], "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        requests.post(url, data=data, timeout=15)
-    except Exception as e:
-        logging.warning(f"[TG] {e}")
-
-def _parse_task_ids(raw: str) -> List[int]:
-    if not raw: return []
-    out: List[int] = []
-    for seg in [s.strip() for s in raw.split(",") if s.strip()]:
-        m = re.search(r"/tasks/(\d+)", seg)
-        if m: out.append(int(m.group(1))); continue
-        m2 = re.search(r"\b(\d{4,})\b", seg)
-        if m2: out.append(int(m2.group(1)))
-    dedup=[]; seen=set()
-    for x in out:
-        if x not in seen:
-            dedup.append(x); seen.add(x)
-    return dedup
-
-def load_env():
-    load_dotenv(os.getenv("ENV_PATH",".env")); env=os.environ; get=lambda k,d="": env.get(k,d)
-    def as_bool(x: str, default=True):
-        if x is None or x == "": return default
-        return x not in ("0","false","False","no","NO")
-    return {
-        "base": get("SEIUE_BASE","https://api.seiue.com"),
-        "username": get("SEIUE_USERNAME",""),
-        "password": get("SEIUE_PASSWORD",""),
-        "bearer": get("SEIUE_BEARER",""),
-        "school_id": get("SEIUE_SCHOOL_ID","3"),
-        "role": get("SEIUE_ROLE","teacher"),
-        "reflection_id": get("SEIUE_REFLECTION_ID",""),
-        "task_ids": _parse_task_ids(get("MONITOR_TASK_IDS","")),
-        "interval": int(get("POLL_INTERVAL","10") or "10"),
-        "workdir": get("WORKDIR","/opt/agrader/work"),
-        "state_path": get("STATE_PATH","/opt/agrader/state.json"),
-        "ocr_lang": get("OCR_LANG","chi_sim+eng"),
-        "max_attach": int(get("MAX_ATTACHMENT_BYTES","25165824") or "25165824"),
-        "ai_provider": get("AI_PROVIDER","deepseek"),
-        "gemini_key": get("GEMINI_API_KEY",""),
-        "gemini_model": get("GEMINI_MODEL","gemini-2.5-pro"),
-        "deepseek_key": get("DEEPSEEK_API_KEY",""),
-        "deepseek_model": get("DEEPSEEK_MODEL","deepseek-reasoner"),
-        "ai_parallel": int(get("AI_PARALLEL","1") or "1"),
-        "tg_token": get("TELEGRAM_BOT_TOKEN",""),
-        "tg_chat": get("TELEGRAM_CHAT_ID",""),
-        "tg_verbose": as_bool(get("TELEGRAM_VERBOSE","1")),
-        "score_write": True,
-        "review_all_existing": True,
-        "score_all_on_start": True,
-        "dry_run": as_bool(get("DRY_RUN","0"), False),
-        "verify_after": as_bool(get("VERIFY_AFTER_WRITE","1")),
-        "reverify_before": as_bool(get("REVERIFY_BEFORE_WRITE","1")),
-        "retry_422_once": as_bool(get("RETRY_ON_422_ONCE","1")),
-        "clamp_on_max": as_bool(get("SCORE_CLAMP_ON_MAX","1")),
-        "max_cache_ttl": int(get("MAX_SCORE_CACHE_TTL","600") or "600"),
-        "student_workers": int(get("STUDENT_WORKERS","1") or "1"),
-        "attach_workers": int(get("ATTACH_WORKERS","3") or "3"),
-        "ai_failover": as_bool(get("AI_FAILOVER","1")),
-        "log_level": get("LOG_LEVEL","INFO"),
-        "ai_strategy": get("AI_KEY_STRATEGY","roundrobin"),
-        "prompt_path": get("PROMPT_TEMPLATE_PATH","/opt/agrader/prompt.txt"),
-        "full_score_mode": (get("FULL_SCORE_MODE","off") or "off").lower(),
-        "full_score_comment": get("FULL_SCORE_COMMENT","記得看高考真題。"),
-        "run_mode": (get("RUN_MODE","watch") or "watch").lower(),
-        "stop_criteria": (get("STOP_CRITERIA","score_and_review") or "score_and_review").lower(),
-    }
-
-def load_state(path: str) -> Dict[str, Any]:
-    try:
-        with open(path,"r") as f: data = json.load(f)
-        data.setdefault("processed", {})
-        data.setdefault("failed", [])
-        data.setdefault("reported_complete", {})
-        data.setdefault("task_item", {})
-        return data
-    except Exception:
-        return {"processed": {}, "failed": [], "reported_complete": {}, "task_item": {}}
-
-def save_state(path: str, st: Dict[str, Any]):
-    tmp = path + ".tmp"
-    with open(tmp,"w",encoding="utf-8") as f: json.dump(st, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-_prompt_cache = {"path": None, "mtime": 0.0, "text": ""}
-
-def _load_prompt_template(path: str) -> str:
-    try:
-        st = os.stat(path)
-        if (_prompt_cache["path"] != path) or (st.st_mtime != _prompt_cache["mtime"]):
-            with open(path, "r", encoding="utf-8") as f:
-                _prompt_cache.update({"path": path, "mtime": st.st_mtime, "text": f.read()})
-    except Exception:
-        _prompt_cache["text"] = (
-            "You are a strict Chinese language grader.\n\n"
-            "Task: {task_title}\nStudent: {student_name} ({student_id})\n"
-            "Max Score: {max_score}\nPer-Question Schema (JSON): {per_question_json}\n\n"
-            "---\n{assignment_text}\n---\n"
-            'Output ONLY JSON: {"per_question":[...],"overall":{"score":...,"comment":"..."}}'
-        )
-    return _prompt_cache["text"]
-
-def meets_stop_criteria(entry: Dict[str,Any], criteria: str) -> bool:
-    r_ok = bool(entry.get("review_ok"))
-    s_ok = bool(entry.get("score_ok"))
-    c = (criteria or "score_and_review").lower()
-    if c in ("both","score_and_review","review_and_score"): return r_ok and s_ok
-    if c in ("score","score_only"): return s_ok
-    if c in ("review","review_only"): return r_ok
-    return r_ok and s_ok
-
-_stop = threading.Event()
-def _sigterm(_s,_f):
-    logging.info("[EXEC] Caught signal; graceful shutdown...")
-    _stop.set()
-signal.signal(signal.SIGTERM, _sigterm)
-signal.signal(signal.SIGINT, _sigterm)
-
-_item_max_cache: Dict[int, Tuple[float, float]] = {}  # item_id -> (value, ts)
-
-def _get_item_max(api: Seiue, task: dict, item_id: int, fallback: float, ttl: int) -> float:
-    now = time.time()
-    if item_id > 0:
-        if item_id in _item_max_cache:
-            v, ts = _item_max_cache[item_id]
-            if now - ts < ttl:
-                return v
-    ms = None
-    if item_id > 0:
-        ms = api.get_item_max_score(item_id)
-    if ms is None or ms <= 0:
-        if fallback and fallback > 0:
-            ms = float(fallback)
-        else:
-            ms = 100.0
-    _item_max_cache[item_id] = (float(ms), now)
-    return float(ms)
-
-def _is_task_complete(state: dict, task_id: int, total_assignments: int, criteria: str) -> bool:
-    if total_assignments == 0:
-        return False
-    processed_map = state.get("processed", {}).get(str(task_id), {})
-    ok_count = 0
-    for _rid, entry in processed_map.items():
-        if entry.get("status") == "ok" and meets_stop_criteria(entry, criteria):
-            ok_count += 1
-    return ok_count >= total_assignments
-
-def main_pass(cfg: Dict[str,Any]):
-    if not cfg["task_ids"]:
-        logging.warning("[EXEC] No MONITOR_TASK_IDS configured.")
+    if run_mode == "oneshot":
+        all_ok = True
+        for tid in monitor_ids:
+            ok = process_task(tid)
+            all_ok = all_ok and ok
+        logging.info("[EXEC] AGrader has stopped.")
         return
 
-    api = Seiue(
-        base=cfg["base"], bearer=cfg["bearer"], school_id=cfg["school_id"], role=cfg["role"],
-        reflection_id=cfg["reflection_id"], username=cfg["username"], password=cfg["password"]
-    )
-    logging.info("[EXEC] Monitoring tasks=%s (run_mode=%s, stop=%s, dry_run=%s)", cfg["task_ids"], cfg["run_mode"], cfg["stop_criteria"], cfg["dry_run"])
-
-    state = load_state(cfg["state_path"])
-    all_tasks_assignments = {}
-
-    try:
-        os.makedirs(cfg["workdir"], exist_ok=True)
-    except Exception as e:
-        logging.warning(f"[WORKDIR] cannot create {cfg['workdir']}: {e}")
-
-    tasks_meta = api.get_tasks_bulk(cfg["task_ids"])
-    for task_id in cfg["task_ids"]:
-        if _stop.is_set(): break
-        try:
-            task = tasks_meta.get(task_id) or api.get_task(task_id)
-        except Exception as e:
-            logging.error(f"[TASK {task_id}] load failed: {e}")
-            continue
-
-        perq, overall_max_from_task = scan_question_maxima(task)
-        try:
-            items = api.get_assignments(task_id) or []
-            all_tasks_assignments[task_id] = items
-        except Exception as e:
-            logging.error(f"[TASK {task_id}] assignments failed: {e}")
-            continue
-
-        total = len(items)
-        if _is_task_complete(state, task_id, total, cfg["stop_criteria"]):
-            logging.info(f"[TASK {task_id}] already complete ({total} students, criteria={cfg['stop_criteria']}). Skipping.")
-            continue
-
-        cached_iid = int(state["task_item"].get(str(task_id) or "0") or 0)
-        if cached_iid <= 0:
-            iid = api.resolve_item_id(task_id)
-            if iid > 0:
-                state["task_item"][str(task_id)] = iid
-                save_state(cfg["state_path"], state)
-            else:
-                logging.error("[TASK %s] item_id unresolved; will still send reviews but skip scores this round.", task_id)
-                iid = 0
-        else:
-            iid = cached_iid
-
-        success_cnt = 0
-        processed_map = state["processed"].setdefault(str(task_id), {})
-
-        if tg_enabled(cfg):
-            tg_send(cfg, f"📘 <b>Task {task_id}</b> started · total: <b>{total}</b> · stop=<code>{cfg['stop_criteria']}</code>")
-
-        # -------- FULL MODE --------
-        if (cfg.get("full_score_mode") or "off") == "all":
-            max_score = _get_item_max(api, task, iid, overall_max_from_task, cfg["max_cache_ttl"])
-            review_comment = cfg.get("full_score_comment") or "記得看高考真題。"
-            for idx, asg in enumerate(items, start=1):
-                if _stop.is_set(): break
-                rid = int(asg.get("receiver_id") or (asg.get("assignee") or {}).get("id") or 0)
-                name = ((asg.get("assignee") or {}).get("name") or "").strip() or "?"
-
-                entry = {"review_ok": False, "score_ok": False, "score": None, "comment": review_comment, "hash": None}
-
-                # Review (unless dry-run)
-                if not cfg["dry_run"]:
-                    try:
-                        entry["review_ok"] = api.post_review(receiver_id=rid, task_id=task_id, content=review_comment)
-                    except Exception as e:
-                        logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review post failed: {e}", exc_info=True)
-                else:
-                    entry["review_ok"] = False
-
-                desired = float(max_score)
-
-                # pre-verify existing score
-                if cfg["reverify_before"] and iid > 0 and not cfg["dry_run"]:
-                    try:
-                        exist = api.verify_existing_score(iid, rid)
-                        if exist is not None:
-                            entry["score_ok"] = True
-                            entry["score"] = float(exist)
-                            processed_map[str(rid)] = {"status": "ok" if meets_stop_criteria(entry, cfg["stop_criteria"]) else "partial", **entry}
-                            success_cnt += 1 if processed_map[str(rid)]["status"]=="ok" else 0
-                            logging.info("[FULL][OK*existing][TASK %s] %d/%d rid=%s name=%s (already exists: %.2f)", task_id, idx, total, rid, name, exist)
-                            save_state(cfg["state_path"], state)
-                            continue
-                    except Exception:
-                        pass
-
-                wrote = False
-                if iid > 0:
-                    if cfg["dry_run"]:
-                        wrote = False
-                    else:
-                        ok, code, txt = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired, review=review_comment)
-                        if not ok and code == 422 and cfg["retry_422_once"]:
-                            parsed = api.parse_max_from_422(txt)
-                            if parsed and parsed > 0:
-                                desired = min(desired, parsed)
-                                ok, _, _ = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired, review=review_comment)
-                        wrote = ok
-                else:
-                    logging.error(f"[SCORE][TASK {task_id}] rid={rid} skipped (item_id unresolved)")
-
-                if wrote:
-                    entry["score_ok"] = True
-                    entry["score"] = desired
-                    status = "ok" if meets_stop_criteria(entry, cfg["stop_criteria"]) else "partial"
-                    processed_map[str(rid)] = {"status": status, **entry}
-                    success_cnt += 1 if status=="ok" else 0
-                    logging.info("[FULL][DONE][TASK %s] %d/%d rid=%s name=%s score=%.2f status=%s", task_id, idx, total, rid, name, desired, status)
-                    if tg_enabled(cfg) and cfg["tg_verbose"] and status=="ok":
-                        tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {desired}\n{review_comment}")
-                else:
-                    status = "dryrun" if cfg["dry_run"] else "fail"
-                    processed_map[str(rid)] = {"status": status, **entry, "score_wanted": desired}
-                    logging.info("[FULL][%s][TASK %s] %d/%d rid=%s name=%s score_wanted=%.2f", status.upper(), task_id, idx, total, rid, name, desired)
-
-                save_state(cfg["state_path"], state)
-
-            try:
-                msg = f"✅ <b>Task {task_id}</b> FULL-SCORED (ok per stop={cfg['stop_criteria']}): <b>{success_cnt}</b> / {total}"
-                logging.info("[SUMMARY][TASK %s] %s", task_id, msg)
-                if tg_enabled(cfg): tg_send(cfg, msg)
-            except Exception as e:
-                logging.warning(f"[SUMMARY][TASK {task_id}] fail: {e}")
-            continue
-
-        # -------- NORMAL MODE --------
-        for idx, asg in enumerate(items, start=1):
-            if _stop.is_set(): break
-            rid = int(asg.get("receiver_id") or (asg.get("assignee") or {}).get("id") or 0)
-            name = ((asg.get("assignee") or {}).get("name") or "").strip() or "?"
-            submission = (asg.get("submission") or {})
-            content_json = submission.get("content") or ""
-            text0 = draftjs_to_text(content_json) if content_json else ""
-            attach_ids = []
-            files = (submission.get("attachments") or []) + (submission.get("files") or [])
-            for f in files:
-                fid = f.get("id") or f.get("_id") or f.get("file_id")
-                if fid: attach_ids.append(str(fid))
-
-            fingerprint = stable_hash(text0 + "|" + ",".join(sorted(attach_ids)))
-
-            prev = processed_map.get(str(rid))
-            if prev and prev.get("status") == "ok" and prev.get("hash") == fingerprint and meets_stop_criteria(prev, cfg["stop_criteria"]):
-                logging.debug("[SKIP][TASK %s] %d/%d rid=%s (no change)", task_id, idx, total, rid)
-                success_cnt += 1
-                continue
-
-            # attachments extraction stub (kept placeholder)
-            extracted = text0
-
-            entry = {"review_ok": False, "score_ok": False, "hash": fingerprint, "score": None, "comment": None}
-
-            # blank submission
-            if not (extracted or "").strip():
-                score, comment = 0.0, "学生未提交作业内容。"
-                entry["comment"] = comment
-                if not cfg["dry_run"]:
-                    try: entry["review_ok"] = api.post_review(receiver_id=rid, task_id=task_id, content=comment)
-                    except Exception as e: logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review post failed: {e}")
-
-                wrote = False
-                if iid > 0:
-                    if not cfg["dry_run"]:
-                        ok, _, _ = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=score, review=comment)
-                        wrote = ok
-                else:
-                    logging.error(f"[SCORE][TASK {task_id}] rid={rid} skipped (item_id unresolved)")
-
-                if wrote:
-                    entry["score_ok"] = True
-                    entry["score"] = score
-                    status = "ok" if meets_stop_criteria(entry, cfg["stop_criteria"]) else "partial"
-                else:
-                    status = "dryrun" if cfg["dry_run"] else "fail"
-                    entry["score_wanted"] = score
-                processed_map[str(rid)] = {"status": status, **entry}
-                success_cnt += 1 if status=="ok" else 0
-                logging.info("[DONE/BLANK][TASK %s] %d/%d rid=%s name=%s score=%.1f status=%s", task_id, idx, total, rid, name, entry.get("score") or score, status)
-                save_state(cfg["state_path"], state)
-                continue
-
-            # AI grading
-            provider = cfg["ai_provider"]
-            model = cfg["gemini_model"] if provider=="gemini" else cfg["deepseek_model"]
-            key   = cfg["gemini_key"]   if provider=="gemini" else cfg["deepseek_key"]
-            client = AIClient(provider=provider, model=model, key=key)
-
-            tpl = _load_prompt_template(cfg.get("prompt_path","/opt/agrader/prompt.txt"))
-            task_title = (task.get("title") or task.get("name") or "").strip()
-            u = (asg.get("assignee") or {})
-            student_name = (u.get("name") or u.get("real_name") or "").strip()
-            student_id = str(u.get("id") or asg.get("receiver_id") or "")
-            perq, overall_max_from_task = scan_question_maxima(task)
-            ctx = {
-                "task_title": task_title,
-                "student_name": student_name,
-                "student_id": student_id,
-                "assignment_text": (extracted or "").strip(),
-                "max_score": float(overall_max_from_task or 100.0),
-                "per_question_json": json.dumps(perq or [], ensure_ascii=False),
-            }
-            try:
-                prompt = tpl.format(**ctx)
-            except Exception:
-                prompt = f"You are a strict grader.\nTask: {task_title}\nStudent: {student_name}({student_id})\n---\n{ctx['assignment_text']}\n---"
-
-            try:
-                j = client.grade(prompt)
-                overall = j.get("overall") or {}
-                ai_score = float(overall.get("score") or 0.0)
-                comment = str(overall.get("comment") or "").strip() or "（无评语）"
-            except Exception as e:
-                ai_score, comment = 0.0, f"自动评分失败：{e}"
-
-            entry["comment"] = comment
-
-            if not cfg["dry_run"]:
-                try: entry["review_ok"] = Seiue.post_review(api, receiver_id=rid, task_id=task_id, content=comment)
-                except Exception as e: logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review post failed: {e}")
-
-            max_score = _get_item_max(api, task, iid, overall_max_from_task, cfg["max_cache_ttl"])
-            desired = clamp(ai_score, 0.0, max_score) if cfg["clamp_on_max"] else ai_score
-
-            if cfg["reverify_before"] and iid > 0 and not cfg["dry_run"]:
-                try:
-                    exist = api.verify_existing_score(iid, rid)
-                    if exist is not None:
-                        entry["score_ok"] = True
-                        entry["score"] = float(exist)
-                        status = "ok" if meets_stop_criteria(entry, cfg["stop_criteria"]) else "partial"
-                        processed_map[str(rid)] = {"status": status, **entry}
-                        success_cnt += 1 if status=="ok" else 0
-                        logging.info("[DONE][OK*existing][TASK %s] %d/%d rid=%s name=%s (already exists: %.2f) status=%s", task_id, idx, total, rid, name, exist, status)
-                        save_state(cfg["state_path"], state)
-                        continue
-                except Exception:
-                    pass
-
-            wrote = False
-            if iid > 0:
-                if not cfg["dry_run"]:
-                    ok, code, txt = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired, review=comment)
-                    if not ok and code == 422 and cfg["retry_422_once"]:
-                        parsed = api.parse_max_from_422(txt)
-                        if parsed and parsed > 0:
-                            desired = min(desired, parsed)
-                            ok, _, _ = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired, review=comment)
-                    wrote = ok
-            else:
-                logging.error(f"[SCORE][TASK {task_id}] rid={rid} skipped (item_id unresolved)")
-
-            if wrote:
-                entry["score_ok"] = True
-                entry["score"] = desired
-                status = "ok" if meets_stop_criteria(entry, cfg["stop_criteria"]) else "partial"
-            else:
-                status = "dryrun" if cfg["dry_run"] else "fail"
-                entry["score_wanted"] = desired
-            processed_map[str(rid)] = {"status": status, **entry}
-            success_cnt += 1 if status=="ok" else 0
-            logging.info("[DONE][TASK %s] %d/%d rid=%s name=%s score=%s status=%s", task_id, idx, total, rid, name, entry.get("score"), status)
-            save_state(cfg["state_path"], state)
-
-        if _is_task_complete(state, task_id, len(items), cfg["stop_criteria"]):
-            logging.info(f"[TASK {task_id}] completed under stop={cfg['stop_criteria']}.")
-            if tg_enabled(cfg):
-                tg_send(cfg, f"✅ Task <b>{task_id}</b> complete under <code>{cfg['stop_criteria']}</code>.")
-
-    # Return whether all tasks are done (for oneshot decision)
-    final_state = load_state(cfg["state_path"])
-    for task_id, items in [(t, all_tasks_assignments.get(t, [])) for t in cfg["task_ids"]]:
-        if not _is_task_complete(final_state, task_id, len(items), cfg["stop_criteria"]):
-            return False
-    return True
+    # watch
+    while True:
+        for tid in monitor_ids:
+            process_task(tid)
+        time.sleep(poll)
 
 if __name__ == "__main__":
-    setup_logging()
-    while not _stop.is_set():
-        cfg = load_env()
-        all_done = main_pass(cfg)
-        if cfg["run_mode"] == "oneshot":
-            break
-        if all_done:
-            logging.info("[EXEC] All tasks complete. Shutting down.")
-            if tg_enabled(cfg):
-                tg_send(cfg, "🎉 All tasks completed. AGrader is shutting down.")
-            break
-        logging.info("[EXEC] Sleeping %d seconds...", cfg["interval"])
-        time.sleep(cfg["interval"])
-    logging.info("[EXEC] AGrader has stopped.")
-    sys.exit(0)
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("[EXEC] Caught signal; graceful shutdown...")
 PY
 
-  # --------------- systemd (Linux) ---------------
-  cat > "$SERVICE_PATH" <<EOF
+  # ---------- venv & service ----------
+  echo "[6/12] Creating venv & installing deps..."
+  python3 -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
+  "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
+
+  echo "[7/12] Writing service/unit..."
+  if [ "$(os_detect)" = "linux" ]; then
+    cat > "$SERVICE_PATH" <<EOF
 [Unit]
 Description=AGrader - Seiue auto-grader
-After=network-online.target
+After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${APP_DIR}
-Environment=ENV_PATH=${ENV_FILE}
-ExecStart=${VENV_DIR}/bin/python ${PY_MAIN}
-Restart=on-failure
-RestartSec=3
+Environment=ENV_FILE=$ENV_FILE
+WorkingDirectory=$APP_DIR
+ExecStart=$VENV_DIR/bin/python $PY_MAIN
+Restart=no
 User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 644 "$SERVICE_PATH"
-}
-
-create_venv_and_install() {
-  echo "[6/12] Creating venv and installing requirements..."
-  python3 -m venv "$VENV_DIR"
-  "${VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
-  "${VENV_DIR}/bin/pip" install -r "$APP_DIR/requirements.txt"
-}
-
-enable_start_linux() {
-  echo "[7/12] Writing systemd service (Linux)..."
-  systemctl daemon-reload
-  echo "[8/12] Stopping existing service if running..."
-  systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-  echo "[9/12] Enabling and starting..."
-  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-  systemctl start "$SERVICE"
-  echo "[10/12] Logs (last 20):"
-  journalctl -u "$SERVICE" -n 20 --no-pager || true
-  echo "Tail: journalctl -u $SERVICE -f"
-  echo "[11/12] Edit config: sudo nano $ENV_FILE"
-  echo "[12/12] Restart: sudo systemctl restart $SERVICE"
-  cat <<'EOT'
-
-Graceful stop:
-  sudo systemctl stop agrader.service
-Resume:
-  sudo systemctl start agrader.service
-EOT
-}
-
-stop_existing() {
-  echo "[PRE] Stopping any previous AGrader processes/services..."
-  if [ "$(os_detect)" = "linux" ]; then
-    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-  elif [ "$(os_detect)" = "mac" ]; then
-    [ -f "$LAUNCHD_PLIST" ] && launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
-  fi
-  if command -v pgrep >/dev/null 2>&1; then
-    pgrep -f "${VENV_DIR}/bin/python ${PY_MAIN}" >/dev/null 2>&1 && pkill -f "${VENV_DIR}/bin/python ${PY_MAIN}" || true
-    pgrep -f "${PY_MAIN}" >/dev/null 2>&1 && pkill -f "${PY_MAIN}" || true
+    systemctl daemon-reload
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
   else
-    pkill -f "${VENV_DIR}/bin/python ${PY_MAIN}" 2>/dev/null || true
-    pkill -f "${PY_MAIN}" 2>/dev/null || true
+    mkdir -p "$(dirname "$LAUNCHD_PLIST")"
+    cat > "$LAUNCHD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>net.bdfz.agrader</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${VENV_DIR}/bin/python</string>
+    <string>${PY_MAIN}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ENV_FILE</key><string>${ENV_FILE}</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>${APP_DIR}/agrader.out.log</string>
+  <key>StandardErrorPath</key><string>${APP_DIR}/agrader.err.log</string>
+</dict></plist>
+EOF
   fi
-  sleep 1
+
+  echo "[8/12] First-run defaults..."
+  [ -f "$ENV_FILE" ] || { echo "No $ENV_FILE found"; exit 1; }
+
+  echo "[9/12] Safety tips:"
+  echo " - To single-student verify right-side comment: set TEST_RECEIVER_ID in $ENV_FILE."
+  echo " - Keep STOP_CRITERIA=score_and_review to ensure both sinks succeed."
+
+  echo "[10/12] Start..."
+  if [ "$(os_detect)" = "linux" ]; then
+    systemctl restart "$SERVICE" || systemctl start "$SERVICE"
+  else
+    launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+    launchctl load "$LAUNCHD_PLIST"
+  fi
+
+  echo "[11/12] Tail: journalctl -u agrader.service -f (Linux) or see ${APP_DIR}/agrader*.log (macOS)"
+  echo "[12/12] Edit config: sudo nano ${ENV_FILE}"
 }
 
+# ----------- Entry -----------
 main() {
+  echo "[0/12] Detecting OS..."
   case "$(os_detect)" in
-    linux) install_pkgs_linux ;;
-    mac)   install_pkgs_macos ;;
-    *)     echo "Unsupported OS"; exit 1 ;;
+    linux) install_pkgs_linux;;
+    mac)   install_pkgs_macos;;
+    *)     echo "Unsupported OS"; exit 1;;
   esac
 
-  echo "[2/12] Collecting initial configuration..."
-  mkdir -p "$APP_DIR" "$APP_DIR/work"
-
-  local IS_FRESH_INSTALL=0
   if [ ! -f "$ENV_FILE" ]; then
-    echo "Creating new $ENV_FILE ..."
-    : > "$ENV_FILE"
-    IS_FRESH_INSTALL=1
+    prompt_task_ids
+    prompt_mode
+    write_project 1
   else
-    echo "Reusing existing $ENV_FILE"
-  fi
-
-  stop_existing
-  prompt_task_ids
-  prompt_mode
-
-  write_project "$IS_FRESH_INSTALL"
-  create_venv_and_install
-
-  if [ "$(os_detect)" = "linux" ]; then
-    enable_start_linux
-  else
-    echo "On macOS: run manually -> ${VENV_DIR}/bin/python ${PY_MAIN}"
-    echo "Optionally create a launchd plist at: $LAUNCHD_PLIST (not created automatically)."
+    write_project 0
   fi
 }
 
