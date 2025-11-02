@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # AGrader - API-first auto-grading pipeline (installer/runner) - FULL INLINE EDITION
 # Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
-# v1.12.1-fullinline-2025-11-02
+# v1.12.2-fullinline-2025-11-02
 #
-# Changes vs 1.12.0:
-# - Guarantee "right-side comment under score": include `comment` (and `review`) in /scores/sync entries.
-# - Keep dual-write: POST /reviews as a second sink.
-# - New TEST_RECEIVER_ID to safely validate with a single student.
-# - Stop only when both score and review are written (STOP_CRITERIA=score_and_review).
-# - Fix: implement Seiue.post_review (prevents AttributeError).
-# - 422 fallback: on schema-reject, retry minimal payload (owner_id, score) + still post /reviews.
+# Fixes vs 1.12.1:
+# - Robust MONITOR_TASK_IDS parsing (ignore spaces/URLs/trailing commas).
+# - Live reload of .env each watch loop (load_dotenv(..., override=True)).
+# - systemd Restart=always (so a bad env edit won’t leave the daemon “dead”).
+# - Keep right-side comment under score; keep dual-write to /reviews.
+# - Add TEST_RECEIVER_ID default into ensure_env_patch.
+# - Add lxml build deps on apt/yum to avoid pip build failures.
 
 set -euo pipefail
 
@@ -21,6 +21,7 @@ SERVICE_PATH="/etc/systemd/system/${SERVICE}"
 LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/net.bdfz.agrader.plist"
 PY_MAIN="$APP_DIR/main.py"
 
+# Carry prompt values across
 MONITOR_TASK_IDS_PROMPT=""
 FULL_SCORE_MODE_PROMPT=""
 FULL_SCORE_COMMENT_PROMPT=""
@@ -62,21 +63,23 @@ install_pkgs_linux() {
     apt-get install -y \
       python3 python3-venv python3-pip curl unzip jq ca-certificates \
       tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
-      poppler-utils ghostscript coreutils
+      poppler-utils ghostscript coreutils \
+      build-essential libxml2-dev libxslt1-dev
   elif have dnf || have yum; then
     local YUM=$(have dnf && echo dnf || echo yum)
     $YUM install -y epel-release || true
-    $YUM install -y python3 python3-pip python3-virtualenv curl unzip jq ca-certificates coreutils
+    $YUM install -y python3 python3-pip python3-virtualenv curl unzip jq ca-certificates coreutils \
+      gcc gcc-c++ make libxml2-devel libxslt-devel
     $YUM install -y tesseract poppler-utils ghostscript || true
     $YUM install -y tesseract-langpack-eng tesseract-langpack-chi_sim || true
     $YUM install -y tesseract-eng tesseract-chi_sim || true
   elif have apk; then
     apk add --no-cache \
       python3 py3-pip py3-venv curl unzip jq ca-certificates coreutils \
-      tesseract-ocr poppler-utils ghostscript libxml2 libxslt \
+      tesseract-ocr poppler-utils ghostscript libxml2 libxslt build-base \
       tesseract-ocr-data-eng tesseract-ocr-data-chi_sim || true
   else
-    echo "Unsupported Linux package manager. Please install: python3/venv/pip, curl, jq, tesseract(+eng+chi_sim), poppler-utils, ghostscript, coreutils."
+    echo "Unsupported Linux package manager. Please install: python3/venv/pip, curl, jq, tesseract(+eng+chi_sim), poppler-utils, ghostscript, coreutils, libxml2-dev, libxslt-dev."
     exit 1
   fi
 }
@@ -99,16 +102,20 @@ ensure_env_patch() {
   [ -f "$ENV_FILE" ] || return 0
   cp -f "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)" || true
 
+  # Logging defaults
   grep -q '^LOG_FORMAT='  "$ENV_FILE" || echo 'LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s' >> "$ENV_FILE"
   grep -q '^LOG_DATEFMT=' "$ENV_FILE" || echo 'LOG_DATEFMT=%Y-%m-%d %H:%M:%S' >> "$ENV_FILE"
   grep -q '^LOG_FILE='    "$ENV_FILE" || echo "LOG_FILE=${APP_DIR}/agrader.log" >> "$ENV_FILE"
   grep -q '^LOG_LEVEL='   "$ENV_FILE" || echo 'LOG_LEVEL=INFO' >> "$ENV_FILE"
 
+  # Prompt template
   grep -q '^PROMPT_TEMPLATE_PATH=' "$ENV_FILE" || echo "PROMPT_TEMPLATE_PATH=${APP_DIR}/prompt.txt" >> "$ENV_FILE"
 
+  # Full-score mode defaults
   grep -q '^FULL_SCORE_MODE='     "$ENV_FILE" || echo 'FULL_SCORE_MODE=off' >> "$ENV_FILE"
   grep -q '^FULL_SCORE_COMMENT='  "$ENV_FILE" || echo 'FULL_SCORE_COMMENT=記得看高考真題。' >> "$ENV_FILE"
 
+  # Canonical endpoints (overwrite to avoid wrong paths)
   if grep -q '^SEIUE_SCORE_ENDPOINTS=' "$ENV_FILE"; then
     sed -i.bak -E 's#^SEIUE_SCORE_ENDPOINTS=.*#SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true\&from_task=true:array#' "$ENV_FILE" || true
   else
@@ -119,6 +126,7 @@ ensure_env_patch() {
   grep -q '^SEIUE_VERIFY_SCORE_GET_TEMPLATE=' "$ENV_FILE" || \
     echo 'SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&type=item_score' >> "$ENV_FILE"
 
+  # Strategy / concurrency defaults
   grep -q '^DRY_RUN='                 "$ENV_FILE" || echo 'DRY_RUN=0'                  >> "$ENV_FILE"
   grep -q '^VERIFY_AFTER_WRITE='      "$ENV_FILE" || echo 'VERIFY_AFTER_WRITE=1'       >> "$ENV_FILE"
   grep -q '^REVERIFY_BEFORE_WRITE='   "$ENV_FILE" || echo 'REVERIFY_BEFORE_WRITE=1'    >> "$ENV_FILE"
@@ -133,17 +141,20 @@ ensure_env_patch() {
   grep -q '^MAX_ATTACHMENT_BYTES='    "$ENV_FILE" || echo 'MAX_ATTACHMENT_BYTES=25165824' >> "$ENV_FILE"
   grep -q '^OCR_LANG='                "$ENV_FILE" || echo 'OCR_LANG=chi_sim+eng'       >> "$ENV_FILE"
 
+  # Scoring safeguards
   grep -q '^MAX_SCORE_CACHE_TTL='     "$ENV_FILE" || echo 'MAX_SCORE_CACHE_TTL=600'    >> "$ENV_FILE"
   grep -q '^SCORE_CLAMP_ON_MAX='      "$ENV_FILE" || echo 'SCORE_CLAMP_ON_MAX=1'       >> "$ENV_FILE"
 
+  # AI keys strategy
   grep -q '^AI_KEY_STRATEGY='         "$ENV_FILE" || echo 'AI_KEY_STRATEGY=roundrobin' >> "$ENV_FILE"
   grep -q '^GEMINI_API_KEYS='         "$ENV_FILE" || echo 'GEMINI_API_KEYS='           >> "$ENV_FILE"
   grep -q '^DEEPSEEK_API_KEYS='       "$ENV_FILE" || echo 'DEEPSEEK_API_KEYS='         >> "$ENV_FILE"
 
+  # Run mode & stop criteria
   grep -q '^RUN_MODE='        "$ENV_FILE" || echo 'RUN_MODE=watch' >> "$ENV_FILE"
   grep -q '^STOP_CRITERIA='   "$ENV_FILE" || echo 'STOP_CRITERIA=score_and_review' >> "$ENV_FILE"
 
-  # New: single-student test gate (empty=off)
+  # Single-student test gate
   grep -q '^TEST_RECEIVER_ID=' "$ENV_FILE" || echo 'TEST_RECEIVER_ID=' >> "$ENV_FILE"
 }
 
@@ -357,6 +368,7 @@ EOF
 
   ensure_env_patch
 
+  # requirements
   cat > "$APP_DIR/requirements.txt" <<'EOF'
 requests==2.32.3
 urllib3==2.2.3
@@ -370,6 +382,7 @@ python-pptx==0.6.23
 lxml==5.3.0
 EOF
 
+  # prompt.txt
   cat > "$APP_DIR/prompt.txt" <<'EOF'
 You are a strict Chinese language grader.
 
@@ -387,9 +400,9 @@ Output ONLY a valid JSON object with this exact shape, nothing else:
 {"per_question":[{"id":"...","score":float,"comment":"..."}],"overall":{"score":float,"comment":"..."}}
 EOF
 
-  # ---------- PY: util tools ----------
+  # ---------- PY: util ----------
   cat > "$APP_DIR/utilx.py" <<'PY'
-import json, hashlib
+import json, hashlib, re
 from typing import Dict, Any, List, Tuple
 
 def draftjs_to_text(content_json: str) -> str:
@@ -429,9 +442,14 @@ def scan_question_maxima(task: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], fl
 
 def stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8","ignore")).hexdigest()
+
+def parse_task_ids(raw: str) -> List[int]:
+    """Robust parser: extract all digit runs; ignore blanks and junk."""
+    if not raw: return []
+    return [int(x) for x in re.findall(r'\d+', raw)]
 PY
 
-  # ---------- PY: auth ----------
+  # ---------- PY: credentials ----------
   cat > "$APP_DIR/credentials.py" <<'PY'
 import logging, requests
 from requests.adapters import HTTPAdapter
@@ -454,7 +472,7 @@ def login(username: str, password: str) -> AuthResult:
         login_url = "https://passport.seiue.com/login?school_id=3&type=account&from=null&redirect_url=null"
         auth_url  = "https://passport.seiue.com/authorize"
         login_form = {"email": username, "login": username, "username": username, "password": password}
-        lr = sess.post(login_url, headers={"Referer": login_url,"Origin": "https://passport.seiue.com","Content-Type": "application/x-www-form-urlencoded"}, data=login_form, timeout=30)
+        _ = sess.post(login_url, headers={"Referer": login_url,"Origin": "https://passport.seiue.com","Content-Type": "application/x-www-form-urlencoded"}, data=login_form, timeout=30)
         auth_form = {"client_id":"GpxvnjhVKt56qTmnPWH1sA","response_type":"token"}
         ar = sess.post(auth_url, headers={"Referer": "https://chalk-c3.seiue.com/","Origin": "https://chalk-c3.seiue.com","Content-Type": "application/x-www-form-urlencoded"}, data=auth_form, timeout=30)
         ar.raise_for_status()
@@ -536,7 +554,7 @@ def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1
     except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: unknown file read exception: {repr(e)}]]"
 PY
 
-  # ---------- PY: ai clients ----------
+  # ---------- PY: AI providers ----------
   cat > "$APP_DIR/ai_providers.py" <<'PY'
 import os, time, json, requests, logging, random, re
 from typing import List
@@ -741,7 +759,7 @@ PY
 
   # ---------- PY: API wrapper ----------
   cat > "$APP_DIR/seiue_api.py" <<'PY'
-import os, logging, requests, threading, re, time, tempfile, shutil
+import os, logging, requests, threading, re, time, tempfile
 from typing import Dict, Any, List, Union, Optional, Tuple
 from credentials import login, AuthResult
 from requests.adapters import HTTPAdapter
@@ -764,7 +782,7 @@ def _flatten_find_item_ids(obj: Union[Dict[str,Any], List[Any]]) -> List[int]:
                 lk = str(k).lower()
                 if lk.endswith("item_id") or lk.endswith("klass_item_id"):
                     try:
-                        iv = int(v); 
+                        iv = int(v)
                         if iv>0: found.append(iv)
                     except Exception:
                         pass
@@ -909,7 +927,6 @@ class Seiue:
 
     # ------------ Writes ------------
     def post_review(self, receiver_id: int, task_id: int, content: str) -> bool:
-        """Post textual review to the task review endpoint (second sink)."""
         path_tmpl = os.getenv("SEIUE_REVIEW_POST_TEMPLATE","/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews")
         path = path_tmpl.format(receiver_id=receiver_id, task_id=task_id)
         url = self._url(path)
@@ -918,7 +935,6 @@ class Seiue:
         if r.status_code in (200,201,202,204):
             return True
         if r.status_code == 405:
-            # Some tenants disable read but allow write; 405 here we treat as soft-ok if backend is quirky
             logging.warning("[REVIEW] 405 on post; treating as soft-ok")
             return True
         if r.status_code >= 400:
@@ -927,7 +943,6 @@ class Seiue:
         return True
 
     def score_sync(self, item_id: int, entries: List[Dict[str,Any]]) -> Tuple[bool, Optional[str]]:
-        """POST array payload; include comment under score via `comment` (and `review` redundantly)."""
         url = self._url(f"/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true")
         r = self._with_refresh(lambda: self.session.post(url, json=entries, timeout=60))
         if r.status_code in (200,201,202,204):
@@ -939,13 +954,12 @@ class Seiue:
             logging.error("[SCORE] sync %s: %s", r.status_code, msg)
         return False, msg
 
-    # ------------ Download helper (for AI) ------------
+    # ------------ Download helper ------------
     def download_to(self, url_or_path: str) -> Optional[str]:
-        """Download authenticated file to temp; return local path."""
         try:
             url = url_or_path if url_or_path.startswith("http") else self._url(url_or_path)
             with self._with_refresh(lambda: self.session.get(url, stream=True, timeout=120)) as r:
-                if r.status_code >= 400: 
+                if r.status_code >= 400:
                     logging.warning("[GET] file %s -> %s", url, r.status_code); return None
                 fd, path = tempfile.mkstemp(prefix="att_", suffix=".bin"); f = os.fdopen(fd, "wb")
                 for chunk in r.iter_content(chunk_size=65536):
@@ -953,21 +967,20 @@ class Seiue:
                 f.close()
                 return path
         except Exception as e:
-            logging.error("[GET] file error: %s", repr(e))
+            logging.error(f"[GET] file error: {repr(e)}")
             return None
-
 PY
 
   # ---------- PY: main ----------
   cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, logging, math
+import os, json, time, logging, math, re
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from ai_providers import AIClient
-from utilx import draftjs_to_text, clamp, scan_question_maxima
+from utilx import draftjs_to_text, clamp, scan_question_maxima, parse_task_ids
 from seiue_api import Seiue, _flatten_find_item_ids
 
-logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL","INFO")), 
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL","INFO")),
   format=os.getenv("LOG_FORMAT","%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"),
   datefmt=os.getenv("LOG_DATEFMT","%Y-%m-%d %H:%M:%S"))
 
@@ -998,8 +1011,19 @@ def safe_float(x, default=0.0):
     try: return float(x)
     except: return default
 
-def main():
+def load_env_once():
     load_dotenv(os.getenv("ENV_FILE",".env"))
+
+def reload_env_each_loop():
+    # force refresh for RUN_MODE=watch updates
+    load_dotenv(os.getenv("ENV_FILE",".env"), override=True)
+
+def get_monitor_ids(raw: str) -> list:
+    # tolerate spaces, URLs, trailing comma/semicolon
+    ids = parse_task_ids((raw or "").strip())
+    return ids
+
+def run_once():
     base = os.getenv("SEIUE_BASE","https://api.seiue.com")
     username = os.getenv("SEIUE_USERNAME","")
     password = os.getenv("SEIUE_PASSWORD","")
@@ -1007,14 +1031,15 @@ def main():
     school_id = os.getenv("SEIUE_SCHOOL_ID","3")
     role = os.getenv("SEIUE_ROLE","teacher")
     reflection = os.getenv("SEIUE_REFLECTION_ID","")
-    monitor_ids = [int(x) for x in (os.getenv("MONITOR_TASK_IDS","").strip().split(",") if os.getenv("MONITOR_TASK_IDS","").strip() else [])]
+    monitor_ids = get_monitor_ids(os.getenv("MONITOR_TASK_IDS",""))
+
     if not monitor_ids:
-        logging.error("No MONITOR_TASK_IDS set."); return
+        logging.error("No MONITOR_TASK_IDS set or parse failed."); return
 
     run_mode = os.getenv("RUN_MODE","watch")
     stop_criteria = os.getenv("STOP_CRITERIA","score_and_review")
     dry_run = as_bool("DRY_RUN", False)
-    test_receiver_id = os.getenv("TEST_RECEIVER_ID","").strip()
+    test_receiver_id = (os.getenv("TEST_RECEIVER_ID","") or "").strip()
 
     ai_provider = os.getenv("AI_PROVIDER","deepseek")
     gem_model = os.getenv("GEMINI_MODEL","gemini-2.5-pro")
@@ -1040,14 +1065,12 @@ def main():
                 logging.warning("[TASK %s] TEST_RECEIVER_ID=%s not found in assignments.", tid, test_receiver_id)
                 return True
 
-        # try find a single klass item id for this task (usually one)
         item_ids = list(dict.fromkeys(_flatten_find_item_ids({"task":task,"assignments":assigns})))
         if not item_ids:
             logging.error("[TASK %s] No item_id found to write scores.", tid)
             return False
         item_id = item_ids[0]
 
-        # max score detect
         max_score = client.get_item_max_score(item_id)
         if max_score is None: max_score = 100.0
 
@@ -1058,22 +1081,19 @@ def main():
         for a in assigns:
             rid = int(a.get("receiver_id") or 0)
             if not rid: continue
-            owner_id = rid  # for score sync
+            owner_id = rid
             assignee = (a.get("assignee") or {}).get("name") or ""
             sub = a.get("submission") or {}
-            # get submission text
             text = ""
             if "content_json" in sub and sub["content_json"]:
                 text = draftjs_to_text(sub["content_json"])
             elif "content" in sub and sub["content"]:
                 text = str(sub["content"])
 
-            # produce score + comment
             if full_mode == "all":
                 score = max_score
                 review_text = full_comment
             else:
-                # Build prompt for AI
                 perq_schema = [{"id": q["id"], "max": q["max"]} for q in (perq or [])]
                 prompt = (open(os.getenv("PROMPT_TEMPLATE_PATH","prompt.txt"),"r",encoding="utf-8").read()
                           .replace("{task_title}", str(task.get("title","")))
@@ -1086,14 +1106,11 @@ def main():
                 score = clamp(safe_float(ai_json.get("overall",{}).get("score",0.0)), 0.0, max_score)
                 review_text = build_review_text(ai_json, fallback="已阅")
 
-            # verify existing
             if as_bool("REVERIFY_BEFORE_WRITE", True):
                 ex = client.verify_existing_score(item_id, owner_id)
                 if ex is not None and abs(ex - score) < 1e-6:
-                    # still ensure right-side comment by re-sync with comment (idempotent expectation)
                     logging.info("[TASK %s] rid=%s already exists: %.2f (will still update comment)", tid, rid, ex)
 
-            # write score+comment (right-side)
             ok_score = True
             err_422 = None
             if not dry_run and as_bool("SCORE_WRITE", True):
@@ -1103,7 +1120,6 @@ def main():
                     logging.info("[API] Score synced (with comment) rid=%s task=%s", rid, tid)
                 else:
                     if err_422 and as_bool("RETRY_ON_422_ONCE", True):
-                        # Retry minimal shape to avoid schema drift
                         logging.warning("[SCORE][422] retry minimal payload rid=%s task=%s: %s", rid, tid, err_422[:160])
                         ok_score, _ = client.score_sync(item_id, [{"owner_id": owner_id, "score": score}])
                         if ok_score:
@@ -1111,7 +1127,6 @@ def main():
                         else:
                             logging.error("[SCORE] still failed rid=%s task=%s", rid, tid)
 
-            # write task review (second sink)
             ok_review = True
             if not dry_run and as_bool("REVIEW_ALL_EXISTING", True):
                 ok_review = client.post_review(receiver_id=rid, task_id=tid, content=review_text)
@@ -1120,21 +1135,21 @@ def main():
                 else:
                     logging.warning("[REVIEW] post failed rid=%s task=%s", rid, tid)
 
-            # stop conditions evaluation
-            if stop_criteria == "score_and_review":
+            if os.getenv("STOP_CRITERIA","score_and_review") == "score_and_review":
                 if ok_score and ok_review: done += 1
-            elif stop_criteria == "score":
+            elif os.getenv("STOP_CRITERIA") == "score":
                 if ok_score: done += 1
-            else: # review
+            else:
                 if ok_review: done += 1
 
-        if done == total or test_receiver_id:
-            logging.info("[SUMMARY][TASK %s] ✅ Task %s complete per stop=%s: %s / %s", tid, tid, stop_criteria, done, total)
+        if done == total or os.getenv("TEST_RECEIVER_ID","").strip():
+            logging.info("[SUMMARY][TASK %s] ✅ Task %s complete per stop=%s: %s / %s", tid, tid, os.getenv("STOP_CRITERIA","score_and_review"), done, total)
             return True
         else:
             logging.info("[SUMMARY][TASK %s] partial: %s / %s", tid, done, total)
             return False
 
+    run_mode = os.getenv("RUN_MODE","watch")
     if run_mode == "oneshot":
         all_ok = True
         for tid in monitor_ids:
@@ -1143,15 +1158,22 @@ def main():
         logging.info("[EXEC] AGrader has stopped.")
         return
 
-    # watch
+    # watch loop with live .env reload
     while True:
         for tid in monitor_ids:
             process_task(tid)
-        time.sleep(poll)
+        time.sleep(int(os.getenv("POLL_INTERVAL","10")))
+        reload_env_each_loop()
+        # allow live change of task list
+        new_ids = get_monitor_ids(os.getenv("MONITOR_TASK_IDS",""))
+        if new_ids != monitor_ids and new_ids:
+            logging.info("[EXEC] MONITOR_TASK_IDS changed: %s -> %s", monitor_ids, new_ids)
+            monitor_ids = new_ids
 
 if __name__ == "__main__":
     try:
-        main()
+        load_env_once()
+        run_once()
     except KeyboardInterrupt:
         logging.info("[EXEC] Caught signal; graceful shutdown...")
 PY
@@ -1174,7 +1196,8 @@ Type=simple
 Environment=ENV_FILE=$ENV_FILE
 WorkingDirectory=$APP_DIR
 ExecStart=$VENV_DIR/bin/python $PY_MAIN
-Restart=no
+Restart=always
+RestartSec=3
 User=root
 
 [Install]
