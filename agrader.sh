@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
 # AGrader - API-first auto-grading pipeline (installer/runner) - FULL INLINE EDITION
 # Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
-# v1.10.7-fullinline-2025-11-02
-# Changes vs 1.10.6:
-# - Fetch real per-item max before scoring (full_score/max_score), cache with TTL.
-# - Clamp desired score in FULL & Normal mode before POST.
-# - Parse 422 message (e.g. “评价项满分40.00”) to auto-downgrade once and retry.
-# - Pre-verify existing scores to avoid re-post & treat as success.
-# - Success accounting fixed: only confirmed writes or “already exists” count as success.
+# v1.10.8-hotfix-fullinline-2025-11-02
+#
+# What this script does:
+# 1) Installs prerequisites (Python3 + venv, curl, jq).
+# 2) Creates /opt/agrader (or updates it) with a Python venv.
+# 3) Writes ALL required project files (main.py, seiue_api.py, ai_providers.py, utilx.py, credentials.py).
+# 4) Creates/updates .env and (re)prompts for MONITOR_TASK_IDS, RUN_MODE, FULL_SCORE_MODE, STOP_CRITERIA.
+# 5) Installs/updates a systemd service on Linux (optional launchd on macOS).
+# 6) Starts the service if RUN_MODE=watch, or runs once if RUN_MODE=oneshot.
+#
+# Your persistent config lives at: /opt/agrader/.env
+#
+# Notes:
+# - No numeric fake IDs are used. Replace placeholders like <TASK_ID> after install.
+# - .env is hot-reloaded by the app on every loop; edits take effect without restart in watch mode.
 
 set -euo pipefail
 
+# ---------- constants ----------
 APP_DIR="/opt/agrader"
 VENV_DIR="$APP_DIR/venv"
 ENV_FILE="$APP_DIR/.env"
@@ -18,14 +27,13 @@ SERVICE="agrader.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE}"
 LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/net.bdfz.agrader.plist"
 PY_MAIN="$APP_DIR/main.py"
+PY_API="$APP_DIR/seiue_api.py"
+PY_AI="$APP_DIR/ai_providers.py"
+PY_UTIL="$APP_DIR/utilx.py"
+PY_CRED="$APP_DIR/credentials.py"
 
-# Globals to carry prompt values through write_project
-MONITOR_TASK_IDS_PROMPT=""
-FULL_SCORE_MODE_PROMPT=""
-FULL_SCORE_COMMENT_PROMPT=""
-
+# ---------- helpers ----------
 have() { command -v "$1" >/dev/null 2>&1; }
-
 os_detect() {
   case "$(uname -s)" in
     Darwin) echo "mac";;
@@ -33,714 +41,503 @@ os_detect() {
     *)      echo "other";;
   esac
 }
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-ask() { local p="$1" var="$2" def="${3:-}"; local ans;
-  if [ -n "${def}" ]; then read -r -p "$p [$def]: " ans || true; ans="${ans:-$def}";
-  else read -r -p "$p: " ans || true; fi
+ask() {
+  # ask "Prompt" VAR [default]
+  local prompt="$1"; local var="$2"; local def="${3:-}"; local ans=""
+  if [ -n "${def}" ]; then
+    read -r -p "$prompt [$def]: " ans || true
+    ans="${ans:-$def}"
+  else
+    read -r -p "$prompt: " ans || true
+  fi
   printf -v "$var" "%s" "$ans"
 }
-ask_secret() { local p="$1" var="$2"; local ans; read -r -s -p "$p: " ans || true; echo; printf -v "$var" "%s" "$ans"; }
+yn() {
+  # yn "question?" VAR [default_y|default_n]
+  local q="$1"; local var="$2"; local def="${3:-default_n}"; local ans=""
+  local hint="[y/N]"; [ "$def" = "default_y" ] && hint="[Y/n]"
+  read -r -p "$q $hint " ans || true
+  ans="${ans:-$([ "$def" = "default_y" ] && echo y || echo n)}"
+  case "$ans" in
+    y|Y) printf -v "$var" "y" ;;
+    n|N) printf -v "$var" "n" ;;
+    *)   printf -v "$var" "n" ;;
+  esac
+}
 
-# safe key=val updater (only touch the target key)
-set_env_kv() {
-  local key="$1"; shift
-  local val="$*"
-  [ -f "$ENV_FILE" ] || { echo "ERROR: $ENV_FILE not found"; return 1; }
-  local esc="${val//\//\\/}"
-  if grep -qE "^${key}=" "$ENV_FILE"; then
-    sed -i.bak -E "s#^${key}=.*#${key}=${esc}#" "$ENV_FILE"
-  else
-    echo "${key}=${val}" >> "$ENV_FILE"
+ensure_root() {
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo "Re-executing with sudo to get root privileges..."
+    exec sudo -E bash "$0" "$@"
   fi
 }
 
 install_pkgs_linux() {
-  echo "[1/12] Installing system dependencies (Linux)..."
-  if have apt; then
+  echo "Installing prerequisites on Linux..."
+  if have apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
-    apt-get install -y \
-      python3 python3-venv python3-pip curl unzip jq ca-certificates \
-      tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
-      poppler-utils ghostscript coreutils
-  elif have dnf || have yum; then
-    local YUM=$(have dnf && echo dnf || echo yum)
-    $YUM install -y epel-release || true
-    $YUM install -y python3 python3-pip python3-virtualenv curl unzip jq ca-certificates coreutils
-    $YUM install -y tesseract poppler-utils ghostscript || true
-    $YUM install -y tesseract-langpack-eng tesseract-langpack-chi_sim || true
-    $YUM install -y tesseract-eng tesseract-chi_sim || true
+    apt-get install -y --no-install-recommends python3 python3-venv python3-pip curl jq ca-certificates
+  elif have dnf; then
+    dnf install -y python3 python3-pip python3-virtualenv curl jq ca-certificates
+  elif have yum; then
+    yum install -y python3 python3-pip python3-virtualenv curl jq ca-certificates || true
   elif have apk; then
-    apk add --no-cache \
-      python3 py3-pip py3-venv curl unzip jq ca-certificates coreutils \
-      tesseract-ocr poppler-utils ghostscript libxml2 libxslt \
-      tesseract-ocr-data-eng tesseract-ocr-data-chi_sim || true
+    apk add --no-cache python3 py3-pip py3-virtualenv curl jq ca-certificates
   else
-    echo "Unsupported Linux package manager. Please install: python3/venv/pip, curl, jq, tesseract(+eng+chi_sim), poppler-utils, ghostscript, coreutils."
-    exit 1
+    die "Unsupported Linux package manager. Install python3, python3-venv, curl, jq manually."
   fi
 }
 
-install_pkgs_macos() {
-  echo "[1/12] Installing system dependencies (macOS/Homebrew)..."
+install_pkgs_mac() {
+  echo "Installing prerequisites on macOS..."
   if ! have brew; then
-    echo "Homebrew not found. Please install Homebrew first: https://brew.sh"
-    exit 1
+    die "Homebrew is required on macOS. Install from https://brew.sh and re-run."
   fi
   brew update
-  brew install jq tesseract poppler ghostscript python@3.12 coreutils || true
-  if ! python3 -c 'import sys; sys.exit(0)' 2>/dev/null; then
-    echo "python3 not found; ensure Homebrew python is linked."
-    exit 1
+  brew install python@3.12 jq coreutils || true
+  # Ensure 'python3' points to brewed python
+  if ! python3 --version >/dev/null 2>&1; then
+    brew link --overwrite python@3.12
   fi
 }
 
-# Ensure sane defaults / enforce canonical endpoints, without overwriting user-set values unless specified
-ensure_env_patch() {
-  [ -f "$ENV_FILE" ] || return 0
-  cp -f "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)" || true
-
-  # Logging defaults
-  grep -q '^LOG_FORMAT='  "$ENV_FILE" || echo 'LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s' >> "$ENV_FILE"
-  grep -q '^LOG_DATEFMT=' "$ENV_FILE" || echo 'LOG_DATEFMT=%Y-%m-%d %H:%M:%S' >> "$ENV_FILE"
-  grep -q '^LOG_FILE='    "$ENV_FILE" || echo "LOG_FILE=${APP_DIR}/agrader.log" >> "$ENV_FILE"
-
-  # Prompt template
-  grep -q '^PROMPT_TEMPLATE_PATH=' "$ENV_FILE" || echo "PROMPT_TEMPLATE_PATH=${APP_DIR}/prompt.txt" >> "$ENV_FILE"
-
-  # Full-score mode defaults
-  grep -q '^FULL_SCORE_MODE='     "$ENV_FILE" || echo 'FULL_SCORE_MODE=off' >> "$ENV_FILE"
-  grep -q '^FULL_SCORE_COMMENT='  "$ENV_FILE" || echo 'FULL_SCORE_COMMENT=記得看高考真題。' >> "$ENV_FILE"
-
-  # Canonical endpoints (overwrite to avoid wrong paths)
-  if grep -q '^SEIUE_SCORE_ENDPOINTS=' "$ENV_FILE"; then
-    sed -i.bak -E 's#^SEIUE_SCORE_ENDPOINTS=.*#SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true\&from_task=true:array#' "$ENV_FILE" || true
-  else
-    echo 'SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true:array' >> "$ENV_FILE"
-  fi
-  grep -q '^SEIUE_REVIEW_POST_TEMPLATE=' "$ENV_FILE" || \
-    echo 'SEIUE_REVIEW_POST_TEMPLATE=/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews' >> "$ENV_FILE"
-  grep -q '^SEIUE_VERIFY_SCORE_GET_TEMPLATE=' "$ENV_FILE" || \
-    echo 'SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&type=item_score' >> "$ENV_FILE"
-
-  # Strategy / concurrency defaults
-  grep -q '^DRY_RUN='                 "$ENV_FILE" || echo 'DRY_RUN=0'                  >> "$ENV_FILE"
-  grep -q '^VERIFY_AFTER_WRITE='      "$ENV_FILE" || echo 'VERIFY_AFTER_WRITE=1'       >> "$ENV_FILE"
-  grep -q '^RETRY_FAILED='            "$ENV_FILE" || echo 'RETRY_FAILED=1'             >> "$ENV_FILE"
-  grep -q '^STUDENT_WORKERS='         "$ENV_FILE" || echo 'STUDENT_WORKERS=1'          >> "$ENV_FILE"
-  grep -q '^ATTACH_WORKERS='          "$ENV_FILE" || echo 'ATTACH_WORKERS=3'           >> "$ENV_FILE"
-  grep -q '^AI_PARALLEL='             "$ENV_FILE" || echo 'AI_PARALLEL=1'              >> "$ENV_FILE"
-  grep -q '^AI_MAX_RETRIES='          "$ENV_FILE" || echo 'AI_MAX_RETRIES=5'           >> "$ENV_FILE"
-  grep -q '^AI_BACKOFF_BASE_SECONDS=' "$ENV_FILE" || echo 'AI_BACKOFF_BASE_SECONDS=2.5'>> "$ENV_FILE"
-  grep -q '^AI_JITTER_SECONDS='       "$ENV_FILE" || echo 'AI_JITTER_SECONDS=0.8'      >> "$ENV_FILE"
-  grep -q '^AI_FAILOVER='             "$ENV_FILE" || echo 'AI_FAILOVER=1'              >> "$ENV_FILE"
-  grep -q '^MAX_ATTACHMENT_BYTES='    "$ENV_FILE" || echo 'MAX_ATTACHMENT_BYTES=25165824' >> "$ENV_FILE"
-  grep -q '^OCR_LANG='                "$ENV_FILE" || echo 'OCR_LANG=chi_sim+eng'       >> "$ENV_FILE"
-
-  # New scoring safeguards
-  grep -q '^MAX_SCORE_CACHE_TTL='     "$ENV_FILE" || echo 'MAX_SCORE_CACHE_TTL=600'    >> "$ENV_FILE"
-  grep -q '^SCORE_CLAMP_ON_MAX='      "$ENV_FILE" || echo 'SCORE_CLAMP_ON_MAX=1'       >> "$ENV_FILE"
-  grep -q '^RETRY_ON_422_ONCE='       "$ENV_FILE" || echo 'RETRY_ON_422_ONCE=1'        >> "$ENV_FILE"
-  grep -q '^REVERIFY_BEFORE_WRITE='   "$ENV_FILE" || echo 'REVERIFY_BEFORE_WRITE=1'    >> "$ENV_FILE"
-
-  # Multi-key AI
-  grep -q '^AI_KEY_STRATEGY='         "$ENV_FILE" || echo 'AI_KEY_STRATEGY=roundrobin' >> "$ENV_FILE"
-  grep -q '^GEMINI_API_KEYS='         "$ENV_FILE" || echo 'GEMINI_API_KEYS='           >> "$ENV_FILE"
-  grep -q '^DEEPSEEK_API_KEYS='       "$ENV_FILE" || echo 'DEEPSEEK_API_KEYS='         >> "$ENV_FILE"
+ensure_dirs() {
+  mkdir -p "$APP_DIR"
+  chmod 755 "$APP_DIR"
 }
 
-# ----- prompts (no more .env creation here) -----
-prompt_task_ids() {
-  echo "[3/12] Configure Task IDs..."
-  local cur=""
-  if [ -f "$ENV_FILE" ]; then
-    cur="$(grep -E '^MONITOR_TASK_IDS=' "$ENV_FILE" | cut -d= -f2- || true)"
+ensure_venv() {
+  if [ ! -x "$VENV_DIR/bin/python" ]; then
+    echo "Creating virtual environment..."
+    python3 -m venv "$VENV_DIR"
   fi
-  echo "Enter Task IDs (comma-separated), or paste URLs that contain /tasks/<id>."
-  local ans norm
-  while :; do
-    read -r -p "Task IDs [${cur:-none}]: " ans || true
-    ans="${ans:-$cur}"
-    norm="$(
-      printf "%s\n" "$ans" \
-      | tr ' ,;' '\n\n\n' \
-      | sed -E 's#.*(/tasks/([0-9]+)).*#\2#; t; s#[^0-9]##g' \
-      | awk 'length>0' \
-      | paste -sd, - \
-      | sed -E 's#,+#,#g; s#^,##; s#,$##'
-    )"
-    if [ -n "$norm" ]; then
-      MONITOR_TASK_IDS_PROMPT="$norm"
-      set_env_kv "MONITOR_TASK_IDS" "$norm"
-      echo "→ MONITOR_TASK_IDS=${norm}"
-      break
-    fi
-    echo "Empty. Please enter at least one ID."
-  done
+  echo "Upgrading pip and installing Python deps..."
+  "$VENV_DIR/bin/pip" install --upgrade pip
+  "$VENV_DIR/bin/pip" install --no-cache-dir requests python-dotenv backoff tiktoken
 }
 
-prompt_mode() {
-  echo "[4/12] Choose grading mode for these tasks:"
-  echo "  1) Full score to every student (review: 記得看高考真題。)"
-  echo "  2) Normal grading workflow"
-  local sel; read -r -p "Select 1 or 2 [2]: " sel || true
-  sel="${sel:-2}"
-  if [ "$sel" = "1" ]; then
-    local cmt; read -r -p "Full-score review comment [記得看高考真題。]: " cmt || true
-    cmt="${cmt:-記得看高考真題。}"
-    FULL_SCORE_MODE_PROMPT="all"
-    FULL_SCORE_COMMENT_PROMPT="$cmt"
-    set_env_kv "FULL_SCORE_MODE" "all"
-    set_env_kv "FULL_SCORE_COMMENT" "$cmt"
-    echo "→ FULL_SCORE_MODE=all"
-    echo "→ FULL_SCORE_COMMENT=$cmt"
-  else
-    FULL_SCORE_MODE_PROMPT="off"
-    set_env_kv "FULL_SCORE_MODE" "off"
-    echo "→ FULL_SCORE_MODE=off"
-  fi
-}
+write_env_if_missing() {
+  if [ ! -f "$ENV_FILE" ]; then
+    cat >"$ENV_FILE" <<'ENV'
+# ========== AGrader .env ==========
+# Core run behaviour
+RUN_MODE=oneshot            # oneshot | watch
+POLL_INTERVAL=10            # seconds for watch mode
+STOP_CRITERIA=score_and_review  # score_and_review | score_only
 
-write_project() {
-  local IS_FRESH_INSTALL="${1:-0}"
-  echo "[5/12] Writing project files..."
-  mkdir -p "$APP_DIR" "$APP_DIR/work"
+# Tasks to grade (comma separated)
+MONITOR_TASK_IDS=<TASK_ID>
 
-  # Inherit prompt values or fallback to any existing ENV values
-  local _TASKS="${MONITOR_TASK_IDS_PROMPT}"
-  local _FSMODE="${FULL_SCORE_MODE_PROMPT}"
-  local _FSCMT="${FULL_SCORE_COMMENT_PROMPT}"
-  [ -z "$_TASKS" ] && _TASKS="$(grep -E '^MONITOR_TASK_IDS=' "$ENV_FILE" | cut -d= -f2- || true)"
-  [ -z "$_FSMODE" ] && _FSMODE="$(grep -E '^FULL_SCORE_MODE=' "$ENV_FILE" | cut -d= -f2- || echo off)"
-  [ -z "$_FSCMT" ] && _FSCMT="$(grep -E '^FULL_SCORE_COMMENT=' "$ENV_FILE" | cut -d= -f2- || echo 記得看高考真題。)"
+# Grading mode
+FULL_SCORE_MODE=off         # off=AI normal grading | all=force full marks
+FULL_SCORE_COMMENT=記得看高考真題。
 
-  if [ "$IS_FRESH_INSTALL" -eq 1 ]; then
-    echo "Fresh install detected — collecting credentials and defaults..."
-    ask "Seiue API Base" SEIUE_BASE "https://api.seiue.com"
-    ask "Seiue Username (leave empty to skip auto-login)" SEIUE_USERNAME ""
-    if [ -n "$SEIUE_USERNAME" ]; then
-      ask_secret "Seiue Password" SEIUE_PASSWORD
-    else
-      SEIUE_PASSWORD=""
-    fi
-    ask "X-School-Id" SEIUE_SCHOOL_ID "3"
-    ask "X-Role" SEIUE_ROLE "teacher"
-    ask "X-Reflection-Id (manual; empty if auto-login)" SEIUE_REFLECTION_ID ""
-    ask_secret "Bearer token (manual; empty if auto-login)" SEIUE_BEARER
+# SEIUE auth (prefer bearer; auto-login is best-effort)
+SEIUE_BASE=https://api.seiue.com
+SEIUE_SCHOOL_ID=3
+SEIUE_ROLE=teacher
+SEIUE_REFLECTION_ID=
+SEIUE_BEARER=
+SEIUE_USERNAME=
+SEIUE_PASSWORD=
 
-    ask "Polling interval seconds" POLL_INTERVAL "10"
+# AI provider (choose one)
+AI_PROVIDER=deepseek        # deepseek | gemini | endpoint
+DEEPSEEK_MODEL=deepseek-reasoner
+DEEPSEEK_API_KEY=
+# GEMINI_MODEL=gemini-2.5-pro
+# GEMINI_API_KEY=
+# Custom endpoint (POST JSON {"prompt": "..."} -> {"answer": "..."}), e.g. ai.bdfz.net
+# AI_ENDPOINT=https://ai.bdfz.net/
 
-    echo
-    echo "Choose AI provider:"
-    echo "  1) gemini"
-    echo "  2) deepseek"
-    ask "Select 1/2" AI_CHOICE "2"
-    if [ "$AI_CHOICE" = "2" ]; then
-      AI_PROVIDER="deepseek"
-      ask_secret "DeepSeek API Key (single; extra keys can be set later in DEEPSEEK_API_KEYS)" DEEPSEEK_API_KEY
-      ask "DeepSeek Model" DEEPSEEK_MODEL "deepseek-reasoner"
-      GEMINI_API_KEY=""; GEMINI_MODEL="gemini-2.5-pro"
-    else
-      AI_PROVIDER="gemini"
-      ask_secret "Gemini API Key (single; extra keys can be set later in GEMINI_API_KEYS)" GEMINI_API_KEY
-      ask "Gemini Model" GEMINI_MODEL "gemini-2.5-pro"
-      DEEPSEEK_API_KEY=""; DEEPSEEK_MODEL="deepseek-reasoner"
-    fi
-
-    echo
-    echo "Telegram (optional, ENTER to skip)"
-    ask "Telegram Bot Token" TELEGRAM_BOT_TOKEN ""
-    ask "Telegram Chat ID" TELEGRAM_CHAT_ID ""
-
-    echo
-    echo "Extraction limits"
-    ask "Enable PDF OCR fallback after pdftotext fails? (1/0)" ENABLE_PDF_OCR_FALLBACK "1"
-    ask "Max PDF pages allowed for OCR fallback" MAX_PDF_OCR_PAGES "20"
-    ask "Max seconds allowed for OCR fallback (timeout)" MAX_PDF_OCR_SECONDS "120"
-    ask "Notify via Telegram when skipping heavy OCR? (1/0)" TELEGRAM_VERBOSE "1"
-    ask "Keep downloaded work files for debugging? (1/0)" KEEP_WORK_FILES "0"
-
-    echo
-    echo "Logging options:"
-    ask "LOG_LEVEL (DEBUG/INFO/WARN/ERROR)" LOG_LEVEL "INFO"
-    ask "LOG_FILE path" LOG_FILE "$APP_DIR/agrader.log"
-    LOG_FORMAT="%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
-    LOG_DATEFMT="%Y-%m-%d %H:%M:%S"
-
-    # Write full env (includes prompts)
-    cat > "$ENV_FILE" <<EOF
-# ---- Seiue ----
-SEIUE_BASE=${SEIUE_BASE}
-SEIUE_USERNAME=${SEIUE_USERNAME}
-SEIUE_PASSWORD=${SEIUE_PASSWORD}
-SEIUE_BEARER=${SEIUE_BEARER}
-SEIUE_SCHOOL_ID=${SEIUE_SCHOOL_ID}
-SEIUE_ROLE=${SEIUE_ROLE}
-SEIUE_REFLECTION_ID=${SEIUE_REFLECTION_ID}
-MONITOR_TASK_IDS=${_TASKS}
-POLL_INTERVAL=${POLL_INTERVAL}
-
-# ---- Endpoints ----
-SEIUE_REVIEW_POST_TEMPLATE=/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews
-SEIUE_SCORE_ENDPOINTS=POST:/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true:array
-SEIUE_VERIFY_SCORE_GET_TEMPLATE=/vnas/common/items/{item_id}/scores?paginated=0&type=item_score
-
-# ---- AI ----
-AI_PROVIDER=${AI_PROVIDER}
-GEMINI_API_KEYS=
-GEMINI_API_KEY=${GEMINI_API_KEY}
-GEMINI_MODEL=${GEMINI_MODEL}
-DEEPSEEK_API_KEYS=
-DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-DEEPSEEK_MODEL=${DEEPSEEK_MODEL}
-AI_KEY_STRATEGY=roundrobin
-AI_PARALLEL=1
-AI_MAX_RETRIES=5
-AI_BACKOFF_BASE_SECONDS=2.5
-AI_JITTER_SECONDS=0.8
-AI_FAILOVER=1
-
-# ---- Telegram ----
-TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-TELEGRAM_VERBOSE=1
-
-# ---- Extractor & limits ----
-MAX_ATTACHMENT_BYTES=25165824
-OCR_LANG=chi_sim+eng
-ENABLE_PDF_OCR_FALLBACK=${ENABLE_PDF_OCR_FALLBACK}
-MAX_PDF_OCR_PAGES=${MAX_PDF_OCR_PAGES}
-MAX_PDF_OCR_SECONDS=${MAX_PDF_OCR_SECONDS}
-KEEP_WORK_FILES=${KEEP_WORK_FILES}
-
-# ---- Logging ----
-LOG_LEVEL=${LOG_LEVEL}
-LOG_FILE=${LOG_FILE}
-LOG_FORMAT=${LOG_FORMAT}
-LOG_DATEFMT=${LOG_DATEFMT}
-
-# ---- Strategy ----
-SCORE_WRITE=1
-REVIEW_ALL_EXISTING=1
-SCORE_GIVE_ALL_ON_START=1
-DRY_RUN=0
+# Safety nets
 VERIFY_AFTER_WRITE=1
-REVERIFY_BEFORE_WRITE=1
-RETRY_FAILED=1
-STUDENT_WORKERS=1
-ATTACH_WORKERS=3
-
-# ---- Prompt template ----
-PROMPT_TEMPLATE_PATH=${APP_DIR}/prompt.txt
-
-# ---- Full-score mode ----
-FULL_SCORE_MODE=${_FSMODE:-off}
-FULL_SCORE_COMMENT=${_FSCMT:-記得看高考真題。}
-
-# ---- Safeguards ----
-MAX_SCORE_CACHE_TTL=600
-SCORE_CLAMP_ON_MAX=1
 RETRY_ON_422_ONCE=1
-
-# ---- Paths/State ----
-STATE_PATH=${APP_DIR}/state.json
-WORKDIR=${APP_DIR}/work
-EOF
+MAX_SCORE_CACHE_TTL=600
+LOG_LEVEL=INFO
+LOG_FORMAT=%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s
+LOG_DATEFMT=%Y-%m-%d %H:%M:%S
+# ==================================
+ENV
     chmod 600 "$ENV_FILE"
-  else
-    echo "Reusing existing $ENV_FILE"
   fi
+}
 
-  ensure_env_patch
+prompt_core_vars() {
+  echo
+  echo "=== Configure core options ==="
+  local cur_tasks cur_run cur_full cur_stop
+  cur_tasks="$(grep -E '^MONITOR_TASK_IDS=' "$ENV_FILE" | sed -E 's/^MONITOR_TASK_IDS=//')"
+  cur_run="$(grep -E '^RUN_MODE=' "$ENV_FILE" | sed -E 's/^RUN_MODE=//')"
+  cur_full="$(grep -E '^FULL_SCORE_MODE=' "$ENV_FILE" | sed -E 's/^FULL_SCORE_MODE=//')"
+  cur_stop="$(grep -E '^STOP_CRITERIA=' "$ENV_FILE" | sed -E 's/^STOP_CRITERIA=//')"
 
-  # requirements
-  cat > "$APP_DIR/requirements.txt" <<'EOF'
-requests==2.32.3
-urllib3==2.2.3
-python-dotenv==1.0.1
-pytz==2024.2
-Pillow==10.4.0
-pytesseract==0.3.13
-pdfminer.six==20231228
-python-docx==1.1.2
-python-pptx==0.6.23
-lxml==5.3.0
+  ask "Task IDs (comma separated, e.g. <TASK_ID>,<TASK_ID>)" NEW_TASKS "${cur_tasks:-<TASK_ID>}"
+  ask "Run mode (oneshot/watch)" NEW_RUN "${cur_run:-oneshot}"
+  ask "Full score mode (off/all)" NEW_FULL "${cur_full:-off}"
+  ask "Stop criteria (score_and_review/score_only)" NEW_STOP "${cur_stop:-score_and_review}"
+
+  # in-place update (.env always contains these keys)
+  tmp="$(mktemp)"; cp "$ENV_FILE" "$tmp"
+  sed -E -e "s|^MONITOR_TASK_IDS=.*|MONITOR_TASK_IDS=${NEW_TASKS}|" \
+         -e "s|^RUN_MODE=.*|RUN_MODE=${NEW_RUN}|" \
+         -e "s|^FULL_SCORE_MODE=.*|FULL_SCORE_MODE=${NEW_FULL}|" \
+         -e "s|^STOP_CRITERIA=.*|STOP_CRITERIA=${NEW_STOP}|" "$tmp" > "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+write_systemd_linux() {
+  cat >"$SERVICE_PATH" <<EOF
+[Unit]
+Description=AGrader - API-first auto-grading service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$VENV_DIR/bin/python $PY_MAIN
+Restart=always
+RestartSec=3
+# Hardening (optional)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
 EOF
+  systemctl daemon-reload
+}
 
-  # prompt.txt
-  cat > "$APP_DIR/prompt.txt" <<'EOF'
-You are a strict Chinese language grader.
-
-Task: {task_title}
-Student: {student_name} ({student_id})
-Max Score: {max_score}
-Per-Question Schema (JSON): {per_question_json}
-
-The student's submission text is below (UTF-8). Use rubric and constraints to grade.
----
-{assignment_text}
----
-
-Output ONLY a valid JSON object with this exact shape, nothing else:
-{"per_question":[{"id":"...","score":float,"comment":"..."}],"overall":{"score":float,"comment":"..."}}
+write_launchd_mac() {
+  mkdir -p "$(dirname "$LAUNCHD_PLIST")"
+  cat >"$LAUNCHD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key><string>net.bdfz.agrader</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>$VENV_DIR/bin/python</string>
+      <string>$PY_MAIN</string>
+    </array>
+    <key>WorkingDirectory</key><string>$APP_DIR</string>
+    <key>StandardOutPath</key><string>$APP_DIR/agrader.out.log</string>
+    <key>StandardErrorPath</key><string>$APP_DIR/agrader.err.log</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+  </dict>
+</plist>
 EOF
+}
 
-  # ----------------- Python files -----------------
-  cat > "$APP_DIR/utilx.py" <<'PY'
-import json, hashlib
-from typing import Dict, Any, List, Tuple
+start_by_mode() {
+  local mode
+  mode="$(grep -E '^RUN_MODE=' "$ENV_FILE" | sed -E 's/^RUN_MODE=//')"
+  case "$mode" in
+    watch)
+      if [ "$(os_detect)" = "linux" ]; then
+        systemctl enable --now "$SERVICE"
+        systemctl status "$SERVICE" --no-pager -l || true
+      elif [ "$(os_detect)" = "mac" ]; then
+        launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+        launchctl load -w "$LAUNCHD_PLIST"
+        echo "launchd loaded. Logs: tail -f $APP_DIR/agrader.err.log"
+      else
+        echo "Unknown OS; start the app manually: $VENV_DIR/bin/python $PY_MAIN"
+      fi
+      ;;
+    *)
+      echo "RUN_MODE=oneshot → running once..."
+      "$VENV_DIR/bin/python" "$PY_MAIN" || true
+      echo "Done."
+      ;;
+  esac
+}
 
-def draftjs_to_text(content_json: str) -> str:
-    try:
-        data = json.loads(content_json)
-        blocks = data.get("blocks", [])
-        return "\n".join(b.get("text","") for b in blocks).strip()
-    except Exception:
-        return content_json
+write_main_py() {
+  cat >"$PY_MAIN" <<'PY'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+AGrader v1.10.8-hotfix
+- Restore NORMAL AI grading workflow (kept FULL mode).
+- Enforce RUN_MODE=oneshot|watch and STOP_CRITERIA=score_and_review|score_only.
+- Pre-verify scores, clamp to true max, retry once on 422 (parse max from message).
+- Post review via Seiue.post_review(); treat 405 as ignorable "not supported".
+"""
 
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-def scan_question_maxima(task: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], float]:
-    overall_max = 0.0
-    perq: List[Dict[str, Any]] = []
-    candidates = []
-    for k in ["score_items","questions","problems","rubric","grading","grading_items"]:
-      v = task.get(k) or task.get("custom_fields", {}).get(k)
-      if isinstance(v, list) and v:
-        candidates = v; break
-    if candidates:
-        for idx, it in enumerate(candidates):
-            qid = str(it.get("id", f"q{idx+1}"))
-            mx = it.get("max") or it.get("max_score") or it.get("full") or 0
-            try: mx = float(mx)
-            except: mx = 0.0
-            perq.append({"id": qid, "max": mx})
-        overall_max = sum(q["max"] for q in perq)
-    else:
-        cm = task.get("custom_fields", {})
-        maybe_max = cm.get("max_score") or cm.get("full") or task.get("max_score")
-        if maybe_max:
-            try: overall_max = float(maybe_max)
-            except: pass
-    return perq, overall_max
-
-def stable_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8","ignore")).hexdigest()
-PY
-
-  cat > "$APP_DIR/credentials.py" <<'PY'
-import logging, requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-class AuthResult:
-    def __init__(self, ok: bool, token: str = "", reflection_id: str = "", detail: str = ""):
-        self.ok = ok; self.token = token; self.reflection_id = reflection_id; self.detail = detail
-
-def _session_with_retries() -> requests.Session:
-    s = requests.Session()
-    r = Retry(total=5, backoff_factor=1.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET","POST"}))
-    s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent": "AGrader/1.10 (+login)","Accept": "application/json, text/plain, */*"})
-    return s
-
-def login(username: str, password: str) -> AuthResult:
-    try:
-        sess = _session_with_retries()
-        login_url = "https://passport.seiue.com/login?school_id=3&type=account&from=null&redirect_url=null"
-        auth_url  = "https://passport.seiue.com/authorize"
-        login_form = {"email": username, "login": username, "username": username, "password": password}
-        lr = sess.post(login_url, headers={"Referer": login_url,"Origin": "https://passport.seiue.com","Content-Type": "application/x-www-form-urlencoded"}, data=login_form, timeout=30)
-        auth_form = {"client_id":"GpxvnjhVKt56qTmnPWH1sA","response_type":"token"}
-        ar = sess.post(auth_url, headers={"Referer": "https://chalk-c3.seiue.com/","Origin": "https://chalk-c3.seiue.com","Content-Type": "application/x-www-form-urlencoded"}, data=auth_form, timeout=30)
-        ar.raise_for_status()
-        j = ar.json() or {}
-        token = j.get("access_token",""); reflection = j.get("active_reflection_id","")
-        if token and reflection: return AuthResult(True, token, str(reflection))
-        return AuthResult(False, detail=f"Missing token/reflection_id keys={list(j.keys())}")
-    except requests.RequestException as e:
-        logging.error(f"[AUTH] {e}", exc_info=True); return AuthResult(False, detail=str(e))
-PY
-
-  cat > "$APP_DIR/extractor.py" <<'PY'
-import os, subprocess, mimetypes, logging
-from typing import Tuple
-from PIL import Image
-import pytesseract
-
-def _run(cmd: list, input_bytes: bytes=None, timeout=180) -> Tuple[int, bytes, bytes]:
-    import subprocess as sp
-    p = sp.Popen(cmd, stdin=sp.PIPE if input_bytes else None, stdout=sp.PIPE, stderr=sp.PIPE)
-    out, err = p.communicate(input=input_bytes, timeout=timeout); return p.returncode, out, err
-
-def _pdf_pages(path: str) -> int:
-    try:
-        code, out, _ = _run(["pdfinfo", path], timeout=20)
-        if code == 0:
-            for line in out.decode("utf-8","ignore").splitlines():
-                if line.lower().startswith("pages:"): return int(line.split(":")[1].strip())
-    except Exception: pass
-    return -1
-
-def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1024) -> str:
-    if not os.path.exists(path): return "[[error: file not found]]"
-    sz = os.path.getsize(path)
-    if sz > size_cap: return f"[[skipped: file too large ({sz} bytes)]]"
-    mt, _ = mimetypes.guess_type(path); ext = (os.path.splitext(path)[1] or "").lower()
-
-    if ext == ".pdf" or (mt and mt.endswith("pdf")):
-      # pdftotext first
-      try:
-        code, out, _ = _run(["pdftotext", "-layout", path, "-"], timeout=120)
-        if code == 0 and out.strip(): return out.decode("utf-8","ignore")
-      except Exception as e: logging.warning(f"[EXTRACT] pdftotext failed: {e}", exc_info=True)
-      enable_fallback = os.getenv("ENABLE_PDF_OCR_FALLBACK","1") not in ("0","false","False")
-      max_pages = int(os.getenv("MAX_PDF_OCR_PAGES","20")); pages = _pdf_pages(path)
-      if (not enable_fallback) or (pages > 0 and pages > max_pages):
-        return f"[[skipped: pdf ocr fallback disabled or too large (pages={pages}, size={sz})]]"
-      import tempfile
-      tmpdir = tempfile.mkdtemp(prefix="pdfocr_"); prefix = os.path.join(tmpdir, "pg")
-      code, _, err = _run(["pdftoppm", "-r", "200", path, prefix], timeout=int(os.getenv("MAX_PDF_OCR_SECONDS","120")))
-      if code != 0: return f"[[error: pdftoppm {err.decode('utf-8','ignore')[:200]}]]"
-      texts=[]
-      for f in sorted(os.listdir(tmpdir)):
-        if f.startswith("pg") and (f.endswith(".ppm") or f.endswith(".png") or f.endswith(".jpg")):
-          try: texts.append(pytesseract.image_to_string(Image.open(os.path.join(tmpdir,f)), lang=ocr_lang))
-          except Exception as e: logging.error(f"[OCR] {e}", exc_info=True); texts.append(f"[[error: tesseract {e}]]")
-      return ("\n".join(texts).strip() or "[[error: ocr empty]]")
-
-    if ext in [".png",".jpg",".jpeg",".bmp",".tiff",".webp"] or (mt and mt.startswith("image/")):
-      try: return pytesseract.image_to_string(Image.open(path), lang=ocr_lang) or "[[error: image ocr empty]]"
-      except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: image ocr exception: {repr(e)}]]"
-
-    if ext == ".docx":
-      try:
-        import docx; return "\n".join(p.text for p in docx.Document(path).paragraphs)
-      except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: docx extract exception: {repr(e)}]]"
-
-    if ext == ".pptx":
-      try:
-        from pptx import Presentation; lines=[]; prs=Presentation(path)
-        for s in prs.slides:
-          for shp in s.shapes:
-            if hasattr(shp,"text"): lines.append(shp.text)
-        return "\n".join(lines) or "[[error: pptx no text]]"
-      except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: pptx extract exception: {repr(e)}]]"
-
-    try:
-      with open(path,"rb") as f: return f.read().decode("utf-8","ignore")
-    except Exception as e: logging.error(f"[EXTRACT] {e}", exc_info=True); return f"[[error: unknown file read exception: {repr(e)}]]"
-PY
-
-  cat > "$APP_DIR/ai_providers.py" <<'PY'
-import os, time, json, requests, logging, random, re
-from typing import List
+import os, sys, time, json, logging
+from typing import Dict, Any, List, Tuple, Optional
+from dotenv import load_dotenv
+from utilx import draftjs_to_text, clamp, scan_question_maxima
+from ai_providers import AIClient
+from seiue_api import Seiue
 
 def _as_bool(x, default=True):
     if x is None: return default
     s = str(x).strip().lower()
     return s not in ("0","false","no","off")
 
-def _backoff_loop():
-    max_retries = int(os.getenv("AI_MAX_RETRIES","5"))
-    base = float(os.getenv("AI_BACKOFF_BASE_SECONDS","1.5"))
-    jitter = float(os.getenv("AI_JITTER_SECONDS","0.5"))
-    for i in range(max_retries):
-        yield i
-        time.sleep((base ** i) + random.uniform(0, jitter))
+def setup_logging():
+    lvl = os.getenv("LOG_LEVEL","INFO").upper()
+    fmt = os.getenv("LOG_FORMAT","%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s")
+    datefmt = os.getenv("LOG_DATEFMT","%Y-%m-%d %H:%M:%S")
+    logging.basicConfig(level=getattr(logging, lvl, logging.INFO), format=fmt, datefmt=datefmt)
 
-def _split_keys(s: str) -> List[str]:
-    if not s: return []
-    return [x.strip() for x in s.split(",") if x.strip()]
+def load_env_every_time():
+    load_dotenv(override=True)  # hot-reload .env every pass
 
-class AIClient:
-    def __init__(self, provider: str, model: str, key: str):
-        self.provider = provider
-        self.model = model
-        self._rr = 0
-        self.strategy = os.getenv("AI_KEY_STRATEGY","roundrobin").lower()
+class MaxCache:
+    def __init__(self, ttl_seconds: int = 600):
+        self.ttl = ttl_seconds
+        self.store: Dict[int, Tuple[float, float]] = {}
 
-        ring = []
-        if provider == "gemini":
-            ring += _split_keys(os.getenv("GEMINI_API_KEYS",""))
-            if key: ring.append(key or os.getenv("GEMINI_API_KEY",""))
-        elif provider == "deepseek":
-            ring += _split_keys(os.getenv("DEEPSEEK_API_KEYS",""))
-            if key: ring.append(key or os.getenv("DEEPSEEK_API_KEY",""))
-        else:
-            if key: ring.append(key)
+    def get(self, item_id: int) -> Optional[float]:
+        now = time.time()
+        v = self.store.get(item_id)
+        if not v: return None
+        mx, exp = v
+        if now <= exp: return mx
+        self.store.pop(item_id, None)
+        return None
 
-        seen=set(); self.keys=[]
-        for k in ring:
-            if k and k not in seen:
-                self.keys.append(k); seen.add(k)
-        if not self.keys:
-            self.keys = [key] if key else [""]
+    def put(self, item_id: int, mx: float):
+        self.store[item_id] = (mx, time.time() + self.ttl)
 
-    def _key_order(self, n: int):
-        if n <= 0: return []
-        if self.strategy == "random":
-            idxs = list(range(n)); random.shuffle(idxs); return idxs
-        return list(range(self._rr, n)) + list(range(0, self._rr))
+def build_prompt(template_path: str, task: Dict[str,Any], student_name: str, student_id: str,
+                 max_score: float, per_q_schema: List[Dict[str,Any]], submission_text: str) -> str:
+    try:
+        with open(template_path, "r", encoding="utf-8") as f:
+            tpl = f.read()
+    except Exception:
+        tpl = (
+            "You are a strict Chinese language grader.\n\n"
+            "Task: {task_title}\nStudent: {student_name} ({student_id})\n"
+            "Max Score: {max_score}\nPer-Question Schema (JSON): {per_question_json}\n\n"
+            "The student's submission text is below (UTF-8). Use rubric and constraints to grade.\n---\n{assignment_text}\n---\n\n"
+            'Output ONLY a valid JSON object with this exact shape, nothing else:\n'
+            '{"per_question":[{"id":"...","score":float,"comment":"..."}],"overall":{"score":float,"comment":"..."} }\n'
+        )
+    title = task.get("title") or task.get("name") or f"Task {task.get('id','')}"
+    body = tpl.format(
+        task_title=title,
+        student_name=student_name,
+        student_id=student_id,
+        max_score=max_score,
+        per_question_json=json.dumps(per_q_schema, ensure_ascii=False),
+        assignment_text=submission_text or "",
+    )
+    return body
 
-    def _advance_rr(self, used_idx):
-        if self.strategy == "roundrobin" and self.keys:
-            self._rr = (used_idx + 1) % len(self.keys)
+def extract_submission_text(assignment: Dict[str,Any]) -> str:
+    sub = (assignment.get("submission") or {})
+    if isinstance(sub, dict):
+        content = sub.get("content") or sub.get("text") or ""
+        txt = draftjs_to_text(content) if content else ""
+        if txt.strip():
+            return txt
+    for key in ("text","content","body"):
+        v = assignment.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
 
-    def grade(self, prompt: str) -> dict:
-        raw = self._call_llm(prompt)
-        return self.parse_or_repair(raw, original_prompt=prompt)
-
-    def parse_or_repair(self, text: str, original_prompt: str = "") -> dict:
-        text = (text or "").strip()
-        if not text:
-            fixed = self.repair_json(original_prompt, text)
-            return self._safe_json_or_fallback(fixed or text)
-
-        if text.startswith("{"):
-            try: return json.loads(text)
-            except Exception: pass
-        m = re.search(r"\{.*\}", text, re.S)
-        if m:
-            try: return json.loads(m.group(0))
-            except Exception: pass
-
-        fixed = self.repair_json(original_prompt, text)
-        return self._safe_json_or_fallback(fixed or text)
-
-    def _safe_json_or_fallback(self, s: str):
+def pick_receiver_identity(assignment: Dict[str,Any]) -> Tuple[Optional[int], str]:
+    assignee = assignment.get("assignee") or {}
+    name = assignee.get("name") or assignee.get("username") or ""
+    try:
+        ref = assignee.get("reflection") or {}
+        rid = int(ref.get("id") or 0) or None
+    except Exception:
+        rid = None
+    if rid is None:
         try:
-            if isinstance(s, dict): return s
-            if isinstance(s, str):
-                s = s.strip()
-                if s.startswith("{"): return json.loads(s)
-                m = re.search(r"\{.*\}", s, re.S)
-                if m: return json.loads(m.group(0))
-        except Exception as e:
-            logging.error(f"[AI] JSON parse failed after repair: {e}", exc_info=True)
-        return {"per_question": [], "overall": {"score": 0.0, "comment": (s[:200] if s else "AI empty")}}
+            rid = int(assignee.get("id") or 0) or None
+        except Exception:
+            rid = None
+    return rid, name
 
-    def _call_llm(self, prompt: str) -> str:
-        if self.provider == "gemini":
-            return self._gemini(prompt)
-        elif self.provider == "deepseek":
-            return self._deepseek(prompt)
+def give_comment_and_score(api: Seiue, ai: Optional[AIClient], task_id: int, full_mode: bool,
+                           full_comment: str, stop_criteria: str, max_cache: MaxCache) -> Dict[str,int]:
+    stats = {"ok":0, "skip":0, "fail":0}
+    task = api.get_task(task_id)
+    assignments = api.get_assignments(task_id) or []
+    item_ids = api.derive_item_ids(task, assignments)
+    if not item_ids:
+        logging.error("[TASK %s] cannot derive any item_id; abort.", task_id)
+        return stats
+    item_id = item_ids[0]
+
+    mx = max_cache.get(item_id)
+    if mx is None:
+        mx = api.get_item_max_score(item_id) or 100.0
+        max_cache.put(item_id, mx)
+
+    perq_schema, overall_guess = scan_question_maxima(task)
+    true_max = mx or overall_guess or 100.0
+
+    for idx, a in enumerate(assignments, 1):
+        rid, sname = pick_receiver_identity(a)
+        if not rid:
+            logging.warning("[TASK %s] #%d missing receiver_id -> skip one.", task_id, idx)
+            stats["skip"] += 1
+            continue
+
+        existing = api.verify_existing_score(item_id, rid)
+        if existing is not None:
+            logging.info("[TASK %s] #%d rid=%s name=%s (already exists: %.2f)", task_id, idx, rid, sname, existing)
+            stats["ok"] += 1
+            continue
+
+        review_text = ""
+        desired = None
+
+        if full_mode:
+            desired = float(true_max)
+            review_text = full_comment or "記得看高考真題。"
         else:
-            raise ValueError("Unknown AI provider")
+            submission_text = extract_submission_text(a)
+            prompt = build_prompt(
+                os.getenv("PROMPT_TEMPLATE_PATH", f"{os.getcwd()}/prompt.txt"),
+                task, sname, str(rid), true_max, perq_schema, submission_text
+            )
+            try:
+                assert ai is not None, "AI client is None in normal grading mode."
+                jr = ai.grade(prompt)
+                overall = (jr.get("overall") or {})
+                desired = float(overall.get("score") or 0.0)
+                review_text = str(overall.get("comment") or "").strip()
+            except Exception as e:
+                logging.error("[AI] parse/grade failed rid=%s: %s", rid, e, exc_info=True)
+                desired = 0.0
+                review_text = review_text or "（AI 評分失敗，暫記 0 分）"
 
-    def _gemini(self, prompt: str) -> str:
-        body = {"contents":[{"parts":[{"text": prompt}]}], "generationConfig":{"temperature":0.2}}
-        for _ in _backoff_loop():
-            order = self._key_order(len(self.keys))
-            for idx in order:
-                key = self.keys[idx]
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={key}"
-                try:
-                    r = requests.post(url, json=body, timeout=180)
-                    if r.status_code == 429 or (500 <= r.status_code < 600):
-                        logging.warning("[AI] Gemini %s; switch key #%d/%d", r.status_code, idx+1, len(self.keys)); continue
-                    r.raise_for_status()
-                    data = r.json()
-                    logging.info("[AI][USE] provider=gemini model=%s key_index=%d/%d", self.model, idx+1, len(self.keys))
-                    self._advance_rr(idx)
-                    try:
-                        return data["candidates"][0]["content"]["parts"][0]["text"]
-                    except Exception:
-                        return json.dumps(data)[:4000]
-                except requests.RequestException as e:
-                    code = getattr(e.response,'status_code',type(e).__name__)
-                    logging.warning("[AI] Gemini exception (%s); switch key #%d/%d", code, idx+1, len(self.keys)); continue
-        return ""
+        desired = clamp(float(desired), 0.0, float(true_max))
 
-    def _deepseek(self, prompt: str) -> str:
-        body={"model": self.model,"messages":[{"role":"system","content":"You are a strict grader. Output ONLY valid JSON per schema."},{"role":"user","content": prompt}],"temperature":0.2}
-        for _ in _backoff_loop():
-            order = self._key_order(len(self.keys))
-            for idx in order:
-                key = self.keys[idx]
-                url = "https://api.deepseek.com/chat/completions"
-                headers={"Authorization": f"Bearer {key}"}
-                try:
-                    r = requests.post(url, headers=headers, json=body, timeout=180)
-                    if r.status_code == 429 or (500 <= r.status_code < 600):
-                        logging.warning("[AI] DeepSeek %s; switch key #%d/%d", r.status_code, idx+1, len(self.keys)); continue
-                    r.raise_for_status()
-                    data = r.json()
-                    logging.info("[AI][USE] provider=deepseek model=%s key_index=%d/%d", self.model, idx+1, len(self.keys))
-                    self._advance_rr(idx)
-                    return data.get("choices",[{}])[0].get("message",{}).get("content","")
-                except requests.RequestException as e:
-                    code = getattr(e.response,'status_code',type(e).__name__)
-                    logging.warning("[AI] DeepSeek exception (%s); switch key #%d/%d", code, idx+1, len(self.keys)); continue
-        return ""
+        review_ok = True
+        if review_text:
+            rok, rcode, rbody = api.post_review(rid, task_id, review_text)
+            if not rok and rcode != 405:
+                review_ok = False
+                logging.warning("[REVIEW][TASK %s] rid=%s failed code=%s body=%s", task_id, rid, rcode, str(rbody)[:200])
 
-    def repair_json(self, original_prompt: str, bad_text: str) -> str:
-        to_fix = (bad_text or "").strip()
-
-        fixed = self._repair_with_provider(self.provider, self.model, self.keys, to_fix)
-        if fixed: return fixed
-
-        if _as_bool(os.getenv("AI_FAILOVER","1"), True):
-            if self.provider == "gemini":
-                alt_provider, alt_model = "deepseek", os.getenv("DEEPSEEK_MODEL","deepseek-reasoner")
-                alt_keys = _split_keys(os.getenv("DEEPSEEK_API_KEYS","")) or _split_keys(os.getenv("DEEPSEEK_API_KEY",""))
-            else:
-                alt_provider, alt_model = "gemini", os.getenv("GEMINI_MODEL","gemini-2.5-pro")
-                alt_keys = _split_keys(os.getenv("GEMINI_API_KEYS","")) or _split_keys(os.getenv("GEMINI_API_KEY",""))
-            fixed = self._repair_with_provider(alt_provider, alt_model, alt_keys, to_fix, mark_alt=True)
-            if fixed: return fixed
-
-        return to_fix
-
-    def _repair_with_provider(self, provider: str, model: str, keys: List[str], text: str, mark_alt: bool=False) -> str:
-        if not keys: return ""
-        def _order(n):
-            if self.strategy == "random":
-                idxs = list(range(n)); random.shuffle(idxs); return idxs
-            return list(range(n))
-
-        sys_prompt = "You are a JSON fixer. Return ONLY the corrected JSON object. No code fences. No commentary."
-        if provider == "deepseek":
-            for _ in _backoff_loop():
-                for idx in _order(len(keys)):
-                    key = keys[idx]
-                    try:
-                        url = "https://api.deepseek.com/chat/completions"
-                        headers={"Authorization": f"Bearer {key}"}
-                        user = "The following is not valid JSON. Please fix it and return only the corrected JSON object.\n\n<<<\n"+(text or "")+"\n>>>"
-                        r = requests.post(url, headers=headers, json={"model": model,"messages":[{"role":"system","content":sys_prompt},{"role":"user","content": user}],"temperature":0.0}, timeout=120)
-                        if r.status_code == 429 or (500 <= r.status_code < 600): continue
-                        r.raise_for_status()
-                        data = r.json()
-                        logging.info("[AI][REPAIR] provider=deepseek%s", " (failover)" if mark_alt else "")
-                        return data.get("choices",[{}])[0].get("message",{}).get("content","")
-                    except requests.RequestException:
-                        continue
-            return ""
-        elif provider == "gemini":
-            instr = "The following is not valid JSON. Please fix it and return only the corrected JSON object."
-            for _ in _backoff_loop():
-                for idx in _order(len(keys)):
-                    key = keys[idx]
-                    try:
-                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-                        body = {"contents":[{"parts":[{"text": instr+"\n\n<<<\n"+(text or "")+"\n>>>\n"}]}], "generationConfig":{"temperature":0.0}}
-                        r = requests.post(url, json=body, timeout=120)
-                        if r.status_code == 429 or (500 <= r.status_code < 600): continue
-                        r.raise_for_status()
-                        data = r.json()
-                        logging.info("[AI][REPAIR] provider=gemini%s", " (failover)" if mark_alt else "")
-                        return data["candidates"][0]["content"]["parts"][0]["text"]
-                    except requests.RequestException:
-                        continue
-            return ""
+        wrote = False
+        ok, code, body = api.post_item_score(item_id, rid, desired, review_text)
+        if not ok and code == 422 and _as_bool(os.getenv("RETRY_ON_422_ONCE","1"), True):
+            mx2 = api.parse_max_from_422(str(body))
+            if isinstance(mx2, float) and mx2 > 0:
+                desired2 = clamp(desired, 0.0, mx2)
+                ok, code, body = api.post_item_score(item_id, rid, desired2, review_text)
+                if ok:
+                    desired = desired2
+                    wrote = True
         else:
-            return ""
+            wrote = ok
+
+        if wrote and _as_bool(os.getenv("VERIFY_AFTER_WRITE","1"), True):
+            exist2 = api.verify_existing_score(item_id, rid)
+            if exist2 is None:
+                logging.info("[VERIFY][TASK %s] rid=%s verify-late (skip strict check)", task_id, rid)
+
+        satisfied = False
+        stop_criteria = (stop_criteria or "score_only").strip().lower()
+        if stop_criteria == "score_and_review":
+            satisfied = wrote and review_ok
+        else:
+            satisfied = wrote
+
+        if satisfied:
+            logging.info("[OK][TASK %s] #%d rid=%s name=%s score=%.2f", task_id, idx, rid, sname, desired)
+            stats["ok"] += 1
+        else:
+            logging.warning("[FAIL][TASK %s] #%d rid=%s name=%s", task_id, idx, rid, sname)
+            stats["fail"] += 1
+
+    return stats
+
+def run_once():
+    api = Seiue(
+        base=os.getenv("SEIUE_BASE","https://api.seiue.com"),
+        bearer=os.getenv("SEIUE_BEARER",""),
+        school_id=os.getenv("SEIUE_SCHOOL_ID","3"),
+        role=os.getenv("SEIUE_ROLE","teacher"),
+        reflection_id=os.getenv("SEIUE_REFLECTION_ID",""),
+        username=os.getenv("SEIUE_USERNAME","") or None,
+        password=os.getenv("SEIUE_PASSWORD","") or None,
+    )
+    ai: Optional[AIClient] = None
+    if os.getenv("FULL_SCORE_MODE","off").strip().lower() != "all":
+        prov = os.getenv("AI_PROVIDER","deepseek").strip().lower()
+        model = os.getenv("DEEPSEEK_MODEL","deepseek-reasoner") if prov=="deepseek" else os.getenv("GEMINI_MODEL","gemini-2.5-pro")
+        key = os.getenv("DEEPSEEK_API_KEY","") if prov=="deepseek" else os.getenv("GEMINI_API_KEY","")
+        endpoint = os.getenv("AI_ENDPOINT","")
+        ai = AIClient(prov, model, key, endpoint=endpoint)
+
+    ids_raw = os.getenv("MONITOR_TASK_IDS","").strip().strip(",")
+    if not ids_raw:
+        logging.error("MONITOR_TASK_IDS missing.")
+        return False
+    task_ids = []
+    for x in ids_raw.split(","):
+        s = x.strip()
+        if not s: continue
+        try:
+            task_ids.append(int(s))
+        except ValueError:
+            logging.warning("Skip non-numeric task id: %s", s)
+    if not task_ids:
+        logging.error("No valid task ids.")
+        return False
+
+    stop_criteria = os.getenv("STOP_CRITERIA","score_only").strip().lower()
+    full_mode = (os.getenv("FULL_SCORE_MODE","off").strip().lower() == "all")
+    full_comment = os.getenv("FULL_SCORE_COMMENT","記得看高考真題。")
+    max_cache = MaxCache(ttl_seconds=int(os.getenv("MAX_SCORE_CACHE_TTL","600")))
+
+    overall_ok = True
+    for tid in task_ids:
+        logging.info("[EXEC] Processing task_id=%s (FULL=%s, STOP=%s)", tid, full_mode, stop_criteria)
+        stats = give_comment_and_score(api, ai, tid, full_mode, full_comment, stop_criteria, max_cache)
+        logging.info("[SUMMARY][TASK %s] ok=%d skip=%d fail=%d", tid, stats["ok"], stats["skip"], stats["fail"])
+        if stats["fail"] > 0:
+            overall_ok = False
+    return overall_ok
+
+def main():
+    load_env_every_time()
+    setup_logging()
+
+    run_mode = os.getenv("RUN_MODE","oneshot").strip().lower()
+    poll = int(os.getenv("POLL_INTERVAL","10") or "10")
+
+    if run_mode == "watch":
+        while True:
+            load_env_every_time()
+            try:
+                run_once()
+            except Exception as e:
+                logging.error("run_once exception: %s", e, exc_info=True)
+            time.sleep(poll)
+    else:
+        ok = run_once()
+        sys.exit(0 if ok else 1)
+
+if __name__ == "__main__":
+    main()
 PY
+  chmod 644 "$PY_MAIN"
+}
 
-  cat > "$APP_DIR/seiue_api.py" <<'PY'
-import os, logging, requests, threading, re, time
+write_seiue_api_py() {
+  cat >"$PY_API" <<'PY'
+import os, logging, requests, threading, re
 from typing import Dict, Any, List, Union, Optional, Tuple
 from credentials import login, AuthResult
 from requests.adapters import HTTPAdapter
@@ -763,7 +560,7 @@ def _flatten_find_item_ids(obj: Union[Dict[str,Any], List[Any]]) -> List[int]:
                 lk = str(k).lower()
                 if lk.endswith("item_id") or lk.endswith("klass_item_id"):
                     try:
-                        iv = int(v); 
+                        iv = int(v)
                         if iv>0: found.append(iv)
                     except Exception:
                         pass
@@ -771,16 +568,27 @@ def _flatten_find_item_ids(obj: Union[Dict[str,Any], List[Any]]) -> List[int]:
         elif isinstance(x, list):
             for y in x: walk(y)
     walk(obj)
-    return list(dict.fromkeys(found))
+    out: List[int] = []
+    seen = set()
+    for i in found:
+        if i not in seen:
+            out.append(i); seen.add(i)
+    return out
 
 class Seiue:
-    def __init__(self, base: str, bearer: str, school_id: str, role: str, reflection_id: str, username: str="", password: str=""):
+    def __init__(self, base: str, bearer: str, school_id: str, role: str, reflection_id: str,
+                 username: Optional[str]=None, password: Optional[str]=None):
         self.base = (base or "https://api.seiue.com").rstrip("/")
-        self.username = username; self.password = password
-        self.school_id = str(school_id or "3"); self.role = role or "teacher"
-        self.reflection_id = str(reflection_id) if reflection_id else ""; self.bearer = bearer or ""
-        self.session = _session_with_retries(); self._init_headers()
-        if not self.bearer and self.username and self.password: self._login_and_apply()
+        self.username = username or ""
+        self.password = password or ""
+        self.school_id = str(school_id or "3")
+        self.role = role or "teacher"
+        self.reflection_id = str(reflection_id) if reflection_id else ""
+        self.bearer = bearer or ""
+        self.session = _session_with_retries()
+        self._init_headers()
+        if not self.bearer and self.username and self.password:
+            self._login_and_apply()
 
     def _init_headers(self):
         if self.bearer: self.session.headers.update({"Authorization": f"Bearer {self.bearer}"})
@@ -807,17 +615,20 @@ class Seiue:
         if not path.startswith("/"): path = "/" + path
         return self.base + path
 
-    def _with_refresh(self, request_fn):
-        r = request_fn()
+    def _with_refresh(self, fn):
+        r = fn()
         if getattr(r,"status_code",None) in (401,403):
             logging.warning("[AUTH] 401/403; re-auth...")
-            if self._login_and_apply(): return request_fn()
+            if self._login_and_apply(): return fn()
         return r
 
+    # --------- fetchers ---------
     def get_task(self, task_id: int):
         url = self._url(f"/chalk/task/v2/tasks/{task_id}")
         r = self._with_refresh(lambda: self.session.get(url, timeout=60))
-        if r.status_code >= 400: logging.error(f"[API] get_task {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
+        if r.status_code >= 400:
+            logging.error(f"[API] get_task {r.status_code}: {(r.text or '')[:400]}")
+            r.raise_for_status()
         return r.json()
 
     def get_tasks_bulk(self, task_ids: List[int]):
@@ -825,26 +636,44 @@ class Seiue:
         ids = ",".join(str(i) for i in sorted(set(task_ids)))
         url = self._url(f"/chalk/task/v2/tasks?id_in={ids}&expand=group")
         r = self._with_refresh(lambda: self.session.get(url, timeout=60))
-        if r.status_code >= 400: logging.error(f"[API] get_tasks_bulk {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
+        if r.status_code >= 400:
+            logging.error(f"[API] get_tasks_bulk {r.status_code}: {(r.text or '')[:400]}")
+            r.raise_for_status()
         arr = r.json() or []
         out = {}
         for obj in arr:
-            tid = int(obj.get("id", 0) or 0)
+            tid = int(obj.get("id") or 0)
             if tid: out[tid] = obj
         return out
 
     def get_assignments(self, task_id: int):
         url = self._url(f"/chalk/task/v2/tasks/{task_id}/assignments?expand=is_excellent,assignee,team,submission,review")
         r = self._with_refresh(lambda: self.session.get(url, timeout=60))
-        if r.status_code >= 400: logging.error(f"[API] get_assignments {r.status_code}: {(r.text or '')[:500]}"); r.raise_for_status()
+        if r.status_code >= 400:
+            logging.error(f"[API] get_assignments {r.status_code}: {(r.text or '')[:400]}")
+            r.raise_for_status()
         return r.json()
 
     def get_item_detail(self, item_id: int):
-        # include expand to expose full_score consistently
-        url = self._url(f"/vnas/klass/items/{item_id}?expand=assessment%2Cassessment_stage%2Cstage")
+        url = self._url(f"/vnas/klass/items/{item_id}?expand=assessment%2Cassessment_stage%2Cstage%2Cscore_items%2Crules")
         r = self._with_refresh(lambda: self.session.get(url, timeout=30))
-        if r.status_code >= 400: logging.error(f"[API] get_item_detail {r.status_code}: {(r.text or '')[:300]}"); r.raise_for_status()
+        if r.status_code >= 400:
+            logging.error(f"[API] get_item_detail {r.status_code}: {(r.text or '')[:300]}")
+            r.raise_for_status()
         return r.json()
+
+    # --------- helpers ---------
+    def derive_item_ids(self, task: Dict[str,Any], assignments: List[Dict[str,Any]]) -> List[int]:
+        ids = []
+        ids += _flatten_find_item_ids(task)
+        for a in assignments:
+            ids += _flatten_find_item_ids(a)
+        out = []
+        seen=set()
+        for i in ids:
+            if i not in seen and i>0:
+                out.append(i); seen.add(i)
+        return out
 
     def get_item_max_score(self, item_id: int) -> Optional[float]:
         try:
@@ -854,7 +683,6 @@ class Seiue:
                 if v is not None:
                     try: return float(v)
                     except: pass
-            # fallbacks via structured payloads
             for arrk in ("score_items","scoring_items","rules"):
                 arr = d.get(arrk)
                 if isinstance(arr, list) and arr:
@@ -864,7 +692,6 @@ class Seiue:
                         try: tot += float(mx or 0)
                         except: pass
                     if tot > 0: return tot
-            # assessment level (less preferred)
             asses = d.get("assessment") or {}
             for k in ("total_item_score","full_score","max_score"):
                 v = asses.get(k)
@@ -884,7 +711,7 @@ class Seiue:
             return None
         try:
             data = r.json()
-            rows = data if isinstance(data,list) else (data.get("data") or data.get("items") or [])
+            rows = data if isinstance(data, list) else (data.get("data") or data.get("items") or [])
             for row in rows:
                 try:
                     if int(row.get("owner_id") or 0) == int(owner_id):
@@ -898,668 +725,343 @@ class Seiue:
 
     def parse_max_from_422(self, text: str) -> Optional[float]:
         if not text: return None
-        # Chinese message like: “必须 ... 小于等于评价项满分40.00。”
         m = re.search(r"满分\s*([0-9]+(?:\.[0-9]+)?)", text)
         if m:
             try: return float(m.group(1))
             except: pass
-        # English-ish fallback
         m2 = re.search(r"(?:max(?:imum)?|<=)\s*([0-9]+(?:\.[0-9]+)?)", text, re.I)
         if m2:
             try: return float(m2.group(1))
             except: pass
         return None
 
-    def post_item_score(self, item_id: int, owner_id: int, task_id: int, score: float) -> Tuple[bool,int,str]:
-        path = f"/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true"
-        url  = self._url(path)
-        payload = [{
-            "owner_id": int(owner_id),
-            "valid": True,
-            "score": str(score),
-            "review": "",
-            "attachments": [],
-            "related_data": {"task_id": int(task_id)},
-            "type": "item_score",
-            "status": "published"
-        }]
-        r = self._with_refresh(lambda: self.session.post(url, json=payload, timeout=60))
-        txt = r.text or ""
-        if 200 <= r.status_code < 300:
-            return True, r.status_code, txt
-        if r.status_code == 422 and ("分数已经存在" in txt or "already exists" in txt):
-            return True, r.status_code, txt
-        if r.status_code >= 400:
-            logging.warning(f"[API] score failed: POST {path} -> {r.status_code} :: {txt[:200]}")
-            # do not raise here; let caller decide retry/skip
-            return False, r.status_code, txt
-        return False, r.status_code, txt
-
-    def resolve_item_id(self, task_id: int) -> int:
+    # --------- writers ---------
+    def post_review(self, receiver_id: int, task_id: int, text: str) -> Tuple[bool, int, str]:
+        path_tmpl = os.getenv("SEIUE_REVIEW_POST_TEMPLATE","/chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews")
+        path = path_tmpl.format(receiver_id=receiver_id, task_id=task_id)
+        url = self._url(path)
         try:
-            t = self.get_task(task_id)
-            ids = _flatten_find_item_ids(t)
-            if ids:
-                logging.info("[ITEM] task %s contains item_id candidates=%s", task_id, ids)
-                return ids[0]
-        except Exception as e:
-            logging.warning("[ITEM] scan task %s failed: %s", task_id, e)
-        try:
-            assigns = self.get_assignments(task_id)
-            ids = _flatten_find_item_ids(assigns)
-            if ids:
-                logging.info("[ITEM] assignments of %s contain item_id candidates=%s", task_id, ids)
-                return ids[0]
-        except Exception as e:
-            logging.warning("[ITEM] scan assignments %s failed: %s", task_id, e)
+            r = self._with_refresh(lambda: self.session.post(
+                url, json={"content": str(text or "")}, timeout=30
+            ))
+            code = getattr(r, "status_code", 0) or 0
+            if code == 405:
+                return False, 405, r.text or ""
+            if code >= 400:
+                return False, code, r.text or ""
+            return True, code, r.text or ""
+        except requests.RequestException as e:
+            return False, -1, str(e)
 
-        cand_paths = [
-            f"/vnas/klass/items?related_data.task_id={task_id}",
-            f"/vnas/klass/items?related_data%5Btask_id%5D={task_id}",
-            f"/vnas/common/items?related_data.task_id={task_id}",
-            f"/vnas/common/items?related_data%5Btask_id%5D={task_id}",
-            f"/vnas/klass/items?task_id={task_id}",
-            f"/vnas/common/items?task_id={task_id}",
+    def post_item_score(self, item_id: int, owner_id: int, score: float, review: Optional[str]=None) -> Tuple[bool,int,str]:
+        spec = os.getenv("SEIUE_SCORE_ENDPOINTS","POST:/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true:array")
+        try:
+            method, rest = spec.split(":", 1)
+            path, payload_style = rest.rsplit(":", 1)
+        except ValueError:
+            method, path, payload_style = "POST", "/vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true", "array"
+
+        url = self._url(path.format(item_id=item_id))
+        row = {"owner_id": int(owner_id), "score": float(score)}
+        if review: row["review"] = str(review)
+        body = [row] if payload_style.lower() != "object" else row
+
+        try:
+            r = self._with_refresh(lambda: self.session.request(method.upper(), url, json=body, timeout=30))
+            code = getattr(r, "status_code", 0) or 0
+            if code >= 400:
+                return False, code, r.text or ""
+            return True, code, r.text or ""
+        except requests.RequestException as e:
+            return False, -1, str(e)
+PY
+  chmod 644 "$PY_API"
+}
+
+write_ai_providers_py() {
+  cat >"$PY_AI" <<'PY'
+import os, json, re, requests, logging
+from typing import Dict, Any, Optional
+from utilx import repair_json
+
+class AIClient:
+    """
+    Pluggable AI client.
+    - provider = deepseek | gemini | endpoint
+    - For provider=endpiont, set AI_ENDPOINT (POST JSON {"prompt": "..."} -> {"answer": "..."}).
+    """
+    def __init__(self, provider: str, model: str, api_key: str, endpoint: Optional[str]=None):
+        self.provider = (provider or "deepseek").lower()
+        self.model = model or "deepseek-reasoner"
+        self.api_key = api_key or ""
+        self.endpoint = endpoint or os.getenv("AI_ENDPOINT","").strip()
+
+    def _call_deepseek(self, prompt: str) -> str:
+        """
+        DeepSeek provides OpenAI-compatible endpoints.
+        We try /v1/chat/completions; if the provider uses /v1/responses, the server should map it.
+        """
+        url = os.getenv("DEEPSEEK_BASE","https://api.deepseek.com").rstrip("/") + "/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type":"application/json"}
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role":"system","content":"Output ONLY valid JSON per instructions."},
+                {"role":"user","content":prompt}
+            ],
+            "temperature": 0.2
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception:
+            return json.dumps({"overall":{"score":0,"comment":"MODEL_PARSE_ERROR"},"per_question":[]}, ensure_ascii=False)
+
+    def _call_gemini(self, prompt: str) -> str:
+        base = os.getenv("GEMINI_BASE","https://generativelanguage.googleapis.com")
+        url = f"{base.rstrip('/')}/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+        headers = {"Content-Type":"application/json"}
+        body = {"contents":[{"parts":[{"text": prompt}]}], "generationConfig":{"temperature":0.2}}
+        r = requests.post(url, headers=headers, json=body, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        # Expect text at candidates[0].content.parts[0].text
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            return json.dumps({"overall":{"score":0,"comment":"MODEL_PARSE_ERROR"},"per_question":[]}, ensure_ascii=False)
+
+    def _call_endpoint(self, prompt: str) -> str:
+        url = self.endpoint
+        if not url:
+            raise RuntimeError("AI_ENDPOINT is not set for provider=endpoint")
+        headers = {"Content-Type":"application/json"}
+        r = requests.post(url, headers=headers, json={"prompt": prompt}, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        ans = data.get("answer") or ""
+        return ans if isinstance(ans, str) else json.dumps(ans, ensure_ascii=False)
+
+    def grade(self, prompt: str) -> Dict[str, Any]:
+        if self.provider == "endpoint":
+            raw = self._call_endpoint(prompt)
+        elif self.provider == "gemini":
+            raw = self._call_gemini(prompt)
+        else:
+            raw = self._call_deepseek(prompt)
+
+        try:
+            obj = repair_json(raw)
+            if not isinstance(obj, dict):
+                raise ValueError("JSON not an object")
+            # normalize
+            if "overall" not in obj: obj["overall"] = {"score":0,"comment":""}
+            if "per_question" not in obj: obj["per_question"] = []
+            # ensure score is a float
+            try:
+                obj["overall"]["score"] = float(obj["overall"].get("score",0.0))
+            except Exception:
+                obj["overall"]["score"] = 0.0
+            obj["overall"]["comment"] = str(obj["overall"].get("comment",""))
+            return obj
+        except Exception as e:
+            logging.error("AI JSON repair failed: %s", e, exc_info=True)
+            return {"overall":{"score":0.0,"comment":"(AI output parse failed)"},"per_question":[]}
+PY
+  chmod 644 "$PY_AI"
+}
+
+write_utilx_py() {
+  cat >"$PY_UTIL" <<'PY'
+import json, re
+from typing import Any, Dict, List, Tuple
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def draftjs_to_text(content: Any) -> str:
+    """
+    Accepts either a DraftJS dict or JSON string; returns concatenated plain text.
+    """
+    try:
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except Exception:
+                return content
+        blocks = (content or {}).get("blocks") or []
+        lines = []
+        for b in blocks:
+            t = b.get("text","")
+            if isinstance(t, str):
+                lines.append(t)
+        return "\n".join(lines).strip()
+    except Exception:
+        return ""
+
+def scan_question_maxima(task: Dict[str,Any]) -> Tuple[List[Dict[str,Any]], float]:
+    """
+    Try to infer per-question schema and total max from task payload (best effort).
+    Returns (schema, overall_guess). Schema example: [{"id":"Q1","max":10}, ...]
+    """
+    schema: List[Dict[str,Any]] = []
+    total = 0.0
+    # common locations
+    cand_lists = []
+    for key in ("assessment","rubric","score_items","scoring_items","rules"):
+        v = task.get(key)
+        if isinstance(v, list): cand_lists.append(v)
+        elif isinstance(v, dict):
+            for k2 in ("items","score_items","scoring_items","rules"):
+                vv = v.get(k2)
+                if isinstance(vv, list): cand_lists.append(vv)
+
+    for arr in cand_lists:
+        for i, it in enumerate(arr, 1):
+            mid = it.get("id") or it.get("name") or f"Q{i}"
+            mx = it.get("full") or it.get("max") or it.get("max_score") or it.get("full_score")
+            try:
+                mx = float(mx)
+            except Exception:
+                mx = 0.0
+            if mx > 0:
+                schema.append({"id": str(mid), "max": float(mx)})
+                total += float(mx)
+
+    overall_guess = total if total > 0 else 0.0
+    return schema, overall_guess
+
+def _extract_json_brace_region(s: str) -> str:
+    """
+    Extract the first plausible {...} region; naive brace match.
+    """
+    start = s.find("{")
+    if start < 0:
+        return s
+    depth = 0
+    for i in range(start, len(s)):
+        c = s[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i+1]
+    return s[start:]
+
+def repair_json(text: str) -> Any:
+    """
+    Try to coerce LLM text into JSON.
+    - extracts first {...}
+    - removes trailing commas
+    - fixes common quote issues
+    """
+    if not isinstance(text, str):
+        return text
+    js = _extract_json_brace_region(text)
+    # remove trailing commas before } or ]
+    js = re.sub(r",(\s*[}\]])", r"\1", js)
+    try:
+        return json.loads(js)
+    except Exception:
+        # attempt to replace smart quotes
+        js2 = js.replace("“","\"").replace("”","\"").replace("’","'").replace("‘","'")
+        js2 = re.sub(r",(\s*[}\]])", r"\1", js2)
+        return json.loads(js2)
+PY
+  chmod 644 "$PY_UTIL"
+}
+
+write_credentials_py() {
+  cat >"$PY_CRED" <<'PY'
+from dataclasses import dataclass
+from typing import Optional
+import requests, logging, json
+
+@dataclass
+class AuthResult:
+    ok: bool
+    token: str = ""
+    reflection_id: Optional[str] = None
+    detail: str = ""
+
+def login(username: str, password: str) -> AuthResult:
+    """
+    Best-effort programmatic login.
+    If your environment prefers static bearer tokens, leave SEIUE_BEARER in .env and skip user/pass.
+    """
+    try:
+        s = requests.Session()
+        s.headers.update({"Accept":"application/json, text/plain, */*","User-Agent":"AGrader/1.10"})
+        # Try authorize endpoint (payload fields may vary across deployments)
+        # We attempt two common shapes.
+        candidates = [
+            ("https://passport.seiue.com/authorize", {"account": username, "password": password}),
+            ("https://passport.seiue.com/authorize", {"username": username, "password": password}),
         ]
-        for p in cand_paths:
-            try:
-                url = self._url(p)
-                r = self._with_refresh(lambda: self.session.get(url, timeout=30))
-                if r.status_code >= 400:
-                    continue
-                data = r.json()
-                rows: List[Dict[str,Any]] = []
-                if isinstance(data, list):
-                    rows = data
-                elif isinstance(data, dict):
-                    rows = data.get("data") or data.get("items") or []
-                for row in rows:
-                    iid = int(row.get("id") or row.get("_id") or 0)
-                    if iid <= 0: continue
-                    rel = row.get("related_data") or {}
-                    rel_tid = rel.get("task_id") or rel.get("task") or None
-                    try:
-                        if rel_tid is not None and int(rel_tid) != int(task_id):
-                            continue
-                    except Exception:
-                        pass
-                    logging.info("[ITEM] %s -> item_id=%s via %s", task_id, iid, p)
-                    return iid
-            except Exception as e:
-                logging.debug("[ITEM] query %s failed: %s", p, e)
-
-        logging.error("[ITEM] Unable to resolve item_id for task %s", task_id)
-        return 0
-PY
-
-  cat > "$APP_DIR/main.py" <<'PY'
-import os, json, time, logging, re, threading, signal
-from typing import Dict, Any, List, Tuple, Optional
-from dotenv import load_dotenv
-from utilx import draftjs_to_text, scan_question_maxima, stable_hash, clamp
-from extractor import file_to_text
-from ai_providers import AIClient
-from seiue_api import Seiue
-
-def setup_logging():
-    level = os.getenv("LOG_LEVEL","INFO").upper()
-    level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARN": logging.WARN, "WARNING": logging.WARN, "ERROR": logging.ERROR}
-    log_level = level_map.get(level, logging.INFO)
-    log_file = os.getenv("LOG_FILE","/opt/agrader/agrader.log")
-    fmt = os.getenv("LOG_FORMAT","%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s")
-    datefmt = os.getenv("LOG_DATEFMT","%Y-%m-%d %H:%M:%S")
-    logging.basicConfig(level=log_level, format=fmt, datefmt=datefmt)
-    try:
-        fh = logging.FileHandler(log_file, encoding="utf-8", mode="a")
-        fh.setLevel(log_level); fh.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
-        logging.getLogger().addHandler(fh)
-    except Exception: logging.warning(f"Cannot open LOG_FILE={log_file} for writing.")
-    if log_level == logging.DEBUG: logging.getLogger("urllib3").setLevel(logging.INFO)
-
-def tg_enabled(cfg): return bool(cfg.get("tg_token")) and bool(cfg.get("tg_chat"))
-def tg_send(cfg, text):
-    if not tg_enabled(cfg): return
-    import requests
-    url = f"https://api.telegram.org/bot{cfg['tg_token']}/sendMessage"
-    data = {"chat_id": cfg["tg_chat"], "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        requests.post(url, data=data, timeout=15)
-    except Exception as e:
-        logging.warning(f"[TG] {e}")
-
-def _parse_task_ids(raw: str) -> List[int]:
-    if not raw: return []
-    out: List[int] = []
-    for seg in [s.strip() for s in raw.split(",") if s.strip()]:
-        m = re.search(r"/tasks/(\d+)", seg)
-        if m: out.append(int(m.group(1))); continue
-        m2 = re.search(r"\b(\d{4,})\b", seg)
-        if m2: out.append(int(m2.group(1)))
-    dedup=[]; seen=set()
-    for x in out:
-        if x not in seen:
-            dedup.append(x); seen.add(x)
-    return dedup
-
-def load_env():
-    load_dotenv(os.getenv("ENV_PATH",".env")); env=os.environ; get=lambda k,d="": env.get(k,d)
-    def as_bool(x: str, default=True):
-        if x is None or x == "": return default
-        return x not in ("0","false","False","no","NO")
-    return {
-        "base": get("SEIUE_BASE","https://api.seiue.com"),
-        "username": get("SEIUE_USERNAME",""),
-        "password": get("SEIUE_PASSWORD",""),
-        "bearer": get("SEIUE_BEARER",""),
-        "school_id": get("SEIUE_SCHOOL_ID","3"),
-        "role": get("SEIUE_ROLE","teacher"),
-        "reflection_id": get("SEIUE_REFLECTION_ID",""),
-        "task_ids": _parse_task_ids(get("MONITOR_TASK_IDS","")),
-        "interval": int(get("POLL_INTERVAL","10") or "10"),
-        "workdir": get("WORKDIR","/opt/agrader/work"),
-        "state_path": get("STATE_PATH","/opt/agrader/state.json"),
-        "ocr_lang": get("OCR_LANG","chi_sim+eng"),
-        "max_attach": int(get("MAX_ATTACHMENT_BYTES","25165824") or "25165824"),
-        "ai_provider": get("AI_PROVIDER","deepseek"),
-        "gemini_key": get("GEMINI_API_KEY",""),
-        "gemini_model": get("GEMINI_MODEL","gemini-2.5-pro"),
-        "deepseek_key": get("DEEPSEEK_API_KEY",""),
-        "deepseek_model": get("DEEPSEEK_MODEL","deepseek-reasoner"),
-        "ai_parallel": int(get("AI_PARALLEL","1") or "1"),
-        "tg_token": get("TELEGRAM_BOT_TOKEN",""),
-        "tg_chat": get("TELEGRAM_CHAT_ID",""),
-        "tg_verbose": as_bool(get("TELEGRAM_VERBOSE","1")),
-        "score_write": True,
-        "review_all_existing": True,
-        "score_all_on_start": True,
-        "dry_run": False,
-        "verify_after": as_bool(get("VERIFY_AFTER_WRITE","1")),
-        "reverify_before": as_bool(get("REVERIFY_BEFORE_WRITE","1")),
-        "retry_422_once": as_bool(get("RETRY_ON_422_ONCE","1")),
-        "clamp_on_max": as_bool(get("SCORE_CLAMP_ON_MAX","1")),
-        "max_cache_ttl": int(get("MAX_SCORE_CACHE_TTL","600") or "600"),
-        "student_workers": int(get("STUDENT_WORKERS","1") or "1"),
-        "attach_workers": int(get("ATTACH_WORKERS","3") or "3"),
-        "ai_failover": as_bool(get("AI_FAILOVER","1")),
-        "log_level": get("LOG_LEVEL","INFO"),
-        "ai_strategy": get("AI_KEY_STRATEGY","roundrobin"),
-        "prompt_path": get("PROMPT_TEMPLATE_PATH","/opt/agrader/prompt.txt"),
-        "full_score_mode": (get("FULL_SCORE_MODE","off") or "off").lower(),
-        "full_score_comment": get("FULL_SCORE_COMMENT","記得看高考真題。"),
-    }
-
-def load_state(path: str) -> Dict[str, Any]:
-    try:
-        with open(path,"r") as f: data = json.load(f)
-        data.setdefault("processed", {})
-        data.setdefault("failed", [])
-        data.setdefault("reported_complete", {})
-        data.setdefault("task_item", {})
-        return data
-    except Exception:
-        return {"processed": {}, "failed": [], "reported_complete": {}, "task_item": {}}
-
-def save_state(path: str, st: Dict[str, Any]):
-    tmp = path + ".tmp"
-    with open(tmp,"w",encoding="utf-8") as f: json.dump(st, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-_prompt_cache = {"path": None, "mtime": 0.0, "text": ""}
-
-def _load_prompt_template(path: str) -> str:
-    try:
-        st = os.stat(path)
-        if (_prompt_cache["path"] != path) or (st.st_mtime != _prompt_cache["mtime"]):
-            with open(path, "r", encoding="utf-8") as f:
-                _prompt_cache.update({"path": path, "mtime": st.st_mtime, "text": f.read()})
-    except Exception:
-        _prompt_cache["text"] = (
-            "You are a strict Chinese language grader.\n\n"
-            "Task: {task_title}\nStudent: {student_name} ({student_id})\n"
-            "Max Score: {max_score}\nPer-Question Schema (JSON): {per_question_json}\n\n"
-            "---\n{assignment_text}\n---\n"
-            'Output ONLY JSON: {"per_question":[...],"overall":{"score":...,"comment":"..."}}'
-        )
-    return _prompt_cache["text"]
-
-def build_prompt(cfg: Dict[str,Any], task: dict, assignment: dict, extracted_text: str, perq: list, overall_max: float) -> str:
-    tpl = _load_prompt_template(cfg.get("prompt_path","/opt/agrader/prompt.txt"))
-    task_title = (task.get("title") or task.get("name") or "").strip()
-    u = (assignment.get("assignee") or {})
-    student_name = (u.get("name") or u.get("real_name") or "").strip()
-    student_id = str(u.get("id") or assignment.get("receiver_id") or "")
-    ctx = {
-        "task_title": task_title,
-        "student_name": student_name,
-        "student_id": student_id,
-        "assignment_text": (extracted_text or "").strip(),
-        "max_score": float(overall_max or 100.0),
-        "per_question_json": json.dumps(perq or [], ensure_ascii=False),
-    }
-    try: return tpl.format(**ctx)
-    except Exception:
-        return (
-            f"You are a strict grader.\nTask: {task_title}\nStudent: {student_name}({student_id})\n"
-            f"Max Score: {ctx['max_score']}\nSchema: {ctx['per_question_json']}\n---\n{ctx['assignment_text']}\n---\n"
-            'Output ONLY JSON: {"per_question":[...],"overall":{"score":...,"comment":"..."}}'
-        )
-
-_stop = threading.Event()
-def _sigterm(_s,_f):
-    logging.info("[EXEC] Caught signal; graceful shutdown...")
-    _stop.set()
-signal.signal(signal.SIGTERM, _sigterm)
-signal.signal(signal.SIGINT, _sigterm)
-
-# --------- Max score cache (memory) ----------
-_item_max_cache: Dict[int, Tuple[float, float]] = {}  # item_id -> (value, ts)
-
-def _get_item_max(api: Seiue, task: dict, item_id: int, fallback: float, ttl: int) -> float:
-    now = time.time()
-    if item_id > 0:
-        if item_id in _item_max_cache:
-            v, ts = _item_max_cache[item_id]
-            if now - ts < ttl:
-                return v
-    # try direct item endpoint
-    ms = None
-    if item_id > 0:
-        ms = api.get_item_max_score(item_id)
-    if ms is None or ms <= 0:
-        # fallback to task-derived maxima if any
-        if fallback and fallback > 0:
-            ms = float(fallback)
-        else:
-            ms = 100.0
-    _item_max_cache[item_id] = (float(ms), now)
-    return float(ms)
-
-def main_loop(cfg: Dict[str,Any]):
-    if not cfg["task_ids"]:
-        logging.warning("[EXEC] No MONITOR_TASK_IDS configured.")
-        time.sleep(cfg["interval"])
-        return
-
-    api = Seiue(
-        base=cfg["base"], bearer=cfg["bearer"], school_id=cfg["school_id"], role=cfg["role"],
-        reflection_id=cfg["reflection_id"], username=cfg["username"], password=cfg["password"]
-    )
-    logging.info("[EXEC] Monitoring tasks=%s", cfg["task_ids"])
-
-    state = load_state(cfg["state_path"])
-
-    try:
-        os.makedirs(cfg["workdir"], exist_ok=True)
-    except Exception as e:
-        logging.warning(f"[WORKDIR] cannot create {cfg['workdir']}: {e}")
-
-    tasks_meta = api.get_tasks_bulk(cfg["task_ids"])
-    for task_id in cfg["task_ids"]:
-        if _stop.is_set(): break
-        try:
-            task = tasks_meta.get(task_id) or api.get_task(task_id)
-        except Exception as e:
-            logging.error(f"[TASK {task_id}] load failed: {e}")
-            continue
-
-        perq, overall_max_from_task = scan_question_maxima(task)
-        try:
-            items = api.get_assignments(task_id) or []
-        except Exception as e:
-            logging.error(f"[TASK {task_id}] assignments failed: {e}")
-            continue
-
-        cached_iid = int(state["task_item"].get(str(task_id) or "0") or 0)
-        if cached_iid <= 0:
-            iid = api.resolve_item_id(task_id)
-            if iid > 0:
-                state["task_item"][str(task_id)] = iid
-                save_state(cfg["state_path"], state)
-            else:
-                logging.error("[TASK %s] item_id unresolved; will still send reviews but skip scores this round.", task_id)
-                iid = 0
-        else:
-            iid = cached_iid
-
-        total = len(items)
-        success_cnt = 0
-        processed_map = state["processed"].setdefault(str(task_id), {})
-
-        if tg_enabled(cfg):
-            tg_send(cfg, f"📘 <b>Task {task_id}</b> started · total: <b>{total}</b>")
-
-        # -------- FULL MODE --------
-        if (cfg.get("full_score_mode") or "off") == "all":
-            max_score = _get_item_max(api, task, iid, overall_max_from_task, cfg["max_cache_ttl"])
-            review_comment = cfg.get("full_score_comment") or "記得看高考真題。"
-            for idx, asg in enumerate(items, start=1):
-                if _stop.is_set(): break
-                rid = int(asg.get("receiver_id") or (asg.get("assignee") or {}).get("id") or 0)
-                name = ((asg.get("assignee") or {}).get("name") or "").strip() or "?"
-
-                # review (best-effort)
-                try: api.post_review(receiver_id=rid, task_id=task_id, content=review_comment)
-                except Exception as e: logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
-
-                desired = float(max_score)
-
-                # pre-verify existing score to avoid re-post
-                if cfg["reverify_before"] and iid > 0:
-                    try:
-                        exist = api.verify_existing_score(iid, rid)
-                        if exist is not None:
-                            processed_map[str(rid)] = {"status":"ok","score":exist,"comment":review_comment}
-                            success_cnt += 1
-                            logging.info("[FULL][OK][TASK %s] %d/%d rid=%s name=%s (already exists: %.2f)", task_id, success_cnt, total, rid, name, exist)
-                            if tg_enabled(cfg) and cfg["tg_verbose"]:
-                                tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {exist}\n{review_comment}")
-                            save_state(cfg["state_path"], state)
-                            continue
-                    except Exception:
-                        pass
-
-                wrote = False
-                if iid > 0:
-                    ok, code, txt = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired)
-                    if not ok and code == 422 and cfg["retry_422_once"]:
-                        parsed = api.parse_max_from_422(txt)
-                        if parsed and parsed > 0:
-                            # update cache & clamp once
-                            _item_max_cache[iid] = (parsed, time.time())
-                            desired = min(desired, parsed)
-                            ok, code2, txt2 = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired)
-                            ok = ok  # final
-                    if ok:
-                        wrote = True
-                else:
-                    logging.error(f"[SCORE][TASK {task_id}] rid={rid} skipped (item_id unresolved)")
-
-                if wrote:
-                    processed_map[str(rid)] = {"status":"ok", "score": desired, "comment": review_comment}
-                    success_cnt += 1
-                    logging.info("[FULL][OK][TASK %s] %d/%d rid=%s name=%s score=%.2f", task_id, success_cnt, total, rid, name, desired)
-                    if tg_enabled(cfg) and cfg["tg_verbose"]:
-                        tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {desired}\n{review_comment}")
-                else:
-                    processed_map[str(rid)] = {"status":"fail", "score_wanted": desired, "comment": review_comment}
-                    logging.info("[FULL][FAIL][TASK %s] rid=%s name=%s score_wanted=%.2f", task_id, rid, name, desired)
-
-                save_state(cfg["state_path"], state)
-                if _stop.is_set(): break
-
-            try:
-                succ_rows = [v for v in (state["processed"].get(str(task_id)) or {}).values() if v.get("status")=="ok"]
-                all_scores = [float(v.get("score",0.0)) for v in succ_rows]
-                avg = (sum(all_scores)/len(all_scores)) if all_scores else 0.0
-                zero_cnt = sum(1 for s in all_scores if s <= 1e-9)
-                msg = f"✅ <b>Task {task_id}</b> FULL-SCORED {success_cnt}/{total}\nAvg: {avg:.2f} · Zero: {zero_cnt}"
-                logging.info("[SUMMARY][TASK %s] %s", task_id, msg)
-                if tg_enabled(cfg): tg_send(cfg, msg)
-            except Exception as e:
-                logging.warning(f"[SUMMARY][TASK {task_id}] fail: {e}")
-
-            save_state(cfg["state_path"], state)
-            continue  # next task
-
-        # -------- NORMAL MODE --------
-        for idx, asg in enumerate(items, start=1):
-            if _stop.is_set(): break
-            rid = int(asg.get("receiver_id") or (asg.get("assignee") or {}).get("id") or 0)
-            name = ((asg.get("assignee") or {}).get("name") or "").strip() or "?"
-            submission = (asg.get("submission") or {})
-            content_json = submission.get("content") or ""
-            text0 = draftjs_to_text(content_json) if content_json else ""
-            attach_ids = []
-            files = (submission.get("attachments") or []) + (submission.get("files") or [])
-            for f in files:
-                fid = f.get("id") or f.get("_id") or f.get("file_id")
-                if fid: attach_ids.append(str(fid))
-
-            fingerprint = stable_hash(text0 + "|" + ",".join(sorted(attach_ids)))
-            extracted = text0
-
-            if attach_ids:
-                for fid in attach_ids:
-                    if _stop.is_set(): break
-                    try:
-                        url = api.get_file_signed_url(fid)
-                        if not url: continue
-                        blob = api.download(url)
-                        if len(blob) > cfg["max_attach"]:
-                            if cfg["tg_verbose"]:
-                                tg_send(cfg, f"📎 Skip large file for <b>{name}</b> ({len(blob)} bytes)")
-                            continue
-                        tmp = os.path.join(cfg["workdir"], f"{task_id}_{rid}_{fid}")
-                        with open(tmp,"wb") as w: w.write(blob)
-                        txt = file_to_text(tmp, ocr_lang=cfg["ocr_lang"], size_cap=cfg["max_attach"])
-                        extracted += ("\n\n" + txt)
-                    except Exception as e:
-                        logging.warning(f"[ATTACH][TASK {task_id}] rid={rid} file {fid} failed: {e}")
-
-            # blank submission
-            if not (extracted or "").strip():
-                score, comment = 0.0, "学生未提交作业内容。"
-                try: api.post_review(receiver_id=rid, task_id=task_id, content=comment)
-                except Exception as e: logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
-
-                wrote = False
-                if iid > 0:
-                    ok, code, txt = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=score)
-                    wrote = ok
-                else:
-                    logging.error(f"[SCORE][TASK {task_id}] rid={rid} skipped (item_id unresolved)")
-
-                if wrote:
-                    processed_map[str(rid)] = {"status":"ok","hash": fingerprint, "score": score, "comment": comment}
-                    success_cnt += 1
-                    logging.info("[DONE][TASK %s] %d/%d rid=%s name=%s score=%.1f", task_id, success_cnt, total, rid, name, score)
-                    if tg_enabled(cfg) and cfg["tg_verbose"]:
-                        tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {score}\n{comment}")
-                else:
-                    processed_map[str(rid)] = {"status":"fail","hash": fingerprint, "score_wanted": score, "comment": comment}
-                    logging.info("[FAIL][TASK %s] rid=%s name=%s score_wanted=%.1f", task_id, rid, name, score)
-
-                save_state(cfg["state_path"], state)
+        for url, payload in candidates:
+            r = s.post(url, json=payload, timeout=30)
+            if r.status_code >= 400:
                 continue
-
-            # AI grading
-            provider = cfg["ai_provider"]
-            model = cfg["gemini_model"] if provider=="gemini" else cfg["deepseek_model"]
-            key   = cfg["gemini_key"]   if provider=="gemini" else cfg["deepseek_key"]
-            client = AIClient(provider=provider, model=model, key=key)
-            prompt = build_prompt(cfg, task, asg, extracted, perq, overall_max_from_task)
             try:
-                j = client.grade(prompt)
-                overall = j.get("overall") or {}
-                ai_score = float(overall.get("score") or 0.0)
-                comment = str(overall.get("comment") or "").strip() or "（无评语）"
-            except Exception as e:
-                ai_score, comment = 0.0, f"自动评分失败：{e}"
-
-            try: api.post_review(receiver_id=rid, task_id=task_id, content=comment)
-            except Exception as e: logging.warning(f"[REVIEW][TASK {task_id}] rid={rid} review fail: {e}")
-
-            # get max and clamp before write
-            max_score = _get_item_max(api, task, iid, overall_max_from_task, cfg["max_cache_ttl"])
-            desired = clamp(ai_score, 0.0, max_score) if cfg["clamp_on_max"] else ai_score
-
-            # pre-verify existing
-            if cfg["reverify_before"] and iid > 0:
-                try:
-                    exist = api.verify_existing_score(iid, rid)
-                    if exist is not None:
-                        processed_map[str(rid)] = {"status":"ok","hash": fingerprint, "score": exist, "comment": comment}
-                        success_cnt += 1
-                        logging.info("[DONE][OK][TASK %s] %d/%d rid=%s name=%s (already exists: %.2f)", task_id, success_cnt, total, rid, name, exist)
-                        if tg_enabled(cfg) and cfg["tg_verbose"]:
-                            tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {exist}\n{comment}")
-                        save_state(cfg["state_path"], state)
-                        continue
-                except Exception:
-                    pass
-
-            wrote = False
-            if iid > 0:
-                ok, code, txt = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired)
-                if not ok and code == 422 and cfg["retry_422_once"]:
-                    parsed = api.parse_max_from_422(txt)
-                    if parsed and parsed > 0:
-                        _item_max_cache[iid] = (parsed, time.time())
-                        desired = min(desired, parsed)
-                        ok, code2, txt2 = api.post_item_score(item_id=iid, owner_id=rid, task_id=task_id, score=desired)
-                        ok = ok
-                if ok: wrote = True
-            else:
-                logging.error(f"[SCORE][TASK {task_id}] rid={rid} skipped (item_id unresolved)")
-
-            if wrote:
-                processed_map[str(rid)] = {"status":"ok","hash": fingerprint, "score": desired, "comment": comment}
-                success_cnt += 1
-                logging.info("[DONE][TASK %s] %d/%d rid=%s name=%s score=%.1f", task_id, success_cnt, total, rid, name, desired)
-                if tg_enabled(cfg) and cfg["tg_verbose"]:
-                    tg_send(cfg, f"🧑‍🎓 <b>{name}</b> · <code>{rid}</code>\n<b>Score:</b> {desired}\n{comment}")
-            else:
-                processed_map[str(rid)] = {"status":"fail","hash": fingerprint, "score_wanted": desired, "comment": comment}
-                logging.info("[FAIL][TASK %s] rid=%s name=%s score_wanted=%.1f", task_id, rid, name, desired)
-
-            save_state(cfg["state_path"], state)
-            if _stop.is_set(): break
-
-        try:
-            succ_rows = [v for v in (state["processed"].get(str(task_id)) or {}).values() if v.get("status")=="ok"]
-            all_scores = [float(v.get("score",0.0)) for v in succ_rows]
-            avg = (sum(all_scores)/len(all_scores)) if all_scores else 0.0
-            zero_cnt = sum(1 for s in all_scores if s <= 1e-9)
-            msg = f"✅ <b>Task {task_id}</b> done {success_cnt}/{total}\nAvg: {avg:.2f} · Zero: {zero_cnt}"
-            logging.info("[SUMMARY][TASK %s] %s", task_id, msg)
-            if tg_enabled(cfg): tg_send(cfg, msg)
-        except Exception as e:
-            logging.warning(f"[SUMMARY][TASK {task_id}] fail: {e}")
-
-        save_state(cfg["state_path"], state)
-
-    time.sleep(cfg["interval"])
-
-if __name__ == "__main__":
-    setup_logging()
-    while True:
-        try:
-            cfg = load_env()
-            main_loop(cfg)
-            if _stop.is_set(): break
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logging.exception("[FATAL] %s", e)
-            time.sleep(3)
+                data = r.json()
+            except Exception:
+                continue
+            token = data.get("access_token") or data.get("token") or ""
+            reflection_id = data.get("active_reflection_id") or data.get("reflection_id") or None
+            if token:
+                return AuthResult(ok=True, token=token, reflection_id=reflection_id, detail="ok")
+        return AuthResult(ok=False, detail="authorize failed")
+    except Exception as e:
+        logging.error("login exception: %s", e, exc_info=True)
+        return AuthResult(ok=False, detail=str(e))
 PY
-
-  # --------------- systemd (Linux) ---------------
-  cat > "$SERVICE_PATH" <<EOF
-[Unit]
-Description=AGrader - Seiue auto-grader
-After=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${APP_DIR}
-Environment=ENV_PATH=${ENV_FILE}
-ExecStart=${VENV_DIR}/bin/python ${PY_MAIN}
-Restart=always
-RestartSec=3
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  chmod 644 "$SERVICE_PATH"
+  chmod 644 "$PY_CRED"
 }
 
-create_venv_and_install() {
-  echo "[6/12] Creating venv and installing requirements..."
-  python3 -m venv "$VENV_DIR"
-  "${VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
-  "${VENV_DIR}/bin/pip" install -r "$APP_DIR/requirements.txt"
-}
+# ---------- main flow ----------
+ensure_root
 
-enable_start_linux() {
-  echo "[7/12] Writing systemd service (Linux)..."
-  systemctl daemon-reload
-  echo "[8/12] Stopping existing service if running..."
-  systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-  echo "[9/12] Enabling and starting..."
-  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-  systemctl start "$SERVICE"
-  echo "[10/12] Logs (last 20):"
-  journalctl -u "$SERVICE" -n 20 --no-pager || true
-  echo "Tail: journalctl -u $SERVICE -f"
-  echo "[11/12] Edit config: sudo nano $ENV_FILE"
-  echo "[12/12] Restart: sudo systemctl restart $SERVICE"
-  cat <<'EOT'
+OS="$(os_detect)"
+case "$OS" in
+  linux) install_pkgs_linux ;;
+  mac)   install_pkgs_mac ;;
+  *)     die "Unsupported OS: $(uname -s)" ;;
+esac
 
-Graceful stop:
-  sudo systemctl stop agrader.service
-Resume:
-  sudo systemctl start agrader.service
-EOT
-}
+ensure_dirs
+ensure_venv
+write_env_if_missing
 
-# --- Preflight cleanup to avoid duplicate runs on the same VPS ---
-stop_existing() {
-  echo "[PRE] Stopping any previous AGrader processes/services..."
-  if [ "$(os_detect)" = "linux" ]; then
-    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-  elif [ "$(os_detect)" = "mac" ]; then
-    [ -f "$LAUNCHD_PLIST" ] && launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+# Always (re)write code to ensure you get the fixed version
+write_main_py
+write_seiue_api_py
+write_ai_providers_py
+write_utilx_py
+write_credentials_py
+
+# Prompt core params on every run (fixes the “upgrade cannot change values” complaint)
+prompt_core_vars
+
+# Services
+if [ "$OS" = "linux" ]; then
+  write_systemd_linux
+elif [ "$OS" = "mac" ]; then
+  yn "Install launchd agent (keeps it running)?" DO_LAUNCHD default_n
+  if [ "$DO_LAUNCHD" = "y" ]; then
+    write_launchd_mac
   fi
+fi
 
-  # Kill old python runners bound to this app path
-  if command -v pgrep >/dev/null 2>&1; then
-    pgrep -f "${VENV_DIR}/bin/python ${PY_MAIN}" >/dev/null 2>&1 && pkill -f "${VENV_DIR}/bin/python ${PY_MAIN}" || true
-    pgrep -f "${PY_MAIN}" >/dev/null 2>&1 && pkill -f "${PY_MAIN}" || true
-  else
-    pkill -f "${VENV_DIR}/bin/python ${PY_MAIN}" 2>/dev/null || true
-    pkill -f "${PY_MAIN}" 2>/dev/null || true
-  fi
-  sleep 1
-}
+start_by_mode
 
-main() {
-  case "$(os_detect)" in
-    linux) install_pkgs_linux ;;
-    mac)   install_pkgs_macos ;;
-    *)     echo "Unsupported OS"; exit 1 ;;
-  esac
-
-  echo "[2/12] Collecting initial configuration..."
-  mkdir -p "$APP_DIR" "$APP_DIR/work"
-
-  # --- unified .env existence here ---
-  local IS_FRESH_INSTALL=0
-  if [ ! -f "$ENV_FILE" ]; then
-    echo "Creating new $ENV_FILE ..."
-    : > "$ENV_FILE"
-    IS_FRESH_INSTALL=1
-  else
-    echo "Reusing existing $ENV_FILE"
-  fi
-
-  # Preflight: stop any previous runs/services before proceeding
-  stop_existing
-
-  # Always (re)ask Task IDs and Mode; values will be written into ENV and also carried into write_project
-  prompt_task_ids
-  prompt_mode
-
-  write_project "$IS_FRESH_INSTALL"
-  create_venv_and_install
-
-  if [ "$(os_detect)" = "linux" ]; then
-    enable_start_linux
-  else
-    echo "On macOS: run manually -> ${VENV_DIR}/bin/python ${PY_MAIN}"
-    echo "Optionally create a launchd plist at: $LAUNCHD_PLIST"
-  fi
-}
-
-main "$@"
+echo
+echo "=== DONE ==="
+echo "App dir: $APP_DIR"
+echo "Venv:    $VENV_DIR"
+echo "Config:  $ENV_FILE (hot-reloaded)"
+if [ "$OS" = "linux" ]; then
+  echo "Service: $SERVICE_PATH  (journalctl -u $SERVICE -f)"
+fi
