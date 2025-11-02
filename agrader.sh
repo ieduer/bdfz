@@ -46,11 +46,12 @@ set_env_kv() {
   local key="$1"; shift
   local val="$*"
   [ -f "$ENV_FILE" ] || { echo "ERROR: $ENV_FILE not found"; return 1; }
-  local esc="${val//\//\\/}"
+  # 我們用 '#' 作分隔符，僅需轉義 '&'
+  local esc="${val//&/\\&}"
   if grep -qE "^${key}=" "$ENV_FILE"; then
     sed -i.bak -E "s#^${key}=.*#${key}=${esc}#" "$ENV_FILE"
   else
-    echo "${key}=${val}" >> "$ENV_FILE"
+    printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
   fi
 }
 
@@ -562,7 +563,8 @@ def _backoff_loop():
     jitter = float(os.getenv("AI_JITTER_SECONDS","0.5"))
     for i in range(max_retries):
         yield i
-        time.sleep((base ** i) + random.uniform(0, jitter))
+        delay = min(base * (i + 1), 8)
+        time.sleep(delay + random.uniform(0, jitter))
 
 def _split_keys(s: str) -> List[str]:
     if not s: return []
@@ -1453,7 +1455,7 @@ def main_pass(cfg: Dict[str,Any]):
                 fid = f.get("id") or f.get("_id") or f.get("file_id")
                 if fid: attach_ids.append(str(fid))
 
-            fingerprint = stable_hash(text0 + "|" + ","".join(sorted(attach_ids)))
+            fingerprint = stable_hash(text0 + "|" + ",".join(sorted(attach_ids)))
 
             prev = processed_map.get(str(rid))
             if prev and prev.get("status") == "ok" and prev.get("hash") == fingerprint and meets_stop_criteria(prev, cfg["stop_criteria"]):
