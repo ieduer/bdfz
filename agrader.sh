@@ -170,10 +170,13 @@ prompt_core_vars() {
   echo
   echo "=== Configure core options ==="
   local cur_tasks cur_run cur_full cur_stop
-  cur_tasks="$(grep -E '^MONITOR_TASK_IDS=' "$ENV_FILE" | sed -E 's/^MONITOR_TASK_IDS=//')"
-  cur_run="$(grep -E '^RUN_MODE=' "$ENV_FILE" | sed -E 's/^RUN_MODE=//')"
-  cur_full="$(grep -E '^FULL_SCORE_MODE=' "$ENV_FILE" | sed -E 's/^FULL_SCORE_MODE=//')"
-  cur_stop="$(grep -E '^STOP_CRITERIA=' "$ENV_FILE" | sed -E 's/^STOP_CRITERIA=//')"
+  # --- PATCHED LINES START ---
+  # Robustly read current values from .env without failing if keys are missing
+  cur_tasks="$(sed -nE 's/^MONITOR_TASK_IDS=(.*)/\1/p' "$ENV_FILE" | head -n1)"
+  cur_run="$(sed -nE 's/^RUN_MODE=(.*)/\1/p' "$ENV_FILE" | head -n1)"
+  cur_full="$(sed -nE 's/^FULL_SCORE_MODE=(.*)/\1/p' "$ENV_FILE" | head -n1)"
+  cur_stop="$(sed -nE 's/^STOP_CRITERIA=(.*)/\1/p' "$ENV_FILE" | head -n1)"
+  # --- PATCHED LINES END ---
 
   ask "Task IDs (comma separated, e.g. <TASK_ID>,<TASK_ID>)" NEW_TASKS "${cur_tasks:-<TASK_ID>}"
   ask "Run mode (oneshot/watch)" NEW_RUN "${cur_run:-oneshot}"
