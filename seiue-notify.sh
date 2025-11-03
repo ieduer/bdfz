@@ -50,7 +50,7 @@ preflight(){
 cleanup_legacy(){
   info "清理歷史殘留進程/鎖/腳本（三斬）…"
   systemctl stop seiue-notify 2>/dev/null || true
-  # 原來這裡是 'python.*seiue_notify\.py'，systemd 會念反斜線，我們 bash 這裡也順便拿掉
+  # 這裡不用反斜線，單純給 pkill 用就好
   pkill -TERM -f 'python.*seiue_notify.py' 2>/dev/null || true
   sleep 0.2
   pkill -KILL -f 'python.*seiue_notify.py' 2>/dev/null || true
@@ -773,7 +773,6 @@ EnvironmentFile=${ENV_FILE}
 Environment=PYTHONUNBUFFERED=1
 
 # —— 三斬（正確 systemd 寫法；用 '-' 忽略失敗）——
-# 注意：這裡全部拿掉反斜線，systemd 就不會再說 Ignoring unknown escape sequences
 ExecStartPre=-/usr/bin/pkill -TERM -f seiue_notify.py
 ExecStartPre=-/usr/bin/pkill -KILL -f seiue_notify.py
 ExecStartPre=-/usr/bin/pkill -f run.sh
@@ -819,7 +818,6 @@ echo "1) systemctl status："
 systemctl status seiue-notify --no-pager -l | sed -n '1,25p' || true
 echo
 echo "2) 只允許單實例："
-# 這裡也順手換成不帶反斜線的
 pgrep -fa 'python.*seiue_notify.py' || echo '尚未啟動'
 echo
 echo "3) 關鍵日誌（Auth/水位/錯誤）："
