@@ -772,8 +772,8 @@ EnvironmentFile=${ENV_FILE}
 Environment=PYTHONUNBUFFERED=1
 
 # —— 三斬（正確 systemd 寫法；用 '-' 忽略失敗）——
-ExecStartPre=-/usr/bin/pkill -TERM -f python.*seiue_notify.py
-ExecStartPre=-/usr/bin/pkill -KILL -f python.*seiue_notify.py
+ExecStartPre=-/usr/bin/pkill -TERM -f seiue_notify.py
+ExecStartPre=-/usr/bin/pkill -KILL -f seiue_notify.py
 ExecStartPre=-/usr/bin/pkill -f run.sh
 ExecStartPre=-/usr/bin/rm -f ${INSTALL_DIR}/.notify.lock
 
