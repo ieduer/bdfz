@@ -1,7 +1,7 @@
 cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.4.4-fix + notice 分派增強版
+# v2.4.4-fix + notice 分派增強版（修正 systemd 反斜線）
 # 變更重點：
 # - 100% 強制覆寫 systemd unit（去掉舊版的 "|| true"；用 '-' 前綴忽略不存在進程）
 # - 維持「三斬」：雙 pkill + 禁用 run.sh + 清鎖
@@ -176,12 +176,11 @@ def parse_ts(s:str)->float:
 
 def fmt_time(s:str)->str:
   if not s: return ""
-  # 可能來自 workflow 的 reviewed_at 是 ISO 帶 Z 的，這裡多試幾種
   for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%fZ"):
     try:
-      dt=datetime.strptime(s, fmt)
+      dt = datetime.strptime(s, fmt)
       if not dt.tzinfo:
-        dt=dt.replace(tzinfo=BEIJING_TZ)
+        dt = dt.replace(tzinfo=BEIJING_TZ)
       return dt.strftime("%Y-%m-%d %H:%M")
     except:
       continue
@@ -367,7 +366,7 @@ class Seiue:
       except: pass
     return r.content, name
 
-  # === 新增：通用 API + 請假相關 ===
+  # 通用 API + 請假相關
   def _get_api(self, url: str) -> Optional[dict]:
     try:
       r = self.s.get(url, timeout=30)
@@ -518,17 +517,15 @@ def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
       t=it.get("published_at") or it.get("created_at") or ""; ts=parse_ts(t) if t else 0.0
       try: nid=int(str(it.get("id") or "0"))
       except: nid=0
-      if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)): 
+      if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)):
         continue
       pending.append((ch,it,ts,nid))
   pending.sort(key=lambda x:(x[2], x[3])); return pending
 
-# ===== 三個專門 renderer =====
 def _format_detailed_leave_message(original: dict,
                                    flow_data: Optional[dict],
                                    absence_data: Optional[dict]) -> str:
   title = original.get("title") or "收到一條請假抄送"
-  # 學生信息
   student_name = "N/A"
   student_class = "N/A"
   if absence_data:
@@ -543,7 +540,6 @@ def _format_detailed_leave_message(original: dict,
   status = status_map.get(raw_status, raw_status or "—")
   reason = (absence_data or {}).get("reason") or "未填寫事由"
 
-  # 時段
   time_lines = []
   for r in (absence_data or {}).get("ranges") or []:
     s = r.get("start") or r.get("from") or r.get("begin_at") or ""
@@ -551,10 +547,8 @@ def _format_detailed_leave_message(original: dict,
     if s or e:
       time_lines.append(f"{s} → {e}")
   time_block = "\n".join(time_lines) if time_lines else "—"
-
   duration = (absence_data or {}).get("formatted_minutes") or ""
 
-  # 流程節點
   flow_lines = []
   flow_hdr = ""
   if flow_data:
@@ -672,7 +666,6 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
   msg_type = it.get("type") or ""
   attrs = it.get("attributes") or {}
 
-  # 1) 請假抄送
   if domain == "leave_flow" and msg_type == "absence.flow_cc_node":
     flow_id = attrs.get("flow_id")
     absence_id = attrs.get("absence_id")
@@ -689,7 +682,6 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
       logging.error("leave_flow enhanced failed: %s", e, exc_info=True)
       return _send_fallback(tg, cli, it, ch, prefix, " (請假詳情失敗)")
 
-  # 2) 討論回覆
   if domain == "task" and msg_type == "task.discussion_replied":
     html_msg = _format_discussion_notice(it)
     if prefix: html_msg = f"{prefix}\n{html_msg}"
@@ -697,7 +689,6 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     _send_attachments(tg, cli, it)
     return ok
 
-  # 3) 考勤異常
   if domain == "attendance" and msg_type == "abnormal_attendance.guardian":
     html_msg = _format_attendance_notice(it)
     if prefix: html_msg = f"{prefix}\n{html_msg}"
@@ -705,7 +696,6 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     _send_attachments(tg, cli, it)
     return ok
 
-  # 4) 其他全走舊版
   return _send_fallback(tg, cli, it, ch, prefix)
 
 def main_loop():
@@ -741,7 +731,7 @@ def main_loop():
           st["seen_global"][gkey]=ts
           wm=st["watermark"][ch]
           if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
-          save_state(st); 
+          save_state(st)
           continue
         sKey = soft_dup_key(it, ts)
         if sKey in st["seen_global"]:
@@ -809,7 +799,7 @@ start_service(){
   systemctl enable --now seiue-notify
 }
 
-info "Seiue sidecar v2.4.4-fix（單實例“三斬”＋防歷史＋雙通道＋去重＋考勤摘要＋請假/討論/考勤分派）"
+info "Seiue sidecar v2.4.4-fix（單實例“三斬”＋防歷史＋雙通道＋去重＋請假/討論/考勤分派）"
 preflight
 ensure_dirs
 cleanup_legacy
