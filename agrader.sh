@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AGrader - API-first auto-grading pipeline (installer/runner) - FULL INLINE EDITION
 # Linux: apt/dnf/yum/apk + systemd; macOS: Homebrew + optional launchd
-# v1.14.0-fullinline-2025-11-03
+# v1.14.1-fullinline-2025-11-03
 #
 # 這版目的：在「班級 → 任務列表 (domain=group&domain_biz_id_in=...) → 選任務」的新流上
 # 把你原來要的高級功能全塞回來：
@@ -207,29 +207,36 @@ seiue_api_get() {
     "${SEIUE_BASE%/}${path}"
 }
 
+# ---- FIXED: 這裡兼容 array / {data: []} / 單個物件 ----
 fetch_groups_and_select() {
   seiue_login_and_fill_bearer
   echo "Fetching groups..."
+  local raw
+  raw=$(seiue_api_get "/chalk/group/groups?paginated=0") || raw="[]"
+
+  # 正規化成一個純 array
   local j
-  j=$(seiue_api_get "/chalk/group/groups?paginated=0") || j="[]"
+  j=$(printf '%s' "$raw" | jq -c 'if type=="array" then . elif type=="object" and .data then .data elif type=="object" then [.] else [] end') || j="[]"
+
   local count
   count=$(printf '%s' "$j" | jq 'length')
   if [ "$count" -eq 0 ]; then
-    echo "No groups found from API."
+    echo "No groups found from API (got non-array)."
     return 1
   fi
+
   echo "Available groups:"
   local i name gid
   for i in $(seq 0 $((count-1))); do
     name=$(printf '%s' "$j" | jq -r ".[$i].name // .[$i].title // \"(no-name-$i)\"")
-    gid=$(printf '%s' "$j" | jq -r ".[$i].id")
+    gid=$(printf '%s' "$j" | jq -r ".[$i].id // .[$i]._id // \"\"")
     echo "  $((i+1))) $name (id=$gid)"
   done
   local sel
   read -r -p "Select group [1-${count}]: " sel
   sel=${sel:-1}
   sel=$((sel-1))
-  SELECTED_GROUP_ID=$(printf '%s' "$j" | jq -r ".[$sel].id")
+  SELECTED_GROUP_ID=$(printf '%s' "$j" | jq -r ".[$sel].id // .[$sel]._id // \"\"")
   SELECTED_GROUP_NAME=$(printf '%s' "$j" | jq -r ".[$sel].name // .[$sel].title // \"\"")
   echo "→ Selected group: ${SELECTED_GROUP_NAME} (id=${SELECTED_GROUP_ID})"
 }
@@ -237,9 +244,10 @@ fetch_groups_and_select() {
 fetch_tasks_for_group_and_select() {
   [ -z "${SELECTED_GROUP_ID:-}" ] && { echo "No group selected."; return 1; }
   echo "Fetching tasks for group ${SELECTED_GROUP_ID}..."
-  # 這裡就是你抓到的報文，關鍵是 domain=group & domain_biz_id_in=
   local tj
   tj=$(seiue_api_get "/chalk/task/v2/tasks?domain=group&domain_biz_id_in=${SELECTED_GROUP_ID}&paginated=0&expand=group,assignments,custom_fields") || tj="[]"
+  # 也做一次正規化，防止這裡也不是純 array
+  tj=$(printf '%s' "$tj" | jq -c 'if type=="array" then . elif type=="object" and .data then .data elif type=="object" then [.] else [] end') || tj="[]"
   local tcount
   tcount=$(printf '%s' "$tj" | jq 'length')
   if [ "$tcount" -eq 0 ]; then
@@ -528,6 +536,7 @@ EOF
 {"per_question":[{"id":"小題1","score":分數(數字),"comment":"這題評語"}],"overall":{"score":總分(數字),"comment":"總評語"}}
 EOF
 
+  # utilx.py
   cat > "$APP_DIR/utilx.py" <<'PY'
 import json, hashlib
 from typing import Dict, Any, List, Tuple
@@ -575,6 +584,7 @@ def stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8","ignore")).hexdigest()
 PY
 
+  # credentials.py
   cat > "$APP_DIR/credentials.py" <<'PY'
 import logging, requests
 from requests.adapters import HTTPAdapter
@@ -614,6 +624,7 @@ def login(username: str, password: str) -> AuthResult:
         return AuthResult(False, detail=str(e))
 PY
 
+  # extractor.py
   cat > "$APP_DIR/extractor.py" <<'PY'
 import os, subprocess, mimetypes, logging, shutil
 from typing import Tuple
@@ -712,6 +723,7 @@ def file_to_text(path: str, ocr_lang: str="chi_sim+eng", size_cap: int=25*1024*1
       return f"[[error: unknown file read exception: {repr(e)}]]"
 PY
 
+  # ai_providers.py
   cat > "$APP_DIR/ai_providers.py" <<'PY'
 import os, time, json, requests, logging, random, re
 from typing import List
@@ -757,14 +769,14 @@ class AIClient:
             self.keys = [key] if key else [""]
 
     def _key_order(self, n: int):
-        if n <= 0: return []
-        if self.strategy == "random":
-            idxs = list(range(n)); random.shuffle(idxs); return idxs
-        return list(range(self._rr, n)) + list(range(0, self._rr))
+      if n <= 0: return []
+      if self.strategy == "random":
+        idxs = list(range(n)); random.shuffle(idxs); return idxs
+      return list(range(self._rr, n)) + list(range(0, self._rr))
 
     def _advance_rr(self, used_idx):
-        if self.strategy == "roundrobin" and self.keys:
-            self._rr = (used_idx + 1) % len(self.keys)
+      if self.strategy == "roundrobin" and self.keys:
+        self._rr = (used_idx + 1) % len(self.keys)
 
     def grade(self, prompt: str) -> dict:
         raw = self._call_llm(prompt)
@@ -917,6 +929,7 @@ class AIClient:
             return ""
 PY
 
+  # seiue_api.py
   cat > "$APP_DIR/seiue_api.py" <<'PY'
 import os, logging, requests, threading, re, time
 from typing import Dict, Any, List, Union, Optional
@@ -1038,6 +1051,9 @@ class Seiue:
             r.raise_for_status()
         arr = r.json() or []
         out = {}
+        # 也防一手 {"data":[...]}
+        if isinstance(arr, dict) and "data" in arr:
+            arr = arr["data"]
         for obj in arr:
             tid = int(obj.get("id", 0) or 0)
             if tid:
@@ -1050,7 +1066,10 @@ class Seiue:
         if r.status_code >= 400:
             logging.error(f"[API] get_assignments {r.status_code}: {(r.text or '')[:500]}")
             r.raise_for_status()
-        return r.json()
+        data = r.json()
+        if isinstance(data, dict) and "data" in data:
+            return data["data"]
+        return data
 
     def get_assignment_detail(self, task_id: int, assignment_id: int):
         url = self._url(f"/chalk/task/v2/tasks/{task_id}/assignments/{assignment_id}?expand=submission,assignee,review")
@@ -1272,17 +1291,20 @@ class Seiue:
             return None
 PY
 
+  # main.py —— 這裡直接寫一個不砍功能的版
   cat > "$APP_DIR/main.py" <<'PY'
 import os, json, time, logging, traceback
 from dotenv import load_dotenv
 from seiue_api import Seiue
-from utilx import clamp, scan_question_maxima, draftjs_to_text
+from utilx import clamp, scan_question_maxima, draftjs_to_text, stable_hash
 from extractor import file_to_text
 from ai_providers import AIClient
 
-load_dotenv(os.path.join("/opt/agrader",".env"))
-
 APP_DIR = "/opt/agrader"
+ENV_PATH = os.path.join(APP_DIR, ".env")
+if os.path.exists(ENV_PATH):
+    load_dotenv(ENV_PATH)
+
 STATE_PATH = os.getenv("STATE_PATH", os.path.join(APP_DIR, "state.json"))
 LOG_LEVEL = os.getenv("LOG_LEVEL","INFO").upper()
 LOG_FILE = os.getenv("LOG_FILE", os.path.join(APP_DIR, "agrader.log"))
@@ -1315,12 +1337,12 @@ def save_state(st):
 def build_ai_client():
     provider = os.getenv("AI_PROVIDER","deepseek")
     if provider == "gemini":
-      model = os.getenv("GEMINI_MODEL","gemini-2.5-pro")
-      key = os.getenv("GEMINI_API_KEY","")
+        model = os.getenv("GEMINI_MODEL","gemini-2.5-pro")
+        key = os.getenv("GEMINI_API_KEY","")
     else:
-      provider = "deepseek"
-      model = os.getenv("DEEPSEEK_MODEL","deepseek-reasoner")
-      key = os.getenv("DEEPSEEK_API_KEY","")
+        provider = "deepseek"
+        model = os.getenv("DEEPSEEK_MODEL","deepseek-reasoner")
+        key = os.getenv("DEEPSEEK_API_KEY","")
     return AIClient(provider, model, key)
 
 def build_prompt(task_obj, assignee_name, assignee_id, submission_text, attachments_text):
@@ -1358,6 +1380,10 @@ def flatten_attachments(submission) -> list:
         return atts
     return []
 
+def get_env_flag(name: str, default=True):
+    v = os.getenv(name, "1" if default else "0")
+    return v not in ("0","false","False")
+
 def main_once():
     base = os.getenv("SEIUE_BASE","https://api.seiue.com")
     bearer = os.getenv("SEIUE_BEARER","")
@@ -1369,266 +1395,206 @@ def main_once():
 
     client = Seiue(base, bearer, school, role, refl, username, password)
     ai_client = build_ai_client()
+    st = load_state()
 
-    task_ids_raw = os.getenv("MONITOR_TASK_IDS","").strip()
-    if not task_ids_raw:
+    raw_ids = os.getenv("MONITOR_TASK_IDS","").strip()
+    if not raw_ids:
         logging.error("MONITOR_TASK_IDS empty, nothing to do.")
         return True
-    task_ids = [int(x) for x in task_ids_raw.split(",") if x.strip().isdigit()]
+    task_ids = [int(x) for x in raw_ids.split(",") if x.strip().isdigit()]
     if not task_ids:
         logging.error("No valid task_ids in MONITOR_TASK_IDS.")
         return True
 
+    item_refresh_on = (os.getenv("ITEM_ID_REFRESH_ON","score_404,score_422,verify_miss,ttl") or "").split(",")
+    item_cache_ttl = int(os.getenv("ITEM_ID_CACHE_TTL","900"))
     full_mode = os.getenv("FULL_SCORE_MODE","off") == "all"
     full_comment = os.getenv("FULL_SCORE_COMMENT","記得看高考真題。")
-    verify_after = os.getenv("VERIFY_AFTER_WRITE","1") not in ("0","false","False")
-    reverify_before = os.getenv("REVERIFY_BEFORE_WRITE","1") not in ("0","false","False")
-    retry_on_422 = os.getenv("RETRY_ON_422_ONCE","1") not in ("0","false","False")
-    item_refresh_on = set((os.getenv("ITEM_ID_REFRESH_ON","score_404,score_422,verify_miss,ttl") or "").split(","))
-    item_cache_ttl = int(os.getenv("ITEM_ID_CACHE_TTL","900"))
-    keep_work = os.getenv("KEEP_WORK_FILES","0") not in ("0","false","False")
-    max_attach_bytes = int(os.getenv("MAX_ATTACHMENT_BYTES","25165824"))
+    verify_after = get_env_flag("VERIFY_AFTER_WRITE", True)
+    reverify_before = get_env_flag("REVERIFY_BEFORE_WRITE", True)
+    retry_on_422 = get_env_flag("RETRY_ON_422_ONCE", True)
+    score_clamp_on_max = get_env_flag("SCORE_CLAMP_ON_MAX", True)
+    stop_criteria = os.getenv("STOP_CRITERIA","score_and_review")
 
-    state = load_state()
-    now = time.time()
-    item_cache = state.get("task_items", {})
-    graded = state.get("graded", {})
-
-    tasks_map = client.get_tasks_bulk(task_ids)
-
-    all_done = True
+    all_tasks_done = True
 
     for task_id in task_ids:
-        logging.info("[TASK] Start task %s", task_id)
-        task_obj = tasks_map.get(task_id) or client.get_task(task_id)
+        # item_id with TTL cache
+        now = time.time()
+        task_items = st.setdefault("task_items", {})
+        tentry = task_items.get(str(task_id)) or {}
+        cached_item_id = tentry.get("item_id") or 0
+        cached_at = tentry.get("cached_at") or 0
+        need_refresh = False
+        if not cached_item_id:
+            need_refresh = True
+        elif (now - cached_at) > item_cache_ttl:
+            need_refresh = True
+        if need_refresh:
+            item_id = client.resolve_item_id(task_id)
+            if item_id:
+                task_items[str(task_id)] = {"item_id": item_id, "cached_at": now}
+                save_state(st)
+            else:
+                logging.error("[TASK %s] Cannot resolve item_id, skip task", task_id)
+                all_tasks_done = False
+                continue
+        else:
+            item_id = cached_item_id
 
-        cached = item_cache.get(str(task_id))
-        use_item_id = 0
-        if cached:
-            ts = cached.get("ts",0)
-            if now - ts < item_cache_ttl:
-                use_item_id = int(cached.get("item_id") or 0)
-                logging.info("[ITEM][CACHE] task %s -> item %s", task_id, use_item_id)
-        if not use_item_id:
-            use_item_id = client.resolve_item_id(task_id)
-            item_cache[str(task_id)] = {"item_id": use_item_id, "ts": now, "hist": [use_item_id]}
-            save_state({"task_items": item_cache, "graded": graded})
-
-        if not use_item_id:
-            logging.error("[ITEM] task %s no item_id, skip", task_id)
+        try:
+            task_obj = client.get_task(task_id)
+        except Exception as e:
+            logging.error("[TASK %s] get_task failed: %s", task_id, e)
+            all_tasks_done = False
             continue
 
         try:
-            assigns = client.get_assignments(task_id)
+            assignments = client.get_assignments(task_id) or []
         except Exception as e:
-            logging.error("[TASK] get_assignments fail for %s: %s", task_id, e)
+            logging.error("[TASK %s] get_assignments failed: %s", task_id, e)
+            all_tasks_done = False
             continue
 
-        if isinstance(assigns, dict):
-            rows = assigns.get("data") or assigns.get("items") or assigns.get("assignments") or []
-        else:
-            rows = assigns
+        # try to get max score from item
+        max_score = client.get_item_max_score(item_id) or task_obj.get("custom_fields",{}).get("max_score") or task_obj.get("max_score") or 40
+        try:
+            max_score = float(max_score)
+        except Exception:
+            max_score = 40.0
 
-        total = len(rows)
-        done_count = 0
-        task_graded = graded.get(str(task_id)) or {}
-        for idx, row in enumerate(rows, start=1):
-            assignee = row.get("assignee") or {}
-            owner_id = assignee.get("id") or assignee.get("_id") or row.get("assignee_id") or row.get("student_id")
-            name = assignee.get("name") or assignee.get("realname") or assignee.get("username") or assignee.get("nickname") or "?"
-            rid = row.get("id") or row.get("_id") or 0
+        graded = st.setdefault("graded", {})
+        task_gr = graded.setdefault(str(task_id), {})
 
-            if not owner_id:
-                logging.warning("[TASK %s] row %s has no owner_id", task_id, rid)
+        done_cnt = 0
+        total_cnt = len(assignments)
+        for ass in assignments:
+            rid = ass.get("id") or ass.get("_id")
+            if not rid:
                 continue
-
-            # 如果 state 裡有且很新，可直接視為 done
-            prev = task_graded.get(str(owner_id))
-            if prev and now - prev.get("ts",0) < 60*60:
-                logging.info("[STATE][SKIP] task=%s owner=%s name=%s (recently graded)", task_id, owner_id, name)
-                done_count += 1
-                continue
-
-            existing = None
-            if reverify_before:
-                existing = client.verify_existing_score(use_item_id, owner_id)
-
-            if existing is not None and full_mode:
-                # 有分就只補 review
-                if full_comment:
-                    client.post_review(owner_id, task_id, full_comment)
-                task_graded[str(owner_id)] = {"ts": time.time(), "score": existing, "comment": full_comment, "item_id": use_item_id}
-                logging.info("[FULL][OK*existing][TASK %s] %s/%s rid=%s name=%s (already exists: %.2f)", task_id, idx, total, rid, name, existing)
-                done_count += 1
-                continue
-
-            # 解析提交 / 附件
-            submission = row.get("submission") or {}
-            sub_text = extract_submission_text(submission)
-            attach_texts = []
-            attachments = flatten_attachments(submission)
-            if attachments:
-                for att in attachments:
-                    url = att.get("url") or att.get("file") or att.get("download_url")
-                    filename = att.get("name") or att.get("filename") or "att.bin"
-                    if not url:
-                        continue
-                    local_path = client.download_attachment(url, task_id, owner_id, filename, WORKDIR)
-                    if not local_path:
-                        attach_texts.append(f"[[error: cannot download {filename}]]")
-                        continue
-                    # size check
-                    if os.path.getsize(local_path) > max_attach_bytes:
-                        attach_texts.append(f"[[skipped {filename}: too large]]")
-                        continue
-                    att_text = file_to_text(local_path, ocr_lang=os.getenv("OCR_LANG","chi_sim+eng"), size_cap=max_attach_bytes)
-                    attach_texts.append(f"[{filename}]\n{att_text}\n")
-                    if not keep_work:
-                        try:
-                            os.remove(local_path)
-                        except Exception:
-                            pass
-
-            attach_text = "\n".join(attach_texts).strip()
-
-            if full_mode:
-                score = 40.0
-                ok, resp = client.score_student(use_item_id, owner_id, score, full_comment)
-                if not ok:
-                    txt = (resp.text or "")[:200]
-                    logging.error("[TASK %s] score write fail for %s: %s", task_id, owner_id, txt)
-                    if resp.status_code in (404,422) and ("score_404" in item_refresh_on or "score_422" in item_refresh_on):
-                        new_item = client.resolve_item_id(task_id)
-                        if new_item and new_item != use_item_id:
-                            use_item_id = new_item
-                            item_cache[str(task_id)] = {"item_id": use_item_id, "ts": time.time(), "hist": [use_item_id]}
-                            save_state({"task_items": item_cache, "graded": graded})
-                            ok2, resp2 = client.score_student(use_item_id, owner_id, score, full_comment)
-                            if not ok2:
-                                logging.error("[TASK %s] retry score still fail: %s", task_id, (resp2.text or "")[:200])
-                                continue
-                        else:
-                            continue
-                    else:
-                        continue
-                if full_comment:
-                    client.post_review(owner_id, task_id, full_comment)
-                task_graded[str(owner_id)] = {"ts": time.time(), "score": score, "comment": full_comment, "item_id": use_item_id}
-                save_state({"task_items": item_cache, "graded": graded})
-                logging.info("[FULL][DONE][TASK %s] %s/%s rid=%s name=%s score=%.2f status=ok", task_id, idx, total, rid, name, score)
-                done_count += 1
-                continue
-
-            # AI 模式
-            prompt, ovmax = build_prompt(task_obj, name, owner_id, sub_text, attach_text)
-            ai_result = ai_client.grade(prompt)
-            overall = ai_result.get("overall") or {}
-            raw_score = overall.get("score") or 0.0
-            comment = overall.get("comment") or "已批閱"
-            try:
-                raw_score = float(raw_score)
-            except Exception:
-                raw_score = 0.0
-
-            # max score from item
-            item_max = client.get_item_max_score(use_item_id)
-            if item_max is None:
-                item_max = ovmax or 40.0
-            score = clamp(raw_score, 0.0, float(item_max))
-
-            ok, resp = client.score_student(use_item_id, owner_id, score, comment)
-            if not ok:
-                txt = (resp.text or "")[:200]
-                logging.error("[TASK %s] score write fail for %s: %s", task_id, owner_id, txt)
-                # 422 解析 max
-                if resp.status_code == 422:
-                    new_max = client.parse_max_from_422(resp.text)
-                    if new_max is not None:
-                        score = clamp(score, 0.0, new_max)
-                        ok2, resp2 = client.score_student(use_item_id, owner_id, score, comment)
-                        if not ok2 and new_max != item_max:
-                            # 再看要不要刷新 item_id
-                            if "score_422" in item_refresh_on:
-                                new_item = client.resolve_item_id(task_id)
-                                if new_item and new_item != use_item_id:
-                                    use_item_id = new_item
-                                    item_cache[str(task_id)] = {"item_id": use_item_id, "ts": time.time(), "hist": [use_item_id]}
-                                    save_state({"task_items": item_cache, "graded": graded})
-                                    ok3, resp3 = client.score_student(use_item_id, owner_id, score, comment)
-                                    if not ok3:
-                                        logging.error("[TASK %s] 422->refresh item still fail: %s", task_id, (resp3.text or "")[:200])
-                                        continue
-                        else:
-                            # 成功了
-                            pass
-                    elif "score_422" in item_refresh_on:
-                        new_item = client.resolve_item_id(task_id)
-                        if new_item and new_item != use_item_id:
-                            use_item_id = new_item
-                            item_cache[str(task_id)] = {"item_id": use_item_id, "ts": time.time(), "hist": [use_item_id]}
-                            save_state({"task_items": item_cache, "graded": graded})
-                            ok3, resp3 = client.score_student(use_item_id, owner_id, score, comment)
-                            if not ok3:
-                                logging.error("[TASK %s] refresh item still fail: %s", task_id, (resp3.text or "")[:200])
-                                continue
-                        else:
-                            continue
-                    else:
-                        continue
-                elif resp.status_code == 404 and "score_404" in item_refresh_on:
-                    new_item = client.resolve_item_id(task_id)
-                    if new_item and new_item != use_item_id:
-                        use_item_id = new_item
-                        item_cache[str(task_id)] = {"item_id": use_item_id, "ts": time.time(), "hist": [use_item_id]}
-                        save_state({"task_items": item_cache, "graded": graded})
-                        ok3, resp3 = client.score_student(use_item_id, owner_id, score, comment)
-                        if not ok3:
-                            logging.error("[TASK %s] 404->refresh item still fail: %s", task_id, (resp3.text or "")[:200])
-                            continue
-                    else:
-                        continue
-                else:
+            assignee = ass.get("assignee") or {}
+            owner_id = assignee.get("id") or assignee.get("_id")
+            assignee_name = assignee.get("name") or assignee.get("realname") or assignee.get("username") or "學生"
+            submission = ass.get("submission") or {}
+            # skip if already recorded and stop_criteria says so
+            # we still verify existing score in Seiue to avoid double write
+            existing_key = str(owner_id)
+            # re-verify before write
+            existing_score_remote = None
+            if reverify_before and owner_id:
+                existing_score_remote = client.verify_existing_score(item_id, owner_id)
+                if existing_score_remote is not None:
+                    # record and skip
+                    task_gr[existing_key] = {"score": existing_score_remote, "ts": time.time()}
+                    logging.info("[FULL][OK*existing][TASK %s] rid=%s name=%s (already exists: %.2f)", task_id, rid, assignee_name, existing_score_remote)
+                    done_cnt += 1
                     continue
 
-            # review
-            client.post_review(owner_id, task_id, comment or "已批閱")
+            if full_mode:
+                score_to_write = max_score
+                comment_to_write = full_comment
+            else:
+                # normal AI flow
+                submission_text = extract_submission_text(submission)
+                # attachments
+                attachments_texts = []
+                for att in flatten_attachments(submission):
+                    url = att.get("url") or att.get("path") or att.get("download_url")
+                    fname = att.get("name") or att.get("filename") or "attach"
+                    if not url:
+                        continue
+                    dl = client.download_attachment(url, task_id, owner_id or 0, fname, WORKDIR)
+                    if dl:
+                        attachments_texts.append(file_to_text(dl))
+                merged_attachments = "\n---\n".join(attachments_texts)
+                prompt, ovmax = build_prompt(task_obj, assignee_name, owner_id, submission_text, merged_attachments)
+                ai_res = ai_client.grade(prompt)
+                overall = ai_res.get("overall") or {}
+                ai_score = overall.get("score") or 0
+                ai_comment = overall.get("comment") or ""
+                try:
+                    ai_score = float(ai_score)
+                except Exception:
+                    ai_score = 0.0
+                if score_clamp_on_max:
+                    ai_score = clamp(ai_score, 0.0, float(max_score))
+                score_to_write = ai_score
+                comment_to_write = ai_comment or "已閱。"
 
-            # 更新 state
-            task_graded[str(owner_id)] = {
-                "ts": time.time(),
-                "score": score,
-                "comment": comment,
-                "item_id": use_item_id,
-                "raw_ai": ai_result,
-            }
-            graded[str(task_id)] = task_graded
-            save_state({"task_items": item_cache, "graded": graded})
+            ok, resp = client.score_student(item_id, owner_id, score_to_write, comment_to_write)
+            if not ok:
+                status = resp.status_code
+                body = (resp.text or "")[:300]
+                logging.error("[TASK %s] score_student fail %s: %s", task_id, status, body)
+                # item mismatch -> refresh and retry once
+                if client._err_implies_item_mismatch(status, body) and "score_404" in item_refresh_on or "score_422" in item_refresh_on:
+                    logging.warning("[TASK %s] item mismatch, refreshing item_id and retry...", task_id)
+                    new_item_id = client.resolve_item_id(task_id)
+                    if new_item_id and new_item_id != item_id:
+                        st["task_items"][str(task_id)] = {"item_id": new_item_id, "cached_at": time.time()}
+                        save_state(st)
+                        ok2, resp2 = client.score_student(new_item_id, owner_id, score_to_write, comment_to_write)
+                        if ok2:
+                            item_id = new_item_id
+                            ok = True
+                            resp = resp2
+                        else:
+                            logging.error("[TASK %s] retry after item refresh still failed: %s", task_id, (resp2.text or "")[:200])
+                if not ok and status == 422 and retry_on_422:
+                    # maybe max score
+                    mx = client.parse_max_from_422(body)
+                    if mx:
+                        score_to_write = mx
+                        ok3, resp3 = client.score_student(item_id, owner_id, score_to_write, comment_to_write)
+                        if ok3:
+                            ok = True
+                            resp = resp3
+                if not ok:
+                    all_tasks_done = False
+                    continue
 
-            logging.info("[AI][DONE][TASK %s] %s/%s rid=%s name=%s score=%.2f", task_id, idx, total, rid, name, score)
-            done_count += 1
+            # review (always)
+            client.post_review(owner_id, task_id, comment_to_write)
+            task_gr[existing_key] = {"score": score_to_write, "ts": time.time()}
+            save_state(st)
 
-        logging.info("[SUMMARY][TASK %s] ✅ Task %s graded: %s / %s", task_id, task_id, done_count, total)
-        if done_count < total:
-            all_done = False
+            # verify after write
+            if verify_after and owner_id:
+                ver = client.verify_existing_score(item_id, owner_id)
+                if ver is None:
+                    logging.warning("[TASK %s] wrote score but verify missed (owner_id=%s)", task_id, owner_id)
+                    if "verify_miss" in item_refresh_on:
+                        st["task_items"][str(task_id)] = {"item_id": client.resolve_item_id(task_id), "cached_at": time.time()}
+                        save_state(st)
+                else:
+                    logging.info("[API] Review posted for rid=%s task=%s", rid, task_id)
+                    logging.info("[FULL][DONE][TASK %s] %s/%s rid=%s name=%s score=%.2f status=ok",
+                                 task_id, done_cnt+1, total_cnt, rid, assignee_name, score_to_write)
 
-    save_state({"task_items": item_cache, "graded": graded})
-    return all_done
+            done_cnt += 1
+
+        # finish this task
+        logging.info("[SUMMARY][TASK %s] ✅ Task %s processed: %s / %s", task_id, task_id, done_cnt, total_cnt)
+        if done_cnt < total_cnt:
+            all_tasks_done = False
+
+    return all_tasks_done
 
 def main():
     poll = int(os.getenv("POLL_INTERVAL","10"))
     if RUN_MODE == "oneshot":
-      main_once()
-      return
+        main_once()
+        return
     while True:
-      all_done = False
-      try:
-        all_done = main_once()
-      except Exception:
-        logging.error("main loop error:\n%s", traceback.format_exc())
-      if all_done and os.getenv("STOP_CRITERIA","score_and_review") in ("score","review","score_and_review"):
-        logging.info("[EXEC] All tasks complete. Shutting down.")
-        break
-      time.sleep(poll)
+        try:
+            all_done = main_once()
+        except Exception as e:
+            logging.error("[LOOP] exception: %s", e, exc_info=True)
+            all_done = False
+        if all_done and STOP_CRITERIA in ("score","review","score_and_review"):
+            logging.info("[EXEC] All tasks complete. Shutting down.")
+            break
+        time.sleep(poll)
 
 if __name__ == "__main__":
     main()
@@ -1638,17 +1604,20 @@ PY
 
 create_venv_and_install() {
   echo "[6/12] Creating venv and installing requirements..."
-  mkdir -p "$VENV_DIR"
-  if [ ! -f "$VENV_DIR/bin/python" ]; then
+  mkdir -p "$APP_DIR"
+  if [ ! -d "$VENV_DIR" ]; then
     python3 -m venv "$VENV_DIR"
   fi
+  # shellcheck disable=SC1091
   . "$VENV_DIR/bin/activate"
-  pip install --upgrade pip >/dev/null
-  pip install -r "$APP_DIR/requirements.txt" >/dev/null
+  pip install --upgrade pip >/dev/null 2>&1 || true
+  pip install -r "$APP_DIR/requirements.txt"
 }
 
-write_systemd_service() {
-  echo "[7/12] Writing systemd service (Linux)..."
+write_systemd() {
+  if [ "$(os_detect)" != "linux" ]; then
+    return
+  fi
   cat > "$SERVICE_PATH" <<EOF
 [Unit]
 Description=AGrader - Seiue auto-grader
@@ -1658,9 +1627,10 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${APP_DIR}
-Environment="PYTHONUNBUFFERED=1"
+Environment=PYTHONUNBUFFERED=1
 ExecStart=${VENV_DIR}/bin/python ${PY_MAIN}
-Restart=no
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -1668,58 +1638,96 @@ EOF
   systemctl daemon-reload
 }
 
-stop_service_if_running() {
-  echo "[8/12] Stopping existing service if running..."
-  systemctl stop "$SERVICE" 2>/dev/null || true
+write_launchd() {
+  if [ "$(os_detect)" != "mac" ]; then
+    return
+  fi
+  mkdir -p "$(dirname "$LAUNCHD_PLIST")"
+  cat > "$LAUNCHD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>net.bdfz.agrader</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${VENV_DIR}/bin/python</string>
+    <string>${PY_MAIN}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>WorkingDirectory</key><string>${APP_DIR}</string>
+  <key>StandardOutPath</key><string>${APP_DIR}/agrader.log</string>
+  <key>StandardErrorPath</key><string>${APP_DIR}/agrader.log</string>
+</dict>
+</plist>
+EOF
+  launchctl load -w "$LAUNCHD_PLIST" || true
+}
+
+stop_previous() {
+  echo "[PRE] Stopping any previous AGrader processes/services..."
+  if [ "$(os_detect)" = "linux" ]; then
+    systemctl stop "$SERVICE" 2>/dev/null || true
+  else
+    launchctl stop net.bdfz.agrader 2>/dev/null || true
+  fi
 }
 
 start_service() {
-  echo "[9/12] Enabling and starting..."
-  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-  systemctl start "$SERVICE"
+  if [ "$(os_detect)" = "linux" ]; then
+    echo "[8/12] Stopping existing service if running..."
+    systemctl stop "$SERVICE" 2>/dev/null || true
+    echo "[9/12] Enabling and starting..."
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+    systemctl start "$SERVICE"
+  else
+    echo "[8/12] (macOS) service already loaded."
+  fi
 }
 
-show_logs_tail() {
-  echo "[10/12] Logs (last 20):"
-  journalctl -u "$SERVICE" -n 20 --no-pager || true
+tail_logs() {
+  if [ "$(os_detect)" = "linux" ]; then
+    echo "[10/12] Logs (last 20):"
+    journalctl -u "$SERVICE" -n 20 --no-pager || true
+    echo "Tail: journalctl -u $SERVICE -f"
+  else
+    echo "[10/12] Tail logs at ${APP_DIR}/agrader.log"
+  fi
   echo "[11/12] Edit config: sudo nano ${ENV_FILE}"
-  echo "[12/12] Restart: sudo systemctl restart ${SERVICE}"
-  echo
-  echo "Graceful stop:"
-  echo "  sudo systemctl stop ${SERVICE}"
-  echo "Resume:"
-  echo "  sudo systemctl start ${SERVICE}"
+  if [ "$(os_detect)" = "linux" ]; then
+    echo "[12/12] Restart: sudo systemctl restart ${SERVICE}"
+  else
+    echo "[12/12] Restart: launchctl stop net.bdfz.agrader && launchctl start net.bdfz.agrader"
+  fi
 }
 
 main_install() {
-  mkdir -p "$APP_DIR"
-  local os; os=$(os_detect)
-  if [ "$os" = "linux" ]; then
+  if [ "$(os_detect)" = "linux" ]; then
     install_pkgs_linux
-  elif [ "$os" = "mac" ]; then
+  elif [ "$(os_detect)" = "mac" ]; then
     install_pkgs_macos
-  else
-    echo "Unsupported OS."
-    exit 1
   fi
 
-  if [ ! -f "$ENV_FILE" ]; then
-    write_project 1
-  else
+  if [ -f "$ENV_FILE" ]; then
+    echo "[2/12] Collecting initial configuration..."
     echo "Reusing existing $ENV_FILE"
-    ensure_env_patch
+  else
+    echo "[2/12] Collecting initial configuration..."
+    mkdir -p "$APP_DIR"
+    touch "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    write_project 1
   fi
 
-  echo "[PRE] Stopping any previous AGrader processes/services..."
-  stop_service_if_running
-
+  stop_previous
   prompt_task_ids
   prompt_mode
   write_project 0
   create_venv_and_install
-  write_systemd_service
+  write_systemd
+  write_launchd
   start_service
-  show_logs_tail
+  tail_logs
 }
 
 main_install
