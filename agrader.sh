@@ -207,12 +207,17 @@ seiue_api_get() {
     "${SEIUE_BASE%/}${path}"
 }
 
-# ---- FIXED: 這裡兼容 array / {data: []} / 單個物件 ----
 fetch_groups_and_select() {
   seiue_login_and_fill_bearer
   echo "Fetching groups..."
   local raw
   raw=$(seiue_api_get "/chalk/group/groups?paginated=0") || raw="[]"
+
+  # 如果回來的是 HttpException，就不要硬當成列表，直接讓後面走「手動輸入 task id」
+  if printf '%s' "$raw" | jq -e 'type=="object" and ((.name? // "") | test("HttpException"))' >/dev/null 2>&1; then
+    echo "API returned HttpException when listing groups, will fallback to manual task id input."
+    return 1
+  fi
 
   # 正規化成一個純 array
   local j
