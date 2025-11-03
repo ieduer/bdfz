@@ -210,39 +210,64 @@ seiue_api_get() {
 fetch_groups_and_select() {
   seiue_login_and_fill_bearer
   echo "Fetching groups..."
-  local raw
-  raw=$(seiue_api_get "/chalk/group/groups?paginated=0") || raw="[]"
 
-  # 如果回來的是 HttpException，就不要硬當成列表，直接讓後面走「手動輸入 task id」
+  # 拉原始報文
+  local raw
+  raw=$(seiue_api_get "/chalk/group/groups?paginated=0") || raw="{}"
+
+  # 存一份下來，之後你說「調取報文記憶」就看這個
+  mkdir -p /opt/agrader 2>/dev/null || true
+  printf '%s\n' "$raw" > /opt/agrader/last_groups.json 2>/dev/null || true
+
+  # 1) 遇到 HttpException：直接讓後面走「手動輸入」
   if printf '%s' "$raw" | jq -e 'type=="object" and ((.name? // "") | test("HttpException"))' >/dev/null 2>&1; then
-    echo "API returned HttpException when listing groups, will fallback to manual task id input."
+    echo "Group API returned HttpException, fallback to manual task IDs."
     return 1
   fi
 
-  # 正規化成一個純 array
+  # 2) 把回應「正規化成陣列」
+  #    - 如果是 array → 就用
+  #    - 如果是 {data: [...]} → 用 data
+  #    - 如果是單一物件 → 包成一個 array
   local j
-  j=$(printf '%s' "$raw" | jq -c 'if type=="array" then . elif type=="object" and .data then .data elif type=="object" then [.] else [] end') || j="[]"
+  j=$(printf '%s' "$raw" | jq -c '
+    if type=="array" then .
+    elif type=="object" and .data and (.data|type)=="array" then .data
+    elif type=="object" then [.]
+    else []
+    end
+  ' 2>/dev/null) || j="[]"
 
+  # 3) 長度為 0 → 沒有班級 → 交給手動
   local count
-  count=$(printf '%s' "$j" | jq 'length')
+  count=$(printf '%s' "$j" | jq 'length' 2>/dev/null || echo 0)
   if [ "$count" -eq 0 ]; then
-    echo "No groups found from API (got non-array)."
+    echo "No groups found from API (empty or non-list)."
     return 1
   fi
 
   echo "Available groups:"
   local i name gid
   for i in $(seq 0 $((count-1))); do
-    name=$(printf '%s' "$j" | jq -r ".[$i].name // .[$i].title // \"(no-name-$i)\"")
-    gid=$(printf '%s' "$j" | jq -r ".[$i].id // .[$i]._id // \"\"")
+    name=$(printf '%s' "$j" | jq -r ".[$i].name // .[$i].title // \"(no-name-$i)\"" 2>/dev/null)
+    gid=$(printf '%s' "$j" | jq -r ".[$i].id   // .[$i]._id   // \"\"" 2>/dev/null)
     echo "  $((i+1))) $name (id=$gid)"
   done
+
   local sel
   read -r -p "Select group [1-${count}]: " sel
   sel=${sel:-1}
   sel=$((sel-1))
-  SELECTED_GROUP_ID=$(printf '%s' "$j" | jq -r ".[$sel].id // .[$sel]._id // \"\"")
-  SELECTED_GROUP_NAME=$(printf '%s' "$j" | jq -r ".[$sel].name // .[$sel].title // \"\"")
+
+  SELECTED_GROUP_ID=$(printf '%s' "$j" | jq -r ".[$sel].id // .[$sel]._id // \"\"" 2>/dev/null)
+  SELECTED_GROUP_NAME=$(printf '%s' "$j" | jq -r ".[$sel].name // .[$sel].title // \"\"" 2>/dev/null)
+
+  # 保險：如果還是沒拿到 id，就讓後面走手動
+  if [ -z "$SELECTED_GROUP_ID" ]; then
+    echo "Selected group has no id, fallback to manual."
+    return 1
+  fi
+
   echo "→ Selected group: ${SELECTED_GROUP_NAME} (id=${SELECTED_GROUP_ID})"
 }
 
