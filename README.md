@@ -50,7 +50,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
 > 需要十幾台機子的實時情況的隨時 Tele 消息，所以寫了。  
 
 ```bash
-<(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/vps.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/vps.sh)
 ```
 
 # 5、WX2HTML 
@@ -62,7 +62,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
 > 偶爾需要下載庫內書，寫下。  
 
 ```bash
-<(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/taiwanebook.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/taiwanebook.sh)
 ```
 
 # 7、Seiue Notification → Telegram
@@ -71,7 +71,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/ipmenu.sh)
 
 
 ```bash
-<(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/seiue-notify.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/seiue-notify.sh)
 ```
 
 ---
