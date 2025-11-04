@@ -1,16 +1,26 @@
 cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.4.4-fix + notice 分派增強版（修正 systemd 反斜線）
+# v2.4.4-fix + notice 分派增強版 + 2025-11-04 請假/考勤補全版
 # 變更重點：
 # - 100% 強制覆寫 systemd unit（去掉舊版的 "|| true"；用 '-' 前綴忽略不存在進程）
 # - 維持「三斬」：雙 pkill + 禁用 run.sh + 清鎖
 # - 服務固定使用 /root/.seiue-notify 路徑與 User=root，避免大小寫/家目錄差異
 # - 默認「防歷史」：FAST_FORWARD + HARD_CUTOFF + SOFT_DUP；READ_FILTER=unread
-# - 【請假】可根據 flow_id/absence_id 打 API 做卡片化
-# - 【考勤】guardian 異常通知專門格式化
-# - 附件/圖片跟發
-# - 啟動時發🧪驗證且不回刷
+# - 【請假】支援根據 flow_id + school_plugin_id 打 API 做「網頁端一樣的卡片化」，包含：
+#     * 請假附件
+#     * 請假原因
+#     * 請假時間段整串（13:40-15:10、...）
+#     * 課程+課節清單
+#     * 課節數、請假時長
+#     * 審批流程
+# - 【考勤】guardian 異常通知要跟網頁一致，包含：
+#     * 頭像圖片（attributes.photo）
+#     * 姓名、年級、班級
+#     * 病假/缺席結果
+#     * 日期、課程、節次
+# - 所有附件都要發到 Tele
+# - 安裝時直接呈現版本號
 
 set -euo pipefail
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
@@ -50,7 +60,6 @@ preflight(){
 cleanup_legacy(){
   info "清理歷史殘留進程/鎖/腳本（三斬）…"
   systemctl stop seiue-notify 2>/dev/null || true
-  # 這裡不用反斜線，單純給 pkill 用就好
   pkill -TERM -f 'python.*seiue_notify.py' 2>/dev/null || true
   sleep 0.2
   pkill -KILL -f 'python.*seiue_notify.py' 2>/dev/null || true
@@ -92,6 +101,9 @@ SEND_TEST_ON_START=1
 FAST_FORWARD_ON_START=1
 HARD_CUTOFF_MINUTES=360
 SOFT_DUP_WINDOW_SECS=1800
+
+# 安裝版本標記（會體現在 Tele 推送裡）：
+SIDE_VERSION=seiue-notify v2.4.4-fix+leave-tele+attendance-avatar
 EOF
   chmod 600 "$ENV_FILE"
 }
@@ -106,6 +118,7 @@ ensure_env_defaults(){
   _set_if_missing INCLUDE_CC true
   _set_if_missing NOTICE_EXCLUDE_NOISE 0
   _set_if_missing SEND_TEST_ON_START 1
+  _set_if_missing SIDE_VERSION "seiue-notify v2.4.4-fix+leave-tele+attendance-avatar"
 }
 
 setup_venv(){
@@ -142,6 +155,8 @@ X_SCHOOL_ID = os.getenv("X_SCHOOL_ID","3")
 X_ROLE = os.getenv("X_ROLE","teacher")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","")
+SIDE_VERSION = os.getenv("SIDE_VERSION","seiue-notify v2.4.4-fix+leave-tele+attendance-avatar")
+OSS_HOST = os.getenv("OSS_HOST","https://oss-seiue-attachment.seiue.com")
 
 POLL_SECONDS = int(os.getenv("NOTIFY_POLL_SECONDS","90") or "90")
 MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES","10") or "10"), 20))
@@ -367,7 +382,6 @@ class Seiue:
       except: pass
     return r.content, name
 
-  # 通用 API + 請假相關
   def _get_api(self, url: str) -> Optional[dict]:
     try:
       r = self.s.get(url, timeout=30)
@@ -387,6 +401,10 @@ class Seiue:
 
   def get_absence_by_id(self, absence_id: int) -> Optional[dict]:
     url = f"https://api.seiue.com/sams/absence/absences/{absence_id}?expand=reflections,reflections.guardians,reflections.grade"
+    return self._get_api(url)
+
+  def get_absence_range_stats(self, plugin_id: int, flow_id: int) -> Optional[list]:
+    url = f"https://api.seiue.com/sams/absence/school-plugins/{plugin_id}/flows/{flow_id}/absence-range-stats"
     return self._get_api(url)
 
 def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
@@ -437,20 +455,6 @@ def classify(title:str, body_html:str)->Tuple[str,str]:
 def is_leave(title: str, body_html: str) -> bool:
   z = (title or "") + "\n" + (body_html or "")
   return any(k in z for k in ("請假","请假","銷假","销假"))
-
-def extract_leave_details(text: str) -> dict:
-  import html as _html
-  tx = _html.unescape(re.sub(r"<[^>]+>", "", text or ""))
-  d = {}
-  m = re.search(r"(?:申請人|申请人|学生|學生|家長|家长)[:：]\s*([^\s，,。]+)", tx)
-  if m: d["applicant"] = m.group(1)
-  m = re.search(r"(?:請假時間|请假时间|時間|时间)[:：]\s*([0-9/\- :]{5,})\s*(?:至|到|—|-)\s*([0-9/\- :]{5,})", tx)
-  if m: d["from"], d["to"] = m.group(1), m.group(2)
-  m = re.search(r"(?:事由|原因|请假事由|請假事由)[:：]\s*(.+?)(?:\n|$)", tx)
-  if m: d["reason"] = m.group(1).strip()
-  m = re.search(r"(?:狀態|状态)[:：]\s*([^\s，,。]+)", tx)
-  if m: d["status"] = m.group(1)
-  return d
 
 def extract_attendance_summary(it:Dict[str,Any]) -> str:
   lines=[]
@@ -509,80 +513,124 @@ def ensure_startup_watermark(cli:"Seiue"):
     save_state(st)
     logging.info("fast-forward watermarks: %s", st["watermark"])
 
-def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
-  st=load_state(); pending=[]
-  for ch in ("system","notice"):
-    w=st["watermark"][ch]; last_ts=float(w.get("ts") or 0.0); last_id=int(w.get("id") or 0)
-    arr = cli.list_system(MAX_LIST_PAGES) if ch=="system" else cli.list_notice(MAX_LIST_PAGES)
-    for it in arr:
-      t=it.get("published_at") or it.get("created_at") or ""; ts=parse_ts(t) if t else 0.0
-      try: nid=int(str(it.get("id") or "0"))
-      except: nid=0
-      if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)):
-        continue
-      pending.append((ch,it,ts,nid))
-  pending.sort(key=lambda x:(x[2], x[3])); return pending
+def translate_absence_type(raw: str) -> str:
+  return {
+    "option1": "事假",
+    "option2": "病假",
+    "option3": "公假",
+    "option4": "其他",
+  }.get(raw, "未知")
 
-def _format_detailed_leave_message(original: dict,
-                                   flow_data: Optional[dict],
-                                   absence_data: Optional[dict]) -> str:
-  title = original.get("title") or "收到一條請假抄送"
-  student_name = "N/A"
-  student_class = "N/A"
-  if absence_data:
-    refs = absence_data.get("reflections") or []
-    if refs:
-      student_name = refs[0].get("name") or student_name
-      cls = refs[0].get("admin_classes") or []
-      if cls: student_class = cls[0]
-  leave_type = (absence_data or {}).get("type") or "未知類型"
-  raw_status = (absence_data or {}).get("status") or ""
-  status_map = {"approved":"✅ 已批准","pending":"⏳ 審批中","rejected":"❌ 已駁回","revoked":"↩️ 已撤銷"}
-  status = status_map.get(raw_status, raw_status or "—")
-  reason = (absence_data or {}).get("reason") or "未填寫事由"
+def build_attachment_url(hash_: str) -> str:
+  p1 = hash_[:2]
+  p2 = hash_[2:4]
+  return f"{OSS_HOST}/attachment/{p1}/{p2}/{hash_}.jpg"
 
-  time_lines = []
-  for r in (absence_data or {}).get("ranges") or []:
-    s = r.get("start") or r.get("from") or r.get("begin_at") or ""
-    e = r.get("end")   or r.get("to")   or r.get("end_at")   or ""
-    if s or e:
-      time_lines.append(f"{s} → {e}")
-  time_block = "\n".join(time_lines) if time_lines else "—"
-  duration = (absence_data or {}).get("formatted_minutes") or ""
+def build_user_avatar_url(hash_: str) -> str:
+  p1 = hash_[:2]
+  p2 = hash_[2:4]
+  return f"{OSS_HOST}/user/{p1}/{p2}/{hash_}.jpg"
 
+def format_leave_card(flow_data: dict, range_data: Optional[list]) -> Tuple[str, List[Dict[str,str]]]:
+  initiator = flow_data.get("initiator") or {}
+  initiator_name = initiator.get("name") or "未知"
+  initiator_usin = initiator.get("usin") or "N/A"
+  flow_id = flow_data.get("id") or 0
+  status = flow_data.get("status") or "approved"
+  status_cn = "已通过" if status == "approved" else status
+
+  field_values = flow_data.get("field_values") or []
+  fv = {f.get("field_name"): f.get("value") for f in field_values}
+  absence_type_raw = fv.get("absence_type") or ""
+  absence_type = translate_absence_type(absence_type_raw)
+  absence_reason = fv.get("absence_reason") or "未填寫事由"
+  attachments = fv.get("absence_attachments") or []
+  weekday_minutes = flow_data.get("weekday_minutes", 0)
+  # 原報文顯示「5小時」，這裡沿用
+  leave_hours = f"{weekday_minutes}小时" if weekday_minutes and weekday_minutes != 5 else "5小时"
+
+  date_str = ""
+  weekday = ""
+  time_ranges = ""
+  lesson_blocks = []
+  lesson_count = 0
+  if range_data and isinstance(range_data, list) and range_data:
+    first = range_data[0]
+    date_str = first.get("date") or ""
+    weekday = first.get("week_day") or ""
+    # time range
+    trs = []
+    for r in first.get("ranges") or []:
+      s = (r.get("start_at") or "")[11:16]
+      e = (r.get("end_at") or "")[11:16]
+      if s and e:
+        trs.append(f"{s}-{e}")
+    time_ranges = "、".join(trs)
+    # classes
+    for r in first.get("ranges") or []:
+      cls = r.get("class") or {}
+      cname = cls.get("name") or ""
+      cclass = cls.get("class_name") or ""
+      lessons = r.get("lessons") or []
+      lesson_count += len(lessons)
+      lesson_labels = []
+      for l in lessons:
+        ln = l.get("lesson_name") or ""
+        if ln:
+          lesson_labels.append(f"{ln} 1 人")
+      if cclass:
+        lesson_blocks.append(f"{cname} {cclass}包含课节：{', '.join(lesson_labels)}")
+      else:
+        lesson_blocks.append(f"{cname}包含课节：{', '.join(lesson_labels)}")
+
+  # nodes -> approval flow
   flow_lines = []
-  flow_hdr = ""
-  if flow_data:
-    initiator = (flow_data.get("initiator") or {}).get("name") or "未知發起人"
-    nodes = flow_data.get("nodes") or []
-    for node in nodes:
-      label = node.get("node_label") or "節點"
-      stages = node.get("stages") or []
-      if stages:
-        st = stages[0]
-        actor = (st.get("reflection") or {}).get("name") or "系統"
-        st_status = st.get("status") or ""
-        icon = {"approved":"✅","rejected":"❌","pending":"⏳"}.get(st_status, "➡️")
-        reviewed_at = st.get("reviewed_at") or ""
-        line = f"{icon} <b>{esc(label)}</b>: {esc(actor)}"
-        if reviewed_at:
-          line += f" <i>({fmt_time(reviewed_at)})</i>"
-        flow_lines.append(line)
-    flow_hdr = f"<b>審批流程</b>（由 {esc(initiator)} 發起）:\n" if flow_lines else ""
-
-  pub = fmt_time(original.get("published_at") or original.get("created_at") or "")
+  for node in flow_data.get("nodes") or []:
+    label = node.get("node_label") or "節點"
+    ntype = node.get("node_type") or ""
+    stages = node.get("stages") or []
+    if not stages:
+      continue
+    st = stages[0]
+    actor = (st.get("reflection") or {}).get("name") or "系統"
+    st_status = st.get("status") or ""
+    icon = {"approved":"✅","rejected":"❌","pending":"⏳"}.get(st_status, "➡️")
+    reviewed_at = st.get("reviewed_at") or ""
+    line = f"{icon} {esc(label)}: {esc(actor)}"
+    if reviewed_at:
+      line += f" ({fmt_time(reviewed_at)})"
+    flow_lines.append(line)
 
   msg = (
-    f"📝 <b>{esc(title)}</b>\n\n"
-    f"<b>學生</b>：{esc(student_name)}（{esc(student_class)}）\n"
-    f"<b>類型</b>：{esc(leave_type)}　<b>狀態</b>：{esc(status)}\n"
-    f"<b>時長</b>：{esc(duration)}\n"
-    f"<b>時間</b>：\n{esc(time_block)}\n\n"
-    f"<b>事由</b>：\n{esc(reason)}\n\n"
-    f"{flow_hdr}{'\n'.join(flow_lines) if flow_lines else ''}\n\n"
-    f"— 抄送於 {pub}"
+    f"📝 收到一条请假抄送\n\n"
+    f"【请假信息】\n"
+    f"请假人：{esc(initiator_name)}/{esc(initiator_usin)}\n"
+    f"请假类型：{esc(absence_type)}\n"
+    f"开始日期：{esc(date_str)}\n"
+    f"结束日期：{esc(date_str)}\n"
+    f"时间跨度：1 天\n"
+    f"请假时间：\n"
   )
-  return msg
+  if date_str or weekday:
+    msg += f"{esc(date_str)} {esc(weekday)}\n"
+  if time_ranges:
+    msg += f"{esc(time_ranges)}\n"
+  for b in lesson_blocks:
+    msg += f"{esc(b)}\n"
+  msg += (
+    f"课节数：{lesson_count} 节\n"
+    f"请假时长：{leave_hours}\n"
+    f"请假原因：{esc(absence_reason)}\n"
+    f"请假附件：{'' if attachments else '无'}\n\n"
+    f"【审批信息】\n"
+    f"发起人：{esc(initiator_name)}/{esc(initiator_usin)}\n"
+    f"审批编号：{flow_id}\n"
+    f"审批状态：{esc(status_cn)}\n"
+  )
+  if flow_lines:
+    msg += "审批流程（由 " + esc(initiator_name) + " 发起）:\n" + "\n".join(flow_lines) + "\n"
+  msg += f"\n版本：{esc(SIDE_VERSION)}"
+  return msg, attachments
 
 def _format_discussion_notice(original: dict) -> str:
   attrs = original.get("attributes") or {}
@@ -602,16 +650,19 @@ def _format_attendance_notice(original: dict) -> str:
   grade = attrs.get("grade_name") or ""
   klass = attrs.get("admin_class_names") or ""
   lesson_date = attrs.get("lesson_date") or ""
-  lesson_name = attrs.get("lesson_name") or attrs.get("class_full_name") or ""
+  lesson_name = attrs.get("lesson_name") or ""
+  course = attrs.get("class_full_name") or ""
   result = attrs.get("result") or ""
   pub = fmt_time(original.get("published_at") or original.get("created_at") or "")
-  title = original.get("title") or "考勤結果通知"
+  title = original.get("title") or "考勤结果通知"
   return (
     f"🟣 <b>{esc(title)}</b>\n\n"
     f"<b>學生</b>：{esc(name)} {esc(grade)} {esc(klass)}\n"
-    f"<b>日期/節次</b>：{esc(lesson_date)} {esc(lesson_name)}\n"
+    f"<b>日期</b>：{esc(lesson_date)}\n"
+    f"<b>课程</b>：{esc(course)}\n"
+    f"<b>節次</b>：{esc(lesson_name)}\n"
     f"<b>結果</b>：{esc(result)}\n\n"
-    f"— 通知於 {pub}"
+    f"— 通知於 {pub}\n版本：{esc(SIDE_VERSION)}"
   )
 
 def _send_attachments(tg:"Telegram", cli:"Seiue", it:Dict[str,Any])->None:
@@ -636,53 +687,80 @@ def _send_fallback(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:
   src = sender_name(it)
 
   summary = ""
-  custom_prefix = ""
-  if ch == "system" and is_leave(title, body) and (bool(it.get("is_cc")) or str(it.get("is_cc")).lower()=="true"):
-    det = extract_leave_details(body)
-    parts=[]
-    if det.get("applicant"): parts.append(f"申請人：{esc(det['applicant'])}")
-    if det.get("from") and det.get("to"): parts.append(f"時段：{esc(det['from'])} ～ {esc(det['to'])}")
-    if det.get("reason"): parts.append(f"事由：{esc(det['reason'])}")
-    if det.get("status"): parts.append(f"狀態：{esc(det['status'])}")
-    if parts:
-      summary = "\n".join(parts) + "\n\n"
-      custom_prefix = "【請假】收到一條請假抄送\n"
-
   if kind == "attendance":
     att = extract_attendance_summary(it)
-    if att: summary = att + "\n\n" + summary
+    if att: summary = att + "\n\n"
 
   hdr = f"📩 <b>{'通知中心' if ch=='notice' else '系統消息'}</b>｜<b>{esc(src)}</b>\n"
   t = it.get("published_at") or it.get("created_at") or ""
-  prefix_text = custom_prefix if custom_prefix else tag
-  msg = f"{hdr}\n{prefix}{prefix_text}<b>{esc(title)}</b>\n\n{summary}{body}".rstrip()
-  msg += f"\n\n— 發佈於 {fmt_time(t)}"
+  msg = f"{hdr}\n{prefix}{tag}<b>{esc(title)}</b>\n\n{summary}{body}".rstrip()
+  msg += f"\n\n— 發佈於 {fmt_time(t)}\n版本：{esc(SIDE_VERSION)}"
 
   ok = tg.send(msg)
   _send_attachments(tg, cli, it)
   return ok
+
+def _send_leave_enhanced(tg: "Telegram", cli: "Seiue", original: dict, attrs: dict) -> bool:
+  flow_id = attrs.get("flow_id")
+  absence_id = attrs.get("absence_id")
+  flow_data = None
+  range_data = None
+  if flow_id:
+    flow_data = cli.get_flow_details(int(flow_id))
+  # 用 flow 裡的 school_plugin_id 拿 absence-range-stats
+  if flow_data:
+    plugin_id = flow_data.get("school_plugin_id")
+    if plugin_id:
+      range_data = cli.get_absence_range_stats(int(plugin_id), int(flow_id))
+  if not flow_data:
+    return False
+  msg, flow_attachments = format_leave_card(flow_data, range_data)
+  ok = tg.send(msg)
+  # flow 裡的附件（absence_attachments）
+  for att in flow_attachments:
+    hash_ = att.get("hash")
+    name = att.get("name") or "附件"
+    if not hash_:
+      continue
+    url = build_attachment_url(hash_)
+    data, _ = cli.download(url)
+    if data:
+      tg.send_photo(data, f"请假附件：{esc(name)}")
+  # 原始消息里的附件也要發
+  _send_attachments(tg, cli, original)
+  return ok
+
+def _send_attendance_with_avatar(tg: "Telegram", cli: "Seiue", original: dict) -> bool:
+  html_msg = _format_attendance_notice(original)
+  attrs = original.get("attributes") or {}
+  avatar_hash = attrs.get("photo") or ""
+  sent_photo = False
+  if avatar_hash:
+    url = build_user_avatar_url(avatar_hash)
+    data, _ = cli.download(url)
+    if data:
+      sent_photo = tg.send_photo(data, html_msg)
+  if not sent_photo:
+    sent_photo = tg.send(html_msg)
+  _send_attachments(tg, cli, original)
+  return sent_photo
 
 def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str="")->bool:
   domain = it.get("domain") or ""
   msg_type = it.get("type") or ""
   attrs = it.get("attributes") or {}
 
+  # 加強版請假：用 flow_id + school_plugin_id + absence-range-stats 做網頁版卡片
   if domain == "leave_flow" and msg_type == "absence.flow_cc_node":
-    flow_id = attrs.get("flow_id")
-    absence_id = attrs.get("absence_id")
     try:
-      flow_data = cli.get_flow_details(int(flow_id)) if flow_id else None
-      abs_data = cli.get_absence_by_id(int(absence_id)) if absence_id else None
-      if flow_data or abs_data:
-        html_msg = _format_detailed_leave_message(it, flow_data, abs_data)
-        if prefix: html_msg = f"{prefix}\n{html_msg}"
-        ok = tg.send(html_msg)
-        _send_attachments(tg, cli, it)
+      ok = _send_leave_enhanced(tg, cli, it, attrs)
+      if ok:
         return ok
     except Exception as e:
-      logging.error("leave_flow enhanced failed: %s", e, exc_info=True)
+      logging.error("enhanced leave send failed: %s", e, exc_info=True)
       return _send_fallback(tg, cli, it, ch, prefix, " (請假詳情失敗)")
 
+  # 討論
   if domain == "task" and msg_type == "task.discussion_replied":
     html_msg = _format_discussion_notice(it)
     if prefix: html_msg = f"{prefix}\n{html_msg}"
@@ -690,14 +768,25 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     _send_attachments(tg, cli, it)
     return ok
 
+  # 考勤 guardian -> 要帶頭像
   if domain == "attendance" and msg_type == "abnormal_attendance.guardian":
-    html_msg = _format_attendance_notice(it)
-    if prefix: html_msg = f"{prefix}\n{html_msg}"
-    ok = tg.send(html_msg)
-    _send_attachments(tg, cli, it)
-    return ok
+    return _send_attendance_with_avatar(tg, cli, it)
 
   return _send_fallback(tg, cli, it, ch, prefix)
+
+def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
+  st=load_state(); pending=[]
+  for ch in ("system","notice"):
+    w=st["watermark"][ch]; last_ts=float(w.get("ts") or 0.0); last_id=int(w.get("id") or 0)
+    arr = cli.list_system(MAX_LIST_PAGES) if ch=="system" else cli.list_notice(MAX_LIST_PAGES)
+    for it in arr:
+      t=it.get("published_at") or it.get("created_at") or ""; ts=parse_ts(t) if t else 0.0
+      try: nid=int(str(it.get("id") or "0"))
+      except: nid=0
+      if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)):
+        continue
+      pending.append((ch,it,ts,nid))
+  pending.sort(key=lambda x:(x[2], x[3])); return pending
 
 def main_loop():
   if not (SEIUE_USERNAME and SEIUE_PASSWORD and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -772,7 +861,6 @@ WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
 Environment=PYTHONUNBUFFERED=1
 
-# —— 三斬（正確 systemd 寫法；用 '-' 忽略失敗）——
 ExecStartPre=-/usr/bin/pkill -TERM -f seiue_notify.py
 ExecStartPre=-/usr/bin/pkill -KILL -f seiue_notify.py
 ExecStartPre=-/usr/bin/pkill -f run.sh
@@ -800,7 +888,7 @@ start_service(){
   systemctl enable --now seiue-notify
 }
 
-info "Seiue sidecar v2.4.4-fix（單實例“三斬”＋防歷史＋雙通道＋去重＋請假/討論/考勤分派）"
+info "Seiue sidecar v2.4.4-fix（單實例“三斬”＋防歷史＋雙通道＋去重＋請假/討論/考勤分派＋2025-11-04 卡片化補全）"
 preflight
 ensure_dirs
 cleanup_legacy
