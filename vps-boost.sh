@@ -3,8 +3,7 @@
 # vps-boost.sh  一鍵初始化 VPS 終端體驗
 # - 安裝 zsh 等工具
 # - 寫 ~/.zshrc（含 [VPS IP]）
-# - 在 ~/.bashrc / ~/.profile 加「自動跳 zsh」
-# - 最後只有「現在不是 zsh」才 exec zsh，避免套殼
+# - 在 ~/.bashrc / ~/.profile 加「自動跳 zsh 並在 zsh 結束後 exit」
 # ------------------------------------------------------------
 set -e
 
@@ -180,13 +179,14 @@ sstatus() {
 # ===== END =====
 EOF
 
-# 6. 在 bashrc / profile 加「自動跳 zsh」
+# 6. 在 bashrc / profile 加「自動跳 zsh 並在 zsh 結束後 exit」
 echo "[6/7] 寫入自動跳 zsh 到 ~/.bashrc / ~/.profile ..."
 BASH_SNIPPET='
 # auto-switch-to-zsh (vps-boost)
 if [ -t 1 ] && command -v zsh >/dev/null 2>&1; then
   if [ -z "$ZSH_VERSION" ]; then
-    exec zsh
+    zsh
+    exit
   fi
 fi
 '
@@ -204,11 +204,10 @@ fi
 
 echo "[7/7] 完成。"
 
-# 7. 當前這次：只有現在不是 zsh 才跳
+# 7. 當前這次也進 zsh，但要跟上面同樣邏輯：不是 zsh 才進
 if [ -z "$ZSH_VERSION" ]; then
-  if [ -x /usr/bin/zsh ]; then
-    exec /usr/bin/zsh
-  elif command -v zsh >/dev/null 2>&1; then
-    exec "$(command -v zsh)"
+  if command -v zsh >/dev/null 2>&1; then
+    zsh
+    exit
   fi
 fi
