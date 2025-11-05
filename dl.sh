@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean
-# version: v0.2.1-2025-11-05
-# features:
-# - install/update /opt/ytweb
-# - Flask backend (progress API)
-# - 8h auto cleanup (in-app thread)
-# - nginx + certbot for xz.bdfz.net
-# - kill old processes / overwrite previous install
-# - FIX: yt-dlp 加 --newline，前端不再卡在 0%
+# version: v0.2.2-2025-11-05
+# changes:
+# - progress regex 放寬成抓任意 "NN%"，避免新版本 yt-dlp 不帶 [download]
+# - 其餘跟 v0.2.1 一樣
+# domain: xz.bdfz.net
 
 set -euo pipefail
 
@@ -18,15 +15,15 @@ RUN_USER="www-data"
 DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 
-echo "[ytweb] installing version v0.2.1-2025-11-05 ..."
+echo "[ytweb] installing version v0.2.2-2025-11-05 ..."
 
-# 0) kill old processes / stop old service
+# 0) kill old
 if systemctl list-units --full -all | grep -q "$SERVICE_NAME"; then
   systemctl stop "$SERVICE_NAME" || true
 fi
 pkill -f "$APP_DIR/app.py" 2>/dev/null || true
 
-# 1) install base packages
+# 1) base pkgs
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
   apt-get install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx
@@ -35,7 +32,7 @@ elif command -v dnf >/dev/null 2>&1; then
 elif command -v yum >/dev/null 2>&1; then
   yum install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx || true
 else
-  echo "No supported package manager found. Please install python3, nginx, certbot manually."
+  echo "install python3 + nginx + certbot manually"
 fi
 
 # 2) dirs
@@ -51,17 +48,17 @@ source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
 pip install flask python-dotenv yt-dlp
 
-# 4) app.py (FULL)
+# 4) app.py
 cat > "$APP_DIR/app.py" <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v0.2.1-2025-11-05
+version: v0.2.2-2025-11-05
 
-changes from v0.2.0:
-- add --newline to yt-dlp so stdout is line-based
-- relax progress regex
+- use --newline
+- progress regex: match any "NN%" to be tolerant with yt-dlp output
+- 8h auto cleanup
 """
 import os
 import uuid
@@ -82,8 +79,8 @@ TASKS = {}
 LOCK = threading.Lock()
 EXPIRE_HOURS = 8
 
-# 更寬鬆一點的進度：例如 "[download]  12.3% of ..." 或 "[download] 100%"
-PROG_RE = re.compile(r'\[download\]\s+(\d+(?:\.\d+)?)%')
+# 很兇的寫法，只要行裡有 "12.3%" 就吃
+PROG_RE = re.compile(r'(\d+(?:\.\d+)?)%')
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -97,7 +94,7 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
     output_tpl = os.path.join(task_dir, "%(title)s-%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
-        "--newline",             # 關鍵：一行一行吐，不用 \r
+        "--newline",
         "-f", fmt,
         "-o", output_tpl,
         url,
@@ -117,7 +114,10 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
         logs.append(line)
         m = PROG_RE.search(line)
         if m:
-            pct = float(m.group(1))
+            try:
+                pct = float(m.group(1))
+            except ValueError:
+                pct = 0.0
             with LOCK:
                 TASKS[task_id]["progress"] = pct
         with LOCK:
@@ -242,7 +242,7 @@ if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5001, debug=False)
 PY
 
-# 5) template (same as last version)
+# 5) template (same as v0.2.1)
 cat > "$APP_DIR/templates/index.html" <<'HTML'
 <!doctype html>
 <html lang="zh-CN">
@@ -259,7 +259,6 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
     a.btn { display: inline-block; background: #0d6efd; color: #fff; padding: 0.5rem 1rem; text-decoration: none; border-radius: 4px; }
     .progress-bar { width: 100%; background: #ddd; height: 10px; border-radius: 5px; overflow: hidden; margin-bottom: 1rem; }
     .progress-bar-inner { height: 10px; background: #0d6efd; width: 0%; transition: width .3s ease; }
-    small { color: #666; }
   </style>
 </head>
 <body>
@@ -341,7 +340,7 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
 </html>
 HTML
 
-# 6) systemd service
+# 6) systemd
 cat > /etc/systemd/system/"$SERVICE_NAME" <<SERVICE
 [Unit]
 Description=yt-dlp web frontend (Flask)
@@ -385,7 +384,7 @@ NG
 ln -sf /etc/nginx/sites-available/ytweb.conf /etc/nginx/sites-enabled/ytweb.conf
 nginx -t && systemctl reload nginx
 
-# 8) HTTPS
+# 8) https
 if command -v certbot >/dev/null 2>&1; then
   certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email || true
 fi
