@@ -1,24 +1,29 @@
-cat >/root/seiue-notify.sh <<'SH'
 #!/usr/bin/env bash
-# Seiue Notification → Telegram - Zero-Arg Installer/Runner
-# v2.4.4-fix + notice 分派增強版 + 2025-11-05 請假/考勤補全版
-# 變更重點（本版）：
-# - 保留你現有的三斬策略＋systemd 覆寫
-# - Python 內部補上：
-#   1) 考勤通知自動抓學生頭像 (attributes.photo) → Tele
-#   2) 請假抄送根據 flow_id + school_plugin_id 拉兩個 API，跟 web 顯示一致
-#   3) flow 裡的 absence_attachments 也會自動下載後丟到 Tele
-# - 仍然走 unread、防歷史、去重
-#
-# 用法：直接執行本檔案即可安裝/覆寫當前版本
-# --------------------------------------------------
-
+# Seiue Notification → Telegram - 安裝/升級腳本
+# 版本：v2.5.0-tele-attach
+# 特性：
+# - 安裝時顯示版本，不再靜默
+# - 三斬：停舊服務 + pkill 舊 py + 禁用舊 run.sh + 清鎖
+# - 強制覆蓋 systemd unit
+# - Python 腳本包含：請假 flow 拉詳情、attendance guardian 封面、消息附件透傳
+# - 安裝完直接顯示 systemd 和日誌，方便確認是否新版本
+# - 啟動後會發一條 🧪 測試到 Telegram
 set -euo pipefail
+
+SIDE_VERSION="v2.5.0-tele-attach"
+
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
 info(){ echo -e "${C_BLUE}INFO:${C_RESET} $1"; }
 success(){ echo -e "${C_GREEN}SUCCESS:${C_RESET} $1"; }
 warn(){ echo -e "${C_YELLOW}WARNING:${C_RESET} $1"; }
 error(){ echo -e "${C_RED}ERROR:${C_RESET} $1" >&2; }
+
+echo
+echo "==============================================="
+echo "  Seiue → Telegram Installer ${SIDE_VERSION}"
+echo "  $(date '+%F %T')"
+echo "==============================================="
+echo
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   echo "需要 root 權限。使用 sudo 重新執行…"
@@ -42,9 +47,11 @@ preflight(){
   if ! need_cmd python3; then
     warn "未發現 python3，嘗試安裝…"
     if command -v apt-get >/dev/null; then apt-get update -y && apt-get install -y python3 python3-venv python3-pip || true; fi
-    if command -v yum >/dev/null;     then yum install -y python3 python3-pip || true; fi
+    if command -v yum >/dev/null; then yum install -y python3 python3-pip || true; fi
   fi
   need_cmd python3 || { error "仍未找到 python3"; exit 1; }
+  PY_VER=$(python3 -V 2>&1 || true)
+  info "使用 Python: ${PY_VER}"
   success "預檢通過。"
 }
 
@@ -87,15 +94,11 @@ SKIP_HISTORY_ON_FIRST_RUN=1
 TELEGRAM_MIN_INTERVAL_SECS=1.5
 NOTICE_EXCLUDE_NOISE=0
 SEND_TEST_ON_START=1
-OSS_HOST=https://oss-seiue-attachment.seiue.com
 
 # 反歷史 + 去重策略（可改）：
 FAST_FORWARD_ON_START=1
 HARD_CUTOFF_MINUTES=360
 SOFT_DUP_WINDOW_SECS=1800
-
-# 安裝版本標記（會體現在 Tele 推送裡）：
-SIDE_VERSION=seiue-notify v2.4.4-fix+leave-tele+attendance-avatar
 EOF
   chmod 600 "$ENV_FILE"
 }
@@ -110,8 +113,6 @@ ensure_env_defaults(){
   _set_if_missing INCLUDE_CC true
   _set_if_missing NOTICE_EXCLUDE_NOISE 0
   _set_if_missing SEND_TEST_ON_START 1
-  _set_if_missing OSS_HOST "https://oss-seiue-attachment.seiue.com"
-  _set_if_missing SIDE_VERSION "seiue-notify v2.4.4-fix+leave-tele+attendance-avatar"
 }
 
 setup_venv(){
@@ -129,6 +130,10 @@ write_python(){
   cat >"$PY_SCRIPT" <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Seiue → Telegram notifier
+版本: v2.5.0-tele-attach
+"""
 import os, sys, time, json, html, fcntl, logging, hashlib, re
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
@@ -148,8 +153,6 @@ X_SCHOOL_ID = os.getenv("X_SCHOOL_ID","3")
 X_ROLE = os.getenv("X_ROLE","teacher")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","")
-SIDE_VERSION = os.getenv("SIDE_VERSION","seiue-notify v2.4.4-fix+leave-tele+attendance-avatar")
-OSS_HOST = os.getenv("OSS_HOST","https://oss-seiue-attachment.seiue.com")
 
 POLL_SECONDS = int(os.getenv("NOTIFY_POLL_SECONDS","90") or "90")
 MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES","10") or "10"), 20))
@@ -185,7 +188,12 @@ def parse_ts(s:str)->float:
 
 def fmt_time(s:str)->str:
   if not s: return ""
-  for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%fZ"):
+  for fmt in (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%fZ",
+  ):
     try:
       dt = datetime.strptime(s, fmt)
       if not dt.tzinfo:
@@ -216,7 +224,8 @@ def save_state(st:Dict[str,Any])->None:
 def acquire_lock_or_exit():
   fd=os.open(LOCK_FILE, os.O_CREAT|os.O_RDWR, 0o644)
   try:
-    fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB); os.ftruncate(fd,0); os.write(fd, str(os.getpid()).encode()); return fd
+    import fcntl as _fcntl
+    _fcntl.flock(fd, _fcntl.LOCK_EX|_fcntl.LOCK_NB); os.ftruncate(fd,0); os.write(fd, str(os.getpid()).encode()); return fd
   except OSError:
     logging.error("已有實例運行，本實例退出。"); sys.exit(0)
 
@@ -262,7 +271,6 @@ class Telegram:
   def send(self, html_text:str)->bool:
     if len(html_text)<=4096:
       return self._post("sendMessage", {"chat_id":self.chat_id,"text":html_text,"parse_mode":"HTML","disable_web_page_preview":True}, None, 30)
-    # split
     safe=4032; parts=[]; buf=""
     for para in html_text.split("\n\n"):
       add=(("\n\n" if buf else "")+para)
@@ -312,8 +320,9 @@ class Seiue:
         j = r.json()
       except Exception:
         txt = r.text or ""
-        m = re.search(r'"access_token"\s*:\s*"([^"]+)"', txt)
-        n = re.search(r'"active_reflection_id"\s*:\s*"?(\d+)"?', txt)
+        import re as _re
+        m = _re.search(r'"access_token"\s*:\s*"([^"]+)"', txt)
+        n = _re.search(r'"active_reflection_id"\s*:\s*"?(\d+)"?', txt)
         j = {"access_token": m.group(1) if m else None,
              "active_reflection_id": n.group(1) if n else None}
       tok = j.get("access_token"); rid = str(j.get("active_reflection_id") or "")
@@ -341,8 +350,6 @@ class Seiue:
 
   def list_notice(self, pages:int)->List[Dict[str,Any]]:
     base={"expand":"sender_reflection,aggregated_messages","owner.id":self.reflection,"paginated":"1","sort":"-published_at,-created_at","notice":"true"}
-    if NOTICE_EXCLUDE_NOISE:
-      base["type_not_in"]="exam.schedule_result_for_examinee,exam.schedule_result_for_examiner,exam.stats_received,exam.published_for_adminclass_teacher,exam.published_for_examinee,exam.published_scoring_for_examinee,exam.published_for_teacher,exam.published_for_mentor,schcal.holiday_created,schcal.holiday_deleted,schcal.holiday_updated,schcal.makeup_created,schcal.makeup_deleted"
     if READ_FILTER=="unread": base["readed"]="false"
     return self._collect(base, pages)
 
@@ -388,17 +395,11 @@ class Seiue:
     return None
 
   def get_flow_details(self, flow_id: int) -> Optional[dict]:
-    # 帶上你 curl 裡面的 expand，讓 nodes/stages/reflection 都有
-    url = (
-      f"https://api.seiue.com/form/workflow/flows/{flow_id}"
-      "?expand=initiator,tags,nodes,nodes.comments,nodes.comments.reflection,"
-      "nodes.stages,nodes.stages.reflection,nodes.stages.returned_reflections,"
-      "nodes.stages.forwarded_reflection,initiator.pupil"
-    )
+    url = f"https://api.seiue.com/form/workflow/flows/{flow_id}?expand=initiator,nodes,nodes.stages,nodes.stages.reflection"
     return self._get_api(url)
 
-  def get_absence_range_stats(self, plugin_id: int, flow_id: int) -> Optional[list]:
-    url = f"https://api.seiue.com/sams/absence/school-plugins/{plugin_id}/flows/{flow_id}/absence-range-stats"
+  def get_absence_by_id(self, absence_id: int) -> Optional[dict]:
+    url = f"https://api.seiue.com/sams/absence/absences/{absence_id}?expand=reflections,reflections.guardians,reflections.grade"
     return self._get_api(url)
 
 def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
@@ -435,6 +436,21 @@ def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
   html_txt="\n\n".join([ln if ln.strip() else "​" for ln in lines])
   return html_txt, attachments
 
+def classify(title:str, body_html:str)->Tuple[str,str]:
+  z=(title or "")+"\n"+(body_html or "")
+  PAIRS=[("leave","【請假】",["請假","请假","銷假","销假"]),
+         ("attendance","【考勤】",["考勤","出勤","打卡","遲到","迟到","早退","缺勤","曠課","旷课"]),
+         ("evaluation","【評價】",["評價","评价","德育","已發布評價","已发布评价"]),
+         ("notice","【通知】",["通知","公告","告知","提醒"])]
+  for key, tag, kws in PAIRS:
+    for k in kws:
+      if k in z: return key, tag
+  return "message","【消息】"
+
+def is_leave(title: str, body_html: str) -> bool:
+  z = (title or "") + "\n" + (body_html or "")
+  return any(k in z for k in ("請假","请假","銷假","销假"))
+
 def extract_attendance_summary(it:Dict[str,Any]) -> str:
   lines=[]
   for m in (it.get("aggregated_messages") or [])[:10]:
@@ -447,6 +463,10 @@ def extract_attendance_summary(it:Dict[str,Any]) -> str:
       lines.append(f"• {esc(one)}")
   body_html, _ = render_content(it.get("content") or "")
   body_txt = re.sub(r"<[^>]+>", "", body_html)
+  m = re.search(r"(?:班級|班级|班|課程|课程|科目|教學班|教学班)[:：]?\s*([^\s，,。]+)", body_txt)
+  if m: lines.insert(0, f"班級/課程：{esc(m.group(1))}")
+  m = re.search(r"(\d{4}-\d{1,2}-\d{1,2}\s*\d{1,2}:\d{2})\s*(?:至|到|—|-)\s*(\d{1,2}:\d{2}|\d{4}-\d{1,2}-\d{1,2}\s*\d{1,2}:\d{2})", body_txt)
+  if m: lines.insert(1, f"時段：{esc(m.group(1))} ～ {esc(m.group(2))}")
   stat_map={"出勤": r"(?:出勤|到勤|簽到|签到)\s*[:：]?\s*(\d+)",
             "請假": r"(?:請假|请假)\s*[:：]?\s*(\d+)",
             "遲到": r"(?:遲到|迟到)\s*[:：]?\s*(\d+)",
@@ -488,112 +508,143 @@ def ensure_startup_watermark(cli:"Seiue"):
     save_state(st)
     logging.info("fast-forward watermarks: %s", st["watermark"])
 
-def translate_absence_type(raw: str) -> str:
-  return {
-    "option1": "事假",
-    "option2": "病假",
-    "option3": "公假",
-    "option4": "其他",
-  }.get(raw, "未知類型")
+def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
+  st=load_state(); pending=[]
+  for ch in ("system","notice"):
+    w=st["watermark"][ch]; last_ts=float(w.get("ts") or 0.0); last_id=int(w.get("id") or 0)
+    arr = cli.list_system(MAX_LIST_PAGES) if ch=="system" else cli.list_notice(MAX_LIST_PAGES)
+    for it in arr:
+      t=it.get("published_at") or it.get("created_at") or ""; ts=parse_ts(t) if t else 0.0
+      try: nid=int(str(it.get("id") or "0"))
+      except: nid=0
+      if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)):
+        continue
+      pending.append((ch,it,ts,nid))
+  pending.sort(key=lambda x:(x[2], x[3])); return pending
 
-def format_leave_card(flow_data: dict, range_data: Optional[list]) -> Tuple[str, List[Dict[str,str]]]:
-  initiator = flow_data.get("initiator") or {}
-  initiator_name = initiator.get("name") or "未知"
-  initiator_usin = initiator.get("usin") or "N/A"
-  flow_id = flow_data.get("id") or 0
-  status = flow_data.get("status") or "approved"
-  status_cn = "已通過" if status == "approved" else status
+def _extract_flow_attachments(flow_data: Optional[dict]) -> List[Dict[str,str]]:
+  # 從工作流裡找類似 absence_attachments 的欄位
+  atts=[]
+  if not flow_data: return atts
+  for fv in flow_data.get("field_values") or []:
+    fn = fv.get("field_name") or ""
+    if "attachment" in fn or "attachments" in fn:
+      val = fv.get("value")
+      if isinstance(val, list):
+        for item in val:
+          h = item.get("hash") or ""
+          mime = item.get("mime") or "image/jpeg"
+          name = item.get("name") or "附件"
+          if len(h) >= 4:
+            # 估一下 OSS 路徑，通常是 attachment/xx/yy/hash.ext
+            ext = "jpg"
+            if "png" in mime: ext = "png"
+            elif "pdf" in mime: ext = "pdf"
+            url = f"https://oss-seiue-attachment.seiue.com/attachment/{h[0:2]}/{h[2:4]}/{h}.{ext}"
+            atts.append({"url": url, "name": name})
+  return atts
 
-  field_values = flow_data.get("field_values") or []
-  fv = {f.get("field_name"): f.get("value") for f in field_values}
-  absence_type_raw = fv.get("absence_type") or ""
-  absence_type = translate_absence_type(absence_type_raw)
-  absence_reason = fv.get("absence_reason") or "未填寫事由"
-  attachments = fv.get("absence_attachments") or []
-  weekday_minutes = flow_data.get("weekday_minutes", 0)
-  leave_hours = f"{weekday_minutes}分鐘" if weekday_minutes else "不明"
+def _try_send_url_as_photo_or_doc(tg:"Telegram", url:str, name:str="附件")->None:
+  try:
+    r = requests.get(url, timeout=40)
+    if r.status_code == 200:
+      data = r.content
+      if name.lower().endswith((".jpg",".jpeg",".png",".gif")):
+        tg.send_photo(data, esc(name))
+      else:
+        tg.send_doc(data, name, esc(name))
+  except Exception as e:
+    logging.warning("Send flow attachment failed %s: %s", url, e)
 
-  date_str = ""
-  weekday = ""
-  time_ranges = ""
-  lesson_blocks = []
-  lesson_count = 0
-  if range_data and isinstance(range_data, list) and range_data:
-    first = range_data[0]
-    date_str = first.get("date") or ""
-    weekday = first.get("week_day") or ""
-    trs = []
-    for r in first.get("ranges") or []:
-      s = (r.get("start_at") or "")[11:16]
-      e = (r.get("end_at") or "")[11:16]
-      if s and e:
-        trs.append(f"{s}-{e}")
-      cls = r.get("class") or {}
-      cname = cls.get("name") or ""
-      cclass = cls.get("class_name") or ""
-      lessons = r.get("lessons") or []
-      if lessons:
-        lesson_count += len(lessons)
-        names = []
-        for l in lessons:
-          ln = l.get("lesson_name") or ""
-          if ln: names.append(ln)
-        if cclass:
-          lesson_blocks.append(f"{cname} {cclass} 課節：{', '.join(names)}")
-        else:
-          lesson_blocks.append(f"{cname} 課節：{', '.join(names)}")
-    time_ranges = "、".join(trs)
+def _format_detailed_leave_message(original: dict,
+                                   flow_data: Optional[dict],
+                                   absence_data: Optional[dict]) -> str:
+  title = original.get("title") or "收到一條請假抄送"
+  student_name = "N/A"
+  student_class = "N/A"
+
+  if absence_data:
+    refs = absence_data.get("reflections") or []
+    if refs:
+      student_name = refs[0].get("name") or student_name
+      cls = refs[0].get("admin_classes") or []
+      if cls: student_class = cls[0]
+
+  # 再從 flow 裡補學生名稱：initiator.name
+  if student_name == "N/A" and flow_data:
+    student_name = (flow_data.get("initiator") or {}).get("name") or student_name
+
+  leave_type = (absence_data or {}).get("type") or "未知類型"
+  raw_status = (absence_data or {}).get("status") or (flow_data or {}).get("status") or ""
+  status_map = {"approved":"✅ 已批准","pending":"⏳ 審批中","rejected":"❌ 已駁回","revoked":"↩️ 已撤銷"}
+  status = status_map.get(raw_status, raw_status or "—")
+  reason = "未填寫事由"
+  if absence_data and absence_data.get("reason"):
+    reason = absence_data["reason"]
+  elif flow_data:
+    # 到 flow 裡找 absence_reason
+    for fv in flow_data.get("field_values") or []:
+      if fv.get("field_name") in ("absence_reason","lego_field_m1fqffbp9xuxo"):
+        reason = fv.get("value") or reason
+
+  time_lines = []
+  if absence_data and (absence_data.get("ranges") or []):
+    for r in absence_data.get("ranges") or []:
+      s = r.get("start") or r.get("from") or r.get("begin_at") or ""
+      e = r.get("end")   or r.get("to")   or r.get("end_at")   or ""
+      if s or e:
+        time_lines.append(f"{s} → {e}")
+  elif flow_data:
+    for fv in flow_data.get("field_values") or []:
+      if fv.get("field_name") == "absence_time_ranges":
+        for rng in fv.get("value") or []:
+          if isinstance(rng, list) and len(rng) == 2:
+            time_lines.append(f"{rng[0]} → {rng[1]}")
+
+  time_block = "\n".join(time_lines) if time_lines else "—"
+
+  duration = (absence_data or {}).get("formatted_minutes") or ""
 
   flow_lines = []
-  for node in flow_data.get("nodes") or []:
-    label = node.get("node_label") or node.get("node_name") or "節點"
-    stages = node.get("stages") or []
-    if not stages:
-      continue
-    stg = stages[0]
-    actor = (stg.get("reflection") or {}).get("name") or "系統"
-    st_status = stg.get("status") or ""
-    icon = {"approved":"✅","rejected":"❌","pending":"⏳"}.get(st_status, "➡️")
-    reviewed_at = stg.get("reviewed_at") or ""
-    line = f"{icon} {esc(label)}: {esc(actor)}"
-    if reviewed_at:
-      line += f" ({fmt_time(reviewed_at)})"
-    flow_lines.append(line)
+  flow_hdr = ""
+  if flow_data:
+    initiator = (flow_data.get("initiator") or {}).get("name") or "未知發起人"
+    nodes = flow_data.get("nodes") or []
+    for node in nodes:
+      label = node.get("node_label") or "節點"
+      stages = node.get("stages") or []
+      if stages:
+        st = stages[0]
+        actor = (st.get("reflection") or {}).get("name") or "系統"
+        st_status = st.get("status") or ""
+        icon = {"approved":"✅","rejected":"❌","pending":"⏳"}.get(st_status, "➡️")
+        reviewed_at = st.get("reviewed_at") or ""
+        line = f"{icon} <b>{esc(label)}</b>: {esc(actor)}"
+        if reviewed_at:
+          line += f" ({fmt_time(reviewed_at)})"
+        flow_lines.append(line)
+    if flow_lines:
+      flow_hdr = f"<b>審批流程</b>（由 {esc(initiator)} 發起）:\n"
+
+  pub = fmt_time(original.get("published_at") or original.get("created_at") or "")
 
   msg = (
-    f"📝 收到一条请假抄送\n\n"
-    f"【請假信息】\n"
-    f"請假人：{esc(initiator_name)}（{esc(initiator_usin)}）\n"
-    f"請假類型：{esc(absence_type)}\n"
+    f"📝 <b>{esc(title)}</b>\n\n"
+    f"<b>學生</b>：{esc(student_name)}（{esc(student_class)}）\n"
+    f"<b>類型</b>：{esc(leave_type)}　<b>狀態</b>：{esc(status)}\n"
+    f"<b>時長</b>：{esc(duration)}\n"
+    f"<b>時間</b>：\n{esc(time_block)}\n\n"
+    f"<b>事由</b>：\n{esc(reason)}\n\n"
+    f"{flow_hdr}{'\n'.join(flow_lines) if flow_lines else ''}\n\n"
+    f"— 抄送於 {pub}"
   )
-  if date_str or weekday:
-    msg += f"日期：{esc(date_str)} {esc(weekday)}\n"
-  if time_ranges:
-    msg += f"時間：{esc(time_ranges)}\n"
-  for b in lesson_blocks:
-    msg += f"{esc(b)}\n"
-  msg += (
-    f"課節數：{lesson_count} 節\n"
-    f"請假時長：{leave_hours}\n"
-    f"事由：{esc(absence_reason)}\n"
-  )
-  if attachments:
-    msg += "表單中有附件，已嘗試提取。\n"
-  else:
-    msg += "表單中無附件。\n"
-  msg += "\n【審批信息】\n"
-  msg += f"審批編號：{flow_id}\n"
-  msg += f"審批狀態：{esc(status_cn)}\n"
-  if flow_lines:
-    msg += "審批流程（由 " + esc(initiator_name) + " 發起）：\n" + "\n".join(flow_lines) + "\n"
-  msg += f"\n版本：{esc(SIDE_VERSION)}"
-  return msg, attachments
+  return msg
 
 def _format_discussion_notice(original: dict) -> str:
-  attrs = original.get("attributes") or {}
   title = original.get("title") or "你在討論中收到了新回復"
   task_snip = re.sub(r"<[^>]+>", "", html.unescape(original.get("content") or ""))[:180]
   pub = fmt_time(original.get("published_at") or original.get("created_at") or "")
+  attrs = original.get("attributes") or {}
   return (
     f"💬 <b>{esc(title)}</b>\n\n"
     f"{esc(task_snip)}\n\n"
@@ -601,14 +652,24 @@ def _format_discussion_notice(original: dict) -> str:
     f"— 通知於 {pub}"
   )
 
+def _maybe_download_attendance_avatar(tg:"Telegram", attrs:dict):
+  photo = attrs.get("photo") or ""
+  if not photo or len(photo) < 8:
+    return
+  # 前端的格式是 user/d0/e3/<photo>...，我們猜公共路徑：
+  base_name = photo
+  p1 = base_name[0:2]
+  p2 = base_name[2:4]
+  url = f"https://oss-seiue-attachment.seiue.com/user/{p1}/{p2}/{base_name}"
+  _try_send_url_as_photo_or_doc(tg, url, "學生頭像")
+
 def _format_attendance_notice(original: dict) -> str:
   attrs = original.get("attributes") or {}
   name = attrs.get("name") or "學生"
   grade = attrs.get("grade_name") or ""
   klass = attrs.get("admin_class_names") or ""
   lesson_date = attrs.get("lesson_date") or ""
-  lesson_name = attrs.get("lesson_name") or ""
-  course = attrs.get("class_full_name") or ""
+  lesson_name = attrs.get("lesson_name") or attrs.get("class_full_name") or ""
   result = attrs.get("result") or ""
   pub = fmt_time(original.get("published_at") or original.get("created_at") or "")
   title = original.get("title") or "考勤结果通知"
@@ -616,257 +677,226 @@ def _format_attendance_notice(original: dict) -> str:
     f"🟣 <b>{esc(title)}</b>\n\n"
     f"<b>學生</b>：{esc(name)} {esc(grade)} {esc(klass)}\n"
     f"<b>日期/節次</b>：{esc(lesson_date)} {esc(lesson_name)}\n"
-    f"<b>課程/班級</b>：{esc(course)}\n"
-    f"<b>結果</b>：{esc(result)}\n"
-    f"\n— 通知於 {pub}"
+    f"<b>結果</b>：{esc(result)}\n\n"
+    f"— 通知於 {pub}"
   )
 
-# === 這裡是本次新增的兩個 helper ====================================
-
-def _attendance_avatar_url(original: dict) -> str:
-  """從考勤通知裡把學生頭像的 OSS 路徑還原出來。"""
-  attrs = original.get("attributes") or {}
-  photo_name = attrs.get("photo") or ""
-  if not photo_name:
-    return ""
-  p1 = photo_name[:2]
-  p2 = photo_name[2:4]
-  return f"{OSS_HOST}/user/{p1}/{p2}/{photo_name}"
-
-def _absence_attachments_from_flow(flow_data: dict) -> list:
-  """從請假 flow 的 field_values 裡把真正的附件列出來，變成 [{url,name}, ...]"""
-  res = []
-  if not flow_data:
-    return res
-  for fv in flow_data.get("field_values") or []:
-    if fv.get("field_name") == "absence_attachments":
-      vals = fv.get("value") or []
-      for att in vals:
-        h = att.get("hash")
-        if not h:
-          continue
-        mime = att.get("mime") or "image/jpeg"
-        ext = mime.split("/")[-1]
-        p1 = h[:2]
-        p2 = h[2:4]
-        url = f"{OSS_HOST}/attachment/{p1}/{p2}/{h}.{ext}"
-        res.append({
-          "url": url,
-          "name": att.get("name") or f"附件.{ext}",
-        })
-  return res
-
-# =====================================================================
-
-def mark_seen(state:dict, key:str, ts:float):
-  state["seen_global"][key] = {"ts": ts}
-
-def should_skip_soft(state:dict, soft_key:str)->bool:
-  return soft_key in state["seen_global"]
-
-def handle_one_notice(it:dict, tg:Telegram, seiue:Seiue, state:dict):
-  mtype = it.get("type") or ""
-  domain = it.get("domain") or ""
-  pub_ts = parse_ts(it.get("published_at") or it.get("created_at") or "") or time.time()
-  gkey = global_key(it)
-  skey = soft_dup_key(it, pub_ts)
-  if pub_ts < HARD_CUTOFF_TS:
-    logging.info("skip by hard-cutoff: %s", gkey)
-    return
-  if should_skip_soft(state, skey):
-    logging.info("skip by soft-dup: %s", skey)
-    return
-
-  # 分類處理
-  if mtype == "absence.flow_cc_node":
-    attrs = it.get("attributes") or {}
-    flow_id = attrs.get("flow_id")
-    if not flow_id:
-      # fallback: 就發原始內容
-      body, atts = render_content(it.get("content") or "")
-      tg.send(f"📝 收到一条请假抄送\n\n{body}")
-      for a in atts:
-        url = a.get("url") or ""
-        if not url:
-          continue
-        data, fname = seiue.download(url)
-        if data:
-          tg.send_doc(data, fname, "請假附件")
-    else:
-      flow_data = seiue.get_flow_details(int(flow_id))
-      ranges = None
-      if flow_data:
-        plugin_id = flow_data.get("school_plugin_id")
-        if plugin_id:
-          ranges = seiue.get_absence_range_stats(int(plugin_id), int(flow_id))
-      msg_html, form_atts = format_leave_card(flow_data or {}, ranges or [])
-      tg.send(msg_html)
-      # 表單附件
-      extra_atts = _absence_attachments_from_flow(flow_data or {})
-      for att in extra_atts:
-        try:
-          data, fname = seiue.download(att["url"])
-          if data:
-            tg.send_photo(data, att.get("name") or "請假附件")
-        except Exception as e:
-          logging.warning("send leave attachment fail: %s", e)
-  elif domain == "attendance" or mtype == "abnormal_attendance.guardian":
-    text = _format_attendance_notice(it)
-    tg.send(text)
-    avatar_url = _attendance_avatar_url(it)
-    if avatar_url:
-      try:
-        data, fname = seiue.download(avatar_url)
-        if data:
-          tg.send_photo(data, "考勤學生頭像")
-      except Exception as e:
-        logging.warning("send attendance avatar fail: %s", e)
-  elif mtype == "task.discussion_replied":
-    tg.send(_format_discussion_notice(it))
-  else:
-    body_html, atts = render_content(it.get("content") or "")
-    title = it.get("title") or "通知"
-    pub = fmt_time(it.get("published_at") or it.get("created_at") or "")
-    msg = f"📣 <b>{esc(title)}</b>\n\n{body_html}\n\n— 通知於 {pub}"
-    tg.send(msg)
-    for a in atts:
-      url = a.get("url") or ""
-      if not url:
-        continue
-      data, fname = seiue.download(url)
-      if data:
-        if a.get("type") == "image":
-          tg.send_photo(data, fname)
-        else:
-          tg.send_doc(data, fname, "附件")
-
-  mark_seen(state, gkey, pub_ts)
-  mark_seen(state, skey, pub_ts)
-
-def handle_one_system(it:dict, tg:Telegram, seiue:Seiue, state:dict):
-  # 目前系統消息不多做，維持原來邏輯：渲染 content
-  body_html, atts = render_content(it.get("content") or "")
-  title = it.get("title") or "消息"
-  pub = fmt_time(it.get("published_at") or it.get("created_at") or "")
-  msg = f"💡 <b>{esc(title)}</b>\n\n{body_html}\n\n— 收到於 {pub}"
-  tg.send(msg)
-  for a in atts:
-    url = a.get("url") or ""
-    if not url:
-      continue
-    data, fname = seiue.download(url)
+def _send_attachments_from_content(tg:"Telegram", cli:"Seiue", it:Dict[str,Any])->None:
+  _, atts = render_content(it.get("content") or "")
+  imgs = [a for a in atts if a.get("type")=="image" and a.get("url")]
+  fils = [a for a in atts if a.get("type")=="file" and a.get("url")]
+  for a in imgs:
+    data,_ = cli.download(a["url"])
+    if data: tg.send_photo(data, "")
+  for a in fils:
+    data,name = cli.download(a["url"])
     if data:
-      if a.get("type") == "image":
-        tg.send_photo(data, fname)
-      else:
-        tg.send_doc(data, fname, "附件")
-  pub_ts = parse_ts(it.get("published_at") or it.get("created_at") or "") or time.time()
-  gkey = global_key(it)
-  skey = soft_dup_key(it, pub_ts)
-  mark_seen(state, gkey, pub_ts)
-  mark_seen(state, skey, pub_ts)
+      cap = f"📎 <b>{esc(a.get('name') or name)}</b>"
+      if a.get("size"): cap += f"（{esc(a['size'])}）"
+      tg.send_doc(data, (a.get("name") or name), cap)
+
+def _send_fallback(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str="", reason:str="")->bool:
+  title = (it.get("title") or "") + reason
+  content = it.get("content") or ""
+  body, _ = render_content(content)
+  kind, tag = classify(title, body)
+  src = sender_name(it)
+
+  summary = ""
+  custom_prefix = ""
+  if ch == "system" and is_leave(title, body) and (bool(it.get("is_cc")) or str(it.get("is_cc")).lower()=="true"):
+    # 很保守的請假摘要
+    summary = ""
+    custom_prefix = "【請假】收到一條請假抄送\n"
+
+  if kind == "attendance":
+    att = extract_attendance_summary(it)
+    if att: summary = att + "\n\n" + summary
+
+  hdr = f"📩 <b>{'通知中心' if ch=='notice' else '系統消息'}</b>｜<b>{esc(src)}</b>\n"
+  t = it.get("published_at") or it.get("created_at") or ""
+  prefix_text = custom_prefix if custom_prefix else tag
+  msg = f"{hdr}\n{prefix}{prefix_text}<b>{esc(title)}</b>\n\n{summary}{body}".rstrip()
+  msg += f"\n\n— 發佈於 {fmt_time(t)}"
+
+  ok = tg.send(msg)
+  _send_attachments_from_content(tg, cli, it)
+  return ok
+
+def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str="")->bool:
+  domain = it.get("domain") or ""
+  msg_type = it.get("type") or ""
+  attrs = it.get("attributes") or {}
+
+  # 【請假】帶 flow/absence 的
+  if domain == "leave_flow" and msg_type == "absence.flow_cc_node":
+    flow_id = attrs.get("flow_id")
+    absence_id = attrs.get("absence_id")
+    try:
+      flow_data = cli.get_flow_details(int(flow_id)) if flow_id else None
+      abs_data = cli.get_absence_by_id(int(absence_id)) if absence_id else None
+      if flow_data or abs_data:
+        html_msg = _format_detailed_leave_message(it, flow_data, abs_data)
+        if prefix: html_msg = f"{prefix}\n{html_msg}"
+        ok = tg.send(html_msg)
+        # 1) 發消息里的附件
+        _send_attachments_from_content(tg, cli, it)
+        # 2) 再發 flow 裡的 absence_attachments
+        flow_atts = _extract_flow_attachments(flow_data)
+        for fa in flow_atts:
+          _try_send_url_as_photo_or_doc(tg, fa["url"], fa["name"])
+        return ok
+    except Exception as e:
+      logging.error("leave_flow enhanced failed: %s", e, exc_info=True)
+      return _send_fallback(tg, cli, it, ch, prefix, " (請假詳情失敗)")
+
+  # 【任務回覆】
+  if domain == "task" and msg_type == "task.discussion_replied":
+    html_msg = _format_discussion_notice(it)
+    if prefix: html_msg = f"{prefix}\n{html_msg}"
+    ok = tg.send(html_msg)
+    _send_attachments_from_content(tg, cli, it)
+    return ok
+
+  # 【考勤】帶 guardian 的
+  if domain == "attendance" and msg_type == "abnormal_attendance.guardian":
+    html_msg = _format_attendance_notice(it)
+    if prefix: html_msg = f"{prefix}\n{html_msg}"
+    ok = tg.send(html_msg)
+    # 先發頭像
+    _maybe_download_attendance_avatar(tg, attrs)
+    # 再發訊息裡的附件
+    _send_attachments_from_content(tg, cli, it)
+    return ok
+
+  # 其他都走 fallback
+  return _send_fallback(tg, cli, it, ch, prefix)
 
 def main_loop():
-  if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    logging.error("缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID，退出。")
-    sys.exit(1)
-  if not SEIUE_USERNAME or not SEIUE_PASSWORD:
-    logging.error("缺少 SEIUE_USERNAME 或 SEIUE_PASSWORD，退出。")
-    sys.exit(1)
-
-  lock_fd = acquire_lock_or_exit()
-  tg = Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-  seiue = Seiue(SEIUE_USERNAME, SEIUE_PASSWORD)
-  if not seiue.login():
-    logging.error("初次登入失敗，退出")
-    sys.exit(1)
-
-  ensure_startup_watermark(seiue)
+  if not (SEIUE_USERNAME and SEIUE_PASSWORD and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+    print("缺少必要環境變量。", file=sys.stderr); sys.exit(1)
+  _lock=acquire_lock_or_exit()
+  tg=Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+  cli=Seiue(SEIUE_USERNAME, SEIUE_PASSWORD)
+  if not cli.login(): print("Seiue 登錄失敗", file=sys.stderr); sys.exit(2)
+  ensure_startup_watermark(cli)
 
   if SEND_TEST_ON_START:
-    tg.send(f"🤖 Seiue 通知監聽已啟動。\n版本：{esc(SIDE_VERSION)}")
+    st = load_state()
+    for ch in ("system","notice"):
+      it=latest_of_channel(cli, ch)
+      if it:
+        try: send_one(tg, cli, it, ch, prefix=f"🧪 <b>安裝驗證</b>｜{SIDE_VERSION}｜")
+        except Exception as e: logging.error("test send error(%s): %s", ch, e)
+        t = it.get("published_at") or it.get("created_at") or ""
+        st["seen_global"][global_key(it)] = parse_ts(t) or time.time()
+    save_state(st)
 
+  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system，全量直推），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}，版本={os.getenv('SIDE_VERSION','v2.5.0-tele-attach')}")
   while True:
     try:
-      st = load_state()
-      # NOTICE
-      notice_items = seiue.list_notice(MAX_LIST_PAGES)
-      notice_items.sort(key=lambda x: parse_ts(x.get("published_at") or x.get("created_at") or ""), reverse=False)
-      for it in notice_items:
-        pub_ts = parse_ts(it.get("published_at") or it.get("created_at") or "") or time.time()
-        # 只處理新於水位線的
-        w = st["watermark"]["notice"]
-        if pub_ts+0.001 <= w["ts"]:
+      st=load_state()
+      pending=list_increment_dual(cli)
+      for ch,it,ts,nid in pending:
+        gkey = global_key(it)
+        if gkey in st["seen_global"]:
           continue
-        handle_one_notice(it, tg, seiue, st)
-        st["watermark"]["notice"] = {"ts": pub_ts, "id": it.get("id") or 0}
-
-      # SYSTEM
-      sys_items = seiue.list_system(2)
-      sys_items.sort(key=lambda x: parse_ts(x.get("published_at") or x.get("created_at") or ""), reverse=False)
-      for it in sys_items:
-        pub_ts = parse_ts(it.get("published_at") or it.get("created_at") or "") or time.time()
-        w = st["watermark"]["system"]
-        if pub_ts+0.001 <= w["ts"]:
+        if ts < HARD_CUTOFF_TS:
+          st["seen_global"][gkey]=ts
+          wm=st["watermark"][ch]
+          if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
+          save_state(st)
           continue
-        handle_one_system(it, tg, seiue, st)
-        st["watermark"]["system"] = {"ts": pub_ts, "id": it.get("id") or 0}
+        sKey = soft_dup_key(it, ts)
+        if sKey in st["seen_global"]:
+          continue
 
-      save_state(st)
-
+        ok=send_one(tg, cli, it, ch)
+        if ok:
+          st["seen_global"][gkey]=ts
+          st["seen_global"][sKey]=ts
+          if len(st["seen_global"]) > 22000:
+            oldest = sorted(st["seen_global"].items(), key=lambda kv: kv[1])[:6000]
+            for k, _ in oldest: st["seen_global"].pop(k, None)
+          wm=st["watermark"][ch]
+          if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
+          save_state(st)
+      time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+      print(f"{datetime.now().strftime('%F %T')} 收到中斷，退出"); break
     except Exception as e:
-      logging.error("主循環錯誤: %s", e, exc_info=True)
-    time.sleep(POLL_SECONDS)
+      logging.error("loop error: %s", e); time.sleep(3)
 
-if __name__ == "__main__":
+if __name__=="__main__":
+  os.environ["SIDE_VERSION"] = "v2.5.0-tele-attach"
   main_loop()
 PY
-  chmod +x "$PY_SCRIPT"
+  chmod 755 "$PY_SCRIPT"
 }
 
-write_unit(){
+write_service(){
   cat >"$UNIT_FILE" <<EOF
 [Unit]
-Description=Seiue -> Telegram notifier
-After=network.target
+Description=Seiue → Telegram notifier (${SIDE_VERSION})
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=simple
 User=root
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$VENV_DIR/bin/python $PY_SCRIPT
-Restart=always
-RestartSec=5
-StandardOutput=append:$OUT_LOG
-StandardError=append:$ERR_LOG
+WorkingDirectory=${INSTALL_DIR}
+EnvironmentFile=${ENV_FILE}
 Environment=PYTHONUNBUFFERED=1
+Environment=SIDE_VERSION=${SIDE_VERSION}
+
+ExecStartPre=-/usr/bin/pkill -TERM -f seiue_notify.py
+ExecStartPre=-/usr/bin/pkill -KILL -f seiue_notify.py
+ExecStartPre=-/usr/bin/pkill -f run.sh
+ExecStartPre=-/usr/bin/rm -f ${INSTALL_DIR}/.notify.lock
+
+ExecStart=${VENV_DIR}/bin/python3 -u ${PY_SCRIPT}
+
+Restart=always
+RestartSec=5s
+StandardOutput=append:${OUT_LOG}
+StandardError=append:${ERR_LOG}
 
 [Install]
 WantedBy=multi-user.target
 EOF
-}
-
-enable_service(){
-  info "重載 systemd…"
   systemctl daemon-reload
-  systemctl enable seiue-notify.service >/dev/null 2>&1 || true
-  systemctl restart seiue-notify.service || true
-  success "seiue-notify 已啟動（systemd）"
 }
 
-main(){
-  preflight
-  ensure_dirs
-  cleanup_legacy
-  collect_env_if_needed
-  ensure_env_defaults
-  setup_venv
-  write_python
-  write_unit
-  enable_service
-  success "安裝完成，版本：seiue-notify v2.4.4-fix+leave-tele+attendance-avatar"
-  echo "日誌：$OUT_LOG / $ERR_LOG"
+start_service(){
+  mkdir -p "$LOG_DIR"; touch "$OUT_LOG" "$ERR_LOG"
+  systemctl enable --now seiue-notify
 }
 
-main "$@"
-SH
+info "開始安裝 ${SIDE_VERSION} …"
+preflight
+ensure_dirs
+cleanup_legacy
+collect_env_if_needed
+ensure_env_defaults
+setup_venv
+write_python
+write_service
+
+info "重啟服務…"
+systemctl restart seiue-notify || true
+
+success "已安裝/升級為 ${SIDE_VERSION}"
+
+echo
+echo "=== systemctl status（前30行） ==="
+systemctl status seiue-notify --no-pager -l | sed -n '1,30p' || true
+
+echo
+echo "=== 最近日誌（120行） ==="
+journalctl -u seiue-notify -n 120 --no-pager -l || true
+
+echo
+echo "=== 目前 ExecStart ==="
+systemctl show -p ExecStart seiue-notify
+
+echo
+echo "完成。現在到 Telegram 看有沒有一條「🧪 安裝驗證｜v2.5.0-tele-attach｜…」的消息。"
