@@ -5,12 +5,12 @@
 # - install/update /opt/ytweb
 # - Flask backend (progress API)
 # - 8h auto cleanup (in-app thread)
-# - nginx + certbot for bdfz.cloudns.org
+# - nginx + certbot for xz.bdfz.net
 # - kill old processes / overwrite previous install
 
 set -euo pipefail
 
-DOMAIN="bdfz.cloudns.org"
+DOMAIN="xz.bdfz.net"
 APP_DIR="/opt/ytweb"
 VENV_DIR="$APP_DIR/venv"
 RUN_USER="www-data"
