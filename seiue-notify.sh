@@ -436,6 +436,67 @@ class Seiue:
     return b"",""
 
   def get_student_detail(self, sid:int)->Optional[dict]:
+  def _search_student_by_name(self, name: str) -> Optional[int]:
+    """
+    搜索學生名，返回最合適的 student_id (biz_id)
+    """
+    import os
+    try:
+      semester_id = os.getenv("SEIUE_SEMESTER_ID", "61564")
+      # 這個 biz_type_in 列表和你桌面 photo 腳本一樣
+      biz_type_in = [
+        "student", "reflection", "pupil", "owner", "user", "student_reflection", "student_user"
+      ]
+      url = "https://api.seiue.com/chalk/search/items"
+      params = {
+        "type_in": "reflection",
+        "biz_type_in": ",".join(biz_type_in),
+        "semester_id": semester_id,
+        "q": name,
+        "expand": "user,guardians,grade"
+      }
+      r = self.s.get(url, params=params, timeout=20)
+      if r.status_code != 200:
+        return None
+      data = r.json()
+      items = data.get("items") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+      if not items:
+        return None
+      # 精確優先
+      name = (name or "").strip()
+      def get_name(x):
+        # 各種可能的名字字段
+        return (x.get("name") or x.get("nickname") or x.get("title") or "").strip()
+      exact = [x for x in items if get_name(x) == name]
+      if exact:
+        return int(exact[0].get("biz_id") or 0) or None
+      starts = [x for x in items if get_name(x).startswith(name)]
+      if starts:
+        return int(starts[0].get("biz_id") or 0) or None
+      contains = [x for x in items if name in get_name(x)]
+      if contains:
+        return int(contains[0].get("biz_id") or 0) or None
+      # fallback: 第一個 student
+      for x in items:
+        if x.get("biz_id"):
+          try:
+            return int(x["biz_id"])
+          except Exception:
+            continue
+      return None
+    except Exception as e:
+      import logging
+      logging.warning("_search_student_by_name(%r) failed: %s", name, e)
+      return None
+
+  def get_student_by_name(self, name: str) -> Optional[dict]:
+    """
+    用名字查學生詳細資料
+    """
+    sid = self._search_student_by_name(name)
+    if not sid:
+      return None
+    return self.get_student_detail(sid)
     try:
       url=f"https://api.seiue.com/chalk/reflection/students/{sid}/rid/{self.reflection}?expand=guardians,grade,user"
       r=self.s.get(url, timeout=30)
@@ -700,7 +761,26 @@ def _maybe_download_attendance_avatar(tg:"Telegram", cli:"Seiue", attrs:dict):
           if data:
             tg.send_photo(data, "學生頭像")
             return
-  # 真沒 id 才走舊的猜 url（這個可能點不開，但這時候我們已經沒辦法了）
+  # 新增：用名字查找學生
+  name_str = attrs.get("student_name") or attrs.get("name") or ""
+  if not name_str:
+    # 嘗試從 title/raw_title 提取
+    for k in ("title", "raw_title"):
+      t = attrs.get(k)
+      if t and "同学" in t:
+        idx = t.find("同学")
+        if idx > 0:
+          name_str = t[:idx].strip()
+          break
+  if name_str:
+    stu = cli.get_student_by_name(name_str.strip())
+    if stu and (stu.get("photo") or stu.get("avatar")):
+      key = stu.get("photo") or stu.get("avatar")
+      data, name = cli.download_student_photo_like_client(key)
+      if data:
+        tg.send_photo(data, "學生頭像")
+        return
+  # 真沒 id/name 才走舊的猜 url（這個可能點不開，但這時候我們已經沒辦法了）
   photo = attrs.get("photo") or ""
   if not photo or len(photo) < 8:
     return
