@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - 安裝/升級腳本
-# 版本：v2.5.1-avatar
+# 版本：v2.5.2-avatar-fix
 # 特性：
 # - 安裝時顯示版本，不再靜默
 # - 三斬：停舊服務 + pkill 舊 py + 禁用舊 run.sh + 清鎖
 # - 強制覆蓋 systemd unit
-# - Python 腳本包含：請假 flow 拉詳情、attendance guardian 封面、消息附件透傳、考勤頭像 best-effort
-# - 安裝完直接顯示 systemd 和日誌，方便確認是否新版本
+# - Python 腳本包含：請假 flow 拉詳情、attendance guardian 封面、消息附件透傳、考勤頭像 best-effort（這次把下載函式補上）
+# - 拉取時同時兼容 _id / id，不再因為接口給 _id 漏發
+# - 預設不再快轉，水位保守，日誌可看出版本
 # - 啟動後會發一條 🧪 測試到 Telegram
 set -euo pipefail
 
-SIDE_VERSION="v2.5.1-avatar"
+SIDE_VERSION="v2.5.2-avatar-fix"
 
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
 info(){ echo -e "${C_BLUE}INFO:${C_RESET} $1"; }
@@ -87,7 +88,7 @@ TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 
 # 可選項（均有合理默認）：
 NOTIFY_POLL_SECONDS=${POLL}
-MAX_LIST_PAGES=10
+MAX_LIST_PAGES=30
 READ_FILTER=unread
 INCLUDE_CC=true
 SKIP_HISTORY_ON_FIRST_RUN=1
@@ -95,9 +96,9 @@ TELEGRAM_MIN_INTERVAL_SECS=1.5
 NOTICE_EXCLUDE_NOISE=0
 SEND_TEST_ON_START=1
 
-# 反歷史 + 去重策略（可改）：
-FAST_FORWARD_ON_START=1
-HARD_CUTOFF_MINUTES=360
+# 反歷史 + 去重策略（這版改成保守）：
+FAST_FORWARD_ON_START=0
+HARD_CUTOFF_MINUTES=1440
 SOFT_DUP_WINDOW_SECS=1800
 EOF
   chmod 600 "$ENV_FILE"
@@ -107,12 +108,13 @@ ensure_env_defaults(){
   [ -f "$ENV_FILE" ] || return 0
   _set_if_missing(){ grep -qE "^$1=" "$ENV_FILE" || printf "%s=%s\n" "$1" "$2" >>"$ENV_FILE"; }
   _set_if_missing READ_FILTER unread
-  _set_if_missing FAST_FORWARD_ON_START 1
-  _set_if_missing HARD_CUTOFF_MINUTES 360
+  _set_if_missing FAST_FORWARD_ON_START 0
+  _set_if_missing HARD_CUTOFF_MINUTES 1440
   _set_if_missing SOFT_DUP_WINDOW_SECS 1800
   _set_if_missing INCLUDE_CC true
   _set_if_missing NOTICE_EXCLUDE_NOISE 0
   _set_if_missing SEND_TEST_ON_START 1
+  _set_if_missing MAX_LIST_PAGES 30
 }
 
 setup_venv(){
@@ -132,7 +134,7 @@ write_python(){
 # -*- coding: utf-8 -*-
 """
 Seiue → Telegram notifier
-版本: v2.5.1-avatar
+版本: v2.5.2-avatar-fix
 """
 import os, sys, time, json, html, fcntl, logging, hashlib, re
 from typing import Dict, Any, List, Tuple, Optional
@@ -155,7 +157,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","")
 
 POLL_SECONDS = int(os.getenv("NOTIFY_POLL_SECONDS","90") or "90")
-MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES","10") or "10"), 20))
+MAX_LIST_PAGES = max(1, min(int(os.getenv("MAX_LIST_PAGES","30") or "30"), 40))
 READ_FILTER = (os.getenv("READ_FILTER","unread").strip().lower())
 INCLUDE_CC = os.getenv("INCLUDE_CC","true").strip().lower() in ("1","true","yes","on")
 SKIP_HISTORY_ON_FIRST_RUN = os.getenv("SKIP_HISTORY_ON_FIRST_RUN","1").strip().lower() in ("1","true","yes","on")
@@ -163,8 +165,8 @@ TELEGRAM_MIN_INTERVAL = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECS","1.5") or "
 NOTICE_EXCLUDE_NOISE = os.getenv("NOTICE_EXCLUDE_NOISE","0").strip().lower() in ("1","true","yes","on")
 SEND_TEST_ON_START = os.getenv("SEND_TEST_ON_START","1").strip().lower() in ("1","true","yes","on")
 
-FAST_FORWARD_ON_START = os.getenv("FAST_FORWARD_ON_START","1").strip().lower() in ("1","true","yes","on")
-HARD_CUTOFF_MINUTES  = int(os.getenv("HARD_CUTOFF_MINUTES","360") or "360")
+FAST_FORWARD_ON_START = os.getenv("FAST_FORWARD_ON_START","0").strip().lower() in ("1","true","yes","on")
+HARD_CUTOFF_MINUTES  = int(os.getenv("HARD_CUTOFF_MINUTES","1440") or "1440")
 SOFT_DUP_WINDOW_SECS = int(os.getenv("SOFT_DUP_WINDOW_SECS","1800") or "1800")
 
 BEIJING_TZ = pytz.timezone("Asia/Shanghai")
@@ -229,9 +231,23 @@ def acquire_lock_or_exit():
   except OSError:
     logging.error("已有實例運行，本實例退出。"); sys.exit(0)
 
+def normalize_id(raw: Any) -> int:
+  """兼容 _id / id，不管是純數字還是 mongo樣字串，最後都變成可排序的int。"""
+  if raw is None:
+    return 0
+  s = str(raw)
+  if s.isdigit():
+    try:
+      return int(s)
+    except:
+      return 0
+  # 非純數字，就對字串做個穩定 hash
+  return int(hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()[:8], 16)
+
 def global_key(it: dict) -> str:
-  nid = str(it.get("id") or "")
-  if nid: return f"id:{nid}"
+  nid = it.get("_id") or it.get("id") or ""
+  if nid:
+    return f"id:{nid}"
   title = it.get("title") or ""
   t = it.get("published_at") or it.get("created_at") or ""
   src = (it.get("sender_reflection") or {}).get("id") or ""
@@ -499,8 +515,8 @@ def ensure_startup_watermark(cli:"Seiue"):
       it=latest_of_channel(cli, ch)
       if it:
         ts=parse_ts(it.get("published_at") or it.get("created_at") or "") or START_TS
-        try: mid=int(str(it.get("id") or "0"))
-        except: mid=0
+        raw_id = it.get("_id") or it.get("id") or "0"
+        mid = normalize_id(raw_id)
       else:
         ts=START_TS; mid=0
       st["watermark"][ch]={"ts":ts,"id":mid}; changed=True
@@ -515,41 +531,28 @@ def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
     arr = cli.list_system(MAX_LIST_PAGES) if ch=="system" else cli.list_notice(MAX_LIST_PAGES)
     for it in arr:
       t=it.get("published_at") or it.get("created_at") or ""; ts=parse_ts(t) if t else 0.0
-      try: nid=int(str(it.get("id") or "0"))
-      except: nid=0
+      raw_id = it.get("_id") or it.get("id") or "0"
+      nid = normalize_id(raw_id)
       if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)):
         continue
       pending.append((ch,it,ts,nid))
   pending.sort(key=lambda x:(x[2], x[3])); return pending
 
-def _extract_flow_attachments(flow_data: Optional[dict]) -> List[Dict[str,str]]:
-  atts = []
-  if not flow_data:
-    return atts
-  for fv in flow_data.get("field_values") or []:
-    fn = fv.get("field_name") or ""
-    if "attachment" in fn or "attachments" in fn:
-      val = fv.get("value")
-      if isinstance(val, list):
-        for item in val:
-          h = item.get("hash")
-          mime = item.get("mime")
-          name = item.get("name")
-          if h and mime and name:
-            atts.append({"hash": h, "mime": mime, "name": name})
-  return atts
-
-def _try_send_url_as_photo_or_doc(tg:"Telegram", url:str, name:str="附件")->None:
+def _download_oss_signed_image(url: str) -> Optional[bytes]:
+  """針對你貼的那種帶 OSSAccessKeyId/Expires/Signature 的 url，走一遍就好。"""
+  headers = {
+    "Host": "oss-seiue-attachment.seiue.com",
+    "Referer": "https://chalk-c3.seiue.com/",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+  }
   try:
-    r = requests.get(url, timeout=40)
+    r = requests.get(url, headers=headers, timeout=25)
     if r.status_code == 200:
-      data = r.content
-      if name.lower().endswith((".jpg",".jpeg",".png",".gif")):
-        tg.send_photo(data, esc(name))
-      else:
-        tg.send_doc(data, name, esc(name))
+      return r.content
   except Exception as e:
-    logging.warning("Send flow attachment failed %s: %s", url, e)
+    logging.warning("oss image fetch failed %s: %s", url, e)
+  return None
 
 def _format_detailed_leave_message(original: dict,
                                    flow_data: Optional[dict],
@@ -662,7 +665,6 @@ def _maybe_download_attendance_avatar(tg: "Telegram", attrs: dict):
     if not photo or len(photo) < 5:
         return
 
-    # 1) 已經是前端給的完整簽名 OSS
     if photo.startswith("https://oss-seiue-attachment.seiue.com/"):
         data = _download_oss_signed_image(photo)
         if data:
@@ -671,7 +673,6 @@ def _maybe_download_attendance_avatar(tg: "Telegram", attrs: dict):
             tg.send(f"📷 學生頭像：{photo}")
         return
 
-    # 2) 只是一個 filename，我們照舊猜路徑
     base_name = photo.split("/")[-1]
     p1 = base_name[0:2]
     p2 = base_name[2:4]
@@ -774,7 +775,6 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     html_msg = _format_attendance_notice(it)
     if prefix: html_msg = f"{prefix}\n{html_msg}"
     ok = tg.send(html_msg)
-    # 這裡是這次唯一的功能新增：考勤時順便拿頭像
     _maybe_download_attendance_avatar(tg, attrs)
     _send_attachments_from_content(tg, cli, it)
     return ok
@@ -795,13 +795,13 @@ def main_loop():
     for ch in ("system","notice"):
       it=latest_of_channel(cli, ch)
       if it:
-        try: send_one(tg, cli, it, ch, prefix=f"🧪 <b>安裝驗證</b>｜v2.5.1-avatar｜")
+        try: send_one(tg, cli, it, ch, prefix=f"🧪 <b>安裝驗證</b>｜v2.5.2-avatar-fix｜")
         except Exception as e: logging.error("test send error(%s): %s", ch, e)
         t = it.get("published_at") or it.get("created_at") or ""
         st["seen_global"][global_key(it)] = parse_ts(t) or time.time()
     save_state(st)
 
-  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system，全量直推），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}，版本={os.getenv('SIDE_VERSION','v2.5.1-avatar')}")
+  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system，全量直推），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}，版本={os.getenv('SIDE_VERSION','v2.5.2-avatar-fix')}")
   while True:
     try:
       st=load_state()
@@ -837,7 +837,7 @@ def main_loop():
       logging.error("loop error: %s", e); time.sleep(3)
 
 if __name__=="__main__":
-  os.environ["SIDE_VERSION"] = "v2.5.1-avatar"
+  os.environ["SIDE_VERSION"] = "v2.5.2-avatar-fix"
   main_loop()
 PY
   chmod 755 "$PY_SCRIPT"
@@ -908,4 +908,4 @@ echo "=== 目前 ExecStart ==="
 systemctl show -p ExecStart seiue-notify
 
 echo
-echo "完成。現在到 Telegram 看有沒有一條「🧪 安裝驗證｜v2.5.1-avatar｜…」的消息。"
+echo "完成。現在到 Telegram 看有沒有一條「🧪 安裝驗證｜v2.5.2-avatar-fix｜…」的消息。"
