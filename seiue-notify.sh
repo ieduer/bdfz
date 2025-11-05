@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - 安裝/升級腳本
-# 版本：v2.5.0-tele-attach
+# 版本：v2.5.1-avatar
 # 特性：
 # - 安裝時顯示版本，不再靜默
 # - 三斬：停舊服務 + pkill 舊 py + 禁用舊 run.sh + 清鎖
 # - 強制覆蓋 systemd unit
-# - Python 腳本包含：請假 flow 拉詳情、attendance guardian 封面、消息附件透傳
+# - Python 腳本包含：請假 flow 拉詳情、attendance guardian 封面、消息附件透傳、考勤頭像 best-effort
 # - 安裝完直接顯示 systemd 和日誌，方便確認是否新版本
 # - 啟動後會發一條 🧪 測試到 Telegram
 set -euo pipefail
 
-SIDE_VERSION="v2.5.0-tele-attach"
+SIDE_VERSION="v2.5.1-avatar"
 
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
 info(){ echo -e "${C_BLUE}INFO:${C_RESET} $1"; }
@@ -132,7 +132,7 @@ write_python(){
 # -*- coding: utf-8 -*-
 """
 Seiue → Telegram notifier
-版本: v2.5.0-tele-attach
+版本: v2.5.1-avatar
 """
 import os, sys, time, json, html, fcntl, logging, hashlib, re
 from typing import Dict, Any, List, Tuple, Optional
@@ -523,25 +523,20 @@ def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
   pending.sort(key=lambda x:(x[2], x[3])); return pending
 
 def _extract_flow_attachments(flow_data: Optional[dict]) -> List[Dict[str,str]]:
-  # 從工作流裡找類似 absence_attachments 的欄位
-  atts=[]
-  if not flow_data: return atts
+  atts = []
+  if not flow_data:
+    return atts
   for fv in flow_data.get("field_values") or []:
     fn = fv.get("field_name") or ""
     if "attachment" in fn or "attachments" in fn:
       val = fv.get("value")
       if isinstance(val, list):
         for item in val:
-          h = item.get("hash") or ""
-          mime = item.get("mime") or "image/jpeg"
-          name = item.get("name") or "附件"
-          if len(h) >= 4:
-            # 估一下 OSS 路徑，通常是 attachment/xx/yy/hash.ext
-            ext = "jpg"
-            if "png" in mime: ext = "png"
-            elif "pdf" in mime: ext = "pdf"
-            url = f"https://oss-seiue-attachment.seiue.com/attachment/{h[0:2]}/{h[2:4]}/{h}.{ext}"
-            atts.append({"url": url, "name": name})
+          h = item.get("hash")
+          mime = item.get("mime")
+          name = item.get("name")
+          if h and mime and name:
+            atts.append({"hash": h, "mime": mime, "name": name})
   return atts
 
 def _try_send_url_as_photo_or_doc(tg:"Telegram", url:str, name:str="附件")->None:
@@ -558,7 +553,8 @@ def _try_send_url_as_photo_or_doc(tg:"Telegram", url:str, name:str="附件")->No
 
 def _format_detailed_leave_message(original: dict,
                                    flow_data: Optional[dict],
-                                   absence_data: Optional[dict]) -> str:
+                                   absence_data: Optional[dict],
+                                   flow_attachments: Optional[List[dict]] = None) -> str:
   title = original.get("title") or "收到一條請假抄送"
   student_name = "N/A"
   student_class = "N/A"
@@ -570,7 +566,6 @@ def _format_detailed_leave_message(original: dict,
       cls = refs[0].get("admin_classes") or []
       if cls: student_class = cls[0]
 
-  # 再從 flow 裡補學生名稱：initiator.name
   if student_name == "N/A" and flow_data:
     student_name = (flow_data.get("initiator") or {}).get("name") or student_name
 
@@ -582,7 +577,6 @@ def _format_detailed_leave_message(original: dict,
   if absence_data and absence_data.get("reason"):
     reason = absence_data["reason"]
   elif flow_data:
-    # 到 flow 裡找 absence_reason
     for fv in flow_data.get("field_values") or []:
       if fv.get("field_name") in ("absence_reason","lego_field_m1fqffbp9xuxo"):
         reason = fv.get("value") or reason
@@ -638,6 +632,17 @@ def _format_detailed_leave_message(original: dict,
     f"{flow_hdr}{'\n'.join(flow_lines) if flow_lines else ''}\n\n"
     f"— 抄送於 {pub}"
   )
+  if flow_attachments:
+      msg += "\n<b>附件</b>：\n"
+      for a in flow_attachments:
+          h = a.get("hash") or ""
+          name = a.get("name") or "附件"
+          if h:
+              prefix1, prefix2 = h[0:2], h[2:4]
+              url = f"https://oss-seiue-attachment.seiue.com/attachment/{prefix1}/{prefix2}/{h}"
+              msg += f"• {name} 👉 {url}\n"
+          else:
+              msg += f"• {name}\n"
   return msg
 
 def _format_discussion_notice(original: dict) -> str:
@@ -654,14 +659,32 @@ def _format_discussion_notice(original: dict) -> str:
 
 def _maybe_download_attendance_avatar(tg:"Telegram", attrs:dict):
   photo = attrs.get("photo") or ""
-  if not photo or len(photo) < 8:
+  if not photo or len(photo) < 5:
     return
-  # 前端的格式是 user/d0/e3/<photo>...，我們猜公共路徑：
-  base_name = photo
-  p1 = base_name[0:2]
-  p2 = base_name[2:4]
-  url = f"https://oss-seiue-attachment.seiue.com/user/{p1}/{p2}/{base_name}"
-  _try_send_url_as_photo_or_doc(tg, url, "學生頭像")
+  # 如果前端直接給了完整簽名鏈接，就用那個
+  if photo.startswith("http://") or photo.startswith("https://"):
+    url = photo
+  else:
+    # 有些會帶 query 的 filename.jpg?... 這裡也先當成完整 path
+    if photo.endswith(".jpg") or photo.endswith(".jpeg") or photo.endswith(".png") or "?" in photo:
+      # 這時候沒法從前端拿 key，我們直接拼 user/{00}/{11}/... 這條公開猜測路徑
+      base_name = photo.split("/")[-1]
+      p1 = base_name[0:2]
+      p2 = base_name[2:4]
+      url = f"https://oss-seiue-attachment.seiue.com/user/{p1}/{p2}/{base_name}"
+    else:
+      # 萬一是奇怪的字段，就不要報錯，直接丟文字
+      tg.send(f"📷 學生頭像（原始）：{esc(photo)}")
+      return
+  try:
+    r = requests.get(url, timeout=20)
+    if r.status_code == 200 and r.content:
+      tg.send_photo(r.content, "學生頭像")
+    else:
+      tg.send(f"📷 學生頭像：{url}")
+  except Exception:
+    # 網路/證書/OSS 限制都給文字 fallback
+    tg.send(f"📷 學生頭像：{url}")
 
 def _format_attendance_notice(original: dict) -> str:
   attrs = original.get("attributes") or {}
@@ -705,7 +728,6 @@ def _send_fallback(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:
   summary = ""
   custom_prefix = ""
   if ch == "system" and is_leave(title, body) and (bool(it.get("is_cc")) or str(it.get("is_cc")).lower()=="true"):
-    # 很保守的請假摘要
     summary = ""
     custom_prefix = "【請假】收到一條請假抄送\n"
 
@@ -728,29 +750,23 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
   msg_type = it.get("type") or ""
   attrs = it.get("attributes") or {}
 
-  # 【請假】帶 flow/absence 的
   if domain == "leave_flow" and msg_type == "absence.flow_cc_node":
     flow_id = attrs.get("flow_id")
     absence_id = attrs.get("absence_id")
     try:
       flow_data = cli.get_flow_details(int(flow_id)) if flow_id else None
       abs_data = cli.get_absence_by_id(int(absence_id)) if absence_id else None
+      flow_atts = _extract_flow_attachments(flow_data)
       if flow_data or abs_data:
-        html_msg = _format_detailed_leave_message(it, flow_data, abs_data)
+        html_msg = _format_detailed_leave_message(it, flow_data, abs_data, flow_attachments=flow_atts)
         if prefix: html_msg = f"{prefix}\n{html_msg}"
         ok = tg.send(html_msg)
-        # 1) 發消息里的附件
         _send_attachments_from_content(tg, cli, it)
-        # 2) 再發 flow 裡的 absence_attachments
-        flow_atts = _extract_flow_attachments(flow_data)
-        for fa in flow_atts:
-          _try_send_url_as_photo_or_doc(tg, fa["url"], fa["name"])
         return ok
     except Exception as e:
       logging.error("leave_flow enhanced failed: %s", e, exc_info=True)
       return _send_fallback(tg, cli, it, ch, prefix, " (請假詳情失敗)")
 
-  # 【任務回覆】
   if domain == "task" and msg_type == "task.discussion_replied":
     html_msg = _format_discussion_notice(it)
     if prefix: html_msg = f"{prefix}\n{html_msg}"
@@ -758,18 +774,15 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     _send_attachments_from_content(tg, cli, it)
     return ok
 
-  # 【考勤】帶 guardian 的
   if domain == "attendance" and msg_type == "abnormal_attendance.guardian":
     html_msg = _format_attendance_notice(it)
     if prefix: html_msg = f"{prefix}\n{html_msg}"
     ok = tg.send(html_msg)
-    # 先發頭像
+    # 這裡是這次唯一的功能新增：考勤時順便拿頭像
     _maybe_download_attendance_avatar(tg, attrs)
-    # 再發訊息裡的附件
     _send_attachments_from_content(tg, cli, it)
     return ok
 
-  # 其他都走 fallback
   return _send_fallback(tg, cli, it, ch, prefix)
 
 def main_loop():
@@ -786,13 +799,13 @@ def main_loop():
     for ch in ("system","notice"):
       it=latest_of_channel(cli, ch)
       if it:
-        try: send_one(tg, cli, it, ch, prefix=f"🧪 <b>安裝驗證</b>｜{SIDE_VERSION}｜")
+        try: send_one(tg, cli, it, ch, prefix=f"🧪 <b>安裝驗證</b>｜v2.5.1-avatar｜")
         except Exception as e: logging.error("test send error(%s): %s", ch, e)
         t = it.get("published_at") or it.get("created_at") or ""
         st["seen_global"][global_key(it)] = parse_ts(t) or time.time()
     save_state(st)
 
-  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system，全量直推），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}，版本={os.getenv('SIDE_VERSION','v2.5.0-tele-attach')}")
+  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system，全量直推），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}，版本={os.getenv('SIDE_VERSION','v2.5.1-avatar')}")
   while True:
     try:
       st=load_state()
@@ -828,7 +841,7 @@ def main_loop():
       logging.error("loop error: %s", e); time.sleep(3)
 
 if __name__=="__main__":
-  os.environ["SIDE_VERSION"] = "v2.5.0-tele-attach"
+  os.environ["SIDE_VERSION"] = "v2.5.1-avatar"
   main_loop()
 PY
   chmod 755 "$PY_SCRIPT"
@@ -899,4 +912,4 @@ echo "=== 目前 ExecStart ==="
 systemctl show -p ExecStart seiue-notify
 
 echo
-echo "完成。現在到 Telegram 看有沒有一條「🧪 安裝驗證｜v2.5.0-tele-attach｜…」的消息。"
+echo "完成。現在到 Telegram 看有沒有一條「🧪 安裝驗證｜v2.5.1-avatar｜…」的消息。"
