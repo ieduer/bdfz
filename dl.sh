@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean
-# version: v0.2.0-2025-11-05
+# version: v0.2.1-2025-11-05
 # features:
 # - install/update /opt/ytweb
 # - Flask backend (progress API)
 # - 8h auto cleanup (in-app thread)
 # - nginx + certbot for xz.bdfz.net
 # - kill old processes / overwrite previous install
+# - FIX: yt-dlp 加 --newline，前端不再卡在 0%
 
 set -euo pipefail
 
@@ -17,13 +18,12 @@ RUN_USER="www-data"
 DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 
-echo "[ytweb] installing version v0.2.0-2025-11-05 ..."
+echo "[ytweb] installing version v0.2.1-2025-11-05 ..."
 
 # 0) kill old processes / stop old service
 if systemctl list-units --full -all | grep -q "$SERVICE_NAME"; then
   systemctl stop "$SERVICE_NAME" || true
 fi
-# 如果有人直接跑過 python /opt/ytweb/app.py，把它殺掉
 pkill -f "$APP_DIR/app.py" 2>/dev/null || true
 
 # 1) install base packages
@@ -38,11 +38,8 @@ else
   echo "No supported package manager found. Please install python3, nginx, certbot manually."
 fi
 
-# 2) directories
-mkdir -p "$APP_DIR"
-mkdir -p "$APP_DIR/templates"
-mkdir -p "$APP_DIR/static"
-mkdir -p "$DOWNLOAD_DIR"
+# 2) dirs
+mkdir -p "$APP_DIR" "$APP_DIR/templates" "$APP_DIR/static" "$DOWNLOAD_DIR"
 chown -R "$RUN_USER":"$RUN_USER" "$DOWNLOAD_DIR" || true
 
 # 3) venv
@@ -54,19 +51,17 @@ source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
 pip install flask python-dotenv yt-dlp
 
-# 4) write app.py (FULL)
+# 4) app.py (FULL)
 cat > "$APP_DIR/app.py" <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v0.2.0-2025-11-05
+version: v0.2.1-2025-11-05
 
-changes:
-- async download with progress
-- /progress/<task_id> endpoint
-- 8h auto-delete worker
-- show expire time in frontend
+changes from v0.2.0:
+- add --newline to yt-dlp so stdout is line-based
+- relax progress regex
 """
 import os
 import uuid
@@ -83,13 +78,12 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"), static_folder=os.path.join(BASE_DIR, "static"))
 
-# task store: {task_id: {...}}
 TASKS = {}
 LOCK = threading.Lock()
 EXPIRE_HOURS = 8
 
-# regex for yt-dlp progress line
-PROG_RE = re.compile(r'\[download\]\s+(\d{1,3}\.\d+)%')
+# 更寬鬆一點的進度：例如 "[download]  12.3% of ..." 或 "[download] 100%"
+PROG_RE = re.compile(r'\[download\]\s+(\d+(?:\.\d+)?)%')
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -103,6 +97,7 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
     output_tpl = os.path.join(task_dir, "%(title)s-%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
+        "--newline",             # 關鍵：一行一行吐，不用 \r
         "-f", fmt,
         "-o", output_tpl,
         url,
@@ -128,7 +123,6 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
         with LOCK:
             TASKS[task_id]["logs"] = "\n".join(logs)
     proc.wait()
-    # list files to find the created one
     files = os.listdir(task_dir)
     if files:
         filename = files[0]
@@ -147,7 +141,6 @@ def cleanup_worker():
                     to_delete.append(tid)
         for tid in to_delete:
             task_dir = os.path.join(DOWNLOAD_DIR, tid)
-            # delete files
             if os.path.isdir(task_dir):
                 for root, dirs, files in os.walk(task_dir, topdown=False):
                     for f in files:
@@ -166,7 +159,7 @@ def cleanup_worker():
                     pass
             with LOCK:
                 TASKS.pop(tid, None)
-        time.sleep(600)  # every 10 minutes
+        time.sleep(600)
 
 @app.route("/", methods=["GET"])
 def index():
@@ -176,7 +169,6 @@ def index():
 def download():
     url = request.form.get("url", "").strip()
     fmt = request.form.get("format", "best").strip() or "best"
-    # allow custom format
     custom_fmt = request.form.get("custom_format", "").strip()
     if custom_fmt:
         fmt = custom_fmt
@@ -201,13 +193,7 @@ def download():
         }
     t = threading.Thread(target=run_ytdlp_task, args=(task_id, url, fmt), daemon=True)
     t.start()
-    # return page that polls progress
-    return render_template(
-        "index.html",
-        started=True,
-        task_id=task_id,
-        expires_at=expires_at.isoformat()
-    )
+    return render_template("index.html", started=True, task_id=task_id, expires_at=expires_at.isoformat())
 
 @app.route("/progress/<task_id>", methods=["GET"])
 def progress(task_id):
@@ -251,13 +237,12 @@ def task_info(task_id):
     })
 
 if __name__ == "__main__":
-    # start cleanup worker
     cleaner = threading.Thread(target=cleanup_worker, daemon=True)
     cleaner.start()
     app.run(host="127.0.0.1", port=5001, debug=False)
 PY
 
-# 5) template with progress + formats + expire time
+# 5) template (same as last version)
 cat > "$APP_DIR/templates/index.html" <<'HTML'
 <!doctype html>
 <html lang="zh-CN">
@@ -378,13 +363,12 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
-# 7) nginx http -> flask
+# 7) nginx
 cat > /etc/nginx/sites-available/ytweb.conf <<NG
 server {
     listen 80;
     server_name $DOMAIN;
 
-    # certbot will use this
     location /.well-known/acme-challenge/ {
         root /var/www/html;
     }
@@ -401,11 +385,9 @@ NG
 ln -sf /etc/nginx/sites-available/ytweb.conf /etc/nginx/sites-enabled/ytweb.conf
 nginx -t && systemctl reload nginx
 
-# 8) HTTPS with certbot (auto renew)
+# 8) HTTPS
 if command -v certbot >/dev/null 2>&1; then
-  # --register-unsafely-without-email 是為了自動化，之後你要可以自己加 email
   certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email || true
-  # certbot 會自己裝 cron/systemd timer
 fi
 
 echo "[ytweb] install done. open: https://$DOMAIN/"
