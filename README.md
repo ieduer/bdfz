@@ -74,6 +74,22 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/taiwanebook.s
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/seiue-notify.sh)
 ```
 
+# 8、SeiueStu → Telegram
+
+> 一個個了解。
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/seiuestu.sh)
+```
+
+# 9、Mentee
+
+> 導導導，但不是寫這玩意。
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/mentee.sh)
+```
+
 ---
 
 # 免責聲明
