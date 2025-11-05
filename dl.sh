@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean
-# version: v0.2.3-2025-11-05
-# changes from v0.2.2:
-# - install ffmpeg so yt-dlp can merge formats
-# - backend normalize youtube-like urls (youtu.be / shorts / m.)
-# - frontend text: show that all yt-dlp sites are supported
-# - still kill old process / overwrite
-# domain: xz.bdfz.net
+# version: v0.2.4-2025-11-05
+# changes from v0.2.3:
+# - FIX: Flask 調 yt-dlp 時找不到可執行檔 -> 顯式指定 yt-dlp 路徑
+# - systemd 裡面寫入 YTDLP_BIN=/opt/ytweb/venv/bin/yt-dlp
+# - 前端說明「下載建立成功後進度才會跳」
 
 set -euo pipefail
 
@@ -16,8 +14,9 @@ VENV_DIR="$APP_DIR/venv"
 RUN_USER="www-data"
 DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
+YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 
-echo "[ytweb] installing version v0.2.3-2025-11-05 ..."
+echo "[ytweb] installing version v0.2.4-2025-11-05 ..."
 
 # 0) stop old
 if systemctl list-units --full -all | grep -q "$SERVICE_NAME"; then
@@ -51,16 +50,16 @@ pip install --upgrade pip
 pip install flask python-dotenv yt-dlp
 
 # 4) app.py
-cat > "$APP_DIR/app.py" <<'PY'
+cat > "$APP_DIR/app.py" <<PY
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v0.2.3-2025-11-05
+version: v0.2.4-2025-11-05
 
-- install ffmpeg (in installer)
-- normalize youtube-like urls
-- wide progress regex
+- use explicit yt-dlp path via env YTDLP_BIN
+- keep youtube url normalization
+- keep 8h cleanup
 """
 import os
 import uuid
@@ -76,64 +75,48 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.environ.get("YTWEB_DOWNLOAD_DIR", "/var/www/yt-downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+YTDLP_BIN = os.environ.get("YTDLP_BIN", os.path.join(BASE_DIR, "venv", "bin", "yt-dlp"))
+if not os.path.isfile(YTDLP_BIN):
+    # fallback to /opt/ytweb/venv/bin/yt-dlp
+    YTDLP_BIN = "/opt/ytweb/venv/bin/yt-dlp"
+
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"), static_folder=os.path.join(BASE_DIR, "static"))
 
 TASKS = {}
 LOCK = threading.Lock()
 EXPIRE_HOURS = 8
 
-# match any "12.3%"
-PROG_RE = re.compile(r'(\d+(?:\.\d+)?)%')
+PROG_RE = re.compile(r"(\\d+(?:\\.\\d+)?)%")
 
 def now_utc():
     return datetime.now(timezone.utc)
 
 def normalize_youtube_url(u: str) -> str:
-    """
-    normalize common youtube links to https://www.youtube.com/watch?v=ID
-    examples:
-    - https://youtu.be/ID
-    - https://youtube.com/shorts/ID
-    - https://m.youtube.com/watch?v=ID
-    - https://www.youtube.com/live/ID
-    """
     try:
-      parsed = urlparse(u)
+        parsed = urlparse(u)
     except Exception:
-      return u
-
+        return u
     host = (parsed.netloc or "").lower()
     path = parsed.path or ""
     qs = parse_qs(parsed.query or "")
-
-    # youtu.be/<id>
     if host in ("youtu.be", "www.youtu.be"):
         vid = path.lstrip("/")
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
-
-    # m.youtube.com -> www.youtube.com
     if host in ("m.youtube.com", "music.youtube.com", "youtube.com"):
         host = "www.youtube.com"
-
-    # shorts
     if "youtube.com" in host and path.startswith("/shorts/"):
         vid = path.split("/shorts/")[1].split("/")[0]
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
-
-    # live
     if "youtube.com" in host and path.startswith("/live/"):
         vid = path.split("/live/")[1].split("/")[0]
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
-
-    # normal watch
     if "youtube.com" in host and path.startswith("/watch"):
         vid = qs.get("v", [""])[0]
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
-
     return u
 
 def normalize_url(u: str) -> str:
@@ -149,24 +132,32 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
     task_dir = task["dir"]
     output_tpl = os.path.join(task_dir, "%(title)s-%(id)s.%(ext)s")
     cmd = [
-        "yt-dlp",
+        YTDLP_BIN,
         "--newline",
         "-f", fmt,
         "-o", output_tpl,
         url,
     ]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True
-    )
-    logs = []
+    logs = [f"cmd: {' '.join(cmd)}"]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+    except FileNotFoundError:
+        # 直接記錯給前端
+        with LOCK:
+            TASKS[task_id]["status"] = "error"
+            TASKS[task_id]["logs"] = "\\n".join(logs + ["ERROR: yt-dlp not found at " + YTDLP_BIN])
+        return
+
     filename = None
     for line in proc.stdout:
-        line = line.rstrip("\n")
+        line = line.rstrip("\\n")
         logs.append(line)
         m = PROG_RE.search(line)
         if m:
@@ -177,7 +168,7 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
             with LOCK:
                 TASKS[task_id]["progress"] = pct
         with LOCK:
-            TASKS[task_id]["logs"] = "\n".join(logs)
+            TASKS[task_id]["logs"] = "\\n".join(logs)
     proc.wait()
     files = os.listdir(task_dir)
     if files:
@@ -185,7 +176,7 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
     with LOCK:
         TASKS[task_id]["status"] = "done" if proc.returncode == 0 and filename else "error"
         TASKS[task_id]["filename"] = filename
-        TASKS[task_id]["logs"] = "\n".join(logs)
+        TASKS[task_id]["logs"] = "\\n".join(logs)
 
 def cleanup_worker():
     while True:
@@ -279,22 +270,6 @@ def get_file(task_id, filename):
         abort(404)
     return send_from_directory(task_dir, filename, as_attachment=True)
 
-@app.route("/tasks/<task_id>", methods=["GET"])
-def task_info(task_id):
-    with LOCK:
-        task = TASKS.get(task_id)
-    if not task:
-        abort(404)
-    files = []
-    if os.path.isdir(task["dir"]):
-        files = os.listdir(task["dir"])
-    return jsonify({
-        "task_id": task_id,
-        "files": files,
-        "status": task["status"],
-        "progress": task["progress"],
-    })
-
 if __name__ == "__main__":
     cleaner = threading.Thread(target=cleanup_worker, daemon=True)
     cleaner.start()
@@ -318,17 +293,11 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
     a.btn { display: inline-block; background: #0d6efd; color: #fff; padding: 0.5rem 1rem; text-decoration: none; border-radius: 4px; }
     .progress-bar { width: 100%; background: #ddd; height: 10px; border-radius: 5px; overflow: hidden; margin-bottom: 1rem; }
     .progress-bar-inner { height: 10px; background: #0d6efd; width: 0%; transition: width .3s ease; }
-    details { margin-bottom: 1rem; }
   </style>
 </head>
 <body>
   <h1>yt-dlp web</h1>
   <p>輸入影片 / 音訊 / 社交平台鏈接，服務端下載。檔案會在 <strong>8 小時</strong> 後自動刪除。</p>
-  <details>
-    <summary>支持哪些鏈接？（基於 yt-dlp，全都行）</summary>
-    <p>已做特別處理：YouTube 所有常見形式（watch、youtu.be、shorts、m.youtube.com、/live/...）。</p>
-    <p>另外還能下：B站、X(Twitter)、TikTok、Instagram、Facebook、Vimeo、SoundCloud…基本上 yt-dlp 支持的都行。</p>
-  </details>
   <form method="post" action="/download">
     <label for="url">URL</label>
     <input type="url" id="url" name="url" required placeholder="https://www.youtube.com/watch?v=... / https://youtu.be/... / https://www.bilibili.com/...">
@@ -350,7 +319,7 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
 
   {% if started %}
     <div id="status-box" class="ok">
-      <p>任務已建立，正在下載中…</p>
+      <p>任務已建立，正在下載中…（幾秒後進度才會跳）</p>
       <p>任務ID：<code id="task-id">{{ task_id }}</code></p>
       {% if normalized_url %}
       <p>已規整鏈接：<code>{{ normalized_url }}</code></p>
@@ -392,7 +361,7 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
           if (data.status === 'done' && data.download_url) {
             statusBox.innerHTML = '<p>下載完成：</p><p><a class="btn" href="' + data.download_url + '">點此下載 ' + (data.filename || '') + '</a></p><p>檔案將在 8 小時後刪除。</p>';
           } else if (data.status === 'error') {
-            statusBox.innerHTML = '<p>下載失敗，下面是 yt-dlp 的日誌，先看它說了啥。</p>';
+            statusBox.innerHTML = '<p>下載失敗，下面是日誌。</p>';
           } else {
             setTimeout(poll, 2000);
           }
@@ -419,6 +388,7 @@ User=$RUN_USER
 Group=$RUN_USER
 WorkingDirectory=$APP_DIR
 Environment=YTWEB_DOWNLOAD_DIR=$DOWNLOAD_DIR
+Environment=YTDLP_BIN=$YTDLP_BIN
 ExecStart=$VENV_DIR/bin/python $APP_DIR/app.py
 Restart=on-failure
 
