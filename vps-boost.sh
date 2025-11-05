@@ -4,7 +4,7 @@
 # - 安裝 zsh 等工具
 # - 寫 ~/.zshrc（含 [VPS IP]）
 # - 在 ~/.bashrc / ~/.profile 加「自動跳 zsh 並在 zsh 結束後 exit」
-# - 不會在腳本最後再幫你開一層 zsh，避免要 exit 兩次
+# - ⭐ 不會在腳本最後再開一層 zsh，避免要 exit 兩次
 # ------------------------------------------------------------
 set -e
 
@@ -204,4 +204,4 @@ else
 fi
 
 echo "[7/7] 完成。"
-echo "=== Done. 下次 ssh 登進來就是自動 zsh；這次這個 shell 你正常 exit 一次就走了。 ==="
+echo "=== Done. 下次 ssh 進來就是自定義 zsh，exit 一次直接斷。 ==="
