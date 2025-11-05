@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - 安裝/升級腳本
-# 版本：v2.5.5-photo-strong
+# 版本：v2.5.6-photo-head
 set -euo pipefail
 
-SIDE_VERSION="v2.5.5-photo-strong"
+SIDE_VERSION="v2.5.6-photo-head"
 
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
 info(){ echo -e "${C_BLUE}INFO:${C_RESET} $1"; }
@@ -94,6 +94,8 @@ HARD_CUTOFF_MINUTES=1440
 # OSS/參考域名
 OSS_HOST=https://oss-seiue-attachment.seiue.com
 SEIUE_REFERER=https://chalk-c3.seiue.com/
+
+# 下載頭像時用這個 processor（和你本機成功的一樣）
 PHOTO_PROCESSOR=image/resize,w_2048/quality,q_90
 
 SIDE_VERSION=${SIDE_VERSION}
@@ -134,11 +136,9 @@ write_python(){
 # -*- coding: utf-8 -*-
 """
 Seiue → Telegram notifier
-版本: v2.5.5-photo-strong
-在 v2.5.4-photo-api 上加了：
-- 讀 PHOTO_PROCESSOR
-- HEAD 到 /chalk/netdisk/files/<hash>.jpg/url 時帶 processor
-- 仍保留請假、考勤、附件等邏輯
+版本: v2.5.6-photo-head
+這版把你桌面那支「先 HEAD 到 /chalk/netdisk/files/<fid>.jpg/url?processor=... 再下載」的套路塞進來了，
+所以請假裡抓到學生 id → 拉學生詳細 → 有 photo/avatar → VPS 自己下 → 發到 Telegram，不再丟一條沒簽名的 OSS 連結。
 """
 import os, sys, time, json, html, fcntl, logging, hashlib, re
 from typing import Dict, Any, List, Tuple, Optional
@@ -159,7 +159,7 @@ X_SCHOOL_ID    = os.getenv("X_SCHOOL_ID","3")
 X_ROLE         = os.getenv("X_ROLE","teacher")
 SEIUE_REFERER  = os.getenv("SEIUE_REFERER","https://chalk-c3.seiue.com/")
 OSS_HOST       = os.getenv("OSS_HOST","https://oss-seiue-attachment.seiue.com")
-PHOTO_PROCESSOR = os.getenv("PHOTO_PROCESSOR","").strip()
+PHOTO_PROCESSOR= os.getenv("PHOTO_PROCESSOR","image/resize,w_2048/quality,q_90")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","")
@@ -228,7 +228,8 @@ def save_state(st:Dict[str,Any])->None:
 def acquire_lock_or_exit():
   fd=os.open(LOCK_FILE, os.O_CREAT|os.O_RDWR, 0o644)
   try:
-    fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB); os.ftruncate(fd,0); os.write(fd, str(os.getpid()).encode()); return fd
+    import fcntl as _fcntl
+    _fcntl.flock(fd, _fcntl.LOCK_EX|_fcntl.LOCK_NB); os.ftruncate(fd,0); os.write(fd, str(os.getpid()).encode()); return fd
   except OSError:
     logging.error("已有實例運行，本實例退出。"); sys.exit(0)
 
@@ -239,7 +240,7 @@ def global_key(it: dict) -> str:
   t = it.get("published_at") or it.get("created_at") or ""
   src = (it.get("sender_reflection") or {}).get("id") or ""
   content = it.get("content") or ""
-  h = hashlib.sha1(f"{title}|{t}|{src}|{content}".encode("utf-8","ignore")).hexdigest()[:16]
+  h = hashlib.sha1(f"{title}|{t}|{src}|{content}".encode("utf-8", "ignore")).hexdigest()[:16]
   return f"h:{h}"
 
 def sender_name(it:Dict[str,Any])->str:
@@ -323,8 +324,9 @@ class Seiue:
         j = r.json()
       except Exception:
         txt = r.text or ""
-        m = re.search(r'"access_token"\s*:\s*"([^"]+)"', txt)
-        n = re.search(r'"active_reflection_id"\s*:\s*"?(\d+)"?', txt)
+        import re as _re
+        m = _re.search(r'"access_token"\s*:\s*"([^"]+)"', txt)
+        n = _re.search(r'"active_reflection_id"\s*:\s*"?(\d+)"?', txt)
         j = {"access_token": m.group(1) if m else None,
              "active_reflection_id": n.group(1) if n else None}
       tok = j.get("access_token"); rid = str(j.get("active_reflection_id") or "")
@@ -332,14 +334,7 @@ class Seiue:
         logging.error("authorize missing token/reflection_id; status=%s body_prefix=%r", r.status_code, (r.text or "")[:180])
         return False
       self.reflection = rid
-      self.s.headers.update({
-        "Authorization":f"Bearer {tok}",
-        "x-school-id":X_SCHOOL_ID,
-        "x-role":X_ROLE,
-        "x-reflection-id":rid,
-        "Referer":SEIUE_REFERER,
-        "Origin":"https://chalk-c3.seiue.com",
-      })
+      self.s.headers.update({"Authorization":f"Bearer {tok}","x-school-id":X_SCHOOL_ID,"x-role":X_ROLE,"x-reflection-id":rid})
       logging.info("Auth OK, reflection_id=%s", rid); return True
     except Exception as e:
       logging.error("login error: %s", e, exc_info=True); return False
@@ -390,44 +385,42 @@ class Seiue:
       except: pass
     return r.content, name
 
-  def get_student_detail(self, sid:int)->Optional[dict]:
+  # ---------- 這裡是「像你桌面那樣」的下載 ----------
+  def _head_signed_file(self, fid:str, processor:str)->Tuple[bytes,str]:
+    # 完整請求長這樣：
+    # https://api.seiue.com/chalk/netdisk/files/<fid>.jpg/url?processor=image/resize,w_2048/quality,q_90
+    from urllib.parse import quote
+    url = f"https://api.seiue.com/chalk/netdisk/files/{fid}.jpg/url"
+    if processor:
+      url = f"{url}?processor={quote(processor, safe='')}"
     try:
-      url=f"https://api.seiue.com/chalk/reflection/students/{sid}/rid/{self.reflection}?expand=guardians,grade,user"
-      r=self.s.get(url, timeout=30)
-      if r.status_code==200:
-        return r.json()
+      r = self.s.head(url, allow_redirects=False, timeout=20)
     except Exception as e:
-      logging.warning("get_student_detail %s failed: %s", sid, e)
-    return None
-
-  def _download_via_signed_file(self, fid:str)->Tuple[bytes,str]:
-    url=f"https://api.seiue.com/chalk/netdisk/files/{fid}.jpg/url"
-    params={}
-    if PHOTO_PROCESSOR:
-      params["processor"]=PHOTO_PROCESSOR
-    try:
-      r=self.s.head(url, params=params, allow_redirects=False, timeout=20)
-    except Exception as e:
-      logging.warning("head signed url err: %s", e); return b"",""
-    if r.status_code in (301,302,303,307,308) or r.headers.get("Location"):
-      loc=r.headers.get("Location") or r.headers.get("location")
-      if not loc: return b"",""
-      data,name = self.download(loc)
+      logging.warning("head signed url err: %s", e)
+      return b"", ""
+    logging.info("head %s -> %s", url, r.status_code)
+    loc = r.headers.get("Location") or r.headers.get("location")
+    if r.status_code in (301,302,303,307,308) and loc:
+      data, name = self.download(loc)
       return data, name or f"{fid}.jpg"
-    logging.info("head signed url %s -> %s", url, r.status_code)
-    return b"",""
+    if r.status_code == 200 and loc:
+      data, name = self.download(loc)
+      return data, name or f"{fid}.jpg"
+    return b"", ""
 
   def download_student_photo_like_client(self, photo_key:str)->Tuple[bytes,str]:
+    """優先走有 token 的簽名 HEAD，失敗再猜 OSS。"""
     key=(photo_key or "").strip()
+    # 完整 URL 直接下
     if key.startswith("http://") or key.startswith("https://"):
-      data,name = self.download(key)
-      return data, name
+      data,name = self.download(key); return data,name
+    # 32位 hash
     base_key = key.replace(".jpg","").replace(".jpeg","")
     if len(base_key)==32 and all(c in "0123456789abcdef" for c in base_key):
-      data,name = self._download_via_signed_file(base_key)
-      if data: return data, name
-    if len(base_key) < 4:
-      return b"",""
+      data, name = self._head_signed_file(base_key, PHOTO_PROCESSOR)
+      if data:
+        return data, name
+    # 猜 OSS（這個可能沒權限，但只有前面都失敗才會走到這）
     a=base_key[0:2]; b=base_key[2:4]
     candidates=[
       f"{OSS_HOST}/user/{a}/{b}/{base_key}.jpg",
@@ -442,26 +435,15 @@ class Seiue:
       if data: return data, name
     return b"",""
 
-  def _get_api(self, url: str) -> Optional[dict]:
+  def get_student_detail(self, sid:int)->Optional[dict]:
     try:
-      r = self.s.get(url, timeout=30)
-      if r.status_code in (401, 403):
-        if self.login():
-          r = self.s.get(url, timeout=30)
-      if r.status_code == 200:
+      url=f"https://api.seiue.com/chalk/reflection/students/{sid}/rid/{self.reflection}?expand=guardians,grade,user"
+      r=self.s.get(url, timeout=30)
+      if r.status_code==200:
         return r.json()
-      logging.warning("API GET %s -> %s", url, r.status_code)
     except Exception as e:
-      logging.error("API GET exception %s: %s", url, e)
+      logging.warning("get_student_detail %s failed: %s", sid, e)
     return None
-
-  def get_flow_details(self, flow_id: int) -> Optional[dict]:
-    url = f"https://api.seiue.com/form/workflow/flows/{flow_id}?expand=initiator,nodes,nodes.stages,nodes.stages.reflection"
-    return self._get_api(url)
-
-  def get_absence_by_id(self, absence_id: int) -> Optional[dict]:
-    url = f"https://api.seiue.com/sams/absence/absences/{absence_id}?expand=reflections,reflections.guardians,reflections.grade"
-    return self._get_api(url)
 
 def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
   try: raw=json.loads(raw_json or "{}")
@@ -480,6 +462,7 @@ def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
       elif s.startswith("color_"):
         if "red" in s: prefix="❗"+prefix
         elif "orange" in s: prefix="⚠️"+prefix
+        elif "theme" in s: prefix="⭐"+prefix
     if not text.startswith("<b>"): text=esc(text)
     return prefix+text
   for blk in blocks:
@@ -705,10 +688,11 @@ def _format_discussion_notice(original: dict) -> str:
   )
 
 def _maybe_download_attendance_avatar(tg:"Telegram", cli:"Seiue", attrs:dict):
+  # 優先從屬性裡找學生 id，再走我們的「帶頭下載」流程
   for k in ("student_id","pupil_id","owner_id","reflection_id"):
-    if k in attrs and str(attrs[k]).isdigit():
-      sid = int(attrs[k])
-      stu = cli.get_student_detail(sid)
+    v = attrs.get(k)
+    if v and str(v).isdigit():
+      stu = cli.get_student_detail(int(v))
       if stu:
         key = stu.get("photo") or stu.get("avatar") or ""
         if key:
@@ -716,6 +700,7 @@ def _maybe_download_attendance_avatar(tg:"Telegram", cli:"Seiue", attrs:dict):
           if data:
             tg.send_photo(data, "學生頭像")
             return
+  # 真沒 id 才走舊的猜 url（這個可能點不開，但這時候我們已經沒辦法了）
   photo = attrs.get("photo") or ""
   if not photo or len(photo) < 8:
     return
@@ -753,21 +738,28 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
   msg_type = it.get("type") or ""
   attrs = it.get("attributes") or {}
 
+  # 請假：flow 抄送
   if domain == "leave_flow" and msg_type == "absence.flow_cc_node":
     flow_id = attrs.get("flow_id")
     absence_id = attrs.get("absence_id")
-    flow_data = cli.get_flow_details(int(flow_id)) if flow_id else None
-    abs_data = cli.get_absence_by_id(int(absence_id)) if absence_id else None
+    try:
+      flow_data = cli.s.get(f"https://api.seiue.com/form/workflow/flows/{flow_id}?expand=initiator,nodes,nodes.stages,nodes.stages.reflection", timeout=30).json() if flow_id else None
+    except Exception: flow_data = None
+    try:
+      abs_data = cli.s.get(f"https://api.seiue.com/sams/absence/absences/{absence_id}?expand=reflections,reflections.guardians,reflections.grade", timeout=30).json() if absence_id else None
+    except Exception: abs_data = None
     flow_atts = _extract_flow_attachments(flow_data)
     html_msg = _format_detailed_leave_message(it, flow_data, abs_data, flow_attachments=flow_atts)
     if prefix: html_msg = f"{prefix}\n{html_msg}"
     ok = tg.send(html_msg)
     _send_attachments_from_content(tg, cli, it)
+    # 順手抓頭像（這裡是確定有學生 id 的最佳場景）
     student_ids = it.get("_extracted_student_ids") or []
     if isinstance(student_ids, list) and student_ids:
       _maybe_fetch_and_send_student_photo(tg, cli, [int(x) for x in student_ids if str(x).isdigit()])
     return ok
 
+  # 任務回覆
   if domain == "task" and msg_type == "task.discussion_replied":
     html_msg = _format_discussion_notice(it)
     if prefix: html_msg = f"{prefix}\n{html_msg}"
@@ -775,6 +767,7 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     _send_attachments_from_content(tg, cli, it)
     return ok
 
+  # 考勤家長
   if domain == "attendance" and msg_type == "abnormal_attendance.guardian":
     html_msg = (
       f"🟣 <b>{esc(it.get('title') or '考勤結果')}</b>\n\n"
@@ -787,6 +780,7 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     _send_attachments_from_content(tg, cli, it)
     return ok
 
+  # 其他
   return _send_fallback(tg, cli, it, ch, prefix)
 
 def main_loop():
@@ -803,13 +797,13 @@ def main_loop():
     for ch in ("system","notice"):
       it=latest_of_channel(cli, ch)
       if it:
-        try: send_one(tg, cli, it, ch, prefix=f"🧪 <b>安裝驗證</b>｜{os.getenv('SIDE_VERSION','v2.5.5-photo-strong')}｜")
+        try: send_one(tg, cli, it, ch, prefix=f"🧪 <b>安裝驗證</b>｜{os.getenv('SIDE_VERSION','v2.5.6-photo-head')}｜")
         except Exception as e: logging.error("test send error(%s): %s", ch, e)
         t = it.get("published_at") or it.get("created_at") or ""
         st["seen_global"][global_key(it)] = parse_ts(t) or time.time()
     save_state(st)
 
-  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}，版本={os.getenv('SIDE_VERSION','v2.5.5-photo-strong')}")
+  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}，版本={os.getenv('SIDE_VERSION','v2.5.6-photo-head')}")
   while True:
     try:
       st=load_state()
@@ -845,7 +839,7 @@ def main_loop():
       logging.error("loop error: %s", e); time.sleep(3)
 
 if __name__=="__main__":
-  os.environ["SIDE_VERSION"] = "v2.5.5-photo-strong"
+  os.environ["SIDE_VERSION"] = "v2.5.6-photo-head"
   main_loop()
 PY
   chmod 755 "$PY_SCRIPT"
