@@ -657,34 +657,30 @@ def _format_discussion_notice(original: dict) -> str:
     f"— 通知於 {pub}"
   )
 
-def _maybe_download_attendance_avatar(tg:"Telegram", attrs:dict):
-  photo = attrs.get("photo") or ""
-  if not photo or len(photo) < 5:
-    return
-  # 如果前端直接給了完整簽名鏈接，就用那個
-  if photo.startswith("http://") or photo.startswith("https://"):
-    url = photo
-  else:
-    # 有些會帶 query 的 filename.jpg?... 這裡也先當成完整 path
-    if photo.endswith(".jpg") or photo.endswith(".jpeg") or photo.endswith(".png") or "?" in photo:
-      # 這時候沒法從前端拿 key，我們直接拼 user/{00}/{11}/... 這條公開猜測路徑
-      base_name = photo.split("/")[-1]
-      p1 = base_name[0:2]
-      p2 = base_name[2:4]
-      url = f"https://oss-seiue-attachment.seiue.com/user/{p1}/{p2}/{base_name}"
+def _maybe_download_attendance_avatar(tg: "Telegram", attrs: dict):
+    photo = attrs.get("photo") or ""
+    if not photo or len(photo) < 5:
+        return
+
+    # 1) 已經是前端給的完整簽名 OSS
+    if photo.startswith("https://oss-seiue-attachment.seiue.com/"):
+        data = _download_oss_signed_image(photo)
+        if data:
+            tg.send_photo(data, "學生頭像")
+        else:
+            tg.send(f"📷 學生頭像：{photo}")
+        return
+
+    # 2) 只是一個 filename，我們照舊猜路徑
+    base_name = photo.split("/")[-1]
+    p1 = base_name[0:2]
+    p2 = base_name[2:4]
+    guess_url = f"https://oss-seiue-attachment.seiue.com/user/{p1}/{p2}/{base_name}"
+    data = _download_oss_signed_image(guess_url)
+    if data:
+        tg.send_photo(data, "學生頭像")
     else:
-      # 萬一是奇怪的字段，就不要報錯，直接丟文字
-      tg.send(f"📷 學生頭像（原始）：{esc(photo)}")
-      return
-  try:
-    r = requests.get(url, timeout=20)
-    if r.status_code == 200 and r.content:
-      tg.send_photo(r.content, "學生頭像")
-    else:
-      tg.send(f"📷 學生頭像：{url}")
-  except Exception:
-    # 網路/證書/OSS 限制都給文字 fallback
-    tg.send(f"📷 學生頭像：{url}")
+        tg.send(f"📷 學生頭像：{guess_url}")
 
 def _format_attendance_notice(original: dict) -> str:
   attrs = original.get("attributes") or {}
