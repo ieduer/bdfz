@@ -94,7 +94,7 @@ HARD_CUTOFF_MINUTES=1440
 # OSS/參考域名
 OSS_HOST=https://oss-seiue-attachment.seiue.com
 SEIUE_REFERER=https://chalk-c3.seiue.com/
-PHOTO_PROCESSOR=image/resize,w_2048/quality,Q_90
+PHOTO_PROCESSOR=image/resize,w_2048/quality,q_90
 
 SIDE_VERSION=${SIDE_VERSION}
 EOF
@@ -113,7 +113,7 @@ ensure_env_defaults(){
   _set_if_missing SEND_TEST_ON_START 1
   _set_if_missing OSS_HOST https://oss-seiue-attachment.seiue.com
   _set_if_missing SEIUE_REFERER https://chalk-c3.seiue.com/
-  _set_if_missing PHOTO_PROCESSOR image/resize,w_2048/quality,Q_90
+  _set_if_missing PHOTO_PROCESSOR image/resize,w_2048/quality,q_90
   _set_if_missing SIDE_VERSION ${SIDE_VERSION}
 }
 
