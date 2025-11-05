@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean
-# version: v0.2.4-2025-11-05
-# changes from v0.2.3:
-# - FIX: Flask 調 yt-dlp 時找不到可執行檔 -> 顯式指定 yt-dlp 路徑
-# - systemd 裡面寫入 YTDLP_BIN=/opt/ytweb/venv/bin/yt-dlp
-# - 前端說明「下載建立成功後進度才會跳」
+# version: v0.2.5-2025-11-05
+# changes from v0.2.4:
+# - progress API 回傳相對路徑的 download_url，避免瀏覽器 mixed content
+# - Flask 加 ProxyFix + PREFERRED_URL_SCHEME=https
+# - nginx 傳 X-Forwarded-Proto https
+# domain: xz.bdfz.net
 
 set -euo pipefail
 
@@ -16,7 +17,7 @@ DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 
-echo "[ytweb] installing version v0.2.4-2025-11-05 ..."
+echo "[ytweb] installing version v0.2.5-2025-11-05 ..."
 
 # 0) stop old
 if systemctl list-units --full -all | grep -q "$SERVICE_NAME"; then
@@ -47,19 +48,21 @@ fi
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
-pip install flask python-dotenv yt-dlp
+pip install flask python-dotenv yt-dlp werkzeug
 
 # 4) app.py
-cat > "$APP_DIR/app.py" <<PY
+cat > "$APP_DIR/app.py" <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v0.2.4-2025-11-05
+version: v0.2.5-2025-11-05
 
-- use explicit yt-dlp path via env YTDLP_BIN
-- keep youtube url normalization
-- keep 8h cleanup
+- explicit yt-dlp path via env YTDLP_BIN
+- youtube url normalization
+- 8h cleanup
+- progress returns relative download_url to avoid mixed content
+- ProxyFix + PREFERRED_URL_SCHEME=https
 """
 import os
 import uuid
@@ -70,6 +73,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 from flask import Flask, request, render_template, send_from_directory, abort, url_for, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.environ.get("YTWEB_DOWNLOAD_DIR", "/var/www/yt-downloads")
@@ -77,16 +81,18 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 YTDLP_BIN = os.environ.get("YTDLP_BIN", os.path.join(BASE_DIR, "venv", "bin", "yt-dlp"))
 if not os.path.isfile(YTDLP_BIN):
-    # fallback to /opt/ytweb/venv/bin/yt-dlp
     YTDLP_BIN = "/opt/ytweb/venv/bin/yt-dlp"
 
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"), static_folder=os.path.join(BASE_DIR, "static"))
+# 讓 Flask 知道前面有反代，協議是 https
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.config["PREFERRED_URL_SCHEME"] = "https"
 
 TASKS = {}
 LOCK = threading.Lock()
 EXPIRE_HOURS = 8
 
-PROG_RE = re.compile(r"(\\d+(?:\\.\\d+)?)%")
+PROG_RE = re.compile(r"(\d+(?:\.\d+)?)%")
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -99,20 +105,25 @@ def normalize_youtube_url(u: str) -> str:
     host = (parsed.netloc or "").lower()
     path = parsed.path or ""
     qs = parse_qs(parsed.query or "")
+    # youtu.be/ID
     if host in ("youtu.be", "www.youtu.be"):
         vid = path.lstrip("/")
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
+    # m. / music. / youtube.com
     if host in ("m.youtube.com", "music.youtube.com", "youtube.com"):
         host = "www.youtube.com"
+    # shorts
     if "youtube.com" in host and path.startswith("/shorts/"):
         vid = path.split("/shorts/")[1].split("/")[0]
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
+    # live
     if "youtube.com" in host and path.startswith("/live/"):
         vid = path.split("/live/")[1].split("/")[0]
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
+    # normal watch
     if "youtube.com" in host and path.startswith("/watch"):
         vid = qs.get("v", [""])[0]
         if vid:
@@ -149,15 +160,14 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
             universal_newlines=True
         )
     except FileNotFoundError:
-        # 直接記錯給前端
         with LOCK:
             TASKS[task_id]["status"] = "error"
-            TASKS[task_id]["logs"] = "\\n".join(logs + ["ERROR: yt-dlp not found at " + YTDLP_BIN])
+            TASKS[task_id]["logs"] = "\n".join(logs + ["ERROR: yt-dlp not found at " + YTDLP_BIN])
         return
 
     filename = None
     for line in proc.stdout:
-        line = line.rstrip("\\n")
+        line = line.rstrip("\n")
         logs.append(line)
         m = PROG_RE.search(line)
         if m:
@@ -168,7 +178,7 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
             with LOCK:
                 TASKS[task_id]["progress"] = pct
         with LOCK:
-            TASKS[task_id]["logs"] = "\\n".join(logs)
+            TASKS[task_id]["logs"] = "\n".join(logs)
     proc.wait()
     files = os.listdir(task_dir)
     if files:
@@ -176,7 +186,7 @@ def run_ytdlp_task(task_id: str, url: str, fmt: str):
     with LOCK:
         TASKS[task_id]["status"] = "done" if proc.returncode == 0 and filename else "error"
         TASKS[task_id]["filename"] = filename
-        TASKS[task_id]["logs"] = "\\n".join(logs)
+        TASKS[task_id]["logs"] = "\n".join(logs)
 
 def cleanup_worker():
     while True:
@@ -259,7 +269,8 @@ def progress(task_id):
         "expires_at": task["expires_at"].isoformat() if task.get("expires_at") else None,
     }
     if task["status"] == "done" and task["filename"]:
-        data["download_url"] = url_for("get_file", task_id=task_id, filename=task["filename"], _external=True)
+        # return relative path to avoid mixed content
+        data["download_url"] = url_for("get_file", task_id=task_id, filename=task["filename"], _external=False)
         data["filename"] = task["filename"]
     return jsonify(data)
 
@@ -415,6 +426,7 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
     }
 }
 NG
