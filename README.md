@@ -90,7 +90,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/seiuestu.sh)
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/mentee.sh)
 ```
 
-# 10、Dl
+# 10、YDW
 
 > 偶爾救急。
 
