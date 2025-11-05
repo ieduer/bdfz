@@ -4,7 +4,7 @@
 # - 安裝 zsh 等工具
 # - 寫 ~/.zshrc（含 [VPS IP]）
 # - 在 ~/.bashrc / ~/.profile 加「自動跳 zsh 並在 zsh 結束後 exit」
-# - ⭐ 不會在腳本最後再開一層 zsh，避免要 exit 兩次
+# - ⭐ 如果這支腳本是你在 zsh 裡面用「bash <(curl ...)」開的，跑完就自動退出這層 bash，回去原本那個 zsh
 # ------------------------------------------------------------
 set -e
 
@@ -204,4 +204,12 @@ else
 fi
 
 echo "[7/7] 完成。"
-echo "=== Done. 下次 ssh 進來就是自定義 zsh，exit 一次直接斷。 ==="
+echo "=== Done. 下次 ssh 進來就是自定義 zsh。 ==="
+
+# 7. 如果這支是「從 zsh 開出來的 bash」跑的，就把這層 bash 也退掉
+# 檢查父行程是不是 zsh / -zsh
+parent_shell="$(ps -o comm= $PPID 2>/dev/null || echo "")"
+if [ "$parent_shell" = "zsh" ] || [ "$parent_shell" = "-zsh" ]; then
+  # 我們現在是在那個 bash 裡，跑完就回去原本的 zsh
+  exit
+fi
