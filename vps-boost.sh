@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# vps-boost.sh  一鍵初始化 VPS 終端體驗（通用穩定版）
+# vps-boost.sh  一鍵初始化 VPS 終端體驗（通用穩定版 + 自動進 zsh + 顯示本機IP）
 # ------------------------------------------------------------
 set -e
 
@@ -38,16 +38,15 @@ else
   exit 1
 fi
 
-echo "[1/5] 更新套件索引..."
+echo "[1/6] 更新套件索引..."
 eval "$UPDATE_CMD"
 
 # 2. 安裝核心工具（失敗直接中止）
-echo "[2/5] 安裝核心工具 (zsh curl git nano htop)..."
+echo "[2/6] 安裝核心工具 (zsh curl git nano htop)..."
 eval "$INSTALL_CMD zsh curl git nano htop"
 
-# 3. 安裝輔助工具（失敗不終止，因為有些發行版名稱不同）
-echo "[3/5] 安裝輔助工具 (lnav multitail fzf fd / ripgrep / bat)..."
-# 依序嘗試常見名稱
+# 3. 安裝輔助工具（失敗不終止）
+echo "[3/6] 安裝輔助工具 (lnav multitail fzf fd / ripgrep / bat)..."
 OPTIONAL_PKGS="lnav multitail fzf fd-find fd ripgrep bat batcat"
 for pkg in $OPTIONAL_PKGS; do
   if eval "$INSTALL_CMD $pkg" >/dev/null 2>&1; then
@@ -61,12 +60,10 @@ done
 ZSH_PATH="$(command -v zsh || true)"
 if [ -n "$ZSH_PATH" ]; then
   if [ "$SHELL" != "$ZSH_PATH" ]; then
-    echo "[4/5] 將預設 shell 改成 zsh (${ZSH_PATH})..."
+    echo "[4/6] 將預設 shell 改成 zsh (${ZSH_PATH})..."
     if [ "$(id -u)" -eq 0 ]; then
-      # root 通常不用密碼
       chsh -s "$ZSH_PATH" "$(whoami)" || echo "警告：chsh 執行失敗，請稍後手動執行 'chsh -s $ZSH_PATH $(whoami)'"
     else
-      # 非 root，可能要密碼
       if command -v sudo >/dev/null 2>&1; then
         echo "注意：接下來可能需要輸入您的帳號密碼以更換登入 shell。"
         sudo chsh -s "$ZSH_PATH" "$(whoami)" || echo "警告：自動 chsh 失敗，請手動執行：sudo chsh -s $ZSH_PATH $(whoami)"
@@ -75,7 +72,7 @@ if [ -n "$ZSH_PATH" ]; then
       fi
     fi
   else
-    echo "[4/5] 略過 chsh，目前 shell 已是 zsh。"
+    echo "[4/6] 略過 chsh，目前 shell 已是 zsh。"
   fi
 else
   echo "警告：找不到 zsh 執行檔，但前面應該已安裝成功。請重新登入後確認。"
@@ -83,7 +80,7 @@ fi
 
 # 5. 寫 ~/.zshrc，先備份舊的
 ZSHRC="$HOME/.zshrc"
-echo "[5/5] 寫入 ~/.zshrc ..."
+echo "[5/6] 寫入 ~/.zshrc ..."
 if [ -f "$ZSHRC" ]; then
   BACKUP="$HOME/.zshrc.bak.$(date +%s)"
   mv "$ZSHRC" "$BACKUP"
@@ -92,10 +89,17 @@ fi
 
 cat > "$ZSHRC" <<'EOF'
 # ===== VPS ZSHRC (generic, safe) =====
+
+# 如果被人在 bash 裡 source，就退出，提醒去用 zsh
+if [ -n "$BASH_VERSION" ]; then
+  echo "This is a zsh config. Run 'zsh' first, then 'source ~/.zshrc'."
+  return 0 2>/dev/null || exit 0
+fi
+
 setopt PROMPT_SUBST
 autoload -Uz compinit && compinit
 
-# 登入提示，避免以為在本機
+# 登入提示
 echo ">>> [VPS] .zshrc loaded at $(date) on $(hostname) <<<"
 
 # 有 bat / batcat 就用來當 cat
@@ -110,25 +114,37 @@ if command -v fdfind >/dev/null 2>&1; then
   alias fd='fdfind'
 fi
 
+# 取本機 IP，優先用 ip route，退回 hostname -I
+_vps_ip() {
+  local _ip=""
+  if command -v ip >/dev/null 2>&1; then
+    _ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+  fi
+  if [ -z "$_ip" ]; then
+    _ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  fi
+  if [ -z "$_ip" ]; then
+    _ip="unknown"
+  fi
+  echo "$_ip"
+}
+VPS_IP=$(_vps_ip)
+
 # ===== prompt 區 =====
-# 超過 3 秒顯示執行時間
 REPORTTIME=3
 
-# 每次 prompt 前打一條灰線，分隔輸出
 precmd() {
   print -P '%F{238}──────────────────────────────────────────────%f'
 }
 
-# VPS 專用 prompt：不使用特殊字元，避免亂碼
-# 範例：[VPS] 12:34:56 host /root (git:main) #
+# 不用特殊字元，避免亂碼；加上 [VPS IP]
 get_git_branch() {
   command git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return
   echo "(git:$(git rev-parse --abbrev-ref HEAD))"
 }
-PROMPT='%F{magenta}[VPS]%f %F{cyan}%D{%H:%M:%S}%f %F{red}%m%f %F{yellow}%~%f $(get_git_branch) %# '
+PROMPT="%F{magenta}[VPS ${VPS_IP}]%f %F{cyan}%D{%H:%M:%S}%f %F{red}%m%f %F{yellow}%~%f \$(get_git_branch) %# "
 
 # ===== systemd / journalctl helper =====
-# 實時看服務並高亮錯誤
 jwatch() {
   local svc="$1"
   local lines="${2:-80}"
@@ -139,7 +155,6 @@ jwatch() {
     | egrep --color=always 'FAILED|FAILURE|Failed|ERROR|exit-code|backoff|$'
 }
 
-# 看最近 N 行
 jtail() {
   local svc="$1"
   local lines="${2:-200}"
@@ -150,7 +165,6 @@ jtail() {
     | egrep --color=always 'FAILED|FAILURE|Failed|ERROR|exit-code|$'
 }
 
-# 只列錯誤
 jerr() {
   local svc="$1"
   if [ -z "$svc" ]; then
@@ -160,7 +174,6 @@ jerr() {
     | egrep -n 'FAILED|FAILURE|Failed|ERROR|exit-code'
 }
 
-# 用 lnav 看這個服務的流
 jflow() {
   local svc="$1"
   if [ -z "$svc" ]; then
@@ -188,7 +201,7 @@ rinstall() {
   curl -fsSL "$url" | bash
 }
 
-# systemd 狀態的短版
+# systemd 狀態短版
 sstatus() {
   local svc="$1"
   if [ -z "$svc" ]; then
@@ -199,4 +212,17 @@ sstatus() {
 # ===== END =====
 EOF
 
-echo "=== Done. 請重新登入或執行 'source ~/.zshrc' 查看效果。 ==="
+echo "[6/6] 完成 zshrc 寫入。"
+
+# 6. 最後直接進 zsh，讓你馬上看到效果
+if [ -x /usr/bin/zsh ]; then
+  echo "=== 切換到 /usr/bin/zsh，載入新設定 ==="
+  exec /usr/bin/zsh
+else
+  if command -v zsh >/dev/null 2>&1; then
+    echo "=== 切換到 $(command -v zsh) ，載入新設定 ==="
+    exec "$(command -v zsh)"
+  else
+    echo "警告：找不到 zsh 執行檔，請手動執行 'zsh' 再 'source ~/.zshrc'"
+  fi
+fi
