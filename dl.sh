@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean
-# version: v0.2.2-2025-11-05
-# changes:
-# - progress regex 放寬成抓任意 "NN%"，避免新版本 yt-dlp 不帶 [download]
-# - 其餘跟 v0.2.1 一樣
+# version: v0.2.3-2025-11-05
+# changes from v0.2.2:
+# - install ffmpeg so yt-dlp can merge formats
+# - backend normalize youtube-like urls (youtu.be / shorts / m.)
+# - frontend text: show that all yt-dlp sites are supported
+# - still kill old process / overwrite
 # domain: xz.bdfz.net
 
 set -euo pipefail
@@ -15,24 +17,24 @@ RUN_USER="www-data"
 DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 
-echo "[ytweb] installing version v0.2.2-2025-11-05 ..."
+echo "[ytweb] installing version v0.2.3-2025-11-05 ..."
 
-# 0) kill old
+# 0) stop old
 if systemctl list-units --full -all | grep -q "$SERVICE_NAME"; then
   systemctl stop "$SERVICE_NAME" || true
 fi
 pkill -f "$APP_DIR/app.py" 2>/dev/null || true
 
-# 1) base pkgs
+# 1) base packages
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
-  apt-get install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx
+  apt-get install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx ffmpeg
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx || true
+  dnf install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx ffmpeg || true
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx || true
+  yum install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx ffmpeg || true
 else
-  echo "install python3 + nginx + certbot manually"
+  echo "install python3 + nginx + certbot + ffmpeg manually"
 fi
 
 # 2) dirs
@@ -54,11 +56,11 @@ cat > "$APP_DIR/app.py" <<'PY'
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v0.2.2-2025-11-05
+version: v0.2.3-2025-11-05
 
-- use --newline
-- progress regex: match any "NN%" to be tolerant with yt-dlp output
-- 8h auto cleanup
+- install ffmpeg (in installer)
+- normalize youtube-like urls
+- wide progress regex
 """
 import os
 import uuid
@@ -67,6 +69,7 @@ import threading
 import time
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, parse_qs
 from flask import Flask, request, render_template, send_from_directory, abort, url_for, jsonify
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -79,11 +82,64 @@ TASKS = {}
 LOCK = threading.Lock()
 EXPIRE_HOURS = 8
 
-# 很兇的寫法，只要行裡有 "12.3%" 就吃
+# match any "12.3%"
 PROG_RE = re.compile(r'(\d+(?:\.\d+)?)%')
 
 def now_utc():
     return datetime.now(timezone.utc)
+
+def normalize_youtube_url(u: str) -> str:
+    """
+    normalize common youtube links to https://www.youtube.com/watch?v=ID
+    examples:
+    - https://youtu.be/ID
+    - https://youtube.com/shorts/ID
+    - https://m.youtube.com/watch?v=ID
+    - https://www.youtube.com/live/ID
+    """
+    try:
+      parsed = urlparse(u)
+    except Exception:
+      return u
+
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    qs = parse_qs(parsed.query or "")
+
+    # youtu.be/<id>
+    if host in ("youtu.be", "www.youtu.be"):
+        vid = path.lstrip("/")
+        if vid:
+            return f"https://www.youtube.com/watch?v={vid}"
+
+    # m.youtube.com -> www.youtube.com
+    if host in ("m.youtube.com", "music.youtube.com", "youtube.com"):
+        host = "www.youtube.com"
+
+    # shorts
+    if "youtube.com" in host and path.startswith("/shorts/"):
+        vid = path.split("/shorts/")[1].split("/")[0]
+        if vid:
+            return f"https://www.youtube.com/watch?v={vid}"
+
+    # live
+    if "youtube.com" in host and path.startswith("/live/"):
+        vid = path.split("/live/")[1].split("/")[0]
+        if vid:
+            return f"https://www.youtube.com/watch?v={vid}"
+
+    # normal watch
+    if "youtube.com" in host and path.startswith("/watch"):
+        vid = qs.get("v", [""])[0]
+        if vid:
+            return f"https://www.youtube.com/watch?v={vid}"
+
+    return u
+
+def normalize_url(u: str) -> str:
+    if "youtu" in u or "youtube.com" in u:
+        return normalize_youtube_url(u)
+    return u
 
 def run_ytdlp_task(task_id: str, url: str, fmt: str):
     with LOCK:
@@ -167,7 +223,8 @@ def index():
 
 @app.route("/download", methods=["POST"])
 def download():
-    url = request.form.get("url", "").strip()
+    raw_url = request.form.get("url", "").strip()
+    url = normalize_url(raw_url)
     fmt = request.form.get("format", "best").strip() or "best"
     custom_fmt = request.form.get("custom_format", "").strip()
     if custom_fmt:
@@ -182,6 +239,7 @@ def download():
         TASKS[task_id] = {
             "id": task_id,
             "url": url,
+            "raw_url": raw_url,
             "format": fmt,
             "dir": task_dir,
             "status": "running",
@@ -193,7 +251,7 @@ def download():
         }
     t = threading.Thread(target=run_ytdlp_task, args=(task_id, url, fmt), daemon=True)
     t.start()
-    return render_template("index.html", started=True, task_id=task_id, expires_at=expires_at.isoformat())
+    return render_template("index.html", started=True, task_id=task_id, expires_at=expires_at.isoformat(), normalized_url=url)
 
 @app.route("/progress/<task_id>", methods=["GET"])
 def progress(task_id):
@@ -206,6 +264,7 @@ def progress(task_id):
         "progress": task["progress"],
         "logs": task["logs"],
         "task_id": task["id"],
+        "url": task.get("url"),
         "expires_at": task["expires_at"].isoformat() if task.get("expires_at") else None,
     }
     if task["status"] == "done" and task["filename"]:
@@ -242,7 +301,7 @@ if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5001, debug=False)
 PY
 
-# 5) template (same as v0.2.1)
+# 5) template
 cat > "$APP_DIR/templates/index.html" <<'HTML'
 <!doctype html>
 <html lang="zh-CN">
@@ -259,20 +318,26 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
     a.btn { display: inline-block; background: #0d6efd; color: #fff; padding: 0.5rem 1rem; text-decoration: none; border-radius: 4px; }
     .progress-bar { width: 100%; background: #ddd; height: 10px; border-radius: 5px; overflow: hidden; margin-bottom: 1rem; }
     .progress-bar-inner { height: 10px; background: #0d6efd; width: 0%; transition: width .3s ease; }
+    details { margin-bottom: 1rem; }
   </style>
 </head>
 <body>
   <h1>yt-dlp web</h1>
-  <p>輸入影片 / 音訊鏈接，服務端下載。檔案會在 <strong>8 小時</strong> 後自動刪除。</p>
+  <p>輸入影片 / 音訊 / 社交平台鏈接，服務端下載。檔案會在 <strong>8 小時</strong> 後自動刪除。</p>
+  <details>
+    <summary>支持哪些鏈接？（基於 yt-dlp，全都行）</summary>
+    <p>已做特別處理：YouTube 所有常見形式（watch、youtu.be、shorts、m.youtube.com、/live/...）。</p>
+    <p>另外還能下：B站、X(Twitter)、TikTok、Instagram、Facebook、Vimeo、SoundCloud…基本上 yt-dlp 支持的都行。</p>
+  </details>
   <form method="post" action="/download">
     <label for="url">URL</label>
-    <input type="url" id="url" name="url" required placeholder="https://www.youtube.com/watch?v=...">
+    <input type="url" id="url" name="url" required placeholder="https://www.youtube.com/watch?v=... / https://youtu.be/... / https://www.bilibili.com/...">
     <label for="format">常用格式 (yt-dlp -f)</label>
     <select id="format" name="format">
       <option value="best" selected>best (影片最佳)</option>
       <option value="bestaudio">bestaudio (最佳音訊)</option>
-      <option value="worst">worst</option>
       <option value="bestvideo+bestaudio/best">bestvideo+bestaudio/best</option>
+      <option value="worst">worst</option>
     </select>
     <label for="custom_format">自定義格式 (可選)</label>
     <input type="text" id="custom_format" name="custom_format" placeholder="例如：bv[ext=mp4]+ba/best">
@@ -287,6 +352,9 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
     <div id="status-box" class="ok">
       <p>任務已建立，正在下載中…</p>
       <p>任務ID：<code id="task-id">{{ task_id }}</code></p>
+      {% if normalized_url %}
+      <p>已規整鏈接：<code>{{ normalized_url }}</code></p>
+      {% endif %}
       {% if expires_at %}
       <p>將在 <strong id="expire-time">{{ expires_at }}</strong> 之後刪除。</p>
       {% endif %}
@@ -324,7 +392,7 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
           if (data.status === 'done' && data.download_url) {
             statusBox.innerHTML = '<p>下載完成：</p><p><a class="btn" href="' + data.download_url + '">點此下載 ' + (data.filename || '') + '</a></p><p>檔案將在 8 小時後刪除。</p>';
           } else if (data.status === 'error') {
-            statusBox.innerHTML = '<p>下載失敗，查看下方日誌。</p>';
+            statusBox.innerHTML = '<p>下載失敗，下面是 yt-dlp 的日誌，先看它說了啥。</p>';
           } else {
             setTimeout(poll, 2000);
           }
