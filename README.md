@@ -90,6 +90,14 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/seiuestu.sh)
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/mentee.sh)
 ```
 
+# 10、Dl
+
+> 偶爾救急。
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/dl.sh)
+```
+
 ---
 
 # 免責聲明
