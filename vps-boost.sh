@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# vps-boost.sh  一鍵初始化 VPS 終端體驗（通用穩定版 + 自動進 zsh + 顯示本機IP）
+# vps-boost.sh  一鍵初始化 VPS 終端體驗（通用穩定版 + 自動進 zsh + 顯示本機IP + bash守門）
 # ------------------------------------------------------------
 set -e
 
@@ -38,15 +38,15 @@ else
   exit 1
 fi
 
-echo "[1/6] 更新套件索引..."
+echo "[1/7] 更新套件索引..."
 eval "$UPDATE_CMD"
 
 # 2. 安裝核心工具（失敗直接中止）
-echo "[2/6] 安裝核心工具 (zsh curl git nano htop)..."
+echo "[2/7] 安裝核心工具 (zsh curl git nano htop)..."
 eval "$INSTALL_CMD zsh curl git nano htop"
 
 # 3. 安裝輔助工具（失敗不終止）
-echo "[3/6] 安裝輔助工具 (lnav multitail fzf fd / ripgrep / bat)..."
+echo "[3/7] 安裝輔助工具 (lnav multitail fzf fd / ripgrep / bat)..."
 OPTIONAL_PKGS="lnav multitail fzf fd-find fd ripgrep bat batcat"
 for pkg in $OPTIONAL_PKGS; do
   if eval "$INSTALL_CMD $pkg" >/dev/null 2>&1; then
@@ -56,11 +56,11 @@ for pkg in $OPTIONAL_PKGS; do
   fi
 done
 
-# 4. 嘗試把預設 shell 換成 zsh
+# 4. 嘗試把預設 shell 換成 zsh（能換就換，不能換也別死）
 ZSH_PATH="$(command -v zsh || true)"
 if [ -n "$ZSH_PATH" ]; then
   if [ "$SHELL" != "$ZSH_PATH" ]; then
-    echo "[4/6] 將預設 shell 改成 zsh (${ZSH_PATH})..."
+    echo "[4/7] 將預設 shell 改成 zsh ($ZSH_PATH)..."
     if [ "$(id -u)" -eq 0 ]; then
       chsh -s "$ZSH_PATH" "$(whoami)" || echo "警告：chsh 執行失敗，請稍後手動執行 'chsh -s $ZSH_PATH $(whoami)'"
     else
@@ -72,7 +72,7 @@ if [ -n "$ZSH_PATH" ]; then
       fi
     fi
   else
-    echo "[4/6] 略過 chsh，目前 shell 已是 zsh。"
+    echo "[4/7] 略過 chsh，目前 shell 已是 zsh。"
   fi
 else
   echo "警告：找不到 zsh 執行檔，但前面應該已安裝成功。請重新登入後確認。"
@@ -80,7 +80,7 @@ fi
 
 # 5. 寫 ~/.zshrc，先備份舊的
 ZSHRC="$HOME/.zshrc"
-echo "[5/6] 寫入 ~/.zshrc ..."
+echo "[5/7] 寫入 ~/.zshrc ..."
 if [ -f "$ZSHRC" ]; then
   BACKUP="$HOME/.zshrc.bak.$(date +%s)"
   mv "$ZSHRC" "$BACKUP"
@@ -114,7 +114,7 @@ if command -v fdfind >/dev/null 2>&1; then
   alias fd='fdfind'
 fi
 
-# 取本機 IP，優先用 ip route，退回 hostname -I
+# 取本機 IP，優先 ip，再 hostname -I
 _vps_ip() {
   local _ip=""
   if command -v ip >/dev/null 2>&1; then
@@ -137,7 +137,7 @@ precmd() {
   print -P '%F{238}──────────────────────────────────────────────%f'
 }
 
-# 不用特殊字元，避免亂碼；加上 [VPS IP]
+# 不用特殊字元，避免亂碼；加上 [VPS <IP>]
 get_git_branch() {
   command git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return
   echo "(git:$(git rev-parse --abbrev-ref HEAD))"
@@ -212,17 +212,43 @@ sstatus() {
 # ===== END =====
 EOF
 
-echo "[6/6] 完成 zshrc 寫入。"
-
-# 6. 最後直接進 zsh，讓你馬上看到效果
-if [ -x /usr/bin/zsh ]; then
-  echo "=== 切換到 /usr/bin/zsh，載入新設定 ==="
-  exec /usr/bin/zsh
-else
-  if command -v zsh >/dev/null 2>&1; then
-    echo "=== 切換到 $(command -v zsh) ，載入新設定 ==="
-    exec "$(command -v zsh)"
-  else
-    echo "警告：找不到 zsh 執行檔，請手動執行 'zsh' 再 'source ~/.zshrc'"
+# 6. 在 bashrc / profile 加自動跳 zsh，防止 ssh 默認進 bash
+echo "[6/7] 寫入 ~/.bashrc 跳轉到 zsh ..."
+BASHRC="$HOME/.bashrc"
+BASH_SNIPPET='
+# auto-switch-to-zsh (added by vps-boost)
+if [ -t 1 ] && command -v zsh >/dev/null 2>&1; then
+  if [ -z "$ZSH_VERSION" ]; then
+    exec zsh
   fi
+fi
+'
+if [ -f "$BASHRC" ]; then
+  # 避免重複寫
+  if ! grep -q "auto-switch-to-zsh (added by vps-boost)" "$BASHRC"; then
+    printf "%s\n" "$BASH_SNIPPET" >> "$BASHRC"
+  fi
+else
+  printf "%s\n" "$BASH_SNIPPET" > "$BASHRC"
+fi
+
+echo "[7/7] 寫入 ~/.profile 跳轉到 zsh (作為備援) ..."
+PROFILE="$HOME/.profile"
+if [ -f "$PROFILE" ]; then
+  if ! grep -q "auto-switch-to-zsh (added by vps-boost)" "$PROFILE"; then
+    printf "%s\n" "$BASH_SNIPPET" >> "$PROFILE"
+  fi
+else
+  printf "%s\n" "$BASH_SNIPPET" > "$PROFILE"
+fi
+
+echo "=== 所有設定寫入完成，切換到 zsh ==="
+
+# 7. 當前這次也直接進 zsh
+if [ -x /usr/bin/zsh ]; then
+  exec /usr/bin/zsh
+elif command -v zsh >/dev/null 2>&1; then
+  exec "$(command -v zsh)"
+else
+  echo "警告：找不到 zsh 執行檔，請手動執行 'zsh'"
 fi
