@@ -98,6 +98,13 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/mentee.sh)
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/dl.sh)
 ```
 
+# 11、Vps-Boost
+
+> 五色令人目盲
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/vps-boost.sh)
+```
 ---
 
 # 免責聲明
