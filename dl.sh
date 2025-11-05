@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean
-# version: v0.2.5-2025-11-05
-# changes from v0.2.4:
-# - progress API 回傳相對路徑的 download_url，避免瀏覽器 mixed content
-# - Flask 加 ProxyFix + PREFERRED_URL_SCHEME=https
-# - nginx 傳 X-Forwarded-Proto https
+# version: v1.0-2025-11-05
+# changes from v1.0:
+# - mobile-friendly index.html (narrow padding, bigger inputs, collapsible log on mobile)
+# - frontend auto-expand log on error/done
+# - keep HTTPS/mixed-content fix
 # domain: xz.bdfz.net
 
 set -euo pipefail
@@ -17,7 +17,7 @@ DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 
-echo "[ytweb] installing version v0.2.5-2025-11-05 ..."
+echo "[ytweb] installing version v1.0-2025-11-05 ..."
 
 # 0) stop old
 if systemctl list-units --full -all | grep -q "$SERVICE_NAME"; then
@@ -56,7 +56,7 @@ cat > "$APP_DIR/app.py" <<'PY'
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v0.2.5-2025-11-05
+version: v1.0-2025-11-05
 
 - explicit yt-dlp path via env YTDLP_BIN
 - youtube url normalization
@@ -84,7 +84,6 @@ if not os.path.isfile(YTDLP_BIN):
     YTDLP_BIN = "/opt/ytweb/venv/bin/yt-dlp"
 
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"), static_folder=os.path.join(BASE_DIR, "static"))
-# 讓 Flask 知道前面有反代，協議是 https
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.config["PREFERRED_URL_SCHEME"] = "https"
 
@@ -105,25 +104,20 @@ def normalize_youtube_url(u: str) -> str:
     host = (parsed.netloc or "").lower()
     path = parsed.path or ""
     qs = parse_qs(parsed.query or "")
-    # youtu.be/ID
     if host in ("youtu.be", "www.youtu.be"):
         vid = path.lstrip("/")
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
-    # m. / music. / youtube.com
     if host in ("m.youtube.com", "music.youtube.com", "youtube.com"):
         host = "www.youtube.com"
-    # shorts
     if "youtube.com" in host and path.startswith("/shorts/"):
         vid = path.split("/shorts/")[1].split("/")[0]
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
-    # live
     if "youtube.com" in host and path.startswith("/live/"):
         vid = path.split("/live/")[1].split("/")[0]
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
-    # normal watch
     if "youtube.com" in host and path.startswith("/watch"):
         vid = qs.get("v", [""])[0]
         if vid:
@@ -269,7 +263,6 @@ def progress(task_id):
         "expires_at": task["expires_at"].isoformat() if task.get("expires_at") else None,
     }
     if task["status"] == "done" and task["filename"]:
-        # return relative path to avoid mixed content
         data["download_url"] = url_for("get_file", task_id=task_id, filename=task["filename"], _external=False)
         data["filename"] = task["filename"]
     return jsonify(data)
@@ -287,7 +280,7 @@ if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5001, debug=False)
 PY
 
-# 5) template
+# 5) mobile-friendly template
 cat > "$APP_DIR/templates/index.html" <<'HTML'
 <!doctype html>
 <html lang="zh-CN">
@@ -296,30 +289,134 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
   <title>yt-dlp web · bdfz</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body { max-width: 720px; margin: 2rem auto; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    input, select, button, textarea { width: 100%; padding: 0.5rem; margin-bottom: 1rem; }
-    .log { white-space: pre-wrap; background: #f6f6f6; padding: 1rem; border: 1px solid #ddd; max-height: 260px; overflow-y: auto; }
-    .ok { background: #e8fff1; padding: 1rem; border: 1px solid #bde5c8; margin-bottom: 1rem; }
-    .err { background: #ffe8e8; padding: 1rem; border: 1px solid #f5c2c2; margin-bottom: 1rem; }
-    a.btn { display: inline-block; background: #0d6efd; color: #fff; padding: 0.5rem 1rem; text-decoration: none; border-radius: 4px; }
-    .progress-bar { width: 100%; background: #ddd; height: 10px; border-radius: 5px; overflow: hidden; margin-bottom: 1rem; }
-    .progress-bar-inner { height: 10px; background: #0d6efd; width: 0%; transition: width .3s ease; }
+    :root {
+      --gap: 1rem;
+      --radius: 6px;
+      --primary: #0d6efd;
+      --bg-soft: #e8fff1;
+    }
+    body {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 1rem 1rem 3rem;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+      background: #fff;
+    }
+    h1 {
+      margin-top: 0.5rem;
+      margin-bottom: 1rem;
+      font-size: 1.6rem;
+    }
+    .top-note {
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      border-radius: 9999px;
+      padding: 0.35rem 0.9rem;
+      font-size: 0.78rem;
+      margin-bottom: 1rem;
+      display: inline-block;
+    }
+    input, select, button, textarea {
+      width: 100%;
+      padding: 0.6rem 0.55rem;
+      margin-bottom: 0.8rem;
+      border: 1px solid #d1d5db;
+      border-radius: var(--radius);
+      font-size: 1rem;
+      box-sizing: border-box;
+    }
+    button {
+      background: #4b5563;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover {
+      background: #374151;
+    }
+    .log-wrap {
+      margin-top: 0.5rem;
+    }
+    .log {
+      white-space: pre-wrap;
+      background: #f6f6f6;
+      padding: 0.75rem;
+      border: 1px solid #ddd;
+      border-radius: var(--radius);
+      max-height: 220px;
+      overflow-y: auto;
+      font-size: 0.8rem;
+    }
+    .log.is-collapsed {
+      max-height: 0;
+      padding: 0;
+      border-width: 0;
+      overflow: hidden;
+    }
+    .ok {
+      background: var(--bg-soft);
+      padding: 1rem;
+      border: 1px solid #bde5c8;
+      border-radius: var(--radius);
+      margin-bottom: 1rem;
+    }
+    .err {
+      background: #ffe8e8;
+      padding: 1rem;
+      border: 1px solid #f5c2c2;
+      border-radius: var(--radius);
+      margin-bottom: 1rem;
+    }
+    a.btn {
+      display: inline-block;
+      background: var(--primary);
+      color: #fff;
+      padding: 0.6rem 0.75rem;
+      text-decoration: none;
+      border-radius: var(--radius);
+      font-weight: 600;
+      width: 100%;
+      text-align: center;
+      box-sizing: border-box;
+    }
+    .progress-bar {
+      width: 100%;
+      background: #e5e7eb;
+      height: 12px;
+      border-radius: 9999px;
+      overflow: hidden;
+      margin-bottom: 0.5rem;
+    }
+    .progress-bar-inner {
+      height: 100%;
+      background: var(--primary);
+      width: 0%;
+      transition: width .3s ease;
+    }
+    @media (min-width: 720px) {
+      body { padding-top: 2rem; }
+      a.btn { width: auto; }
+      .log.is-collapsed { max-height: 220px; padding: 0.75rem; border-width: 1px; }
+    }
   </style>
 </head>
 <body>
+  <div class="top-note">檔案會在 8 小時後自動刪除</div>
   <h1>yt-dlp web</h1>
-  <p>輸入影片 / 音訊 / 社交平台鏈接，服務端下載。檔案會在 <strong>8 小時</strong> 後自動刪除。</p>
+  <p style="margin-top:-0.4rem;">貼你要下的影片 / 音訊 / 社交平台鏈接。基於 yt-dlp，能下的都會試。</p>
   <form method="post" action="/download">
-    <label for="url">URL</label>
+    <label for="url" style="font-weight:600;font-size:0.85rem;">URL</label>
     <input type="url" id="url" name="url" required placeholder="https://www.youtube.com/watch?v=... / https://youtu.be/... / https://www.bilibili.com/...">
-    <label for="format">常用格式 (yt-dlp -f)</label>
+    <label for="format" style="font-weight:600;font-size:0.85rem;">常用格式 (yt-dlp -f)</label>
     <select id="format" name="format">
       <option value="best" selected>best (影片最佳)</option>
       <option value="bestaudio">bestaudio (最佳音訊)</option>
       <option value="bestvideo+bestaudio/best">bestvideo+bestaudio/best</option>
       <option value="worst">worst</option>
     </select>
-    <label for="custom_format">自定義格式 (可選)</label>
+    <label for="custom_format" style="font-weight:600;font-size:0.85rem;">自定義格式 (可選)</label>
     <input type="text" id="custom_format" name="custom_format" placeholder="例如：bv[ext=mp4]+ba/best">
     <button type="submit">開始下載</button>
   </form>
@@ -330,19 +427,21 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
 
   {% if started %}
     <div id="status-box" class="ok">
-      <p>任務已建立，正在下載中…（幾秒後進度才會跳）</p>
-      <p>任務ID：<code id="task-id">{{ task_id }}</code></p>
+      <p style="margin-top:0;">任務已建立，正在下載中…（幾秒後進度才會跳）</p>
+      <p style="margin-bottom:0.2rem;">任務ID：<code id="task-id">{{ task_id }}</code></p>
       {% if normalized_url %}
-      <p>已規整鏈接：<code>{{ normalized_url }}</code></p>
+      <p style="margin-bottom:0.2rem;">已規整鏈接：<code>{{ normalized_url }}</code></p>
       {% endif %}
       {% if expires_at %}
-      <p>將在 <strong id="expire-time">{{ expires_at }}</strong> 之後刪除。</p>
+      <p style="margin-bottom:0;">將在 <strong id="expire-time">{{ expires_at }}</strong> 之後刪除。</p>
       {% endif %}
     </div>
     <div class="progress-bar">
       <div id="pb" class="progress-bar-inner"></div>
     </div>
-    <div id="logs" class="log"></div>
+    <div class="log-wrap">
+      <div id="logs" class="log is-collapsed"></div>
+    </div>
   {% endif %}
 
   <script>
@@ -353,6 +452,10 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
     const pb = document.getElementById('pb');
     const logsEl = document.getElementById('logs');
     const statusBox = document.getElementById('status-box');
+
+    function expandLog() {
+      if (logsEl) logsEl.classList.remove('is-collapsed');
+    }
 
     function poll() {
       fetch('/progress/' + taskId)
@@ -370,8 +473,10 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
             if (et) et.textContent = data.expires_at;
           }
           if (data.status === 'done' && data.download_url) {
+            expandLog();
             statusBox.innerHTML = '<p>下載完成：</p><p><a class="btn" href="' + data.download_url + '">點此下載 ' + (data.filename || '') + '</a></p><p>檔案將在 8 小時後刪除。</p>';
           } else if (data.status === 'error') {
+            expandLog();
             statusBox.innerHTML = '<p>下載失敗，下面是日誌。</p>';
           } else {
             setTimeout(poll, 2000);
