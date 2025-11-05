@@ -4,6 +4,7 @@
 # - 安裝 zsh 等工具
 # - 寫 ~/.zshrc（含 [VPS IP]）
 # - 在 ~/.bashrc / ~/.profile 加「自動跳 zsh 並在 zsh 結束後 exit」
+# - 不會在腳本最後再幫你開一層 zsh，避免要 exit 兩次
 # ------------------------------------------------------------
 set -e
 
@@ -52,7 +53,7 @@ for pkg in lnav multitail fzf fd-find fd ripgrep bat batcat; do
   fi
 done
 
-# 4. 嘗試 chsh
+# 4. 嘗試 chsh（能換就換，不行就靠 bashrc）
 ZSH_PATH="$(command -v zsh || true)"
 if [ -n "$ZSH_PATH" ]; then
   if [ "$SHELL" != "$ZSH_PATH" ]; then
@@ -179,7 +180,7 @@ sstatus() {
 # ===== END =====
 EOF
 
-# 6. 在 bashrc / profile 加「自動跳 zsh 並在 zsh 結束後 exit」
+# 6. 在 bashrc / profile 加「自動跳 zsh 然後 exit」
 echo "[6/7] 寫入自動跳 zsh 到 ~/.bashrc / ~/.profile ..."
 BASH_SNIPPET='
 # auto-switch-to-zsh (vps-boost)
@@ -203,11 +204,4 @@ else
 fi
 
 echo "[7/7] 完成。"
-
-# 7. 當前這次也進 zsh，但要跟上面同樣邏輯：不是 zsh 才進
-if [ -z "$ZSH_VERSION" ]; then
-  if command -v zsh >/dev/null 2>&1; then
-    zsh
-    exit
-  fi
-fi
+echo "=== Done. 下次 ssh 登進來就是自動 zsh；這次這個 shell 你正常 exit 一次就走了。 ==="
