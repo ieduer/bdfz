@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Seiue Notification → Telegram - 安裝/升級腳本
-# 版本：v2.5.7-flow-attach
+# 版本：v2.5.9-assessment
 set -euo pipefail
 
-SIDE_VERSION="v2.5.7-flow-attach"
+SIDE_VERSION="v2.5.9-assessment"
 
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
 info(){ echo -e "${C_BLUE}INFO:${C_RESET} $1"; }
@@ -95,8 +95,11 @@ HARD_CUTOFF_MINUTES=1440
 OSS_HOST=https://oss-seiue-attachment.seiue.com
 SEIUE_REFERER=https://chalk-c3.seiue.com/
 
-# 下載頭像時用這個 processor（和你本機成功的一樣）
+# 下載頭像時用這個 processor
 PHOTO_PROCESSOR=image/resize,w_2048/quality,q_90
+
+# 下載約談附件開關
+CHAT_DOWNLOAD_ATTACH=1
 
 SIDE_VERSION=${SIDE_VERSION}
 EOF
@@ -116,6 +119,7 @@ ensure_env_defaults(){
   _set_if_missing OSS_HOST https://oss-seiue-attachment.seiue.com
   _set_if_missing SEIUE_REFERER https://chalk-c3.seiue.com/
   _set_if_missing PHOTO_PROCESSOR image/resize,w_2048/quality,q_90
+  _set_if_missing CHAT_DOWNLOAD_ATTACH 1
   _set_if_missing SIDE_VERSION ${SIDE_VERSION}
 }
 
@@ -136,11 +140,12 @@ write_python(){
 # -*- coding: utf-8 -*-
 """
 Seiue → Telegram notifier
-版本: v2.5.7-flow-attach
-這版做了三件事：
-1. 上次斷掉的 get_student_detail 補上了；
-2. 加了 download_file_by_id，可走你抓包那條 /chalk/netdisk/files/<hash>/url?processor=...&download=true；
-3. 請假流程的附件先下載到 VPS，再發 Telegram，下載不到才丟 OSS 連結。
+版本: v2.5.9-assessment
+
+這版在 v2.5.8-chat-form 的基礎上多做了：
+1. 增加「德育/評價已發布」的專門分支，會根據通知帶過來的 assessment_id / item_id / owner_id
+   去 /vnas/common/... 把真正的評價內容拉回來；
+2. 沒帶齊參數就回退到原來的兜底文本。
 """
 import os, sys, time, json, html, fcntl, logging, hashlib, re
 from typing import Dict, Any, List, Tuple, Optional
@@ -149,18 +154,12 @@ import requests, pytz
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------------------------------------------------------------------
-# 基本路徑/檔案
-# ---------------------------------------------------------------------
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE, "logs"); os.makedirs(LOG_DIR, exist_ok=True)
 STATE_FILE = os.path.join(BASE, "notify_state.json")
 LOCK_FILE  = os.path.join(BASE, ".notify.lock")
 LOG_FILE   = os.path.join(LOG_DIR, "notify.log")
 
-# ---------------------------------------------------------------------
-# 環境變量
-# ---------------------------------------------------------------------
 SEIUE_USERNAME = os.getenv("SEIUE_USERNAME","")
 SEIUE_PASSWORD = os.getenv("SEIUE_PASSWORD","")
 X_SCHOOL_ID    = os.getenv("X_SCHOOL_ID","3")
@@ -168,6 +167,7 @@ X_ROLE         = os.getenv("X_ROLE","teacher")
 SEIUE_REFERER  = os.getenv("SEIUE_REFERER","https://chalk-c3.seiue.com/")
 OSS_HOST       = os.getenv("OSS_HOST","https://oss-seiue-attachment.seiue.com")
 PHOTO_PROCESSOR= os.getenv("PHOTO_PROCESSOR","image/resize,w_2048/quality,q_90")
+CHAT_DOWNLOAD_ATTACH = os.getenv("CHAT_DOWNLOAD_ATTACH","1").strip().lower() in ("1","true","yes","on")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","")
@@ -187,9 +187,6 @@ BEIJING_TZ = pytz.timezone("Asia/Shanghai")
 START_TS = time.time()
 HARD_CUTOFF_TS = START_TS - HARD_CUTOFF_MINUTES*60
 
-# ---------------------------------------------------------------------
-# logging
-# ---------------------------------------------------------------------
 logging.basicConfig(
   level=logging.INFO,
   format="%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s",
@@ -197,11 +194,7 @@ logging.basicConfig(
   handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8", mode="a"), logging.StreamHandler(sys.stdout)],
 )
 
-# ---------------------------------------------------------------------
-# 小工具
-# ---------------------------------------------------------------------
-def esc(s:str)->str:
-  return html.escape(s or "", quote=False)
+def esc(s:str)->str: return html.escape(s or "", quote=False)
 
 def parse_ts(s:str)->float:
   for fmt in ("%Y-%m-%d %H:%M:%S","%Y-%m-%dT%H:%M:%S%z","%Y-%m-%dT%H:%M:%S","%Y-%m-%dT%H:%M:%S.%fZ"):
@@ -224,14 +217,13 @@ def load_state()->Dict[str,Any]:
   if not os.path.exists(STATE_FILE):
     return {"seen_global":{}, "watermark":{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}}}
   try:
-    with open(STATE_FILE,"r",encoding="utf-8") as f:
-      st=json.load(f)
+    with open(STATE_FILE,"r",encoding="utf-8") as f: st=json.load(f)
     st.setdefault("seen_global",{})
     st.setdefault("watermark",{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}})
     for ch in ("system","notice"):
       st["watermark"].setdefault(ch,{"ts":0.0,"id":0})
     return st
-  except Exception:
+  except:
     return {"seen_global":{}, "watermark":{"system":{"ts":0.0,"id":0}, "notice":{"ts":0.0,"id":0}}}
 
 def save_state(st:Dict[str,Any])->None:
@@ -263,33 +255,26 @@ def sender_name(it:Dict[str,Any])->str:
   sr=it.get("sender_reflection") or it.get("sender") or {}
   return sr.get("name") or sr.get("nickname") or "系統"
 
-# ---------------------------------------------------------------------
-# Telegram 客戶端
-# ---------------------------------------------------------------------
 class Telegram:
   def __init__(self, token:str, chat_id:str):
-    self.base=f"https://api.telegram.org/bot{token}"
-    self.chat_id=chat_id
+    self.base=f"https://api.telegram.org/bot{token}"; self.chat_id=chat_id
     self.s=requests.Session()
     self.s.mount("https://", HTTPAdapter(max_retries=Retry(total=4, backoff_factor=1.3, status_forcelist=(429,500,502,503,504))))
     self._last=0.0
   def _pace(self):
     delta=time.time()-self._last
-    if delta<1.5:
-      time.sleep(1.5-delta)
+    if delta<1.5: time.sleep(1.5-delta)
   def _post(self, ep:str, data:dict, files:dict=None, timeout:int=60)->bool:
     back=1.0
     for _ in range(6):
       try:
         self._pace()
         r=self.s.post(f"{self.base}/{ep}", data=data, files=files, timeout=timeout); self._last=time.time()
-        if r.status_code==200:
-          return True
+        if r.status_code==200: return True
         if r.status_code==429:
           try: delay=int(r.json().get("parameters",{}).get("retry_after",3))
           except: delay=3
-          time.sleep(delay+1)
-          continue
+          time.sleep(delay+1); continue
         if 500<=r.status_code<600:
           time.sleep(back); back=min(back*2,15); continue
         return False
@@ -297,7 +282,6 @@ class Telegram:
         time.sleep(back); back=min(back*2,15)
     return False
   def send(self, html_text:str)->bool:
-    # 簡化：這裡不切片長文，因為我們本身不長
     return self._post("sendMessage", {"chat_id":self.chat_id,"text":html_text,"parse_mode":"HTML","disable_web_page_preview":True}, None, 60)
   def send_photo(self, data:bytes, cap:str="")->bool:
     if len(cap)>1024: cap=cap[:1000]+"…"
@@ -306,54 +290,35 @@ class Telegram:
     if len(cap)>1024: cap=cap[:1000]+"…"
     return self._post("sendDocument", {"chat_id":self.chat_id,"caption":cap,"parse_mode":"HTML"}, {"document":(name,data)}, 180)
 
-# ---------------------------------------------------------------------
-# Seiue API 客戶端
-# ---------------------------------------------------------------------
 class Seiue:
   def __init__(self, user:str, pwd:str):
     self.u=user; self.p=pwd
     self.s=requests.Session()
     self.s.mount("https://", HTTPAdapter(max_retries=Retry(total=5, backoff_factor=1.6, status_forcelist=(429,500,502,503,504))))
     self.reflection=None
-
   def login(self)->bool:
     try:
-      self.s.post(
-        "https://passport.seiue.com/login?school_id=3",
-        headers={"Content-Type":"application/x-www-form-urlencoded","Origin":"https://passport.seiue.com"},
-        data={"email":self.u,"password":self.p},
-        timeout=30
-      )
-      r = self.s.post(
-        "https://passport.seiue.com/authorize",
-        headers={
-          "Content-Type":"application/x-www-form-urlencoded",
-          "X-Requested-With":"XMLHttpRequest",
-          "Origin":"https://chalk-c3.seiue.com",
-          "Referer":"https://chalk-c3.seiue.com/",
-        },
-        data={"client_id":"GpxvnjhVKt56qTmnPWH1sA","response_type":"token"},
-        timeout=30
-      )
+      self.s.post("https://passport.seiue.com/login?school_id=3",
+                  headers={"Content-Type":"application/x-www-form-urlencoded","Origin":"https://passport.seiue.com"},
+                  data={"email":self.u,"password":self.p}, timeout=30)
+      r = self.s.post("https://passport.seiue.com/authorize",
+                      headers={"Content-Type":"application/x-www-form-urlencoded",
+                               "X-Requested-With":"XMLHttpRequest",
+                               "Origin":"https://chalk-c3.seiue.com",
+                               "Referer":"https://chalk-c3.seiue.com/"},
+                      data={"client_id":"GpxvnjhVKt56qTmnPWH1sA","response_type":"token"}, timeout=30)
       j = r.json()
       tok = j.get("access_token"); rid = str(j.get("active_reflection_id") or "")
       if not tok or not rid:
         logging.error("authorize missing token/reflection_id")
         return False
       self.reflection = rid
-      self.s.headers.update({
-        "Authorization":f"Bearer {tok}",
-        "x-school-id":X_SCHOOL_ID,
-        "x-role":X_ROLE,
-        "x-reflection-id":rid,
-      })
+      self.s.headers.update({"Authorization":f"Bearer {tok}","x-school-id":X_SCHOOL_ID,"x-role":X_ROLE,"x-reflection-id":rid})
       logging.info("Auth OK, reflection_id=%s", rid)
       return True
     except Exception as e:
-      logging.error("login error: %s", e, exc_info=True)
-      return False
+      logging.error("login error: %s", e, exc_info=True); return False
 
-  # 原本你缺的這個
   def get_student_detail(self, sid:int)->Optional[dict]:
     try:
       url=f"https://api.seiue.com/chalk/reflection/students/{sid}/rid/{self.reflection}?expand=guardians,grade,user"
@@ -364,79 +329,55 @@ class Seiue:
       logging.warning("get_student_detail(%s) failed: %s", sid, e)
     return None
 
-  # 新增：用名字搜學生（給考勤/請假裡只有名字的情況兜底）
   def _search_student_by_name(self, name: str) -> Optional[int]:
     try:
       semester_id = os.getenv("SEIUE_SEMESTER_ID", "61564")
       url = "https://api.seiue.com/chalk/search/items"
       params = {
-        "biz_type_in": ",".join([
-          "student",
-          "reflection",
-          "student_user",
-          "owner",
-          "pupil",
-        ]),
+        "biz_type_in": "student,reflection,student_user,owner,pupil",
         "keyword": name,
         "semester_id": semester_id,
       }
       r = self.s.get(url, params=params, timeout=20)
-      if r.status_code != 200:
-        return None
+      if r.status_code != 200: return None
       data = r.json()
       items = data if isinstance(data, list) else data.get("items", [])
-      if not items:
-        return None
+      if not items: return None
       name = name.strip()
-      # 精確
       for it in items:
-        if it.get("biz_type") == "student":
-          label = (it.get("label") or "").strip()
-          if label == name:
-            return int(it["biz_id"])
-      # 退一步
+        if it.get("biz_type") == "student" and (it.get("label") or "").strip() == name:
+          return int(it["biz_id"])
       for it in items:
         if it.get("biz_type") == "student":
           return int(it["biz_id"])
-      return None
     except Exception as e:
       logging.warning("_search_student_by_name(%r) failed: %s", name, e)
-      return None
+    return None
 
   def get_student_by_name(self, name: str) -> Optional[dict]:
     sid = self._search_student_by_name(name)
-    if not sid:
-      return None
+    if not sid: return None
     return self.get_student_detail(sid)
 
-  # 原本就有的通用下載
   def download(self, url:str)->Tuple[bytes,str]:
     r=self.s.get(url, timeout=60, stream=True)
-    if r.status_code!=200:
-      return b"","attachment.bin"
+    if r.status_code!=200: return b"","attachment.bin"
     name="attachment.bin"
     cd=r.headers.get("Content-Disposition") or ""
     if "filename=" in cd:
       name=cd.split("filename=",1)[1].strip('"; ')
     else:
-      # 從 URL 裡猜
       from urllib.parse import urlparse, unquote
-      try:
-        name = unquote(urlparse(r.url).path.rsplit("/",1)[-1]) or name
-      except Exception:
-        pass
+      try: name=unquote(urlparse(r.url).path.rsplit('/',1)[-1]) or name
+      except: pass
     return r.content, name
 
-  # 新增：下載 netdisk fileId（你抓包那種）
   def download_file_by_id(self, fid:str, processor:str="", download:bool=False)->Tuple[bytes,str]:
     from urllib.parse import quote
     qs=[]
-    if processor:
-      qs.append("processor="+quote(processor, safe=""))
-    if download:
-      qs.append("download=true")
+    if processor: qs.append("processor="+quote(processor, safe=""))
+    if download: qs.append("download=true")
     q = ("?"+"&".join(qs)) if qs else ""
-    # 先試無後綴，再試 .jpg
     candidates = [
       f"https://api.seiue.com/chalk/netdisk/files/{fid}/url{q}",
       f"https://api.seiue.com/chalk/netdisk/files/{fid}.jpg/url{q}",
@@ -449,43 +390,66 @@ class Seiue:
       loc = r.headers.get("Location") or r.headers.get("location")
       logging.info("HEAD %s -> %s loc=%s", url, r.status_code, bool(loc))
       if loc:
-        data, name = self.download(loc)
+        data,name = self.download(loc)
         if data:
           return data, name or (fid + ".bin")
     return b"", ""
 
-  # 從學生 photo/avatar 下載
   def download_student_photo_like_client(self, photo_key:str)->Tuple[bytes,str]:
     key=(photo_key or "").strip()
-    # 直接 URL
     if key.startswith("http://") or key.startswith("https://"):
       return self.download(key)
-    # 32位 hash
     base_key = key.replace(".jpg","").replace(".jpeg","")
     if len(base_key)==32 and all(c in "0123456789abcdef" for c in base_key):
       data, name = self.download_file_by_id(base_key, PHOTO_PROCESSOR, False)
-      if data:
-        return data, name
-    # OSS 猜路徑（最後兜底）
+      if data: return data, name
     a = base_key[0:2]; b=base_key[2:4]
-    guess = [
+    for u in (
       f"{OSS_HOST}/user/{a}/{b}/{base_key}.jpg",
       f"{OSS_HOST}/attachment/{a}/{b}/{base_key}.jpg",
       f"{OSS_HOST}/attachment/{base_key}.jpg",
-    ]
-    for u in guess:
+    ):
       data,name = self.download(u)
-      if data:
-        return data, name
+      if data: return data, name
     return b"",""
 
-  # 拉系統消息 / 通知
+  def get_chat(self, chat_id:int, instance_id:Optional[int]=None)->Optional[dict]:
+    if instance_id:
+      url = f"https://api.seiue.com/chalk/chat/instances/{instance_id}/chats/{chat_id}?expand=members,owner,discussion,members.reflection,members.reflection.pupil"
+      r = self.s.get(url, timeout=30)
+      if r.status_code == 200:
+        return r.json()
+    return None
+
+  def get_chat_schedule_section(self, chat_id:int)->Optional[dict]:
+    url = f"https://api.seiue.com/chalk/chat/chats/{chat_id}/schedule-section?expand=section_members,schedule,schedule.compere,section_members.reflection"
+    r = self.s.get(url, timeout=30)
+    if r.status_code==200:
+      return r.json()
+    return None
+
+  def get_chat_form_answers(self, chat_id:int)->Optional[list]:
+    url = f"https://api.seiue.com/form/chat/chat-form/{chat_id}/answers?paginated=0"
+    r = self.s.get(url, timeout=30)
+    if r.status_code==200:
+      try: return r.json()
+      except: return None
+    return None
+
+  def get_chat_form_template(self, template_id:int, instance_id:Optional[int]=None)->Optional[dict]:
+    base = f"https://api.seiue.com/form/chat/chat-form-template?expand=form_template_fields&id={template_id}"
+    if instance_id:
+      base += f"&instance_id={instance_id}"
+    r = self.s.get(base, timeout=30)
+    if r.status_code==200:
+      return r.json()
+    return None
+
   def _get_me(self, params:dict):
     url="https://api.seiue.com/chalk/me/received-messages"
     r=self.s.get(url, params=params, timeout=30)
     if r.status_code in (401,403):
-      if self.login():
-        r=self.s.get(url, params=params, timeout=30)
+      if self.login(): r=self.s.get(url, params=params, timeout=30)
     return r
 
   def list_system(self, pages:int)->List[Dict[str,Any]]:
@@ -505,18 +469,13 @@ class Seiue:
       q=dict(base, **{"page":str(p),"per_page":"20"})
       r=self._get_me(q)
       if r.status_code!=200: break
-      try:
-        j=r.json()
-      except Exception:
-        break
+      try: j=r.json()
+      except Exception: break
       arr=j["items"] if isinstance(j,dict) and "items" in j else (j if isinstance(j,list) else [])
       if not arr: break
       items.extend(arr)
     return items
 
-# ---------------------------------------------------------------------
-# 消息渲染 / 附件提取
-# ---------------------------------------------------------------------
 def render_content(raw_json:str)->Tuple[str,List[Dict[str,Any]]]:
   try: raw=json.loads(raw_json or "{}")
   except: raw={}
@@ -544,48 +503,38 @@ def classify(title:str, body_html:str)->Tuple[str,str]:
   z=(title or "")+"\n"+(body_html or "")
   PAIRS=[("leave","【請假】",["請假","请假","銷假","销假"]),
          ("attendance","【考勤】",["考勤","出勤","打卡","遲到","迟到","早退","缺勤","曠課","旷课"]),
-         ("notice","【通知】",["通知","公告","告知","提醒"])]
+         ("notice","【通知】",["通知","公告","告知","提醒"]),
+         ("chat","【約談】",["約談","约谈","辅导","談話","谈话"])]
   for key, tag, kws in PAIRS:
     for k in kws:
       if k in z: return key, tag
   return "message","【消息】"
 
-# ---------------------------------------------------------------------
-# 請假流程附件抽取 + 真下載
-# ---------------------------------------------------------------------
 def _extract_flow_attachments(flow_data: Optional[dict]) -> List[Dict[str,str]]:
   atts = []
   if not flow_data:
     return atts
   for fv in flow_data.get("field_values") or []:
     fn = fv.get("field_name") or ""
-    # 字段名裡帶 attachment 就拉
     if "attachment" in fn:
       val = fv.get("value")
       if isinstance(val, list):
         for item in val:
-          h = item.get("hash")
-          name = item.get("name") or "附件"
-          if h:
-            atts.append({"hash":h, "name":name})
+          h = item.get("hash"); name = item.get("name") or "附件"
+          if h: atts.append({"hash":h,"name":name})
   return atts
 
 def _send_flow_attachments_download_first(tg:"Telegram", cli:"Seiue", flow_atts:List[Dict[str,str]]):
   for a in flow_atts:
     h = a["hash"]; name = a["name"]
-    # 這裡就是你抓包那條：先去 /chalk/netdisk/files/<hash>/url?processor=quality-Q-75&download=true
     data, realname = cli.download_file_by_id(h, "quality-Q-75", True)
     if data:
       tg.send_doc(data, realname or name, f"請假附件：{esc(name)}")
     else:
-      # 真不行就用靜態 oss
       p1,p2=h[0:2],h[2:4]
       url = f"{OSS_HOST}/attachment/{p1}/{p2}/{h}.jpg"
       tg.send(f"📎 請假附件：{esc(name)}\n{url}")
 
-# ---------------------------------------------------------------------
-# 特定類型推送
-# ---------------------------------------------------------------------
 def _send_attachments_from_content(tg:"Telegram", cli:"Seiue", it:Dict[str,Any])->None:
   _, atts = render_content(it.get("content") or "")
   for a in atts:
@@ -599,7 +548,6 @@ def _send_attachments_from_content(tg:"Telegram", cli:"Seiue", it:Dict[str,Any])
       tg.send_doc(data, a.get("name") or name, esc(a.get("name") or name))
 
 def _maybe_download_attendance_avatar(tg:"Telegram", cli:"Seiue", attrs:dict):
-  # 先用 id
   for key in ("student_id","pupil_id","owner_id","reflection_id"):
     v = attrs.get(key)
     if v and str(v).isdigit():
@@ -611,7 +559,6 @@ def _maybe_download_attendance_avatar(tg:"Telegram", cli:"Seiue", attrs:dict):
           if data:
             tg.send_photo(data, "學生頭像")
             return
-  # 再用名字猜
   name_str = attrs.get("student_name") or attrs.get("name") or ""
   if name_str:
     stu = cli.get_student_by_name(name_str.strip())
@@ -619,7 +566,6 @@ def _maybe_download_attendance_avatar(tg:"Telegram", cli:"Seiue", attrs:dict):
       data,name = cli.download_student_photo_like_client(stu.get("photo") or stu.get("avatar"))
       if data:
         tg.send_photo(data, "學生頭像")
-        return
 
 def _format_detailed_leave_message(original: dict,
                                    flow_data: Optional[dict],
@@ -653,7 +599,6 @@ def _format_detailed_leave_message(original: dict,
       e = r.get("end") or r.get("to") or ""
       if s or e:
         time_lines.append(f"{s} → {e}")
-
   time_block = "\n".join(time_lines) if time_lines else "—"
   duration = (absence_data or {}).get("formatted_minutes") or ""
 
@@ -692,7 +637,6 @@ def _format_detailed_leave_message(original: dict,
     msg += "\n<b>附件</b>："
     for a in flow_attachments:
       msg += f"\n• {esc(a.get('name') or '附件')}"
-
   original.setdefault("_extracted_student_ids", student_ids)
   return msg
 
@@ -700,22 +644,248 @@ def _send_fallback(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:
   title = (it.get("title") or "") + reason
   content = it.get("content") or ""
   body, _ = render_content(content)
+  attrs = it.get("attributes") or {}
   kind, tag = classify(title, body)
   src = sender_name(it)
   hdr = f"📩 <b>{'通知中心' if ch=='notice' else '系統消息'}</b>｜<b>{esc(src)}</b>\n"
   t = it.get("published_at") or it.get("created_at") or ""
-  msg = f"{hdr}\n{prefix}{tag}<b>{esc(title)}</b>\n\n{body}".rstrip()
+  extra_lines=[]
+  if (not body.strip()) and isinstance(attrs, dict) and attrs:
+    pretty_keys=("course_name","lesson_name","student_name","class_name","semester_name","teacher_name","score","comment")
+    for k in pretty_keys:
+      v=attrs.get(k)
+      if v: extra_lines.append(f"<b>{esc(k)}</b>：{esc(str(v))}")
+    if not extra_lines:
+      for i,(k,v) in enumerate(attrs.items()):
+        if i>=5: break
+        extra_lines.append(f"<b>{esc(str(k))}</b>：{esc(str(v))}")
+  full_body = body
+  if extra_lines:
+    full_body = (body + "\n\n" if body else "") + "\n".join(extra_lines)
+  msg = f"{hdr}\n{prefix}{tag}<b>{esc(title)}</b>\n\n{full_body}".rstrip()
   msg += f"\n\n— 發佈於 {fmt_time(t)}"
   ok = tg.send(msg)
   _send_attachments_from_content(tg, cli, it)
+  return ok
+
+def _send_chat_message(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str="")->bool:
+  attrs = it.get("attributes") or {}
+  chat_id = attrs.get("chat_id") or attrs.get("id") or attrs.get("biz_id")
+  instance_id = attrs.get("chat_instance_id") or attrs.get("instance_id") or attrs.get("biz_id")
+  if not chat_id:
+    return _send_fallback(tg, cli, it, ch, prefix, reason="")
+  try: chat_id = int(str(chat_id))
+  except: return _send_fallback(tg, cli, it, ch, prefix, reason="")
+  sec = cli.get_chat_schedule_section(chat_id)
+  answers = cli.get_chat_form_answers(chat_id) or []
+  template = None
+  if answers:
+    template_id = None
+    for ans in answers:
+      tid = ans.get("form_template_id")
+      if tid:
+        template_id = tid; break
+    if template_id:
+      template = cli.get_chat_form_template(int(template_id), instance_id=instance_id)
+  title = it.get("title") or (sec.get("title") if isinstance(sec, dict) else "") or "約談記錄"
+  pub = fmt_time(it.get("published_at") or it.get("created_at") or "")
+  student_name = ""
+  student_id = 0
+  place = ""
+  time_span = ""
+  if isinstance(sec, dict):
+    place = sec.get("place_name") or (sec.get("schedule") or {}).get("place_name") or ""
+    st = sec.get("start_time") or (sec.get("schedule") or {}).get("start_time") or ""
+    ed = sec.get("end_time") or (sec.get("schedule") or {}).get("end_time") or ""
+    time_span = f"{st} → {ed}" if st or ed else ""
+    for m in (sec.get("section_members") or []):
+      ref = m.get("reflection") or {}
+      if (ref.get("role")=="student") or (ref.get("id") and ref.get("id") != cli.reflection):
+        student_name = ref.get("name") or student_name
+        student_id = ref.get("id") or student_id
+        break
+  answer_lines=[]
+  attachment_hashes=[]
+  if answers:
+    for ans in answers:
+      label = ans.get("label") or ""
+      if label:
+        answer_lines.append(f"<b>{esc(label)}</b>")
+      attrs2 = ans.get("attributes")
+      if attrs2 and isinstance(attrs2, dict):
+        files = attrs2.get("files") or attrs2.get("attachments") or []
+        if isinstance(files, list):
+          for f in files:
+            h = f.get("hash") or f.get("file_id")
+            nm = f.get("name") or "附件"
+            if h:
+              attachment_hashes.append((h,nm))
+  parts = []
+  parts.append(f"🟠 <b>{esc(title)}</b>")
+  if student_name:
+    parts.append(f"<b>學生</b>：{esc(student_name)}")
+  if time_span:
+    parts.append(f"<b>時間</b>：{esc(time_span)}")
+  if place:
+    parts.append(f"<b>地點</b>：{esc(place)}")
+  if answer_lines:
+    parts.append("\n".join(answer_lines))
+  parts.append(f"— 約談於 {pub}")
+  msg = "\n".join(parts)
+  if prefix:
+    msg = f"{prefix}\n{msg}"
+  ok = tg.send(msg)
+  if student_id:
+    stu = cli.get_student_detail(int(student_id))
+    if stu:
+      key = stu.get("photo") or stu.get("avatar")
+      if key:
+        data,name = cli.download_student_photo_like_client(key)
+        if data:
+          tg.send_photo(data, "學生頭像")
+  if CHAT_DOWNLOAD_ATTACH and attachment_hashes:
+    for h, nm in attachment_hashes:
+      data, realname = cli.download_file_by_id(h, "quality-Q-75", True)
+      if data:
+        tg.send_doc(data, realname or nm, f"約談附件：{esc(nm)}")
+      else:
+        p1,p2=h[0:2],h[2:4]
+        url = f"{OSS_HOST}/attachment/{p1}/{p2}/{h}.jpg"
+        tg.send(f"📎 約談附件：{esc(nm)}\n{url}")
+  return ok
+
+# ========== 新增：德育/評價通知處理 ==========
+def _send_assessment_message(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str="") -> bool:
+  attrs = it.get("attributes") or {}
+  assessment_id = (
+      attrs.get("assessment_id")
+      or attrs.get("vnas_assessment_id")
+      or attrs.get("assessmentId")
+  )
+  item_id = (
+      attrs.get("item_id")
+      or attrs.get("vnas_item_id")
+      or attrs.get("itemId")
+  )
+  owner_id = (
+      attrs.get("owner_id")
+      or attrs.get("reflection_id")
+      or attrs.get("student_id")
+      or attrs.get("ownerId")
+  )
+  op_type = attrs.get("operation_type") or "moral"
+
+  if not (assessment_id and item_id and owner_id):
+    return _send_fallback(tg, cli, it, ch, prefix, reason="")
+
+  assessment = None
+  try:
+    url_ass = f"https://api.seiue.com/vnas/common/assessments/{assessment_id}?expand=items,plan&operation_type={op_type}&policy=evaluated"
+    r = cli.s.get(url_ass, timeout=30)
+    if r.status_code == 200:
+      assessment = r.json()
+  except Exception as e:
+    logging.warning("fetch assessment %s failed: %s", assessment_id, e)
+
+  score_detail = []
+  try:
+    url_item = (
+      f"https://api.seiue.com/vnas/common/items/{item_id}/score-details"
+      f"?expand=item,evaluator&operation_type={op_type}"
+      f"&owner_id={owner_id}&paginated=0&policy=evaluated"
+    )
+    r2 = cli.s.get(url_item, timeout=30)
+    if r2.status_code == 200:
+      score_detail = r2.json()
+  except Exception as e:
+    logging.warning("fetch score details failed: %s", e)
+
+  latest = None
+  if isinstance(score_detail, list) and score_detail:
+    latest = max(
+      score_detail,
+      key=lambda d: d.get("created_at") or d.get("updated_at") or ""
+    )
+
+  student_name = ""
+  student_class = ""
+  try:
+    if str(owner_id).isdigit():
+      stu = cli.get_student_detail(int(owner_id))
+      if stu:
+        student_name = stu.get("name") or ""
+        ac = stu.get("admin_classes") or []
+        if isinstance(ac, list) and ac:
+          student_class = ac[0]
+  except Exception:
+    pass
+
+  title = it.get("title") or "评价已发布"
+  pub = fmt_time(it.get("published_at") or it.get("created_at") or "")
+  assess_name = (assessment or {}).get("name") or ""
+  item_name = ""
+  item_desc = ""
+  if latest and latest.get("item"):
+    item_name = latest["item"].get("name") or ""
+    item_desc = latest["item"].get("description") or ""
+  score_val = ""
+  tag_val = ""
+  evaluator_name = ""
+  if latest:
+    score_val = latest.get("score") or latest.get("gained_score") or ""
+    tag_val = latest.get("tag") or ""
+    ev = latest.get("evaluator") or {}
+    evaluator_name = ev.get("name") or ""
+
+  parts = []
+  parts.append(f"🟡 <b>{esc(title)}</b>")
+  if assess_name:
+    parts.append(f"<b>評價標題</b>：{esc(assess_name)}")
+  if item_name:
+    parts.append(f"<b>評價項目</b>：{esc(item_name)}")
+  if student_name:
+    if student_class:
+      parts.append(f"<b>對象</b>：{esc(student_name)}（{esc(student_class)}）")
+    else:
+      parts.append(f"<b>對象</b>：{esc(student_name)}")
+  if score_val:
+    parts.append(f"<b>得分/變動</b>：{esc(str(score_val))}")
+  if tag_val:
+    parts.append(f"<b>標籤</b>：{esc(tag_val)}")
+  if evaluator_name:
+    parts.append(f"<b>評價人</b>：{esc(evaluator_name)}")
+  if item_desc:
+    short_desc = item_desc.strip()
+    if len(short_desc) > 200:
+      short_desc = short_desc[:200] + "…"
+    parts.append(f"<b>說明</b>：{esc(short_desc)}")
+
+  parts.append(f"— 發佈於 {pub}")
+
+  msg = "\n".join(parts)
+  if prefix:
+    msg = f"{prefix}\n{msg}"
+
+  ok = tg.send(msg)
+
+  if str(owner_id).isdigit():
+    stu = cli.get_student_detail(int(owner_id))
+    if stu:
+      key = stu.get("photo") or stu.get("avatar")
+      if key:
+        data, _ = cli.download_student_photo_like_client(key)
+        if data:
+          tg.send_photo(data, "學生頭像")
+
   return ok
 
 def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str="")->bool:
   domain = it.get("domain") or ""
   msg_type = it.get("type") or ""
   attrs = it.get("attributes") or {}
+  title = it.get("title") or ""
 
-  # 1) 請假抄送：這是我們重點做的
+  # 請假
   if domain == "leave_flow" and msg_type == "absence.flow_cc_node":
     flow_id = attrs.get("flow_id")
     absence_id = attrs.get("absence_id")
@@ -731,10 +901,8 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     html_msg = _format_detailed_leave_message(it, flow_data, abs_data, flow_atts)
     if prefix: html_msg = f"{prefix}\n{html_msg}"
     ok = tg.send(html_msg)
-    # 真的把附件傳上去
     if flow_atts:
       _send_flow_attachments_download_first(tg, cli, flow_atts)
-    # 學生頭像也順手搞
     student_ids = it.get("_extracted_student_ids") or []
     if isinstance(student_ids, list) and student_ids:
       for sid in student_ids:
@@ -748,7 +916,7 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
               break
     return ok
 
-  # 2) 考勤家長
+  # 考勤
   if domain == "attendance" and msg_type == "abnormal_attendance.guardian":
     html_msg = (
       f"🟣 <b>{esc(it.get('title') or '考勤結果')}</b>\n\n"
@@ -761,12 +929,22 @@ def send_one(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, prefix:str=""
     _send_attachments_from_content(tg, cli, it)
     return ok
 
-  # 其他：走原本 fallback
+  # 約談 / chat
+  if domain == "chat" or "chat" in (msg_type or "") or any(k in attrs for k in ("chat_id","chat_instance_id")):
+    return _send_chat_message(tg, cli, it, ch, prefix)
+
+  # 德育/評價已發布
+  if (
+    "评价已发布" in title
+    or "评价已發布" in title
+    or attrs.get("operation_type") == "moral"
+    or ("assessment_id" in attrs and "item_id" in attrs)
+  ):
+    return _send_assessment_message(tg, cli, it, ch, prefix)
+
+  # 其他走兜底
   return _send_fallback(tg, cli, it, ch, prefix)
 
-# ---------------------------------------------------------------------
-# 增量拉取
-# ---------------------------------------------------------------------
 def latest_of_channel(cli:"Seiue", ch:str)->Optional[Dict[str,Any]]:
   arr = cli.list_notice(1) if ch=="notice" else cli.list_system(1)
   return arr[0] if arr else None
@@ -774,8 +952,7 @@ def latest_of_channel(cli:"Seiue", ch:str)->Optional[Dict[str,Any]]:
 def ensure_startup_watermark(cli:"Seiue"):
   st=load_state(); changed=False
   for ch in ("system","notice"):
-    w=st["watermark"][ch]
-    last_ts=float(w.get("ts") or 0.0)
+    w=st["watermark"][ch]; last_ts=float(w.get("ts") or 0.0)
     if FAST_FORWARD_ON_START or last_ts==0.0:
       it=latest_of_channel(cli, ch)
       if it:
@@ -803,26 +980,21 @@ def list_increment_dual(cli:"Seiue")->List[Tuple[str,Dict[str,Any],float,int]]:
       if last_ts and (ts<last_ts or (ts==last_ts and nid<=last_id)):
         continue
       pending.append((ch,it,ts,nid))
-  pending.sort(key=lambda x:(x[2], x[3]))
-  return pending
+  pending.sort(key=lambda x:(x[2], x[3])); return pending
 
-# ---------------------------------------------------------------------
-# main loop
-# ---------------------------------------------------------------------
 def main_loop():
   if not (SEIUE_USERNAME and SEIUE_PASSWORD and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
     print("缺少必要環境變量。", file=sys.stderr); sys.exit(1)
   _lock=acquire_lock_or_exit()
   tg=Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
   cli=Seiue(SEIUE_USERNAME, SEIUE_PASSWORD)
-  if not cli.login():
-    print("Seiue 登錄失敗", file=sys.stderr); sys.exit(2)
+  if not cli.login(): print("Seiue 登錄失敗", file=sys.stderr); sys.exit(2)
   ensure_startup_watermark(cli)
 
   if SEND_TEST_ON_START:
-    tg.send(f"🧪 安裝驗證｜{os.getenv('SIDE_VERSION','v2.5.7-flow-attach')}｜啟動完成。")
+    tg.send(f"🧪 安裝驗證｜{os.getenv('SIDE_VERSION','v2.5.9-assessment')}｜啟動完成。")
 
-  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}，版本={os.getenv('SIDE_VERSION','v2.5.7-flow-attach')}")
+  print(f"{datetime.now().strftime('%F %T')} 開始輪詢（notice+system），每 {POLL_SECONDS}s，頁數<= {MAX_LIST_PAGES}，版本={os.getenv('SIDE_VERSION','v2.5.9-assessment')}")
   while True:
     try:
       st=load_state()
@@ -834,36 +1006,29 @@ def main_loop():
         if ts < HARD_CUTOFF_TS:
           st["seen_global"][gkey]=ts
           wm=st["watermark"][ch]
-          if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]):
-            wm["ts"]=ts; wm["id"]=nid
+          if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
           save_state(st); continue
-
         sDup = f"soft:{sender_name(it)}|{it.get('title') or ''}|{int(ts//SOFT_DUP_WINDOW_SECS)}"
         if sDup in st["seen_global"]:
           continue
-
         ok=send_one(tg, cli, it, ch)
         if ok:
           st["seen_global"][gkey]=ts
           st["seen_global"][sDup]=ts
-          # 限制 seen 表長度
           if len(st["seen_global"]) > 24000:
             oldest = sorted(st["seen_global"].items(), key=lambda kv: kv[1])[:6000]
             for k,_ in oldest: st["seen_global"].pop(k, None)
           wm=st["watermark"][ch]
-          if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]):
-            wm["ts"]=ts; wm["id"]=nid
+          if ts>wm["ts"] or (ts==wm["ts"] and nid>wm["id"]): wm["ts"]=ts; wm["id"]=nid
           save_state(st)
       time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
-      print(f"{datetime.now().strftime('%F %T')} 收到中斷，退出")
-      break
+      print(f"{datetime.now().strftime('%F %T')} 收到中斷，退出"); break
     except Exception as e:
-      logging.error("loop error: %s", e, exc_info=True)
-      time.sleep(3)
+      logging.error("loop error: %s", e, exc_info=True); time.sleep(3)
 
 if __name__=="__main__":
-  os.environ["SIDE_VERSION"] = "v2.5.7-flow-attach"
+  os.environ["SIDE_VERSION"] = "v2.5.9-assessment"
   main_loop()
 PY
   chmod 755 "$PY_SCRIPT"
