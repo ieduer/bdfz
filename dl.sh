@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean
-# version: v1.0-2025-11-05
-# changes from v1.0:
-# - mobile-friendly index.html (narrow padding, bigger inputs, collapsible log on mobile)
-# - frontend auto-expand log on error/done
-# - keep HTTPS/mixed-content fix
+# version: v1.1-2025-11-08
+# changes from v1.0-2025-11-05:
+# - systemd 改 Restart=always，避免正常停止後不重啟
+# - nginx 加入 80->https 及 443 ssl 反代，符合「必須 https」
+# - 安裝健康檢查 /usr/local/sbin/check-ytweb.sh 並加 cron，每分鐘確保 5001 活著
+# - 保留 mobile-friendly 前端 + 相對下載路徑 + yt-dlp 顯式路徑
 # domain: xz.bdfz.net
 
 set -euo pipefail
@@ -17,9 +18,9 @@ DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 
-echo "[ytweb] installing version v1.0-2025-11-05 ..."
+echo "[ytweb] installing version v1.1-2025-11-08 ..."
 
-# 0) stop old
+# 0) stop old service/process
 if systemctl list-units --full -all | grep -q "$SERVICE_NAME"; then
   systemctl stop "$SERVICE_NAME" || true
 fi
@@ -38,7 +39,7 @@ else
 fi
 
 # 2) dirs
-mkdir -p "$APP_DIR" "$APP_DIR/templates" "$APP_DIR/static" "$DOWNLOAD_DIR"
+mkdir -p "$APP_DIR" "$APP_DIR/templates" "$APP_DIR/static" "$DOWNLOAD_DIR" /var/www/html
 chown -R "$RUN_USER":"$RUN_USER" "$DOWNLOAD_DIR" || true
 
 # 3) venv
@@ -56,10 +57,10 @@ cat > "$APP_DIR/app.py" <<'PY'
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v1.0-2025-11-05
+version: v1.1-2025-11-08
 
 - explicit yt-dlp path via env YTDLP_BIN
-- youtube url normalization
+- youtube url normalization (watch/shorts/live/youtu.be)
 - 8h cleanup
 - progress returns relative download_url to avoid mixed content
 - ProxyFix + PREFERRED_URL_SCHEME=https
@@ -81,16 +82,17 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 YTDLP_BIN = os.environ.get("YTDLP_BIN", os.path.join(BASE_DIR, "venv", "bin", "yt-dlp"))
 if not os.path.isfile(YTDLP_BIN):
+    # fallback
     YTDLP_BIN = "/opt/ytweb/venv/bin/yt-dlp"
 
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"), static_folder=os.path.join(BASE_DIR, "static"))
+# behind nginx
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.config["PREFERRED_URL_SCHEME"] = "https"
 
 TASKS = {}
 LOCK = threading.Lock()
 EXPIRE_HOURS = 8
-
 PROG_RE = re.compile(r"(\d+(?:\.\d+)?)%")
 
 def now_utc():
@@ -104,20 +106,25 @@ def normalize_youtube_url(u: str) -> str:
     host = (parsed.netloc or "").lower()
     path = parsed.path or ""
     qs = parse_qs(parsed.query or "")
+    # youtu.be/ID
     if host in ("youtu.be", "www.youtu.be"):
         vid = path.lstrip("/")
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
+    # m., music.
     if host in ("m.youtube.com", "music.youtube.com", "youtube.com"):
         host = "www.youtube.com"
+    # shorts
     if "youtube.com" in host and path.startswith("/shorts/"):
         vid = path.split("/shorts/")[1].split("/")[0]
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
+    # live
     if "youtube.com" in host and path.startswith("/live/"):
         vid = path.split("/live/")[1].split("/")[0]
         if vid:
             return f"https://www.youtube.com/watch?v={vid}"
+    # watch?v=
     if "youtube.com" in host and path.startswith("/watch"):
         vid = qs.get("v", [""])[0]
         if vid:
@@ -493,7 +500,7 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
 </html>
 HTML
 
-# 6) systemd
+# 6) systemd (Restart=always)
 cat > /etc/systemd/system/"$SERVICE_NAME" <<SERVICE
 [Unit]
 Description=yt-dlp web frontend (Flask)
@@ -506,7 +513,9 @@ WorkingDirectory=$APP_DIR
 Environment=YTWEB_DOWNLOAD_DIR=$DOWNLOAD_DIR
 Environment=YTDLP_BIN=$YTDLP_BIN
 ExecStart=$VENV_DIR/bin/python $APP_DIR/app.py
-Restart=on-failure
+Restart=always
+RestartSec=3
+StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
@@ -516,15 +525,31 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
-# 7) nginx
+# 7) nginx (force https)
 cat > /etc/nginx/sites-available/ytweb.conf <<NG
 server {
     listen 80;
+    listen [::]:80;
     server_name $DOMAIN;
 
     location /.well-known/acme-challenge/ {
         root /var/www/html;
     }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
     location / {
         proxy_pass http://127.0.0.1:5001;
@@ -533,15 +558,34 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
     }
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
 }
 NG
 
 ln -sf /etc/nginx/sites-available/ytweb.conf /etc/nginx/sites-enabled/ytweb.conf
 nginx -t && systemctl reload nginx
 
-# 8) https
+# 8) https cert (first time)
 if command -v certbot >/dev/null 2>&1; then
   certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email || true
+  nginx -t && systemctl reload nginx
+fi
+
+# 9) healthcheck script + cron
+cat >/usr/local/sbin/check-ytweb.sh <<'SH'
+#!/bin/bash
+if ! curl -s --max-time 3 http://127.0.0.1:5001/ >/dev/null; then
+  systemctl restart ytweb.service
+fi
+SH
+chmod +x /usr/local/sbin/check-ytweb.sh
+
+# add to root cron (idempotent enough for this use case)
+if ! crontab -l 2>/dev/null | grep -q 'check-ytweb.sh'; then
+  ( crontab -l 2>/dev/null ; echo "* * * * * /usr/local/sbin/check-ytweb.sh" ) | crontab -
 fi
 
 echo "[ytweb] install done. open: https://$DOMAIN/"
