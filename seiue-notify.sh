@@ -693,11 +693,33 @@ def _send_chat_message(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, pre
   student_id = 0
   place = ""
   time_span = ""
+  raw_start = ""
+  raw_end = ""
+  raw_title = ""
+  raw_content = ""
+  raw_attachments = []
+  raw_place_id = None
+  raw_place_name = ""
+  raw_pupil = None
+  raw_members_wo_teacher = []
   if isinstance(sec, dict):
-    place = sec.get("place_name") or (sec.get("schedule") or {}).get("place_name") or ""
-    st = sec.get("start_time") or (sec.get("schedule") or {}).get("start_time") or ""
-    ed = sec.get("end_time") or (sec.get("schedule") or {}).get("end_time") or ""
+    schedule = sec.get("schedule") or {}
+    place = sec.get("place_name") or schedule.get("place_name") or ""
+    raw_place_name = place
+    raw_place_id = sec.get("place_id") or schedule.get("place_id")
+
+    st = sec.get("start_time") or schedule.get("start_time") or ""
+    ed = sec.get("end_time") or schedule.get("end_time") or ""
+    raw_start = st
+    raw_end = ed
     time_span = f"{st} → {ed}" if st or ed else ""
+
+    raw_title = sec.get("title") or schedule.get("title") or ""
+    raw_content = sec.get("content") or schedule.get("content") or ""
+    raw_attachments = sec.get("attachments") or schedule.get("attachments") or []
+    raw_pupil = sec.get("pupil") or schedule.get("pupil")
+    raw_members_wo_teacher = sec.get("members_without_teacher") or schedule.get("members_without_teacher") or []
+
     for m in (sec.get("section_members") or []):
       ref = m.get("reflection") or {}
       if (ref.get("role")=="student") or (ref.get("id") and ref.get("id") != cli.reflection):
@@ -728,6 +750,41 @@ def _send_chat_message(tg:"Telegram", cli:"Seiue", it:Dict[str,Any], ch:str, pre
     parts.append(f"<b>時間</b>：{esc(time_span)}")
   if place:
     parts.append(f"<b>地點</b>：{esc(place)}")
+
+  # ---- 補充原始約談字段（按需展示）----
+  if raw_start or raw_end:
+    parts.append(f"\"start_time\": \"{esc(raw_start)}\",")
+    parts.append(f"\"end_time\": \"{esc(raw_end)}\",")
+  if raw_title:
+    parts.append(f"\"title\": \"{esc(raw_title)}\",")
+  if raw_content is not None and str(raw_content).strip() != "":
+    parts.append(f"\"content\": \"{esc(str(raw_content))}\",")
+
+  try:
+    parts.append(f"\"attachments\": {esc(json.dumps(raw_attachments, ensure_ascii=False))},")
+  except Exception:
+    parts.append(f"\"attachments\": [],")
+
+  try:
+    parts.append(f"\"place_id\": {esc(json.dumps(raw_place_id, ensure_ascii=False))},")
+  except Exception:
+    parts.append(f"\"place_id\": null,")
+
+  if raw_place_name:
+    parts.append(f"\"place_name\": \"{esc(raw_place_name)}\",")
+
+  if raw_pupil is not None:
+    try:
+      parts.append(f"\"pupil\": {esc(json.dumps(raw_pupil, ensure_ascii=False))},")
+    except Exception:
+      parts.append(f"\"pupil\": {{}},")
+
+  if raw_members_wo_teacher:
+    try:
+      parts.append(f"\"members_without_teacher\": {esc(json.dumps(raw_members_wo_teacher, ensure_ascii=False))},")
+    except Exception:
+      parts.append(f"\"members_without_teacher\": [],")
+
   if answer_lines:
     parts.append("\n".join(answer_lines))
   parts.append(f"— 約談於 {pub}")
