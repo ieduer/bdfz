@@ -93,19 +93,41 @@ v4v6(){
 # 安装 Sing-box 核心
 inssb(){
     green "下载并安装 Sing-box 内核..."
-    sbcore=$(curl -Ls https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | grep -Eo '"[0-9.]+' | sed -n 1p | tr -d '"')
-    sbname="sing-box-$sbcore-linux-$cpu"
     mkdir -p /etc/s-box
-    curl -L -o /etc/s-box/sing-box.tar.gz  -# --retry 2 https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz
-    if [[ -f '/etc/s-box/sing-box.tar.gz' ]]; then
-        tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
-        mv /etc/s-box/$sbname/sing-box /etc/s-box
-        rm -rf /etc/s-box/{sing-box.tar.gz,$sbname}
-        chown root:root /etc/s-box/sing-box
-        chmod +x /etc/s-box/sing-box
-    else
-        red "下载内核失败，请检查网络。" && exit
+
+    # 从 GitHub 官方 API 获取最新版本号 (tag_name 形如 v1.13.0)
+    sbcore=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')
+    if [[ -z "$sbcore" ]]; then
+        red "无法从 GitHub API 获取 sing-box 最新版本号，请检查网络或稍后重试。"
+        exit 1
     fi
+
+    sbname="sing-box-$sbcore-linux-$cpu"
+    sburl="https://github.com/SagerNet/sing-box/releases/download/v${sbcore}/${sbname}.tar.gz"
+
+    green "准备下载版本: ${sbcore} (${sbname})"
+    curl -fL -o /etc/s-box/sing-box.tar.gz -# --retry 2 "$sburl" || {
+        red "下载 sing-box 内核失败，请检查网络或 GitHub 访问。"
+        exit 1
+    }
+
+    # 解压并校验
+    tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box 2>/dev/null || {
+        red "解压 sing-box.tar.gz 失败，文件可能损坏。"
+        rm -f /etc/s-box/sing-box.tar.gz
+        exit 1
+    }
+
+    if [[ ! -x "/etc/s-box/${sbname}/sing-box" ]]; then
+        red "未在解压目录中找到 sing-box 可执行文件，安装中止。"
+        exit 1
+    fi
+
+    mv "/etc/s-box/${sbname}/sing-box" /etc/s-box/
+    rm -rf "/etc/s-box/${sbname}" /etc/s-box/sing-box.tar.gz
+    chown root:root /etc/s-box/sing-box
+    chmod +x /etc/s-box/sing-box
+    green "Sing-box 内核安装完成。"
 }
 
 # 随机端口生成
@@ -152,11 +174,14 @@ apply_acme(){
     
     green "安装 acme.sh..."
     curl https://get.acme.sh | sh
+
+    # 优先选择 Let's Encrypt 作为默认 CA，避免 ZeroSSL 需要 EAB 的问题
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-    
-    green "正在申请证书 (Stand-alone 模式)..."
-    ~/.acme.sh/acme.sh --register-account -m "admin@$domain_name"
-    ~/.acme.sh/acme.sh --issue -d "$domain_name" --standalone -k ec-256
+
+    green "正在申请证书 (Stand-alone 模式，CA: Let's Encrypt)..."
+    ~/.acme.sh/acme.sh --register-account -m "admin@$domain_name" --server letsencrypt
+    ~/.acme.sh/acme.sh --issue -d "$domain_name" --standalone -k ec-256 --server letsencrypt
     
     if [[ $? -ne 0 ]]; then
         red "证书申请失败！请检查域名解析是否正确，或 80 端口是否被占用。"
