@@ -235,6 +235,7 @@ setup_firewall(){
     # 放行必要端口
     ufw allow "$ssh_port"/tcp comment "SSH"
     ufw allow 80/tcp comment "ACME"
+    ufw allow 443/tcp comment "HTTPS"
     ufw allow "$port_vl_re"/tcp comment "Vless"
     ufw allow "$port_vm_ws"/tcp comment "Vmess"
     ufw allow "$port_hy2"/udp comment "Hysteria2"
