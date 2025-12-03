@@ -529,7 +529,14 @@ client_conf(){
         return
     fi
 
-    green "以下为基于当前服务端自动生成的 Sing-box 客户端配置 (tun 全局模式)："
+    # 获取当前服务器公网 IP，用于客户端直接连 IP；获取失败时退回域名
+    v4v6
+    host="$domain"
+    if [[ -n "$v4" ]]; then
+        host="$v4"
+    fi
+
+    green "以下为基于当前服务端自动生成的 Sing-box 客户端配置 (tun 全局模式，最新版模板)："
     echo
     cat <<EOF
 {
@@ -563,11 +570,6 @@ client_conf(){
       }
     ],
     "rules": [
-      {
-        "outbound": "any",
-        "server": "localdns",
-        "disable_cache": true
-      },
       {
         "clash_mode": "Global",
         "server": "proxydns"
@@ -632,7 +634,7 @@ client_conf(){
     {
       "type": "vless",
       "tag": "vless-sb",
-      "server": "$domain",
+      "server": "$host",
       "server_port": $port_vl,
       "uuid": "$uuid",
       "flow": "xtls-rprx-vision",
@@ -653,7 +655,7 @@ client_conf(){
     {
       "type": "vmess",
       "tag": "vmess-sb",
-      "server": "$domain",
+      "server": "$host",
       "server_port": $port_vm,
       "uuid": "$uuid",
       "security": "auto",
@@ -680,7 +682,7 @@ client_conf(){
     {
       "type": "hysteria2",
       "tag": "hy2-sb",
-      "server": "$domain",
+      "server": "$host",
       "server_port": $port_hy,
       "password": "$uuid",
       "tls": {
@@ -695,7 +697,7 @@ client_conf(){
     {
       "type": "tuic",
       "tag": "tuic5-sb",
-      "server": "$domain",
+      "server": "$host",
       "server_port": $port_tu,
       "uuid": "$uuid",
       "password": "$uuid",
@@ -771,6 +773,10 @@ client_conf(){
         "action": "hijack-dns"
       },
       {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
         "clash_mode": "Direct",
         "outbound": "direct"
       },
@@ -784,10 +790,6 @@ client_conf(){
       },
       {
         "rule_set": "geosite-cn",
-        "outbound": "direct"
-      },
-      {
-        "ip_is_private": true,
         "outbound": "direct"
       },
       {
