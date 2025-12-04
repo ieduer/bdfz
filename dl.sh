@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# dl.sh - ytweb with progress, HTTPS, 8h auto-clean
-# version: v1.3-2025-11-30
-# changes from v1.2-2025-11-30:
-# - 強制要求 root 以及 systemd (systemctl) 存在，避免半截安裝
-# - base packages 增加 curl，供健康檢查腳本使用
-# - venv 內使用 python -m pip --upgrade 安裝/升級依賴
-# - 每次安裝時自動升級 yt-dlp，並顯示當前版本
-# - 保持 auto (不傳 -f) 為預設下載策略；完整覆蓋 app.py / 模板 / systemd / nginx / healthcheck
+# dl.sh - ytweb with progress, HTTPS, 8h auto-clean, Telegram notify
+# version: v1.5-2025-12-03
+# changes from v1.4-2025-12-03:
+# - 移除所有硬編碼的 Telegram token / chat_id
+# - systemd 使用 EnvironmentFile=-/etc/ytweb.env 注入 TG_BOT_TOKEN / TG_CHAT_ID
+# - 安裝腳本首次安裝時生成 /etc/ytweb.env 模板（不含任何真實祕鑰）
 # domain: xz.bdfz.net
 
 set -euo pipefail
@@ -21,7 +19,7 @@ DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 
-echo "[ytweb] installing version v1.3-2025-11-30 ..."
+echo "[ytweb] installing version v1.5-2025-12-03 ..."
 
 # 必須 root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -83,9 +81,9 @@ fi
 
 V_PY="$VENV_DIR/bin/python"
 
-echo "[ytweb] upgrading pip and installing/refreshing dependencies (flask, dotenv, yt-dlp, werkzeug) ..."
+echo "[ytweb] upgrading pip and installing/refreshing dependencies (flask, dotenv, yt-dlp, werkzeug, requests) ..."
 "$V_PY" -m pip install --upgrade pip
-"$V_PY" -m pip install --upgrade flask python-dotenv yt-dlp werkzeug
+"$V_PY" -m pip install --upgrade flask python-dotenv yt-dlp werkzeug requests
 
 # 更新後的 yt-dlp 路徑 & 版本
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
@@ -98,7 +96,7 @@ cat > "$APP_DIR/app.py" <<'PY'
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v1.3-2025-11-30
+version: v1.4-2025-12-03
 
 - explicit yt-dlp path via env YTDLP_BIN
 - youtube url normalization (watch/shorts/live/youtu.be)
@@ -106,6 +104,8 @@ version: v1.3-2025-11-30
 - progress returns relative download_url to avoid mixed content
 - ProxyFix + PREFERRED_URL_SCHEME=https
 - auto 模式：不傳 -f，讓 yt-dlp 自行選擇 bestvideo+bestaudio
+- 限制檔名長度，避免 Errno 36
+- 下載完成後透過 Telegram 發送通知（由環境變量注入 TG_BOT_TOKEN / TG_CHAT_ID）
 """
 import os
 import uuid
@@ -115,8 +115,14 @@ import time
 import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
+
 from flask import Flask, request, render_template, send_from_directory, abort, url_for, jsonify
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+try:
+  import requests  # type: ignore
+except Exception:  # pragma: no cover
+  requests = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.environ.get("YTWEB_DOWNLOAD_DIR", "/var/www/yt-downloads")
@@ -127,13 +133,19 @@ if not os.path.isfile(YTDLP_BIN):
   # fallback
   YTDLP_BIN = "/opt/ytweb/venv/bin/yt-dlp"
 
+YTWEB_DOMAIN = os.environ.get("YTWEB_DOMAIN", "")
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+
+BEIJING_TZ = timezone(timedelta(hours=8))
+
 app = Flask(
   __name__,
   template_folder=os.path.join(BASE_DIR, "templates"),
   static_folder=os.path.join(BASE_DIR, "static"),
 )
-# behind nginx
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+# behind nginx; x_for=1 以獲取真實客戶端 IP
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config["PREFERRED_URL_SCHEME"] = "https"
 
 TASKS = {}
@@ -141,8 +153,10 @@ LOCK = threading.Lock()
 EXPIRE_HOURS = 8
 PROG_RE = re.compile(r"(\d+(?:\.\d+)?)%")
 
+
 def now_utc():
   return datetime.now(timezone.utc)
+
 
 def normalize_youtube_url(u: str) -> str:
   try:
@@ -177,25 +191,77 @@ def normalize_youtube_url(u: str) -> str:
       return f"https://www.youtube.com/watch?v={vid}"
   return u
 
+
 def normalize_url(u: str) -> str:
   if "youtu" in u or "youtube.com" in u:
     return normalize_youtube_url(u)
   return u
 
-def run_ytdlp_task(task_id, url, fmt):
+
+def send_telegram_notification(task: dict, filename: str, download_path: str) -> None:
+  """下載完成後的通知。
+
+  push: 用戶 IP、北京時間、原始鏈接、解析後鏈接、文件名、下載鏈接
   """
+  if not TG_BOT_TOKEN or not TG_CHAT_ID or not requests:
+    return
+
+  ip = task.get("client_ip") or "-"
+  raw_url = task.get("raw_url") or ""
+  norm_url = task.get("url") or ""
+
+  now_bj = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+  if YTWEB_DOMAIN and download_path.startswith("/"):
+    full_url = f"https://{YTWEB_DOMAIN}{download_path}"
+  else:
+    full_url = download_path
+
+  text_lines = [
+    "ytweb 下載完成",
+    f"IP: {ip}",
+    f"北京時間: {now_bj}",
+    f"原始鏈接: {raw_url}",
+    f"解析後: {norm_url}",
+    f"文件: {filename}",
+    f"下載鏈接: {full_url}",
+  ]
+  text = "\n".join(text_lines)
+
+  try:
+    requests.post(
+      f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+      data={
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+      },
+      timeout=5,
+    )
+  except Exception:
+    # 失敗時靜默忽略，避免影響下載
+    pass
+
+
+def run_ytdlp_task(task_id, url, fmt):
+  """執行 yt-dlp 下載任務。
+
   如果 fmt 為 None，則不傳 -f，讓 yt-dlp 使用預設策略（bestvideo+bestaudio）。
+  限制檔名長度，避免 Errno 36。
   """
   with LOCK:
     task = TASKS.get(task_id)
   if not task:
     return
+
   task_dir = task["dir"]
-  output_tpl = os.path.join(task_dir, "%(title)s-%(id)s.%(ext)s")
+  # 限制 title 最長 60 字元，避免檔名過長；同時搭配 --trim-filenames
+  output_tpl = os.path.join(task_dir, "%(title).60s-%(id)s.%(ext)s")
 
   cmd = [
     YTDLP_BIN,
     "--newline",
+    "--trim-filenames",
+    "80",
   ]
   if fmt:
     cmd += ["-f", fmt]
@@ -205,6 +271,7 @@ def run_ytdlp_task(task_id, url, fmt):
     url,
   ]
   logs = [f"cmd: {' '.join(cmd)}"]
+
   try:
     proc = subprocess.Popen(
       cmd,
@@ -216,10 +283,11 @@ def run_ytdlp_task(task_id, url, fmt):
     )
   except FileNotFoundError:
     with LOCK:
-      TASKS[task_id]["status"] = "error"
-      TASKS[task_id]["logs"] = "\n".join(
-        logs + ["ERROR: yt-dlp not found at " + YTDLP_BIN]
-      )
+      if task_id in TASKS:
+        TASKS[task_id]["status"] = "error"
+        TASKS[task_id]["logs"] = "\n".join(
+          logs + ["ERROR: yt-dlp not found at " + YTDLP_BIN]
+        )
     return
 
   filename = None
@@ -233,17 +301,50 @@ def run_ytdlp_task(task_id, url, fmt):
       except ValueError:
         pct = 0.0
       with LOCK:
-        TASKS[task_id]["progress"] = pct
+        if task_id in TASKS:
+          TASKS[task_id]["progress"] = pct
     with LOCK:
-      TASKS[task_id]["logs"] = "\n".join(logs)
+      if task_id in TASKS:
+        TASKS[task_id]["logs"] = "\n".join(logs)
+
   proc.wait()
-  files = os.listdir(task_dir)
-  if files:
-    filename = files[0]
+
+  # 選擇最終文件：排除 .part / .ytdl / 臨時文件，取最大的那個
+  try:
+    candidates = []
+    for f in os.listdir(task_dir):
+      if any(f.endswith(suf) for suf in (".part", ".ytdl", ".tmp")):
+        continue
+      full = os.path.join(task_dir, f)
+      if os.path.isfile(full):
+        try:
+          size = os.path.getsize(full)
+        except OSError:
+          size = 0
+        candidates.append((size, f))
+    if candidates:
+      candidates.sort(reverse=True)
+      filename = candidates[0][1]
+  except OSError:
+    filename = None
+
   with LOCK:
-    TASKS[task_id]["status"] = "done" if proc.returncode == 0 and filename else "error"
-    TASKS[task_id]["filename"] = filename
-    TASKS[task_id]["logs"] = "\n".join(logs)
+    task = TASKS.get(task_id)
+    if not task:
+      return
+    task["status"] = "done" if proc.returncode == 0 and filename else "error"
+    task["filename"] = filename
+    task["logs"] = "\n".join(logs)
+    status = task["status"]
+    task_snapshot = dict(task)
+
+  if status == "done" and filename:
+    download_path = f"/files/{task_id}/{filename}"
+    try:
+      send_telegram_notification(task_snapshot, filename, download_path)
+    except Exception:
+      pass
+
 
 def cleanup_worker():
   while True:
@@ -275,9 +376,11 @@ def cleanup_worker():
         TASKS.pop(tid, None)
     time.sleep(600)
 
+
 @app.route("/", methods=["GET"])
 def index():
   return render_template("index.html")
+
 
 @app.route("/download", methods=["POST"])
 def download():
@@ -291,10 +394,16 @@ def download():
   fmt_for_worker = fmt if fmt else None  # None => auto
   if not url:
     return render_template("index.html", error="URL is required.")
+
+  # 取得客戶端 IP（優先 X-Forwarded-For 第一個）
+  xff = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+  client_ip = xff or (request.remote_addr or "")
+
   task_id = str(uuid.uuid4())
   task_dir = os.path.join(DOWNLOAD_DIR, task_id)
   os.makedirs(task_dir, exist_ok=True)
   expires_at = now_utc() + timedelta(hours=EXPIRE_HOURS)
+
   with LOCK:
     TASKS[task_id] = {
       "id": task_id,
@@ -308,13 +417,16 @@ def download():
       "filename": None,
       "created_at": now_utc(),
       "expires_at": expires_at,
+      "client_ip": client_ip,
     }
+
   t = threading.Thread(
     target=run_ytdlp_task,
     args=(task_id, url, fmt_for_worker),
     daemon=True,
   )
   t.start()
+
   return render_template(
     "index.html",
     started=True,
@@ -322,6 +434,7 @@ def download():
     expires_at=expires_at.isoformat(),
     normalized_url=url,
   )
+
 
 @app.route("/progress/<task_id>", methods=["GET"])
 def progress(task_id):
@@ -349,12 +462,14 @@ def progress(task_id):
     data["filename"] = task["filename"]
   return jsonify(data)
 
+
 @app.route("/files/<task_id>/<path:filename>", methods=["GET"])
 def get_file(task_id, filename):
   task_dir = os.path.join(DOWNLOAD_DIR, task_id)
   if not os.path.isdir(task_dir):
     abort(404)
   return send_from_directory(task_dir, filename, as_attachment=True)
+
 
 if __name__ == "__main__":
   cleaner = threading.Thread(target=cleanup_worker, daemon=True)
@@ -370,6 +485,10 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
   <meta charset="utf-8">
   <title>yt-dlp web · bdfz</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Favicon / Icons (WEBP, cache-busted) -->
+  <link rel="icon" href="https://img.bdfz.net/20250503004.webp?v=20251122" type="image/webp">
+  <link rel="shortcut icon" href="https://img.bdfz.net/20250503004.webp?v=20251122" type="image/webp">
+  <link rel="apple-touch-icon" href="https://img.bdfz.net/20250503004.webp?v=20251122">
   <style>
     :root {
       --gap: 1rem;
@@ -487,7 +606,6 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
 <body>
   <div class="top-note">檔案會在 8 小時後自動刪除</div>
   <h1>yt-dlp web</h1>
-  <p style="margin-top:-0.4rem;">貼你要下的影片 / 音訊 / 社交平台鏈接。基於 yt-dlp，能下的都會試。</p>
   <form method="post" action="/download">
     <label for="url" style="font-weight:600;font-size:0.85rem;">URL</label>
     <input type="url" id="url" name="url" required placeholder="https://www.youtube.com/watch?v=... / https://youtu.be/... / https://www.bilibili.com/...">
@@ -501,6 +619,7 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
     </select>
     <label for="custom_format" style="font-weight:600;font-size:0.85rem;">自定義格式 (可選)</label>
     <input type="text" id="custom_format" name="custom_format" placeholder="例如：bv[ext=mp4]+ba/best">
+    <p style="font-size:0.78rem;color:#6b7280;margin-top:-0.35rem;">進階示例：<code>bv[ext=mp4]+ba/best</code>（優先 MP4）、<code>bv[height&lt;=720]+ba/best</code>（最高 720p）。更多語法可參考 yt-dlp 文檔。</p>
     <button type="submit">開始下載</button>
   </form>
 
@@ -576,7 +695,7 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
 </html>
 HTML
 
-# 6) systemd (Restart=always)
+# 6) systemd (Restart=always, secrets via /etc/ytweb.env)
 cat > /etc/systemd/system/"$SERVICE_NAME" <<SERVICE
 [Unit]
 Description=yt-dlp web frontend (Flask)
@@ -588,6 +707,9 @@ Group=$RUN_USER
 WorkingDirectory=$APP_DIR
 Environment=YTWEB_DOWNLOAD_DIR=$DOWNLOAD_DIR
 Environment=YTDLP_BIN=$YTDLP_BIN
+Environment=YTWEB_DOMAIN=$DOMAIN
+# optional env file (for secrets like TG_BOT_TOKEN / TG_CHAT_ID)
+EnvironmentFile=-/etc/ytweb.env
 ExecStart=$VENV_DIR/bin/python $APP_DIR/app.py
 Restart=always
 RestartSec=3
@@ -596,6 +718,21 @@ StartLimitBurst=5
 [Install]
 WantedBy=multi-user.target
 SERVICE
+
+# 6.1) /etc/ytweb.env 模板（如不存在）
+if [ ! -f /etc/ytweb.env ]; then
+  echo "[ytweb] creating /etc/ytweb.env template (fill TG_BOT_TOKEN / TG_CHAT_ID manually) ..."
+  cat > /etc/ytweb.env <<'ENV'
+# ytweb environment (secrets)
+# Fill in your Telegram bot token and chat id, then:
+#   systemctl daemon-reload
+#   systemctl restart ytweb.service
+
+#TG_BOT_TOKEN="123456:REPLACE_ME"
+#TG_CHAT_ID="123456789"
+ENV
+  chmod 600 /etc/ytweb.env
+fi
 
 echo "[ytweb] reloading systemd units ..."
 systemctl daemon-reload
