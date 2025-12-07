@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # quiz-submit.sh 
 # 平台：macOS（Homebrew jq + curl）
-# 版本：2025-11-13-14-AI-KEEP+COOKIES+CSRF+DUAL-REFERER+MULTI-VARIANTS
+# 版本：2025-12-06-01-SUBQUIZ-PUT-SIMPLE
 #
 # ✅ 本版目標
 #  讓不該人做的事情自己解決。
@@ -14,7 +14,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2025-11-13-14-AI-KEEP+COOKIES+CSRF+DUAL-REFERER+MULTI-VARIANTS"
+SCRIPT_VERSION="2025-12-06-01-SUBQUIZ-PUT-SIMPLE"
 log() { printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 die() { printf "[%s] ERROR: %s\n" "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
 need_bin() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
@@ -366,7 +366,7 @@ log "已生成載荷：$payload_path"
 [[ "$DRY_RUN" == "1" ]] && { log "DRY_RUN=1：不提交。"; exit 0; }
 
 # -------------------------
-# 5) 兩步提交（多變體 × 雙 Referer × 帶 Cookie/CSRF）
+# 5) 兩步提交（PUT /api/quiz/{id}/save?finish=...，雙 Referer）
 # -------------------------
 REFERERS=(
   "${BASE}/analysis/${QUIZ_ID}"
@@ -374,20 +374,20 @@ REFERERS=(
 )
 
 send_one() {
-  local method="$1" url="$2" body_file="$3" referer="$4" tag="$5"
+  local url="$1" referer="$2" tag="$3"
   local hdr="./out/last-hdr-${tag}-${QUIZ_ID}.txt"
   local out="./out/last-resp-${tag}-${QUIZ_ID}.json"
   local http_code
-  http_code="$(curl -sS -X "$method" "$url" \
+  http_code="$(curl -sS -X PUT "$url" \
               "${COMMON_H[@]}" "${EXTRA_CSRF[@]}" \
               -H "Referer: ${referer}" \
-              --data-binary @"${body_file}" \
+              --data-binary @"${payload_path}" \
               -D "$hdr" -o "$out" -w "%{http_code}" \
               -c "$COOKIEJAR" -b "$COOKIEJAR" || true)"
   local api_code; api_code="$(jq -r 'try .code // empty' "$out" 2>/dev/null || true)"
   local api_msg;  api_msg="$(jq -r 'try .message // .msg // .error // empty' "$out" 2>/dev/null || true)"
   echo "$http_code" > "./out/last-http-${tag}-${QUIZ_ID}.txt"
-  cp "$body_file" "./out/last-body-${tag}-${QUIZ_ID}.json"
+  cp "$payload_path" "./out/last-body-${tag}-${QUIZ_ID}.json"
   if [[ "$api_code" == "200" ]]; then
     log "✔ 成功：${tag} (HTTP ${http_code}, api.code=${api_code})"
     return 0
@@ -396,53 +396,25 @@ send_one() {
   return 1
 }
 
-build_bodies() {
-  local finish_bool="$1" ; local finish_lit; finish_lit="$(to_bool "$finish_bool")"
-  local b_raw="./out/body-raw-${finish_bool}-${QUIZ_ID}.json"
-  local b_with_finished="./out/body-withfinished-${finish_bool}-${QUIZ_ID}.json"
-  local b_wrapped_data="./out/body-datawrap-${finish_bool}-${QUIZ_ID}.json"
-  local b_with_ids="./out/body-withids-${finish_bool}-${QUIZ_ID}.json"
-
-  cp "$payload_path" "$b_raw"
-  jq --argjson fin "$( [[ "$finish_lit" == "true" ]] && echo true || echo false )" '.finished = $fin' "$payload_path" > "$b_with_finished"
-  jq -n --slurpfile P "$payload_path" '{data: $P[0]}' > "$b_wrapped_data"
-  jq -n --slurpfile P "$payload_path" --arg id "$QUIZ_ID" --argjson fin "$( [[ "$finish_lit" == "true" ]] && echo true || echo false )" \
-    '{quizId: ($id|tonumber), finish: $fin, data: $P[0]}' > "$b_with_ids"
-
-  printf "%s\n" "$b_raw|$b_with_finished|$b_wrapped_data|$b_with_ids"
-}
-
 try_submit_finish() {
-  local finish="$1"
-  local urls=(
-    "${BASE}/api/quiz/${QUIZ_ID}/save?finish=${finish}"
-    "${BASE}/api/quiz/${QUIZ_ID}/save?quizId=${QUIZ_ID}&finish=${finish}"
-  )
-  IFS='|' read -r B1 B2 B3 B4 < <(build_bodies "$finish")
-  local bodies=("$B1" "$B2" "$B3" "$B4")
-  local methods=("PUT" "POST")
+  local finish_lit; finish_lit="$(to_bool "$1")"
+  local url="${BASE}/api/quiz/${QUIZ_ID}/save?finish=${finish_lit}"
 
   for ref in "${REFERERS[@]}"; do
-    for m in "${methods[@]}"; do
-      for u in "${urls[@]}"; do
-        for i in "${!bodies[@]}"; do
-          local tag="f${finish}-${m}-r$(( ${#ref} % 97 ))-u$(( ${#u} % 101 ))-b$((i+1))"
-          if send_one "$m" "$u" "${bodies[$i]}" "$ref" "$tag"; then
-            return 0
-          fi
-        done
-      done
-    done
+    local tag="f${finish_lit}-PUT-r$(( ${#ref} % 97 ))"
+    if send_one "$url" "$ref" "$tag"; then
+      return 0
+    fi
   done
   return 1
 }
 
-log "提交 save(false)（多變體 × 雙 Referer） ..."
+log "提交 save(false)（PUT, finish=false） ..."
 if ! try_submit_finish false; then
   die "save(false) 所有變體均返回非 200（請對比 ./out/last-* 與前端成功包）"
 fi
 
-log "提交 save(true)（多變體 × 雙 Referer） ..."
+log "提交 save(true)（PUT, finish=true） ..."
 if ! try_submit_finish true; then
   die "save(true) 所有變體均返回非 200（請對比 ./out/last-* 與前端成功包）"
 fi
