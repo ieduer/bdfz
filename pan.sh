@@ -9,7 +9,9 @@
 #  - 每日自動清理過期文件 (systemd timer + cleanup.py)
 #
 
+
 set -Eeuo pipefail
+INSTALLER_VERSION="pan-install-2025-12-07-02"
 
 DOMAIN="pan.bdfz.net"
 APP_USER="panuser"
@@ -61,6 +63,28 @@ check_os() {
   fi
 }
 
+stop_existing_service() {
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}.service"; then
+      warn "檢測到已存在的 ${SERVICE_NAME}.service，先停止舊服務..."
+      systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+    fi
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}-cleanup.timer"; then
+      warn "檢測到已存在的 ${SERVICE_NAME}-cleanup.timer，先停止舊定時任務..."
+      systemctl stop "${SERVICE_NAME}-cleanup.timer" 2>/dev/null || true
+    fi
+  fi
+}
+
+kill_old_uvicorn() {
+  if command -v pgrep >/dev/null 2>&1; then
+    if pgrep -f "uvicorn app.main:app" >/dev/null 2>&1; then
+      warn "發現舊的 uvicorn app.main:app 進程，將嘗試終止..."
+      pkill -f "uvicorn app.main:app" 2>/dev/null || true
+    fi
+  fi
+}
+
 install_packages() {
   log "[1/7] 安裝系統依賴 (nginx, python-venv, sqlite3)..."
   apt update
@@ -91,9 +115,12 @@ create_user_and_dirs() {
 setup_venv_and_deps() {
   log "[3/7] 建立 Python 虛擬環境並安裝依賴..."
 
-  if [[ ! -d "${APP_DIR}/venv" ]]; then
-    "${PYTHON_BIN}" -m venv "${APP_DIR}/venv"
+  if [[ -d "${APP_DIR}/venv" ]]; then
+    warn "檢測到已存在的虛擬環境，將刪除並重新創建以覆蓋安裝..."
+    rm -rf "${APP_DIR}/venv"
   fi
+
+  "${PYTHON_BIN}" -m venv "${APP_DIR}/venv"
 
   # shellcheck disable=SC1091
   source "${APP_DIR}/venv/bin/activate"
@@ -151,14 +178,21 @@ app = FastAPI(title="pan.bdfz.net upload service")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
-async def get_db():
-  conn = await aiosqlite.connect(DB_PATH)
-  conn.row_factory = aiosqlite.Row
-  return conn
+def get_db():
+  """
+  Return an aiosqlite connection factory suitable for use with:
+      async with get_db() as conn:
+          ...
+  NOTE: do NOT `await` this before using in `async with`, otherwise
+  the same connection object would be awaited twice and cause
+  'threads can only be started once'.
+  """
+  return aiosqlite.connect(DB_PATH)
 
 
 async def init_db():
-  async with await get_db() as conn:
+  async with get_db() as conn:
+    conn.row_factory = aiosqlite.Row
     await conn.execute(
       """
       CREATE TABLE IF NOT EXISTS uploads (
@@ -263,7 +297,9 @@ async def handle_upload(
   now_iso = datetime.datetime.utcnow().isoformat()
   max_bytes = MAX_FILE_MB * 1024 * 1024
 
-  async with await get_db() as conn:
+  async with get_db() as conn:
+    conn.row_factory = aiosqlite.Row
+
     for upload_file in files:
       file_uuid = str(uuid.uuid4())
       safe_name = upload_file.filename.replace("/", "_").replace("\\", "_")
@@ -366,7 +402,8 @@ async def handle_upload(
 
 @app.get("/id/{upload_id}", response_class=HTMLResponse)
 async def list_by_upload_id(request: Request, upload_id: str):
-  async with await get_db() as conn:
+  async with get_db() as conn:
+    conn.row_factory = aiosqlite.Row
     cur = await conn.execute(
       """
       SELECT id, upload_id, category, note, original_name, stored_path,
@@ -393,7 +430,8 @@ async def list_by_upload_id(request: Request, upload_id: str):
 @app.get("/d/{file_id}/{filename:path}")
 @app.get("/d/{file_id}")
 async def download_file(request: Request, file_id: str, filename: Optional[str] = None):
-  async with await get_db() as conn:
+  async with get_db() as conn:
+    conn.row_factory = aiosqlite.Row
     cur = await conn.execute(
       """
       SELECT id, upload_id, original_name, stored_path
@@ -403,6 +441,7 @@ async def download_file(request: Request, file_id: str, filename: Optional[str] 
       (file_id,),
     )
     row = await cur.fetchone()
+
     if not row:
       raise HTTPException(status_code=404, detail="文件不存在")
 
@@ -921,6 +960,12 @@ EOF
 
   log "Nginx 已配置完成，目前使用 HTTP（80）。"
 
+  local CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+  if [[ -d "${CERT_DIR}" ]]; then
+    warn "檢測到已存在 ${DOMAIN} 的 Let's Encrypt 證書 (${CERT_DIR})，本次安裝將跳過自動申請。"
+    return
+  fi
+
   echo
   read -r -p "是否現在使用 certbot 自動申請 Let's Encrypt 證書並啟用 HTTPS? [y/N] " use_ssl || use_ssl=""
   if [[ "${use_ssl}" =~ ^[Yy]$ ]]; then
@@ -933,6 +978,9 @@ EOF
 }
 
 main() {
+  log "pan installer version: ${INSTALLER_VERSION}"
+  stop_existing_service
+  kill_old_uvicorn
   check_root
   check_os
   install_packages
