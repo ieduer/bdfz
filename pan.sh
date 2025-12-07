@@ -933,15 +933,15 @@ EOF
 }
 
 main() {
-  check_root()
-  check_os()
-  install_packages()
-  create_user_and_dirs()
-  setup_venv_and_deps()
-  write_app_code()
-  setup_env_file()
-  setup_systemd()
-  setup_nginx()
+  check_root
+  check_os
+  install_packages
+  create_user_and_dirs
+  setup_venv_and_deps
+  write_app_code
+  setup_env_file
+  setup_systemd
+  setup_nginx
 
   echo
   log "========================================================"
