@@ -9,9 +9,16 @@
 #  - 每日自動清理過期文件 (systemd timer + cleanup.py)
 #  - 自動檢測已有 Let's Encrypt 證書，存在則直接上 443，不重複申請
 #
+# 修改記錄 (v2025-12-07-MOD):
+#  1. 刪除左側備註
+#  2. 加入取消上傳
+#  3. 右側顯示全部文件 (按類別排序)
+#  4. 支援文件夾上傳
+#  5. MD5 校驗去重
+#
 
 set -Eeuo pipefail
-INSTALLER_VERSION="pan-install-2025-12-07-ssl-v4"
+INSTALLER_VERSION="pan-install-2025-12-07-mod-full"
 
 DOMAIN="pan.bdfz.net"
 APP_USER="panuser"
@@ -236,11 +243,13 @@ write_app_code() {
   log "[5/8] 寫入 FastAPI 應用程式代碼、模板與清理腳本..."
 
   # ---------------- app/main.py ----------------
+  # 修改：加入 MD5 去重，修改列表接口，移除 Note 邏輯
   cat >"${APP_DIR}/app/main.py" <<'PY'
 import os
 import uuid
 import datetime
 import html
+import hashlib
 from pathlib import Path
 from typing import List, Optional, Dict
 
@@ -295,12 +304,21 @@ async def init_db():
         original_name TEXT NOT NULL,
         stored_path TEXT NOT NULL,
         size_bytes INTEGER NOT NULL,
+        md5 TEXT,
         uploader_ip TEXT,
         user_agent TEXT,
         created_at TEXT NOT NULL
       )
       """
     )
+    
+    # 檢查是否需要添加 md5 欄位 (舊庫升級)
+    try:
+      await conn.execute("SELECT md5 FROM uploads LIMIT 1")
+    except Exception:
+      print("Migrating DB: Adding 'md5' column to uploads table...")
+      await conn.execute("ALTER TABLE uploads ADD COLUMN md5 TEXT")
+
     await conn.execute(
       """
       CREATE TABLE IF NOT EXISTS downloads (
@@ -383,7 +401,7 @@ async def handle_upload(
   secret: Optional[str] = Form(None),
   files: List[UploadFile] = File(...),
   category: Optional[str] = Form(None),
-  note: Optional[str] = Form(None),
+  note: Optional[str] = Form(None), # 保留參數以防前端傳遞報錯，但業務上已忽略
 ):
   if UPLOAD_SECRET and (not secret or secret.strip() != UPLOAD_SECRET):
     raise HTTPException(status_code=403, detail="上傳口令錯誤")
@@ -406,15 +424,23 @@ async def handle_upload(
 
     for upload_file in files:
       file_uuid = str(uuid.uuid4())
-      safe_name = upload_file.filename.replace("/", "_").replace("\\", "_")
+      
+      # 處理上傳文件名，支援文件夾上傳的路徑保留 (將 / 替換為 __ 以扁平化存儲)
+      # upload_file.filename 可能包含路徑 (webkitdirectory)
+      safe_name = upload_file.filename.replace("\\", "/") # 統一分隔符
+      safe_name = safe_name.lstrip("./") 
 
       subdir = FILES_DIR / datetime.datetime.utcnow().strftime("%Y/%m/%d")
       subdir.mkdir(parents=True, exist_ok=True)
 
-      stored_path_rel = subdir.relative_to(FILES_DIR) / f"{file_uuid}__{safe_name}"
+      # 將路徑分隔符換成底線，確保存在同一層級，避免目錄遍歷
+      flat_name = safe_name.replace("/", "__")
+      stored_path_rel = subdir.relative_to(FILES_DIR) / f"{file_uuid}__{flat_name}"
       dest_path = FILES_DIR / stored_path_rel
 
       size_bytes = 0
+      hasher = hashlib.md5()
+
       try:
         async with aiofiles.open(dest_path, "wb") as f:
           while True:
@@ -427,6 +453,7 @@ async def handle_upload(
                 status_code=413,
                 detail=f"文件 {upload_file.filename} 過大，超過 {MAX_FILE_MB} MB 限制",
               )
+            hasher.update(chunk)
             await f.write(chunk)
       except HTTPException:
         if dest_path.exists():
@@ -435,17 +462,41 @@ async def handle_upload(
           except OSError:
             pass
         raise
+      
+      file_md5 = hasher.hexdigest()
+      final_stored_path_rel = str(stored_path_rel)
+      
+      # --- MD5 去重邏輯 ---
+      # 檢查資料庫是否存在相同 MD5 的文件
+      cursor = await conn.execute("SELECT stored_path FROM uploads WHERE md5 = ? LIMIT 1", (file_md5,))
+      existing_row = await cursor.fetchone()
+      
+      if existing_row:
+        existing_path_rel = existing_row["stored_path"]
+        existing_full_path = FILES_DIR / existing_path_rel
+        
+        # 確保舊文件物理存在
+        if existing_full_path.exists():
+           # 刪除剛剛上傳的臨時文件
+           try:
+             dest_path.unlink()
+           except:
+             pass
+           # 將新記錄指向舊的存儲路徑
+           final_stored_path_rel = existing_path_rel
+           # print(f"Deduplicated: {safe_name} -> {existing_path_rel}")
 
       record_id = file_uuid
       cat_val = (category or "").strip()
       note_val = (note or "").strip()
+      
       await conn.execute(
         """
         INSERT INTO uploads (
           id, upload_id, category, note,
-          original_name, stored_path, size_bytes,
+          original_name, stored_path, size_bytes, md5,
           uploader_ip, user_agent, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
           record_id,
@@ -453,8 +504,9 @@ async def handle_upload(
           cat_val,
           note_val,
           safe_name,
-          str(stored_path_rel),
+          final_stored_path_rel,
           size_bytes,
+          file_md5,
           client_ip,
           ua,
           now_iso,
@@ -480,9 +532,7 @@ async def handle_upload(
   ]
   if category:
     lines.append(f"類別: {html.escape(category)}")
-  if note:
-    safe_note = note[:200]
-    lines.append(f"備註: {html.escape(safe_note)}")
+  # 備註已移除
   lines.append(f"上傳 IP: <code>{html.escape(client_ip)}</code>")
   lines.append(f"文件數: {len(created_records)}，總大小: {human_size(total_size)}")
   lines.append("")
@@ -528,23 +578,25 @@ async def handle_upload(
 
 
 @app.get("/api/list")
-async def api_list(upload_id: str = Query(..., alias="upload_id")):
-  upload_id = upload_id.strip()
-  if not upload_id:
-    raise HTTPException(status_code=400, detail="upload_id 必填")
-
-  async with get_db() as conn:
-    conn.row_factory = aiosqlite.Row
-    cur = await conn.execute(
-      """
+async def api_list(upload_id: Optional[str] = Query(None, alias="upload_id")):
+  # 修改：不再強制要求 upload_id，若為空則返回全部，且按類別排序
+  sql = """
       SELECT id, upload_id, category, note, original_name, stored_path,
              size_bytes, uploader_ip, created_at
       FROM uploads
-      WHERE upload_id = ?
-      ORDER BY created_at ASC
-      """,
-      (upload_id,),
-    )
+  """
+  params = []
+  
+  if upload_id and upload_id.strip():
+      sql += " WHERE upload_id = ?"
+      params.append(upload_id.strip())
+  
+  # 按 類別 -> 文件名 -> 時間 排序
+  sql += " ORDER BY category ASC, original_name ASC, created_at DESC"
+
+  async with get_db() as conn:
+    conn.row_factory = aiosqlite.Row
+    cur = await conn.execute(sql, tuple(params))
     rows = await cur.fetchall()
 
   files = []
@@ -640,17 +692,12 @@ async def download_file(request: Request, file_id: str, filename: Optional[str] 
     )
     await conn.commit()
 
-  lines = [
-    "📥 <b>文件被下載</b>",
-    f"上傳 ID: <code>{html.escape(row['upload_id'])}</code>",
-    f"文件: {html.escape(row['original_name'])}",
-    f"下載 IP: <code>{html.escape(client_ip)}</code>",
-  ]
-  await send_telegram_message("\n".join(lines))
+  # 下載時的文件名取 basename (避免多層目錄導致瀏覽器存儲異常)
+  dl_filename = os.path.basename(row["original_name"])
 
   return FileResponse(
     path=str(file_path),
-    filename=row["original_name"],
+    filename=dl_filename,
     media_type="application/octet-stream",
   )
 
@@ -664,6 +711,7 @@ PY
   chown "${APP_USER}:${APP_USER}" "${APP_DIR}/app/main.py"
 
   # ---------------- app/cleanup.py ----------------
+  # 修改：清理時檢查文件是否被多條記錄引用 (因為引入了 MD5 去重)
   cat >"${APP_DIR}/app/cleanup.py" <<'PY'
 #!/usr/bin/env python3
 import os
@@ -704,26 +752,35 @@ def main():
     conn.close()
     return
 
-  # 1. 先刪除資料庫記錄，確保對外狀態一致
-  for row in rows_to_delete:
-    file_id = row["id"]
-    cur.execute("DELETE FROM downloads WHERE upload_file_id = ?", (file_id,))
-    cur.execute("DELETE FROM uploads WHERE id = ?", (file_id,))
+  # 1. 先刪除資料庫記錄
+  ids_to_del = [r["id"] for r in rows_to_delete]
+  if ids_to_del:
+      placeholders = ",".join("?" * len(ids_to_del))
+      cur.execute(f"DELETE FROM downloads WHERE upload_file_id IN ({placeholders})", ids_to_del)
+      cur.execute(f"DELETE FROM uploads WHERE id IN ({placeholders})", ids_to_del)
+      conn.commit()
 
-  conn.commit()
-
-  # 2. 再刪物理文件；即使中途失敗，最多留下孤兒文件
+  # 2. 再刪物理文件
+  # 注意：由於引入了 MD5 去重，多個記錄可能指向同一個 stored_path
+  # 只有當沒有任何記錄指向該 stored_path 時，才能物理刪除
+  
+  candidate_paths = set(r["stored_path"] for r in rows_to_delete)
   removed_files = 0
-  for row in rows_to_delete:
-    rel_path = row["stored_path"]
-    file_path = (FILES_DIR / rel_path).resolve()
-
-    if str(file_path).startswith(str(FILES_DIR.resolve())) and file_path.is_file():
-      try:
-        file_path.unlink()
-        removed_files += 1
-      except OSError as e:
-        print(f"Error removing file {file_path}: {e}")
+  
+  for rel_path in candidate_paths:
+      # 檢查是否還有其他記錄引用此路徑
+      cur.execute("SELECT 1 FROM uploads WHERE stored_path = ? LIMIT 1", (rel_path,))
+      if cur.fetchone():
+          # 仍被引用，跳過
+          continue
+      
+      file_path = (FILES_DIR / rel_path).resolve()
+      if str(file_path).startswith(str(FILES_DIR.resolve())) and file_path.is_file():
+          try:
+            file_path.unlink()
+            removed_files += 1
+          except OSError as e:
+            print(f"Error removing file {file_path}: {e}")
 
   conn.close()
 
@@ -740,6 +797,7 @@ PY
   chown "${APP_USER}:${APP_USER}" "${APP_DIR}/app/cleanup.py"
 
   # ---------------- templates/base.html ----------------
+  # 保留原 CSS，未做刪減
   cat >"${APP_DIR}/templates/base.html" <<'HTML'
 <!DOCTYPE html>
 <html lang="zh-Hans">
@@ -1116,14 +1174,15 @@ PY
 HTML
 
   # ---------------- templates/index.html ----------------
+  # 修改：移除備註，加入文件夾上傳複選框，加入取消按鈕，右側加載全部
   cat >"${APP_DIR}/templates/index.html" <<'HTML'
 {% extends "base.html" %}
 {% block content %}
 <div class="grid">
-  <!-- 右側：ID + 上傳 / 下載 -->
+  <!-- 左側：上傳區 -->
   <div class="card">
     <div class="card-inner">
-      <h2><span class="icon">⬆️</span> 上傳附件</h2>
+      <h2><span class="icon">⬆️</span> 上傳文件</h2>
 
       <!-- ID + 口令 -->
       <div class="slot-row">
@@ -1141,7 +1200,7 @@ HTML
         <span id="slot-status" class="status"></span>
       </div>
 
-      <!-- 上傳表單（有 JS 截獲，無 JS 則正常提交） -->
+      <!-- 上傳表單 -->
       <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
         <input type="hidden" id="upload_id" name="upload_id" />
         <input type="hidden" id="secret" name="secret" />
@@ -1153,44 +1212,48 @@ HTML
               id="category"
               name="category"
               type="text"
-              placeholder="可選：作業名稱 / 小組編號"
-            />
-          </div>
-          <label for="note">備註</label>
-          <div class="slot-input-wrap">
-            <input
-              id="note"
-              name="note"
-              type="text"
-              placeholder="可選：說明文字（例如 姓名）"
+              placeholder="可選：用於右側排序分類"
             />
           </div>
         </div>
+        <!-- 備註欄位已移除 -->
 
-        <label for="files">選擇文件（可多選）</label>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;margin-bottom:4px;">
+            <label for="files" style="margin-bottom:0;">選擇文件</label>
+            <label style="font-size:0.82rem;display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--muted);">
+                <input type="checkbox" id="chk-folder"> 文件夾模式
+            </label>
+        </div>
+        
         <input type="file" id="files" name="files" multiple required />
 
         <div id="file-preview" class="file-list-preview"></div>
 
         <div class="row-between" style="margin-top:10px;">
-          <button id="btn-upload" type="submit">開始上傳</button>
+          <div style="display:flex; gap:8px;">
+             <button id="btn-upload" type="submit">開始上傳</button>
+             <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;">取消</button>
+          </div>
           <span id="upload-status" class="status"></span>
         </div>
         <div class="progress" id="upload-progress">
           <div class="progress-bar" id="upload-progress-bar"></div>
         </div>
       </form>
+    </div>
+  </div>
 
-      <hr style="margin:16px 0;border:none;border-top:1px dashed rgba(148,163,184,0.5);" />
-
-      <h2><span class="icon">⬇️</span> 附件下載</h2>
+  <!-- 右側：全部下載 -->
+  <div class="card">
+      <div class="card-inner">
+      <h2><span class="icon">⬇️</span> 全部文件</h2>
       <p style="font-size:0.8rem;margin:0 0 6px;color:rgba(148,163,184,0.9);">
-        當前 ID 下所有附件會列在這裡，按「類別」與「備註」分組顯示，點擊即可下載。
+        所有上傳記錄（按類別排序）。
       </p>
-      <ul id="download-list" class="download-list"></ul>
-      <div class="progress" id="download-progress">
-        <div class="progress-bar" id="download-progress-bar"></div>
+      <div style="margin-bottom:8px;">
+         <button id="btn-refresh" type="button" style="font-size:0.75rem;padding:4px 10px;">🔄 刷新列表</button>
       </div>
+      <ul id="download-list" class="download-list"></ul>
       <div id="download-status" class="download-progress-text"></div>
     </div>
   </div>
@@ -1199,10 +1262,11 @@ HTML
 <script>
   (function () {
     const API_UPLOAD = "/upload";
-    const API_LIST = "/api/list";
+    const API_LIST = "/api/list"; // 獲取全部列表
 
     let currentId = "";
     let currentSecret = "";
+    let xhrUpload = null; // 用於取消
 
     function setStatus(id, msg, ok) {
       const el = document.getElementById(id);
@@ -1261,6 +1325,20 @@ HTML
       return "剩餘約 " + min + " 分 " + s + " 秒";
     }
 
+    // 文件夾模式切換
+    document.getElementById("chk-folder").addEventListener("change", function(e) {
+      const fileInput = document.getElementById("files");
+      if(e.target.checked) {
+        fileInput.setAttribute("webkitdirectory", "");
+        fileInput.setAttribute("directory", "");
+      } else {
+        fileInput.removeAttribute("webkitdirectory");
+        fileInput.removeAttribute("directory");
+      }
+      fileInput.value = "";
+      document.getElementById("file-preview").textContent = "";
+    });
+
     function applySlot() {
       const idInput = document.getElementById("slot-id");
       const secretInput = document.getElementById("slot-secret");
@@ -1282,24 +1360,18 @@ HTML
       upSecret.value = currentSecret;
 
       setStatus("slot-status", "當前 ID：" + currentId, true);
-
-      loadFiles().catch(console.error);
       return true;
     }
 
+    // 載入右側列表 (全部)
     async function loadFiles() {
       const listEl = document.getElementById("download-list");
       const statusEl = document.getElementById("download-status");
-      hideProgress("download-progress", "download-progress-bar");
-      if (!currentId) {
-        if (listEl) listEl.innerHTML = "";
-        if (statusEl) statusEl.textContent = "";
-        return;
-      }
+      
       try {
         if (statusEl) statusEl.textContent = "正在載入附件列表…";
-        const url = API_LIST + "?upload_id=" + encodeURIComponent(currentId);
-        const res = await fetch(url, { headers: { Accept: "application/json" } });
+        // 不帶 upload_id 參數，後端會返回全部
+        const res = await fetch(API_LIST, { headers: { Accept: "application/json" } });
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
         if (!data || !data.ok) throw new Error("服務器返回錯誤");
@@ -1307,7 +1379,7 @@ HTML
         if (!listEl) return;
         if (!files.length) {
           listEl.innerHTML =
-            "<li><span style='font-size:0.8rem;color:rgba(148,163,184,0.9);'>當前 ID 下尚無附件。</span></li>";
+            "<li><span style='font-size:0.8rem;color:rgba(148,163,184,0.9);'>暫無附件。</span></li>";
           if (statusEl) statusEl.textContent = "";
           return;
         }
@@ -1322,7 +1394,7 @@ HTML
         }
 
         listEl.innerHTML = "";
-        const keys = Object.keys(groups);
+        const keys = Object.keys(groups).sort(); // 類別排序
         for (const key of keys) {
           const group = groups[key];
           const heading = document.createElement("li");
@@ -1343,14 +1415,14 @@ HTML
 
             const nameSpan = document.createElement("span");
             nameSpan.className = "dl-name";
-            nameSpan.textContent = f.name || "(無名文件)";
+            // 如果文件名過長顯示...
+            let dispName = f.name || "(無名文件)";
+            if(dispName.length > 50) dispName = dispName.substring(0, 48) + "...";
+            nameSpan.textContent = dispName;
 
             const metaSpan = document.createElement("span");
             metaSpan.className = "dl-meta";
             let meta = f.size_human || formatBytes(f.size_bytes || 0);
-            if (f.note) {
-              meta += " · " + f.note;
-            }
             metaSpan.textContent = meta;
 
             left.appendChild(nameSpan);
@@ -1360,11 +1432,6 @@ HTML
             a.dataset.fileName = f.name || "";
             a.appendChild(left);
             a.appendChild(right);
-
-            a.addEventListener("click", function (ev) {
-              ev.preventDefault();
-              downloadWithProgress(a.href, a.dataset.fileName || "download.bin");
-            });
 
             li.appendChild(a);
             listEl.appendChild(li);
@@ -1390,10 +1457,7 @@ HTML
         preview.textContent = "";
         return;
       }
-      const names = Array.from(files)
-        .map((f) => "· " + f.name)
-        .join("  ");
-      preview.textContent = names;
+      preview.textContent = "已選擇 " + files.length + " 個項目";
     }
 
     function uploadWithXHR(event) {
@@ -1406,6 +1470,7 @@ HTML
       const form = document.getElementById("upload-form");
       const input = document.getElementById("files");
       const btn = document.getElementById("btn-upload");
+      const btnCancel = document.getElementById("btn-cancel");
 
       if (!input || !input.files || !input.files.length) {
         setStatus("upload-status", "請先選擇至少一個文件。", false);
@@ -1416,17 +1481,18 @@ HTML
       const totalBytes = files.reduce((sum, f) => sum + (f.size || 0), 0);
 
       btn.disabled = true;
+      btnCancel.style.display = "inline-flex";
       setStatus("upload-status", "準備上傳 " + files.length + " 個文件…", true);
       showProgress("upload-progress", "upload-progress-bar", 0);
 
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", API_UPLOAD, true);
-      xhr.responseType = "json";
-      xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+      xhrUpload = new XMLHttpRequest();
+      xhrUpload.open("POST", API_UPLOAD, true);
+      xhrUpload.responseType = "json";
+      xhrUpload.setRequestHeader("X-Requested-With", "XMLHttpRequest");
 
       const startTs = Date.now();
 
-      xhr.upload.onprogress = function (evt) {
+      xhrUpload.upload.onprogress = function (evt) {
         if (!evt.lengthComputable) return;
         const loaded = evt.loaded;
         const percent = Math.max(0, Math.min(100, Math.round((loaded / evt.total) * 100)));
@@ -1449,20 +1515,23 @@ HTML
         setStatus("upload-status", msg, true);
       };
 
-      xhr.onerror = function () {
-        hideProgress("upload-progress", "upload-progress-bar");
-        btn.disabled = false;
-        setStatus("upload-status", "上傳過程中發生錯誤。", false);
+      xhrUpload.onerror = function () {
+        cleanupUpload();
+        setStatus("upload-status", "網絡錯誤。", false);
       };
 
-      xhr.onload = function () {
-        btn.disabled = false;
-        hideProgress("upload-progress", "upload-progress-bar");
-        if (xhr.status >= 200 && xhr.status < 300) {
-          let data = xhr.response;
+      xhrUpload.onabort = function () {
+        cleanupUpload();
+        setStatus("upload-status", "上傳已取消。", false);
+      };
+
+      xhrUpload.onload = function () {
+        cleanupUpload();
+        if (xhrUpload.status >= 200 && xhrUpload.status < 300) {
+          let data = xhrUpload.response;
           if (!data || typeof data !== "object") {
             try {
-              data = JSON.parse(xhr.responseText || "{}");
+              data = JSON.parse(xhrUpload.responseText || "{}");
             } catch (e) {
               data = {};
             }
@@ -1473,7 +1542,6 @@ HTML
               input.value = "";
               document.getElementById("file-preview").textContent = "";
               document.getElementById("category").value = "";
-              document.getElementById("note").value = "";
             } catch (e) {}
             loadFiles().catch(console.error);
           } else {
@@ -1481,9 +1549,9 @@ HTML
             setStatus("upload-status", "上傳失敗：" + detail, false);
           }
         } else {
-          let detail = "HTTP " + xhr.status;
+          let detail = "HTTP " + xhrUpload.status;
           try {
-            const j = JSON.parse(xhr.responseText || "{}");
+            const j = JSON.parse(xhrUpload.responseText || "{}");
             if (j && j.detail) detail = j.detail;
           } catch (e) {}
           setStatus("upload-status", "上傳失敗：" + detail, false);
@@ -1491,22 +1559,24 @@ HTML
       };
 
       const formData = new FormData(form);
-      xhr.send(formData);
+      xhrUpload.send(formData);
+
+      function cleanupUpload() {
+          btn.disabled = false;
+          btnCancel.style.display = "none";
+          xhrUpload = null;
+          hideProgress("upload-progress", "upload-progress-bar");
+      }
     }
 
-    function downloadWithProgress(url, filename) {
-      const statusEl = document.getElementById("download-status");
-      showProgress("download-progress", "download-progress-bar", 100);
-      if (statusEl) {
-        statusEl.textContent = "正在下載：" + filename;
-      }
-      // 交給瀏覽器處理實際下載
-      window.location.href = url;
-      setTimeout(() => {
-        hideProgress("download-progress", "download-progress-bar");
-        if (statusEl) statusEl.textContent = "";
-      }, 2000);
-    }
+    // 取消按鈕
+    document.getElementById("btn-cancel").addEventListener("click", function() {
+        if(xhrUpload) {
+            xhrUpload.abort();
+        }
+    });
+
+    document.getElementById("btn-refresh").addEventListener("click", loadFiles);
 
     document.addEventListener("DOMContentLoaded", function () {
       const btnSlot = document.getElementById("btn-set-slot");
@@ -1525,6 +1595,9 @@ HTML
       if (fileInput) {
         fileInput.addEventListener("change", onFileInputChange);
       }
+      
+      // 初始加載
+      loadFiles();
     });
   })();
 </script>
@@ -1555,9 +1628,6 @@ HTML
             {{ r.size_bytes }} bytes
             {% if r.category %}
             · {{ r.category }}
-            {% endif %}
-            {% if r.note %}
-            · {{ r.note }}
             {% endif %}
           </span>
         </a>
