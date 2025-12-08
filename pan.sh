@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
 #
-# pan.sh - 一鍵部署 pan.bdfz.net 公共上傳/下載服務
+# pan.sh - 一鍵部署 SUENの網盤 (pan.bdfz.net 公共上傳/下載服務)
 #  - Nginx + FastAPI + Uvicorn + SQLite (aiosqlite 異步)
-#  - 流式上傳，避免整個文件讀入記憶體
+#  - 流式上傳到後端（避免整個文件讀入記憶體，框架使用臨時文件中轉）
 #  - 上傳/下載記錄到 SQLite
 #  - 上傳 & 下載 Telegram 通知 (httpx 異步)
-#  - 支援上傳口令 UPLOAD_SECRET（可選）
+#  - 支援上傳口令 UPLOAD_SECRET（可選，全局口令）
 #  - 每日自動清理過期文件 (systemd timer + cleanup.py)
+#  - 自動檢測已有 Let's Encrypt 證書，存在則直接上 443，不重複申請
 #
 
-
 set -Eeuo pipefail
-INSTALLER_VERSION="pan-install-2025-12-07-02"
+INSTALLER_VERSION="pan-install-2025-12-07-ssl-v3"
 
 DOMAIN="pan.bdfz.net"
 APP_USER="panuser"
 APP_DIR="/opt/pan-app"
 DATA_DIR="/srv/pan"
+TMP_DIR="${DATA_DIR}/tmp"
 SERVICE_NAME="pan"
 PYTHON_BIN="python3"
 
-# 顏色輸出（簡單）
+NGINX_SITE_AVAIL="/etc/nginx/sites-available/${DOMAIN}"
+NGINX_SITE_ENABLED="/etc/nginx/sites-enabled/${DOMAIN}"
+
+# 顏色輸出
 RED="$(printf '\033[31m')"
 GREEN="$(printf '\033[32m')"
 YELLOW="$(printf '\033[33m')"
@@ -35,7 +39,7 @@ warn() {
 }
 
 err() {
-  echo -e "${RED}!!!${RESET} $*" >&2
+  echo -e "${RED}!!!${RESET} $*"
 }
 
 abort() {
@@ -86,7 +90,7 @@ kill_old_uvicorn() {
 }
 
 install_packages() {
-  log "[1/7] 安裝系統依賴 (nginx, python-venv, sqlite3)..."
+  log "[1/8] 安裝系統依賴 (nginx, python, sqlite3, certbot)..."
   apt update
   DEBIAN_FRONTEND=noninteractive apt install -y \
     nginx \
@@ -95,11 +99,13 @@ install_packages() {
     python3-pip \
     sqlite3 \
     ca-certificates \
-    curl
+    curl \
+    certbot \
+    python3-certbot-nginx
 }
 
 create_user_and_dirs() {
-  log "[2/7] 創建專用用戶與目錄..."
+  log "[2/8] 創建專用用戶與目錄..."
 
   if ! id -u "${APP_USER}" >/dev/null 2>&1; then
     useradd --system --home "${APP_DIR}" --shell /usr/sbin/nologin "${APP_USER}"
@@ -108,12 +114,13 @@ create_user_and_dirs() {
     warn "系統用戶 ${APP_USER} 已存在，略過創建。"
   fi
 
-  mkdir -p "${APP_DIR}" "${APP_DIR}/app" "${APP_DIR}/templates" "${APP_DIR}/static" "${DATA_DIR}/files"
+  mkdir -p "${APP_DIR}" "${APP_DIR}/app" "${APP_DIR}/templates" "${APP_DIR}/static" "${DATA_DIR}/files" "${TMP_DIR}"
   chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}" "${DATA_DIR}"
+  chmod 700 "${TMP_DIR}"
 }
 
 setup_venv_and_deps() {
-  log "[3/7] 建立 Python 虛擬環境並安裝依賴..."
+  log "[3/8] 建立 Python 虛擬環境並安裝依賴..."
 
   if [[ -d "${APP_DIR}/venv" ]]; then
     warn "檢測到已存在的虛擬環境，將刪除並重新創建以覆蓋安裝..."
@@ -137,35 +144,127 @@ setup_venv_and_deps() {
   deactivate
 }
 
+write_env_template() {
+  log "[4/8] 檢查 .env 配置..."
+
+  local env_file="${APP_DIR}/.env"
+  if [[ -f "${env_file}" ]]; then
+    warn ".env 已存在。"
+    read -r -p "是否覆蓋生成新的樣例 .env？(y/N) " ans || ans=""
+    case "${ans}" in
+      y|Y)
+        warn "將覆蓋原有 .env（請注意備份）。"
+        ;;
+      *)
+        log "保留原有 .env，不做修改。"
+        return
+        ;;
+    esac
+  fi
+
+  cat >"${env_file}" <<ENV
+# SUENの網盤 配置樣例
+# 真正部署時請填入實際值，然後重啟 systemd 服務：sudo systemctl restart ${SERVICE_NAME}.service
+
+# 文件數據目錄（默認 ${DATA_DIR}）
+PAN_DATA_DIR=${DATA_DIR}
+
+# 前端展示的基礎 URL，用於 Telegram 通知中的連結（默認 https://${DOMAIN}）
+BASE_URL=https://${DOMAIN}
+
+# 全局上傳口令（如設置，則上傳必須提供正確口令；留空則不啟用）
+UPLOAD_SECRET=
+
+# Telegram 通知（可選）
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# 單個文件最大大小（MB），需要略小於 Nginx client_max_body_size
+MAX_FILE_MB=102300
+
+# 清理天數，超過此天數的文件會被每天定時任務刪除
+CLEANUP_DAYS=30
+ENV
+
+  chown "${APP_USER}:${APP_USER}" "${env_file}"
+  chmod 600 "${env_file}"
+  log "已生成 .env 樣例（PAN_DATA_DIR / BASE_URL 已使用當前腳本配置值）。"
+}
+
+check_tmp_space() {
+  log "[4.5/8] 檢查臨時目錄空間 (MAX_FILE_MB × 5 併發理論需求)..."
+
+  mkdir -p "${TMP_DIR}"
+  chown "${APP_USER}:${APP_USER}" "${TMP_DIR}"
+
+  local env_file="${APP_DIR}/.env"
+  local max_mb="102300"
+
+  # 從 .env 讀 MAX_FILE_MB（若已手動調整）
+  if [[ -f "${env_file}" ]]; then
+    local from_env
+    from_env="$(grep -E '^MAX_FILE_MB=' "${env_file}" | tail -n1 | cut -d'=' -f2)" || true
+    if [[ -n "${from_env}" && "${from_env}" =~ ^[0-9]+$ ]]; then
+      max_mb="${from_env}"
+    fi
+  fi
+
+  local concurrent=5
+  local required_bytes=$((max_mb * 1024 * 1024 * concurrent))
+
+  # df -P：第二行的第四列是可用空間 (KB)
+  local avail_kb
+  avail_kb="$(df -P "${TMP_DIR}" | awk 'NR==2{print $4}')" || true
+  if [[ -z "${avail_kb}" ]]; then
+    warn "無法取得 ${TMP_DIR} 所在分區空間資訊，略過臨時目錄空間檢查。"
+    return
+  fi
+
+  local avail_bytes=$((avail_kb * 1024))
+  local required_gb=$((required_bytes / 1024 / 1024 / 1024))
+  local avail_gb=$((avail_bytes / 1024 / 1024 / 1024))
+
+  if (( avail_bytes < required_bytes )); then
+    warn "臨時目錄 ${TMP_DIR} 所在分區可用空間約 ${avail_gb} GiB，低於 MAX_FILE_MB×5 的理論需求約 ${required_gb} GiB。"
+    warn "仍繼續安裝，但請留意：在高併發大文件上傳時可能因空間不足而失敗。"
+  else
+    log "臨時目錄所在分區可用空間約 ${avail_gb} GiB，足以支撐 MAX_FILE_MB×5 併發的理論需求約 ${required_gb} GiB。"
+  fi
+}
+
 write_app_code() {
-  log "[4/7] 寫入 FastAPI 應用程式代碼、模板與清理腳本..."
+  log "[5/8] 寫入 FastAPI 應用程式代碼、模板與清理腳本..."
 
   # ---------------- app/main.py ----------------
   cat >"${APP_DIR}/app/main.py" <<'PY'
 import os
 import uuid
 import datetime
+import html
 from pathlib import Path
 from typing import List, Optional
 
 import aiosqlite
 import aiofiles
 import httpx
-from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException, Query
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("PAN_DATA_DIR", "/srv/pan"))
-FILES_DIR = DATA_DIR / "files"
-DB_PATH = DATA_DIR / "pan.db"
 
-FILES_DIR.mkdir(parents=True, exist_ok=True)
+# 先載入 .env，再讀取 PAN_DATA_DIR 等環境變量
+load_dotenv(BASE_DIR / ".env")
+
+DATA_DIR = Path(os.environ.get("PAN_DATA_DIR", "/srv/pan"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-load_dotenv(BASE_DIR / ".env")
+FILES_DIR = DATA_DIR / "files"
+FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = DATA_DIR / "pan.db"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -174,19 +273,12 @@ UPLOAD_SECRET = os.getenv("UPLOAD_SECRET", "").strip()
 # 預設略低於 Nginx 100 GiB 上限，用於預留 multipart 開銷
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "102300"))
 
-app = FastAPI(title="pan.bdfz.net upload service")
+app = FastAPI(title="SUENの網盤")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 def get_db():
-  """
-  Return an aiosqlite connection factory suitable for use with:
-      async with get_db() as conn:
-          ...
-  NOTE: do NOT `await` this before using in `async with`, otherwise
-  the same connection object would be awaited twice and cause
-  'threads can only be started once'.
-  """
+  """返回 aiosqlite 連線工廠，配合 async with 使用。"""
   return aiosqlite.connect(DB_PATH)
 
 
@@ -226,7 +318,9 @@ async def init_db():
 def get_client_ip(request: Request) -> str:
   xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
   if xff:
-    return xff.split(",")[0].strip()
+    parts = [p.strip() for p in xff.split(",") if p.strip()]
+    if parts:
+      return parts[-1]
   return request.client.host if request.client else "unknown"
 
 
@@ -259,6 +353,16 @@ def human_size(num_bytes: int) -> str:
   return f"{num_bytes:.1f}PB"
 
 
+def is_ajax(request: Request) -> bool:
+  xrw = (request.headers.get("x-requested-with") or "").lower()
+  if xrw == "xmlhttprequest":
+    return True
+  accept = (request.headers.get("accept") or "").lower()
+  if "application/json" in accept:
+    return True
+  return False
+
+
 @app.on_event("startup")
 async def startup_event():
   await init_db()
@@ -272,14 +376,14 @@ async def index(request: Request):
   return templates.TemplateResponse("index.html", {"request": request})
 
 
-@app.post("/upload", response_class=HTMLResponse)
+@app.post("/upload")
 async def handle_upload(
   request: Request,
   upload_id: str = Form(...),
-  category: Optional[str] = Form(None),
-  note: Optional[str] = Form(None),
   secret: Optional[str] = Form(None),
   files: List[UploadFile] = File(...),
+  category: Optional[str] = Form(None),
+  note: Optional[str] = Form(None),
 ):
   if UPLOAD_SECRET and (not secret or secret.strip() != UPLOAD_SECRET):
     raise HTTPException(status_code=403, detail="上傳口令錯誤")
@@ -370,24 +474,43 @@ async def handle_upload(
   total_size = sum(r["size_bytes"] for r in created_records)
   lines = [
     "📤 <b>新上傳</b>",
-    f"ID: <code>{upload_id}</code>",
+    f"ID: <code>{html.escape(upload_id)}</code>",
   ]
   if category:
-    lines.append(f"類別: {category}")
+    lines.append(f"類別: {html.escape(category)}")
   if note:
-    lines.append(f"備註: {note[:200]}")
-  lines.append(f"上傳 IP: <code>{client_ip}</code>")
+    safe_note = note[:200]
+    lines.append(f"備註: {html.escape(safe_note)}")
+  lines.append(f"上傳 IP: <code>{html.escape(client_ip)}</code>")
   lines.append(f"文件數: {len(created_records)}，總大小: {human_size(total_size)}")
   lines.append("")
   for r in created_records[:5]:
-    lines.append(f"• {r['original_name']} ({human_size(r['size_bytes'])})")
+    lines.append(f"• {html.escape(r['original_name'])} ({human_size(r['size_bytes'])})")
   if len(created_records) > 5:
     lines.append(f"... 以及另外 {len(created_records) - 5} 個文件")
   lines.append("")
   detail_url = f"{BASE_URL}/id/{upload_id}"
-  lines.append(f"詳情: {detail_url}")
+  lines.append(f"詳情: {html.escape(detail_url)}")
 
   await send_telegram_message("\n".join(lines))
+
+  if is_ajax(request):
+    return JSONResponse(
+      {
+        "ok": True,
+        "upload_id": upload_id,
+        "detail_url": detail_url,
+        "files": [
+          {
+            "id": r["id"],
+            "name": r["original_name"],
+            "size_bytes": r["size_bytes"],
+            "size_human": human_size(r["size_bytes"]),
+          }
+          for r in created_records
+        ],
+      }
+    )
 
   return templates.TemplateResponse(
     "upload_success.html",
@@ -398,6 +521,42 @@ async def handle_upload(
       "detail_url": detail_url,
     },
   )
+
+
+@app.get("/api/list")
+async def api_list(upload_id: str = Query(..., alias="upload_id")):
+  upload_id = upload_id.strip()
+  if not upload_id:
+    raise HTTPException(status_code=400, detail="upload_id 必填")
+
+  async with get_db() as conn:
+    conn.row_factory = aiosqlite.Row
+    cur = await conn.execute(
+      """
+      SELECT id, upload_id, category, note, original_name, stored_path,
+             size_bytes, uploader_ip, created_at
+      FROM uploads
+      WHERE upload_id = ?
+      ORDER BY created_at ASC
+      """,
+      (upload_id,),
+    )
+    rows = await cur.fetchall()
+
+  files = []
+  for row in rows:
+    files.append(
+      {
+        "id": row["id"],
+        "upload_id": row["upload_id"],
+        "name": row["original_name"],
+        "size_bytes": row["size_bytes"],
+        "size_human": human_size(row["size_bytes"]),
+        "created_at": row["created_at"],
+      }
+    )
+
+  return JSONResponse({"ok": True, "upload_id": upload_id, "files": files})
 
 
 @app.get("/id/{upload_id}", response_class=HTMLResponse)
@@ -471,9 +630,9 @@ async def download_file(request: Request, file_id: str, filename: Optional[str] 
 
   lines = [
     "📥 <b>文件被下載</b>",
-    f"上傳 ID: <code>{row['upload_id']}</code>",
-    f"文件: {row['original_name']}",
-    f"下載 IP: <code>{client_ip}</code>",
+    f"上傳 ID: <code>{html.escape(row['upload_id'])}</code>",
+    f"文件: {html.escape(row['original_name'])}",
+    f"下載 IP: <code>{html.escape(client_ip)}</code>",
   ]
   await send_telegram_message("\n".join(lines))
 
@@ -488,6 +647,9 @@ async def download_file(request: Request, file_id: str, filename: Optional[str] 
 async def health():
   return {"status": "ok"}
 PY
+
+  chmod 644 "${APP_DIR}/app/main.py"
+  chown "${APP_USER}:${APP_USER}" "${APP_DIR}/app/main.py"
 
   # ---------------- app/cleanup.py ----------------
   cat >"${APP_DIR}/app/cleanup.py" <<'PY'
@@ -563,447 +725,1004 @@ if __name__ == "__main__":
 PY
 
   chmod +x "${APP_DIR}/app/cleanup.py"
+  chown "${APP_USER}:${APP_USER}" "${APP_DIR}/app/cleanup.py"
 
-  # ---------------- templates ----------------
+  # ---------------- templates/base.html ----------------
   cat >"${APP_DIR}/templates/base.html" <<'HTML'
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-Hans">
   <head>
-    <meta charset="utf-8">
-    <title>pan.bdfz.net - 附件上傳</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="utf-8" />
+    <title>SUENの網盤</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="https://img.bdfz.net/20250503004.webp" type="image/webp" />
+
     <style>
-      body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-        max-width: 900px;
-        margin: 2rem auto;
-        padding: 0 1rem;
-        background: #f5f5f5;
+      :root {
+        font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+        color-scheme: dark;
+        --bg: #020617;
+        --fg: #d1fae5;
+        --card-bg: rgba(2, 6, 23, 0.95);
+        --border: rgba(34, 197, 94, 0.45);
+        --accent: #22c55e;
+        --accent-soft: rgba(34, 197, 94, 0.25);
+        --muted: #6ee7b7;
       }
-      header {
-        margin-bottom: 1.5rem;
-      }
-      .card {
-        background: #ffffff;
-        border-radius: 8px;
-        padding: 1.5rem;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-      }
-      label {
-        display: block;
-        margin-top: 0.75rem;
-        font-weight: 600;
-      }
-      input[type="text"],
-      textarea,
-      select {
-        width: 100%;
-        padding: 0.4rem 0.5rem;
-        margin-top: 0.25rem;
-        border-radius: 4px;
-        border: 1px solid #ccc;
+
+      * {
         box-sizing: border-box;
       }
-      input[type="file"] {
-        margin-top: 0.4rem;
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
       }
-      button {
-        margin-top: 1rem;
-        padding: 0.5rem 1.2rem;
-        border: none;
-        border-radius: 4px;
-        background: #2563eb;
-        color: #fff;
-        font-weight: 600;
-        cursor: pointer;
+
+      body {
+        min-height: 100vh;
+        background: radial-gradient(circle at top, #020b1f 0, #020617 55%, #000 100%);
+        color: var(--fg);
       }
-      button:hover {
-        background: #1d4ed8;
+
+      .page {
+        max-width: 1120px;
+        margin: 0 auto;
+        padding: 18px 16px 40px;
       }
-      .hint {
-        font-size: 0.85rem;
-        color: #666;
+
+      header {
+        text-align: center;
+        margin-bottom: 18px;
       }
-      .muted {
-        color: #777;
-        font-size: 0.9rem;
+
+      header h1 {
+        margin: 0;
+        font-size: 1.6rem;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--accent);
+        font-family: "Menlo", "SF Mono", ui-monospace, monospace;
+        text-shadow: 0 0 12px rgba(34, 197, 94, 0.8), 0 0 24px rgba(22, 163, 74, 0.9);
       }
-      table {
+
+      header p {
+        margin: 4px 0 0;
+        font-size: 0.8rem;
+        color: var(--muted);
+        font-family: "Menlo", ui-monospace, monospace;
+        letter-spacing: 0.12em;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+        gap: 18px;
+      }
+
+      @media (max-width: 860px) {
+        .grid {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+
+      .card {
+        background: var(--card-bg);
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        box-shadow: 0 20px 60px rgba(15, 23, 42, 0.9);
+        padding: 16px 18px 18px;
+        backdrop-filter: blur(12px);
+        position: relative;
+        overflow: hidden;
+      }
+
+      .card::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: radial-gradient(circle at top left, rgba(34, 197, 94, 0.15), transparent 70%);
+        pointer-events: none;
+        mix-blend-mode: screen;
+      }
+
+      .card-inner {
+        position: relative;
+        z-index: 1;
+      }
+
+      .card h2 {
+        margin: 0 0 8px;
+        font-size: 1.02rem;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-family: "Menlo", ui-monospace, monospace;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #bbf7d0;
+      }
+
+      .card h2 span.icon {
+        font-size: 1.1rem;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 4px;
+        font-size: 0.86rem;
+        font-weight: 500;
+      }
+
+      input[type="text"],
+      input[type="password"] {
         width: 100%;
-        border-collapse: collapse;
-        margin-top: 0.5rem;
-      }
-      th, td {
-        padding: 0.4rem 0.5rem;
-        border-bottom: 1px solid #e5e7eb;
-        text-align: left;
-      }
-      th {
-        background: #f3f4f6;
-        font-size: 0.9rem;
-      }
-      a {
-        color: #2563eb;
-        text-decoration: none;
-      }
-      a:hover {
-        text-decoration: underline;
-      }
-      .badge {
-        display: inline-block;
-        padding: 0.1rem 0.4rem;
+        padding: 7px 9px;
         border-radius: 999px;
-        background: #e5e7eb;
-        font-size: 0.75rem;
+        border: 1px solid var(--border);
+        font-size: 0.9rem;
+        outline: none;
+        background: rgba(0, 0, 0, 0.9);
+        color: var(--fg);
+        font-family: "Menlo", ui-monospace, monospace;
+      }
+
+      input::placeholder {
+        color: rgba(148, 163, 184, 0.7);
+      }
+
+      input:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px var(--accent-soft);
+        background: rgba(15, 23, 42, 1);
+      }
+
+      input[type="file"] {
+        font-size: 0.82rem;
+        color: var(--fg);
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: rgba(0, 0, 0, 0.9);
+        font-family: "Menlo", ui-monospace, monospace;
+        max-width: 100%;
+      }
+
+      button {
+        border: none;
+        border-radius: 999px;
+        padding: 6px 14px;
+        font-size: 0.84rem;
+        font-weight: 500;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: radial-gradient(circle at top, #22c55e, #16a34a);
+        color: #020617;
+        box-shadow: 0 10px 24px rgba(34, 197, 94, 0.75);
+        transition: background 0.12s ease, transform 0.1s ease, box-shadow 0.1s ease, filter 0.12s ease;
+        white-space: nowrap;
+        font-family: "Menlo", ui-monospace, monospace;
+      }
+
+      button:hover {
+        filter: brightness(1.08);
+        transform: translateY(-1px);
+        box-shadow: 0 16px 36px rgba(34, 197, 94, 0.9);
+      }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: wait;
+        transform: none;
+        box-shadow: none;
+        filter: none;
+      }
+
+      .status {
+        margin-top: 4px;
+        font-size: 0.78rem;
+        min-height: 1.1em;
+        font-family: "Menlo", ui-monospace, monospace;
+      }
+
+      .status.ok {
+        color: #4ade80;
+      }
+
+      .status.err {
+        color: #fca5a5;
+      }
+
+      .progress {
+        width: 100%;
+        height: 6px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.9);
+        overflow: hidden;
+        margin-top: 4px;
+        display: none;
+      }
+
+      .progress-bar {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(to right, #22c55e, #4ade80);
+        transition: width 0.1s linear;
+      }
+
+      .row-between {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .slot-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 6px;
+      }
+
+      .slot-row label {
+        margin: 0;
+        white-space: nowrap;
+        font-family: "Menlo", ui-monospace, monospace;
+        color: #bbf7d0;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        font-size: 0.8rem;
+      }
+
+      .slot-row .slot-input-wrap {
+        min-width: 120px;
+        max-width: 180px;
+        flex: 1;
+      }
+
+      .file-list-preview {
+        margin-top: 4px;
+        font-size: 0.78rem;
+        color: var(--muted);
+        font-family: "Menlo", ui-monospace, monospace;
+        white-space: normal;
+        word-break: break-all;
+        min-height: 1.1em;
+      }
+
+      .download-list {
+        list-style: none;
+        padding: 0;
+        margin: 6px 0 4px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-height: 360px;
+        overflow-y: auto;
+      }
+
+      .download-list li a {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 8px 12px;
+        border-radius: 10px;
+        border: 1px dashed rgba(34, 197, 94, 0.6);
+        text-decoration: none;
+        color: var(--fg);
+        background: rgba(0, 0, 0, 0.7);
+        font-size: 0.86rem;
+        font-family: "Menlo", ui-monospace, monospace;
+        transition: border-color 0.12s ease, background 0.12s ease, transform 0.1s ease,
+          box-shadow 0.1s ease;
+      }
+
+      .download-list li a:hover {
+        border-color: #4ade80;
+        background: rgba(22, 101, 52, 0.8);
+        transform: translateY(-1px);
+        box-shadow: 0 10px 24px rgba(34, 197, 94, 0.6);
+      }
+
+      .dl-name {
+        font-weight: 500;
+      }
+
+      .dl-meta {
+        font-size: 0.76rem;
+        color: var(--muted);
+      }
+
+      .download-progress-text {
+        margin-top: 4px;
+        font-size: 0.78rem;
+        font-family: "Menlo", ui-monospace, monospace;
+        color: var(--muted);
+        min-height: 1.1em;
+      }
+
+      footer {
+        margin-top: 24px;
+        font-size: 0.78rem;
+        color: var(--muted);
+        text-align: right;
+        font-family: "Menlo", ui-monospace, monospace;
+      }
+
+      footer span#script-info::before {
+        content: "[";
+        margin-right: 3px;
+      }
+
+      footer span#script-info::after {
+        content: "]";
+        margin-left: 3px;
+      }
+
+      .explain-list {
+        margin: 6px 0 0;
+        padding-left: 1.1rem;
+        font-size: 0.84rem;
+        color: rgba(226, 232, 240, 0.92);
+      }
+
+      .explain-list li {
+        margin-bottom: 3px;
       }
     </style>
   </head>
   <body>
-    <header>
-      <h1>pan.bdfz.net</h1>
-      <p class="muted">附件上傳 / 下載服務（僅限課堂教學用途）</p>
-    </header>
-    <main class="card">
+    <div class="page">
+      <header>
+        <h1>SUENの網盤</h1>
+        <p>SYS: NET DRIVE NODE · STATUS: ONLINE</p>
+      </header>
+
       {% block content %}{% endblock %}
-    </main>
+
+      <footer>
+        <span id="script-info">SUEN-NET-DRIVE · FRONTEND v2025-12-07-SSL</span>
+      </footer>
+    </div>
   </body>
 </html>
 HTML
 
+  # ---------------- templates/index.html ----------------
   cat >"${APP_DIR}/templates/index.html" <<'HTML'
 {% extends "base.html" %}
 {% block content %}
-<h2>上傳附件</h2>
-<form action="/upload" method="post" enctype="multipart/form-data">
-  <label for="upload_id">上傳 ID（必填，例如：班級作業代碼）</label>
-  <input type="text" id="upload_id" name="upload_id" required>
+<div class="grid">
+  <!-- 左側：說明 -->
+  <div class="card">
+    <div class="card-inner">
+      <h2><span class="icon">ℹ️</span> 使用說明</h2>
+      <ul class="explain-list">
+        <li>先在右側輸入「ID」與「口令」，點擊「設定 ID / 口令」。</li>
+        <li>ID 一般為班級 / 作業代碼，例如 <code>2025-CLS-01-HW5</code>。</li>
+        <li>同一個 ID 下，所有人上傳的附件會集中在一起，方便老師統一下載。</li>
+        <li>服務端會記錄上傳 / 下載 IP、時間與大小，僅用於教學管理。</li>
+        <li>請勿上傳與課堂無關或侵權內容，違規將被清理並關閉權限。</li>
+      </ul>
+    </div>
+  </div>
 
-  <label for="category">類別（可選，例如：作業 / 資料）</label>
-  <input type="text" id="category" name="category" placeholder="作業 / 資料 / 其他">
+  <!-- 右側：ID + 上傳 / 下載 -->
+  <div class="card">
+    <div class="card-inner">
+      <h2><span class="icon">⬆️</span> 上傳附件</h2>
 
-  <label for="note">備註（可選）</label>
-  <textarea id="note" name="note" rows="2" placeholder="例如：第 5 次作業，語文 X 班"></textarea>
+      <!-- ID + 口令 -->
+      <div class="slot-row">
+        <label for="slot-id">ID</label>
+        <div class="slot-input-wrap">
+          <input id="slot-id" name="slot-id" type="text" placeholder="例如：2025-CLASS-A" />
+        </div>
+        <label for="slot-secret">口令</label>
+        <div class="slot-input-wrap">
+          <input id="slot-secret" name="slot-secret" type="password" placeholder="必填（由老師提供）" />
+        </div>
+      </div>
+      <div class="row-between" style="margin-bottom:8px;">
+        <button id="btn-set-slot" type="button">設定 ID / 口令</button>
+        <span id="slot-status" class="status"></span>
+      </div>
 
-  <label for="secret">上傳口令（如老師提供，必填）</label>
-  <input type="text" id="secret" name="secret" placeholder="由老師提供">
+      <!-- 上傳表單（有 JS 截獲，無 JS 則正常提交） -->
+      <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+        <input type="hidden" id="upload_id" name="upload_id" />
+        <input type="hidden" id="secret" name="secret" />
 
-  <label for="files">選擇文件（可多選）</label>
-  <input type="file" id="files" name="files" multiple required>
+        <label for="files">選擇文件（可多選）</label>
+        <input type="file" id="files" name="files" multiple required />
 
-  <p class="hint">
-    備註：請合理控制單個文件大小；服務端會記錄上傳 IP、時間、大小並推送管理員，僅用於教學管理用途。
-  </p>
+        <div id="file-preview" class="file-list-preview"></div>
 
-  <button type="submit">開始上傳</button>
-</form>
+        <div class="row-between" style="margin-top:10px;">
+          <button id="btn-upload" type="submit">開始上傳</button>
+          <span id="upload-status" class="status"></span>
+        </div>
+        <div class="progress" id="upload-progress">
+          <div class="progress-bar" id="upload-progress-bar"></div>
+        </div>
+      </form>
+
+      <hr style="margin:16px 0;border:none;border-top:1px dashed rgba(148,163,184,0.5);" />
+
+      <h2><span class="icon">⬇️</span> 附件下載</h2>
+      <p style="font-size:0.8rem;margin:0 0 6px;color:rgba(148,163,184,0.9);">
+        當前 ID 下所有附件會列在這裡，點擊即可下載。請確認 ID / 口令輸入正確。
+      </p>
+      <ul id="download-list" class="download-list"></ul>
+      <div class="progress" id="download-progress">
+        <div class="progress-bar" id="download-progress-bar"></div>
+      </div>
+      <div id="download-status" class="download-progress-text"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const API_UPLOAD = "/upload";
+    const API_LIST = "/api/list";
+
+    let currentId = "";
+    let currentSecret = "";
+
+    function setStatus(id, msg, ok) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = msg || "";
+      el.className = "status" + (msg ? (ok ? " ok" : " err") : "");
+    }
+
+    function showProgress(containerId, barId, percent) {
+      const container = document.getElementById(containerId);
+      const bar = document.getElementById(barId);
+      if (!container || !bar) return;
+      container.style.display = "block";
+      bar.style.width = (percent || 0) + "%";
+      if (percent >= 100) {
+        setTimeout(() => {
+          container.style.display = "none";
+          bar.style.width = "0%";
+        }, 800);
+      }
+    }
+
+    function hideProgress(containerId, barId) {
+      const container = document.getElementById(containerId);
+      const bar = document.getElementById(barId);
+      if (!container || !bar) return;
+      container.style.display = "none";
+      bar.style.width = "0%";
+    }
+
+    function formatBytes(bytes) {
+      const n = Number(bytes);
+      if (!Number.isFinite(n) || n <= 0) return "0 B";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let val = n;
+      let idx = 0;
+      while (val >= 1024 && idx < units.length - 1) {
+        val /= 1024;
+        idx++;
+      }
+      const digits = idx === 0 ? 0 : 2;
+      return val.toFixed(digits) + " " + units[idx];
+    }
+
+    function formatSpeed(bytesPerSec) {
+      if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return "0 B/s";
+      return formatBytes(bytesPerSec) + "/s";
+    }
+
+    function formatETA(remainingSeconds) {
+      if (!Number.isFinite(remainingSeconds) || remainingSeconds <= 0) return "剩餘 < 1 秒";
+      const sec = Math.round(remainingSeconds);
+      if (sec < 60) return "剩餘約 " + sec + " 秒";
+      const min = Math.floor(sec / 60);
+      const s = sec % 60;
+      return "剩餘約 " + min + " 分 " + s + " 秒";
+    }
+
+    function applySlot() {
+      const idInput = document.getElementById("slot-id");
+      const secretInput = document.getElementById("slot-secret");
+      const upId = document.getElementById("upload_id");
+      const upSecret = document.getElementById("secret");
+
+      const idVal = (idInput.value || "").trim();
+      const secretVal = (secretInput.value || "").trim();
+
+      if (!idVal || !secretVal) {
+        setStatus("slot-status", "ID 和口令均為必填。", false);
+        return false;
+      }
+
+      currentId = idVal;
+      currentSecret = secretVal;
+
+      upId.value = currentId;
+      upSecret.value = currentSecret;
+
+      setStatus("slot-status", "當前 ID：" + currentId, true);
+
+      loadFiles().catch(console.error);
+      return true;
+    }
+
+    async function loadFiles() {
+      const listEl = document.getElementById("download-list");
+      const statusEl = document.getElementById("download-status");
+      hideProgress("download-progress", "download-progress-bar");
+      if (!currentId) {
+        if (listEl) listEl.innerHTML = "";
+        if (statusEl) statusEl.textContent = "";
+        return;
+      }
+      try {
+        if (statusEl) statusEl.textContent = "正在載入附件列表…";
+        const url = API_LIST + "?upload_id=" + encodeURIComponent(currentId);
+        const res = await fetch(url, { headers: { Accept: "application/json" } });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error("服務器返回錯誤");
+        const files = data.files || [];
+        if (!listEl) return;
+        if (!files.length) {
+          listEl.innerHTML =
+            "<li><span style='font-size:0.8rem;color:rgba(148,163,184,0.9);'>當前 ID 下尚無附件。</span></li>";
+          if (statusEl) statusEl.textContent = "";
+          return;
+        }
+        listEl.innerHTML = "";
+        for (const f of files) {
+          const li = document.createElement("li");
+          const a = document.createElement("a");
+          const left = document.createElement("div");
+          const right = document.createElement("div");
+
+          left.className = "dl-left";
+          right.className = "dl-right";
+
+          const nameSpan = document.createElement("span");
+          nameSpan.className = "dl-name";
+          nameSpan.textContent = f.name || "(無名文件)";
+
+          const metaSpan = document.createElement("span");
+          metaSpan.className = "dl-meta";
+          metaSpan.textContent = f.size_human || formatBytes(f.size_bytes || 0);
+
+          left.appendChild(nameSpan);
+          right.appendChild(metaSpan);
+
+          a.href = "/d/" + encodeURIComponent(f.id) + "/" + encodeURIComponent(f.name || "");
+          a.dataset.fileName = f.name || "";
+          a.appendChild(left);
+          a.appendChild(right);
+
+          a.addEventListener("click", function (ev) {
+            ev.preventDefault();
+            downloadWithProgress(a.href, a.dataset.fileName || "download.bin");
+          });
+
+          li.appendChild(a);
+          listEl.appendChild(li);
+        }
+        if (statusEl) statusEl.textContent = "";
+      } catch (err) {
+        console.error(err);
+        if (listEl) {
+          listEl.innerHTML = "<li><span style='font-size:0.8rem;color:#fecaca;'>載入附件列表失敗。</span></li>";
+        }
+        if (statusEl) statusEl.textContent = "";
+      }
+    }
+
+    function onFileInputChange() {
+      const input = document.getElementById("files");
+      const preview = document.getElementById("file-preview");
+      if (!input || !preview) return;
+      const files = input.files;
+      if (!files || !files.length) {
+        preview.textContent = "";
+        return;
+      }
+      const names = Array.from(files)
+        .map((f) => "· " + f.name)
+        .join("  ");
+      preview.textContent = names;
+    }
+
+    function uploadWithXHR(event) {
+      event.preventDefault();
+
+      if (!applySlot()) {
+        return;
+      }
+
+      const form = document.getElementById("upload-form");
+      const input = document.getElementById("files");
+      const btn = document.getElementById("btn-upload");
+
+      if (!input || !input.files || !input.files.length) {
+        setStatus("upload-status", "請先選擇至少一個文件。", false);
+        return;
+      }
+
+      const files = Array.from(input.files);
+      const totalBytes = files.reduce((sum, f) => sum + (f.size || 0), 0);
+
+      btn.disabled = true;
+      setStatus("upload-status", "準備上傳 " + files.length + " 個文件…", true);
+      showProgress("upload-progress", "upload-progress-bar", 0);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", API_UPLOAD, true);
+      xhr.responseType = "json";
+      xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+
+      const startTs = Date.now();
+
+      xhr.upload.onprogress = function (evt) {
+        if (!evt.lengthComputable) return;
+        const loaded = evt.loaded;
+        const percent = Math.max(0, Math.min(100, Math.round((loaded / evt.total) * 100)));
+        showProgress("upload-progress", "upload-progress-bar", percent);
+
+        const elapsedSec = (Date.now() - startTs) / 1000;
+        const speed = elapsedSec > 0 ? loaded / elapsedSec : 0;
+        const remainBytes = Math.max(0, totalBytes - loaded);
+        const eta = speed > 0 ? remainBytes / speed : 0;
+
+        const msg =
+          "已上傳 " +
+          formatBytes(loaded) +
+          " / " +
+          formatBytes(totalBytes) +
+          " · " +
+          formatSpeed(speed) +
+          " · " +
+          formatETA(eta);
+        setStatus("upload-status", msg, true);
+      };
+
+      xhr.onerror = function () {
+        hideProgress("upload-progress", "upload-progress-bar");
+        btn.disabled = false;
+        setStatus("upload-status", "上傳過程中發生錯誤。", false);
+      };
+
+      xhr.onload = function () {
+        btn.disabled = false;
+        hideProgress("upload-progress", "upload-progress-bar");
+        if (xhr.status >= 200 && xhr.status < 300) {
+          let data = xhr.response;
+          if (!data || typeof data !== "object") {
+            try {
+              data = JSON.parse(xhr.responseText || "{}");
+            } catch (e) {
+              data = {};
+            }
+          }
+          if (data.ok) {
+            setStatus("upload-status", "上傳成功，共 " + (data.files || []).length + " 個文件。", true);
+            try {
+              input.value = "";
+              document.getElementById("file-preview").textContent = "";
+            } catch (e) {}
+            loadFiles().catch(console.error);
+          } else {
+            const detail = (data && data.detail) || "未知錯誤";
+            setStatus("upload-status", "上傳失敗：" + detail, false);
+          }
+        } else {
+          let detail = "HTTP " + xhr.status;
+          try {
+            const j = JSON.parse(xhr.responseText || "{}");
+            if (j && j.detail) detail = j.detail;
+          } catch (e) {}
+          setStatus("upload-status", "上傳失敗：" + detail, false);
+        }
+      };
+
+      const formData = new FormData(form);
+      xhr.send(formData);
+    }
+
+    function downloadWithProgress(url, filename) {
+      const statusEl = document.getElementById("download-status");
+      showProgress("download-progress", "download-progress-bar", 100);
+      if (statusEl) {
+        statusEl.textContent = "正在下載：" + filename;
+      }
+      // 交給瀏覽器處理實際下載
+      window.location.href = url;
+      setTimeout(() => {
+        hideProgress("download-progress", "download-progress-bar");
+        if (statusEl) statusEl.textContent = "";
+      }, 2000);
+    }
+
+    document.addEventListener("DOMContentLoaded", function () {
+      const btnSlot = document.getElementById("btn-set-slot");
+      if (btnSlot) {
+        btnSlot.addEventListener("click", function () {
+          applySlot();
+        });
+      }
+
+      const form = document.getElementById("upload-form");
+      if (form && window.XMLHttpRequest && window.FormData) {
+        form.addEventListener("submit", uploadWithXHR);
+      }
+
+      const fileInput = document.getElementById("files");
+      if (fileInput) {
+        fileInput.addEventListener("change", onFileInputChange);
+      }
+    });
+  })();
+</script>
 {% endblock %}
 HTML
 
+  # ---------------- templates/upload_success.html ----------------
   cat >"${APP_DIR}/templates/upload_success.html" <<'HTML'
 {% extends "base.html" %}
 {% block content %}
-<h2>上傳成功</h2>
-<p>上傳 ID：<strong>{{ upload_id }}</strong></p>
-<p>你可以使用以下地址查看本次上傳的文件列表：</p>
-<p><a href="{{ detail_url }}">{{ detail_url }}</a></p>
+<div class="card">
+  <div class="card-inner">
+    <h2><span class="icon">✅</span> 上傳完成</h2>
+    <p style="font-size:0.9rem;margin:4px 0 10px;">
+      上傳 ID：<code>{{ upload_id }}</code>
+    </p>
+    <p style="font-size:0.85rem;margin:0 0 10px;color:rgba(148,163,184,0.95);">
+      請將此 ID 告訴老師或同組同學，所有人使用同一個 ID 上傳附件。
+    </p>
 
-<h3>本次上傳的文件</h3>
-<table>
-  <thead>
-    <tr>
-      <th>文件名</th>
-      <th>大小</th>
-      <th>下載</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for r in records %}
-    <tr>
-      <td>{{ r.original_name }}</td>
-      <td>{{ (r.size_bytes / 1024 / 1024) | round(2) }} MB</td>
-      <td><a href="/d/{{ r.id }}">下載</a></td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+    {% if records %}
+    <ul class="download-list">
+      {% for r in records %}
+      <li>
+        <a href="/d/{{ r.id }}/{{ r.original_name }}">
+          <span class="dl-name">{{ r.original_name }}</span>
+          <span class="dl-meta">{{ r.size_bytes }} bytes</span>
+        </a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p style="font-size:0.85rem;color:#fecaca;">沒有記錄到任何文件。</p>
+    {% endif %}
 
-<p class="hint">提示：請將上方「查看列表」鏈接妥善保存或提交給老師。</p>
+    <p style="font-size:0.85rem;margin-top:10px;">
+      查看此 ID 下所有附件：
+      <a href="/id/{{ upload_id }}">/id/{{ upload_id }}</a>
+    </p>
+  </div>
+</div>
 {% endblock %}
 HTML
 
+  # ---------------- templates/list_by_id.html ----------------
   cat >"${APP_DIR}/templates/list_by_id.html" <<'HTML'
 {% extends "base.html" %}
 {% block content %}
-<h2>上傳 ID：{{ upload_id }}</h2>
+<div class="card">
+  <div class="card-inner">
+    <h2><span class="icon">📂</span> 附件列表</h2>
+    <p style="font-size:0.9rem;margin:4px 0 10px;">
+      上傳 ID：<code>{{ upload_id }}</code>
+    </p>
 
-{% if rows and rows|length > 0 %}
-<table>
-  <thead>
-    <tr>
-      <th>文件名</th>
-      <th>大小 (預估)</th>
-      <th>上傳時間 (UTC)</th>
-      <th>上傳 IP</th>
-      <th>下載</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for row in rows %}
-    <tr>
-      <td>{{ row["original_name"] }}</td>
-      <td>{{ (row["size_bytes"] / 1024 / 1024) | round(2) }} MB</td>
-      <td class="muted">{{ row["created_at"] }}</td>
-      <td class="muted">{{ row["uploader_ip"] }}</td>
-      <td><a href="/d/{{ row["id"] }}">下載</a></td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% else %}
-<p>暫無記錄，請確認上傳 ID 是否正確。</p>
-{% endif %}
+    {% if rows %}
+    <ul class="download-list">
+      {% for row in rows %}
+      <li>
+        <a href="/d/{{ row.id }}/{{ row.original_name }}">
+          <span class="dl-name">{{ row.original_name }}</span>
+          <span class="dl-meta">
+            {{ row.size_bytes }} bytes · {{ row.created_at }}
+          </span>
+        </a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p style="font-size:0.85rem;color:rgba(148,163,184,0.95);">
+      此 ID 下暫無附件。
+    </p>
+    {% endif %}
+  </div>
+</div>
 {% endblock %}
 HTML
-
-  # ---------------- .env.example ----------------
-  cat >"${APP_DIR}/.env.example" <<'ENV'
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-BASE_URL=https://pan.bdfz.net
-UPLOAD_SECRET=CLASS-202412
-MAX_FILE_MB=102300
-PAN_DATA_DIR=/srv/pan
-CLEANUP_DAYS=30
-ENV
-
-  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
 }
 
-setup_env_file() {
-  log "[5/7] 配置 .env（Telegram / 口令 / 服務基礎配置）..."
+write_systemd_units() {
+  log "[6/8] 寫入 systemd 服務與定時任務..."
 
-  ENV_FILE="${APP_DIR}/.env"
-
-  if [[ ! -f "${ENV_FILE}" ]]; then
-    cp "${APP_DIR}/.env.example" "${ENV_FILE}"
-    chown "${APP_USER}:${APP_USER}" "${ENV_FILE}"
-    chmod 600 "${ENV_FILE}"
-    log "已從 .env.example 初始化 .env"
-  else
-    warn ".env 已存在，將在此基礎上更新。"
-  fi
-
-  set_env_var() {
-    local var="$1"
-    local prompt="$2"
-    local default="${3:-}"
-    local cur val escaped
-
-    cur="$(grep -E "^${var}=" "${ENV_FILE}" 2>/dev/null | sed "s/^${var}=//")" || cur=""
-
-    if [[ -n "${cur}" ]]; then
-      read -r -p "${prompt} [當前: ${cur}] (直接回車保留): " val || val=""
-      if [[ -z "${val}" ]]; then
-        val="${cur}"
-      fi
-    else
-      if [[ -n "${default}" ]]; then
-        read -r -p "${prompt} (預設: ${default}): " val || val=""
-        [[ -z "${val}" ]] && val="${default}"
-      else
-        read -r -p "${prompt}: " val || val=""
-      fi
-    fi
-
-    escaped="$(printf '%s\n' "${val}" | sed 's/[&/]/\\&/g')"
-    local delimiter=$'\x01'
-
-    if grep -qE "^${var}=" "${ENV_FILE}"; then
-      sed -i "s${delimiter}^${var}=.*${delimiter}${var}=${escaped}${delimiter}" "${ENV_FILE}"
-    else
-      echo "${var}=${val}" >> "${ENV_FILE}"
-    fi
-  }
-
-  echo
-  echo "--- Telegram 設定 ---"
-  set_env_var "TELEGRAM_BOT_TOKEN" "Telegram Bot Token（可留空以禁用通知）" ""
-  set_env_var "TELEGRAM_CHAT_ID" "Telegram Chat ID（可留空以禁用通知）" ""
-
-  echo
-  echo "--- 基本服務配置 ---"
-  set_env_var "BASE_URL" "BASE_URL（通知中的完整鏈接基準）" "https://${DOMAIN}"
-
-  echo
-  echo "--- 上傳口令（防止亂傳）---"
-  set_env_var "UPLOAD_SECRET" "上傳口令（可留空 = 不啟用）" ""
-
-  echo
-  echo "--- 文件大小限制 / 自動清理策略 ---"
-  set_env_var "MAX_FILE_MB" "單文件大小限制（MB）" "102300"
-  set_env_var "CLEANUP_DAYS" "自動清理天數（例如 30）" "30"
-
-  chown "${APP_USER}:${APP_USER}" "${ENV_FILE}"
-  chmod 600 "${ENV_FILE}"
-
-  log ".env 已更新：${ENV_FILE}"
-}
-
-setup_systemd() {
-  log "[6/7] 設定 systemd 服務與定時清理..."
-
-  SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-  CLEAN_SERVICE="/etc/systemd/system/${SERVICE_NAME}-cleanup.service"
-  CLEAN_TIMER="/etc/systemd/system/${SERVICE_NAME}-cleanup.timer"
-
-  cat >"${SERVICE_FILE}" <<EOF
+  cat >/etc/systemd/system/${SERVICE_NAME}.service <<UNIT
 [Unit]
-Description=pan.bdfz.net upload/download service
+Description=SUEN Net Drive (pan.bdfz.net) FastAPI Service
 After=network.target
 
 [Service]
-Type=simple
 User=${APP_USER}
+Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
-EnvironmentFile=${APP_DIR}/.env
-ExecStart=${APP_DIR}/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
-Restart=on-failure
-RestartSec=5
+Environment=TMPDIR=${TMP_DIR}
+EnvironmentFile=-${APP_DIR}/.env
+ExecStart=${APP_DIR}/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
-  cat >"${CLEAN_SERVICE}" <<EOF
+  cat >/etc/systemd/system/${SERVICE_NAME}-cleanup.service <<UNIT
 [Unit]
-Description=pan.bdfz.net daily cleanup service
-After=network.target
+Description=SUEN Net Drive (pan.bdfz.net) Cleanup Old Files
 
 [Service]
 Type=oneshot
 User=${APP_USER}
+Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
-EnvironmentFile=${APP_DIR}/.env
-ExecStart=${APP_DIR}/venv/bin/python app/cleanup.py
-EOF
+EnvironmentFile=-${APP_DIR}/.env
+ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/app/cleanup.py
+UNIT
 
-  cat >"${CLEAN_TIMER}" <<EOF
+  cat >/etc/systemd/system/${SERVICE_NAME}-cleanup.timer <<UNIT
 [Unit]
-Description=Run pan.bdfz.net cleanup daily
+Description=Daily cleanup for SUEN Net Drive (pan.bdfz.net)
 
 [Timer]
 OnCalendar=*-*-* 03:30:00
 Persistent=true
-Unit=${SERVICE_NAME}-cleanup.service
 
 [Install]
 WantedBy=timers.target
-EOF
+UNIT
 
   systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}.service"
-  systemctl enable --now "${SERVICE_NAME}-cleanup.timer"
-
-  systemctl status "${SERVICE_NAME}.service" --no-pager || true
+  systemctl enable "${SERVICE_NAME}.service" "${SERVICE_NAME}-cleanup.timer"
+  systemctl restart "${SERVICE_NAME}.service"
+  systemctl start "${SERVICE_NAME}-cleanup.timer"
 }
 
-setup_nginx() {
-  log "[7/7] 配置 Nginx 反向代理與限速..."
+write_nginx_conf() {
+  log "[7/8] 配置 Nginx 反向代理..."
 
-  # http 級別限速設定
-  local LIMIT_CONF="/etc/nginx/conf.d/pan_upload_limit.conf"
-  cat >"${LIMIT_CONF}" <<'EOF'
-limit_req_zone $binary_remote_addr zone=pan_upload:10m rate=5r/m;
-EOF
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
 
-  NGINX_CONF="/etc/nginx/sites-available/${DOMAIN}"
+  if [[ -f "${NGINX_SITE_AVAIL}" ]]; then
+    warn "備份原有 Nginx 配置為 ${NGINX_SITE_AVAIL}.bak-${ts}"
+    cp "${NGINX_SITE_AVAIL}" "${NGINX_SITE_AVAIL}.bak-${ts}"
+  fi
 
-  cat >"${NGINX_CONF}" <<EOF
+  local cert_dir="/etc/letsencrypt/live/${DOMAIN}"
+  local max_mb="102300"
+  if [[ -f "${APP_DIR}/.env" ]]; then
+    local val
+    val="$(grep -E '^MAX_FILE_MB=' "${APP_DIR}/.env" | tail -n1 | cut -d'=' -f2)"
+    if [[ -n "${val}" && "${val}" =~ ^[0-9]+$ ]]; then
+      max_mb="${val}"
+    fi
+  fi
+  local nginx_size="${max_mb}m"
+
+  if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]]; then
+    log "檢測到已存在的 Let's Encrypt 證書，直接寫入 HTTPS 配置，不重新申請。"
+
+    cat >"${NGINX_SITE_AVAIL}" <<NGINX
 server {
     listen 80;
     server_name ${DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
 
-    client_max_body_size 100g;
+server {
+    listen 443 ssl http2;
+    server_name ${DOMAIN};
 
-    location /static/ {
-        alias ${APP_DIR}/static/;
-    }
+    ssl_certificate     ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+    ssl_trusted_certificate ${cert_dir}/chain.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
 
-    location /upload {
-        limit_req zone=pan_upload burst=10 nodelay;
+    client_max_body_size ${nginx_size};
 
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+    location /health {
+        proxy_pass http://127.0.0.1:8000/health;
+        include /etc/nginx/proxy_params;
+        proxy_redirect off;
     }
 
     location / {
         proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        include /etc/nginx/proxy_params;
+        proxy_redirect off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
     }
 }
-EOF
+NGINX
+  else
+    warn "未找到 /etc/letsencrypt/live/${DOMAIN} 下的證書，暫時僅配置 HTTP 80。"
+    warn "首次部署請確認 DNS 正確後自行執行：certbot --nginx -d ${DOMAIN}"
 
-  ln -sf "${NGINX_CONF}" /etc/nginx/sites-enabled/"${DOMAIN}"
+    cat >"${NGINX_SITE_AVAIL}" <<NGINX
+server {
+    listen 80;
+    server_name ${DOMAIN};
 
-  if [[ -f /etc/nginx/sites-enabled/default ]]; then
-    rm -f /etc/nginx/sites-enabled/default
+    client_max_body_size ${nginx_size};
+
+    location /health {
+        proxy_pass http://127.0.0.1:8000/health;
+        include /etc/nginx/proxy_params;
+        proxy_redirect off;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        include /etc/nginx/proxy_params;
+        proxy_redirect off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}
+NGINX
   fi
+
+  ln -sf "${NGINX_SITE_AVAIL}" "${NGINX_SITE_ENABLED}"
 
   nginx -t
   systemctl reload nginx
+}
 
-  log "Nginx 已配置完成，目前使用 HTTP（80）。"
+final_checks() {
+  log "[8/8] 最後檢查..."
 
-  local CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
-  if [[ -d "${CERT_DIR}" ]]; then
-    warn "檢測到已存在 ${DOMAIN} 的 Let's Encrypt 證書 (${CERT_DIR})，本次安裝將跳過自動申請。"
-    return
-  fi
+  systemctl status "${SERVICE_NAME}.service" --no-pager || true
+  systemctl status nginx --no-pager || true
 
-  echo
-  read -r -p "是否現在使用 certbot 自動申請 Let's Encrypt 證書並啟用 HTTPS? [y/N] " use_ssl || use_ssl=""
-  if [[ "${use_ssl}" =~ ^[Yy]$ ]]; then
-    apt install -y certbot python3-certbot-nginx
-    certbot --nginx -d "${DOMAIN}"
-    log "如無報錯，HTTPS 已啟用。"
-  else
-    warn "已跳過自動配置 HTTPS。如需之後啟用，可執行：certbot --nginx -d ${DOMAIN}"
-  fi
+  log "安裝器版本：${INSTALLER_VERSION}"
+  log "如需檢查後端健康狀態，可在伺服器上執行：curl -s http://127.0.0.1:8000/health"
+  log "前端訪問：https://${DOMAIN}"
 }
 
 main() {
-  log "pan installer version: ${INSTALLER_VERSION}"
-  stop_existing_service
-  kill_old_uvicorn
+  log "=== SUEN Net Drive 安裝腳本 (${INSTALLER_VERSION}) 啟動 ==="
   check_root
   check_os
+  stop_existing_service
+  kill_old_uvicorn
   install_packages
   create_user_and_dirs
   setup_venv_and_deps
+  write_env_template
+  check_tmp_space
   write_app_code
-  setup_env_file
-  setup_systemd
-  setup_nginx
-
-  echo
-  log "========================================================"
-  log " pan.bdfz.net 已部署完成"
-  log " - 應用目錄: ${APP_DIR}"
-  log " - 數據目錄: ${DATA_DIR}"
-  log " - systemd 服務: ${SERVICE_NAME}.service"
-  log " - 每日清理:   ${SERVICE_NAME}-cleanup.timer (03:30 UTC)"
-  log " - .env 配置:  ${APP_DIR}/.env"
-  log "========================================================"
-  echo
-  echo "建議下一步："
-  echo "  1) 確認 DNS 已指向本機 IP 並可通過 http://${DOMAIN}/ 或 https://${DOMAIN}/ 訪問"
-  echo "  2) 視情況在前置（如 Cloudflare / DMIT Nginx）上增加白名單與額外 WAF 規則。"
+  write_systemd_units
+  write_nginx_conf
+  final_checks
+  log "=== 安裝完成。如為重裝，舊進程與配置已被覆蓋，證書保持不變。==="
 }
 
 main "$@"
