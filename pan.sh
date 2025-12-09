@@ -1315,10 +1315,9 @@ HTML
         <input type="file" id="files-normal" name="files" multiple style="display:none" />
         <input type="file" id="files-folder" name="files" multiple webkitdirectory directory style="display:none" />
 
-        <div class="slot-row">
-           <label>選擇文件</label>
-           <div class="custom-dropdown" id="dropdown-select">
-              <button type="button" class="custom-dropdown-btn" id="btn-select-main">
+        <div style="display:flex; gap:12px; margin-top:16px;">
+           <div class="custom-dropdown" id="dropdown-select" style="flex:1;">
+              <button type="button" class="custom-dropdown-btn" id="btn-select-main" style="width:100%;">
                 📄 選擇文件 ▾
               </button>
               <div class="custom-dropdown-menu" id="dropdown-menu">
@@ -1330,13 +1329,11 @@ HTML
                   </button>
               </div>
            </div>
-           <div id="file-preview" class="file-list-preview" style="text-align:left; margin-top:2px;"></div>
+           
+           <button id="btn-upload" type="submit" style="flex:1; justify-content: center;">開始上傳</button>
+           <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;box-shadow:0 10px 24px rgba(239,68,68,0.75);flex:1;justify-content:center;">取消</button>
         </div>
-
-        <div class="slot-row" style="margin-bottom:0;">
-             <button id="btn-upload" type="submit" style="width:100%; justify-content: center;">開始上傳</button>
-             <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;box-shadow:0 10px 24px rgba(239,68,68,0.75);width:100%;justify-content:center;">取消</button>
-        </div>
+        <div id="file-preview" class="file-list-preview" style="text-align:left; margin-top:2px;"></div>
 
         <div style="margin-top:8px;">
            <span id="upload-status" class="status"></span>
@@ -1549,36 +1546,54 @@ HTML
         
         container.innerHTML = "";
         
-        if (!files || !files.length) {
-            container.innerHTML = "<div style='color:rgba(148,163,184,0.9);text-align:center;'>無符合條件的附件。</div>";
-            return;
-        }
-
+        // Define fixed categories to ensure they always appear
+        const fixedCategories = ["高考", "辭書", "課程", "電影", "音樂", "其他類"];
+        
+        // Group files
         const groups = {};
-        for (const f of files) {
-          const cat = (f.category || "").trim();
-          const key = cat || "未分類";
-          if (!groups[key]) groups[key] = { name: key, items: [] };
-          groups[key].items.push(f);
+        // Initialize groups
+        fixedCategories.forEach(c => { groups[c] = []; });
+        groups["未分類"] = []; // Extra bucket
+
+        if (files && files.length) {
+            for (const f of files) {
+                const cat = (f.category || "").trim();
+                if (groups[cat]) {
+                    groups[cat].push(f);
+                } else {
+                    groups["未分類"].push(f);
+                }
+            }
         }
+        
+        // Render each fixed category
+        fixedCategories.forEach(name => {
+            renderCategorySection(container, name, groups[name]);
+        });
+        
+        // Render unknown categories if any
+        if (groups["未分類"].length > 0) {
+            renderCategorySection(container, "未分類", groups["未分類"]);
+        }
+    }
 
-        const keys = Object.keys(groups).sort(); 
+    function renderCategorySection(container, name, items) {
+        // Always render header
+        const heading = document.createElement("div");
+        heading.className = "category-heading";
+        const count = items ? items.length : 0;
+        heading.innerHTML = `<span class="icon">📁</span> ${name} <span style="margin-left:auto;font-size:0.7em;color:var(--muted);">${count}</span>`;
+        container.appendChild(heading);
 
-        for (const key of keys) {
-            const group = groups[key];
-            
-            // Category Header
-            const heading = document.createElement("div");
-            heading.className = "category-heading";
-            heading.innerHTML = `<span class="icon">📁</span> ${group.name} <span style="margin-left:auto;font-size:0.7em;color:var(--muted);">${group.items.length}</span>`;
-            container.appendChild(heading);
+        const ul = document.createElement("ul");
+        ul.className = "download-list";
+        ul.style.marginBottom = "16px";
 
-            // List
-            const ul = document.createElement("ul");
-            ul.className = "download-list";
-            ul.style.marginBottom = "16px";
-            
-            for (const f of group.items) {
+        if (!items || items.length === 0) {
+            // Render explicit empty state for this category
+            ul.innerHTML = `<li><span style="font-size:0.8rem;color:rgba(148,163,184,0.5);padding:4px 0;display:block;">（暫無文件）</span></li>`;
+        } else {
+            for (const f of items) {
                 const li = document.createElement("li");
                 
                 const box = document.createElement("div");
@@ -1630,8 +1645,8 @@ HTML
                 li.appendChild(box);
                 ul.appendChild(li);
             }
-            container.appendChild(ul);
         }
+        container.appendChild(ul);
     }
 
     function filterData(files) {
