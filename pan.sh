@@ -1315,20 +1315,22 @@ HTML
         <input type="file" id="files-normal" name="files" multiple style="display:none" />
         <input type="file" id="files-folder" name="files" multiple webkitdirectory directory style="display:none" />
 
-        <div style="display:flex; gap:12px; margin-top:16px;">
-           <div class="custom-dropdown" id="dropdown-select" style="flex:1;">
-              <button type="button" class="custom-dropdown-btn" id="btn-select-main" style="width:100%;">
-                📄 選擇文件 ▾
-              </button>
-              <div class="custom-dropdown-menu" id="dropdown-menu">
-                  <button type="button" class="custom-dropdown-item" id="opt-file">
-                      <span style="font-size:1.1em">📄</span> 選擇文件 (Files)
-                  </button>
-                  <button type="button" class="custom-dropdown-item" id="opt-folder">
-                      <span style="font-size:1.1em">📂</span> 選擇文件夾 (Folder)
-                  </button>
-              </div>
-           </div>
+        <!-- 選擇模式：文件 or 文件夾 -->
+        <div style="display:flex; gap:16px; margin-top:12px; margin-bottom:8px; align-items:center;">
+           <label style="cursor:pointer; display:flex; gap:6px; align-items:center; font-size:0.9rem;">
+              <input type="radio" name="upload-mode" value="file" checked style="accent-color:var(--accent);">
+              <span>📄 上傳文件</span>
+           </label>
+           <label style="cursor:pointer; display:flex; gap:6px; align-items:center; font-size:0.9rem;">
+              <input type="radio" name="upload-mode" value="folder" style="accent-color:var(--accent);">
+              <span>� 上傳文件夾</span>
+           </label>
+        </div>
+
+        <div style="display:flex; gap:12px;">
+           <button type="button" id="btn-select-content" style="flex:1; justify-content: center;">
+             會先選擇文件...
+           </button>
            
            <button id="btn-upload" type="submit" style="flex:1; justify-content: center;">開始上傳</button>
            <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;box-shadow:0 10px 24px rgba(239,68,68,0.75);flex:1;justify-content:center;">取消</button>
@@ -1463,38 +1465,33 @@ HTML
     }
 
     // --- Unified Select Button Logic ---
-    const btnSelectMain = document.getElementById("btn-select-main");
-    const dropdownMenu = document.getElementById("dropdown-menu");
+    const btnSelectContent = document.getElementById("btn-select-content");
     const inputNormal = document.getElementById("files-normal");
     const inputFolder = document.getElementById("files-folder");
     const preview = document.getElementById("file-preview");
 
-    // Toggle Dropdown
-    if(btnSelectMain && dropdownMenu) {
-        btnSelectMain.addEventListener("click", (e) => {
-            e.stopPropagation();
-            dropdownMenu.classList.toggle("show");
+    if (btnSelectContent) {
+        const updateBtnText = () => {
+             const mode = document.querySelector('input[name="upload-mode"]:checked').value;
+             btnSelectContent.textContent = (mode === "folder") ? "📂 選擇文件夾" : "📄 選擇文件";
+        };
+        updateBtnText(); // Init
+
+        document.querySelectorAll('input[name="upload-mode"]').forEach(radio => {
+            radio.addEventListener("change", updateBtnText);
+        });
+        
+        btnSelectContent.addEventListener("click", () => {
+            const mode = document.querySelector('input[name="upload-mode"]:checked').value;
+            if (mode === "folder") {
+                if(inputNormal) inputNormal.value = "";
+                if(inputFolder) inputFolder.click();
+            } else {
+                if(inputFolder) inputFolder.value = "";
+                if(inputNormal) inputNormal.click();
+            }
         });
     }
-
-    // Close dropdown on outside click
-    document.addEventListener("click", () => {
-        if(dropdownMenu) dropdownMenu.classList.remove("show");
-    });
-
-    // Option: File
-    document.getElementById("opt-file").addEventListener("click", () => {
-        // Clear folder input
-        if(inputFolder) inputFolder.value = ""; 
-        if(inputNormal) inputNormal.click();
-    });
-
-    // Option: Folder
-    document.getElementById("opt-folder").addEventListener("click", () => {
-        // Clear normal input
-        if(inputNormal) inputNormal.value = "";
-        if(inputFolder) inputFolder.click();
-    });
 
     function onFileInputChange(e) {
       const files = e.target.files;
@@ -1547,7 +1544,7 @@ HTML
         container.innerHTML = "";
         
         // Define fixed categories to ensure they always appear
-        const fixedCategories = ["高考", "辭書", "課程", "電影", "音樂", "其他類"];
+        const fixedCategories = ["高考", "辭書", "課程", "電影", "音樂", "其他"];
         
         // Group files
         const groups = {};
@@ -1557,7 +1554,19 @@ HTML
 
         if (files && files.length) {
             for (const f of files) {
-                const cat = (f.category || "").trim();
+                let cat = (f.category || "").trim();
+                // Fix: map any unknown/empty category to "未分類" or strict mapping
+                if (!fixedCategories.includes(cat)) {
+                     // Maybe it has extra whitespace or case issues?
+                     // Try to match softly
+                     const match = fixedCategories.find(fc => fc === cat);
+                     if (match) {
+                        cat = match;
+                     } else {
+                        cat = "未分類";
+                     }
+                }
+                
                 if (groups[cat]) {
                     groups[cat].push(f);
                 } else {
