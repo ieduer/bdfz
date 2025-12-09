@@ -1157,11 +1157,11 @@ PY
       .custom-dropdown {
         position: relative;
         display: inline-block;
-        width: 100%;
+        width: auto;
         z-index: 20;
       }
       .custom-dropdown-btn {
-        width: 100%;
+        /* width: 100%; removed for side-by-side */
         justify-content: center;
       }
       .custom-dropdown-menu {
@@ -1310,13 +1310,13 @@ HTML
         <input type="file" id="files-normal" name="files" multiple style="display:none" />
         <input type="file" id="files-folder" name="files" multiple webkitdirectory directory style="display:none" />
 
-        <!-- 統一選擇按鈕 -->
-        <div style="margin-top:12px;">
-           <div class="custom-dropdown" id="dropdown-select">
+        <!-- 統一選擇按鈕 + 上傳按鈕 一行顯示 -->
+        <div class="row-between" style="margin-top:12px; align-items: center; justify-content: flex-start; gap: 12px;">
+           <div class="custom-dropdown" id="dropdown-select" style="width: auto;">
               <button type="button" class="custom-dropdown-btn" id="btn-select-main">
                 📄 選擇文件 ▾
               </button>
-              <div class="custom-dropdown-menu" id="dropdown-menu">
+              <div class="custom-dropdown-menu" id="dropdown-menu" style="width: 200px;">
                   <button type="button" class="custom-dropdown-item" id="opt-file">
                       <span style="font-size:1.1em">📄</span> 選擇文件 (Files)
                   </button>
@@ -1325,16 +1325,17 @@ HTML
                   </button>
               </div>
            </div>
-        </div>
 
-        <div id="file-preview" class="file-list-preview" style="text-align:center; margin-top:8px;"></div>
-
-        <div class="row-between" style="margin-top:16px;">
-          <div style="display:flex; gap:8px;">
+           <div style="display:flex; gap:8px;">
              <button id="btn-upload" type="submit">開始上傳</button>
              <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;box-shadow:0 10px 24px rgba(239,68,68,0.75);">取消</button>
-          </div>
-          <span id="upload-status" class="status"></span>
+           </div>
+        </div>
+        
+        <div id="file-preview" class="file-list-preview" style="margin-top:8px;"></div>
+        
+        <div style="margin-top:8px;">
+           <span id="upload-status" class="status"></span>
         </div>
         <div class="progress" id="upload-progress">
           <div class="progress-bar" id="upload-progress-bar"></div>
