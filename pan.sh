@@ -1033,10 +1033,9 @@ PY
 
       .slot-row {
         display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 10px;
-        margin-bottom: 6px;
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 16px;
       }
 
       .slot-row label {
@@ -1050,9 +1049,7 @@ PY
       }
 
       .slot-row .slot-input-wrap {
-        min-width: 120px;
-        max-width: 180px;
-        flex: 1;
+        width: 100%;
       }
 
       .file-list-preview {
@@ -1147,17 +1144,25 @@ PY
       }
 
       .category-heading {
-        margin: 12px 0 4px;
-        font-size: 0.8rem;
+        margin: 24px 0 8px;
+        font-size: 0.95rem;
         font-family: "Menlo", ui-monospace, monospace;
-        color: #bbf7d0;
+        color: var(--accent);
         letter-spacing: 0.08em;
         text-transform: uppercase;
+        border-bottom: 1px solid rgba(34, 197, 94, 0.3);
+        padding-bottom: 4px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .category-heading:first-child {
+        margin-top: 0;
       }
       .custom-dropdown {
         position: relative;
         display: inline-block;
-        width: auto;
+        width: 100%;
         z-index: 20;
       }
       .custom-dropdown-btn {
@@ -1268,55 +1273,55 @@ HTML
   <!-- 左側：上傳區 -->
   <div class="card">
     <div class="card-inner">
-
-      <!-- ID + 口令 -->
-      <div class="slot-row">
-        <label for="slot-id">ID</label>
-        <div class="slot-input-wrap">
-          <input id="slot-id" name="slot-id" type="text" placeholder="" />
-        </div>
-        <label for="slot-secret">口令</label>
-        <div class="slot-input-wrap">
-          <input id="slot-secret" name="slot-secret" type="password" placeholder="" />
-        </div>
-      </div>
-
-      <!-- 上傳表單 -->
       <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
         <input type="hidden" id="upload_id" name="upload_id" />
         <input type="hidden" id="secret" name="secret" />
 
-        <div class="slot-row" style="margin-top:4px;">
-          <label for="category">類別 <span style="color:#ef4444">*</span></label>
-          <div class="slot-input-wrap">
-            <select
-              id="category"
-              name="category"
-              required
-              style="width:100%;padding:7px 9px;border-radius:999px;border:1px solid var(--border);font-size:0.9rem;outline:none;background:rgba(0,0,0,0.9);color:var(--fg);font-family:inherit;appearance:none;-webkit-appearance:none;"
-            >
-              <option value="" disabled selected>-- 請選擇分類 --</option>
-              <option value="高考">高考</option>
-              <option value="辭書">辭書</option>
-              <option value="課程">課程</option>
-              <option value="電影">電影</option>
-              <option value="音樂">音樂</option>
-              <option value="其他類">其他類</option>
-            </select>
-          </div>
+        <div class="slot-row">
+            <label for="slot-id">ID</label>
+            <div class="slot-input-wrap">
+                <input id="slot-id" name="slot-id" type="text" placeholder="" required />
+            </div>
         </div>
-        
+
+        <div class="slot-row">
+            <label for="slot-secret">口令</label>
+            <div class="slot-input-wrap">
+                 <input id="slot-secret" name="slot-secret" type="password" placeholder="" />
+            </div>
+        </div>
+
+        <div class="slot-row">
+            <label for="category">類別</label>
+            <div class="slot-input-wrap">
+                <select
+                id="category"
+                name="category"
+                required
+                style="width:100%;padding:7px 9px;border-radius:999px;border:1px solid var(--border);font-size:0.9rem;outline:none;background:rgba(0,0,0,0.9);color:var(--fg);font-family:inherit;appearance:none;-webkit-appearance:none;"
+                >
+                <option value="" disabled selected>-- 請選擇分類 --</option>
+                <option value="高考">高考</option>
+                <option value="辭書">辭書</option>
+                <option value="課程">課程</option>
+                <option value="電影">電影</option>
+                <option value="音樂">音樂</option>
+                <option value="其他類">其他類</option>
+                </select>
+            </div>
+        </div>
+
         <!-- 隱藏的實際文件輸入框 -->
         <input type="file" id="files-normal" name="files" multiple style="display:none" />
         <input type="file" id="files-folder" name="files" multiple webkitdirectory directory style="display:none" />
 
-        <!-- 統一選擇按鈕 + 上傳按鈕 一行顯示 -->
-        <div class="row-between" style="margin-top:12px; align-items: center; justify-content: flex-start; gap: 12px;">
-           <div class="custom-dropdown" id="dropdown-select" style="width: auto;">
+        <div class="slot-row">
+           <label>選擇文件</label>
+           <div class="custom-dropdown" id="dropdown-select">
               <button type="button" class="custom-dropdown-btn" id="btn-select-main">
                 📄 選擇文件 ▾
               </button>
-              <div class="custom-dropdown-menu" id="dropdown-menu" style="width: 200px;">
+              <div class="custom-dropdown-menu" id="dropdown-menu">
                   <button type="button" class="custom-dropdown-item" id="opt-file">
                       <span style="font-size:1.1em">📄</span> 選擇文件 (Files)
                   </button>
@@ -1325,15 +1330,14 @@ HTML
                   </button>
               </div>
            </div>
-
-           <div style="display:flex; gap:8px;">
-             <button id="btn-upload" type="submit">開始上傳</button>
-             <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;box-shadow:0 10px 24px rgba(239,68,68,0.75);">取消</button>
-           </div>
+           <div id="file-preview" class="file-list-preview" style="text-align:left; margin-top:2px;"></div>
         </div>
-        
-        <div id="file-preview" class="file-list-preview" style="margin-top:8px;"></div>
-        
+
+        <div class="slot-row" style="margin-bottom:0;">
+             <button id="btn-upload" type="submit" style="width:100%; justify-content: center;">開始上傳</button>
+             <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;box-shadow:0 10px 24px rgba(239,68,68,0.75);width:100%;justify-content:center;">取消</button>
+        </div>
+
         <div style="margin-top:8px;">
            <span id="upload-status" class="status"></span>
         </div>
@@ -1346,21 +1350,18 @@ HTML
 
   <!-- 右側：全部文件 -->
   <div class="card">
-      <div class="card-inner">
-      <div style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:flex-start; flex-direction:column; gap:8px;">
-         <!-- 搜索框 -->
-         <div class="search-box-wrap" style="width:100%;">
+    <div class="card-inner" style="position:relative;">
+        <div class="search-box-wrap" style="width:100%;margin-bottom:18px;">
              <span class="search-icon-symbol">🔍</span>
-             <input type="text" id="search-input" class="search-input" placeholder="搜索文件名、類別或 ID..." />
-         </div>
-         <div style="width:100%; display:flex; justify-content:space-between; align-items:center;">
-             <button id="btn-refresh" type="button" style="font-size:0.75rem;padding:4px 10px;">🔄 刷新列表</button>
-             <span style="font-size:0.75rem; color:var(--muted); opacity:0.8;">點擊類別可篩選</span>
-         </div>
-      </div>
-      <ul id="download-list" class="download-list"></ul>
-      <div id="download-status" class="download-progress-text"></div>
+             <input type="text" id="search-input" class="search-input" placeholder="全局搜索..." />
+        </div>
+        
+        <div id="file-area-container">
+           <!-- Rendered content goes here -->
+           <div id="download-status" class="download-progress-text" style="text-align:center;">正在載入...</div>
+        </div>
     </div>
+  </div>
   </div>
 </div>
 
@@ -1541,13 +1542,15 @@ HTML
       return true;
     }
 
-    // --- Rendering List ---
+    // --- Rendering List (Refactored for Areas) ---
     function renderList(files) {
-        const listEl = document.getElementById("download-list");
-        if (!listEl) return;
+        const container = document.getElementById("file-area-container");
+        if (!container) return;
+        
+        container.innerHTML = "";
         
         if (!files || !files.length) {
-            listEl.innerHTML = "<li><span style='font-size:0.8rem;color:rgba(148,163,184,0.9);'>無符合條件的附件。</span></li>";
+            container.innerHTML = "<div style='color:rgba(148,163,184,0.9);text-align:center;'>無符合條件的附件。</div>";
             return;
         }
 
@@ -1559,45 +1562,30 @@ HTML
           groups[key].items.push(f);
         }
 
-        listEl.innerHTML = "";
         const keys = Object.keys(groups).sort(); 
-        let hasFilterMatch = false;
 
         for (const key of keys) {
-            if (activeCategoryFilter && key !== activeCategoryFilter) {
-                continue;
-            }
-            hasFilterMatch = true;
-            
             const group = groups[key];
-            const heading = document.createElement("li");
-            heading.style.cursor = "pointer";
-            heading.title = activeCategoryFilter ? "點擊取消篩選" : "點擊篩選此類別";
             
-            const headingContent = document.createElement("div");
-            headingContent.className = "category-heading";
-            headingContent.textContent = "類別：" + group.name + (activeCategoryFilter ? " (篩選中 ✕)" : "");
+            // Category Header
+            const heading = document.createElement("div");
+            heading.className = "category-heading";
+            heading.innerHTML = `<span class="icon">📁</span> ${group.name} <span style="margin-left:auto;font-size:0.7em;color:var(--muted);">${group.items.length}</span>`;
+            container.appendChild(heading);
+
+            // List
+            const ul = document.createElement("ul");
+            ul.className = "download-list";
+            ul.style.marginBottom = "16px";
             
-            if (activeCategoryFilter) {
-               headingContent.style.color = "#4ade80"; 
-            }
-
-            heading.appendChild(headingContent);
-            heading.addEventListener("click", () => {
-                activeCategoryFilter = (activeCategoryFilter === key) ? null : key;
-                renderList(filterData(allFilesCache)); // Re-render with current search + new category filter
-            });
-
-            listEl.appendChild(heading);
-
             for (const f of group.items) {
                 const li = document.createElement("li");
                 
-                const container = document.createElement("div");
-                container.style.display = "flex";
-                container.style.alignItems = "center";
-                container.style.justifyContent = "space-between";
-                container.style.gap = "8px";
+                const box = document.createElement("div");
+                box.style.display = "flex";
+                box.style.alignItems = "center";
+                box.style.justifyContent = "space-between";
+                box.style.gap = "8px";
                 
                 const a = document.createElement("a");
                 a.href = "/d/" + encodeURIComponent(f.id) + "/" + encodeURIComponent(f.name || "");
@@ -1609,7 +1597,6 @@ HTML
                 const nameSpan = document.createElement("span");
                 nameSpan.className = "dl-name";
                 let dispName = f.name || "(無名文件)";
-                // Highlight search term? Optional, but good.
                 if(dispName.length > 40) dispName = dispName.substring(0, 38) + "...";
                 nameSpan.textContent = dispName;
                 left.appendChild(nameSpan);
@@ -1638,16 +1625,12 @@ HTML
                     copyToClipboard(fullUrl);
                 };
 
-                container.appendChild(a);
-                container.appendChild(shareBtn);
-                li.appendChild(container);
+                box.appendChild(a);
+                box.appendChild(shareBtn);
+                li.appendChild(box);
+                ul.appendChild(li);
             }
-        }
-        
-        if (activeCategoryFilter && !hasFilterMatch) {
-            // If currently filtered category is gone due to search, we might want to keep it empty or reset.
-            // keeping it empty is correct behavior for "search within category" or "search global but category mismatches"
-             listEl.innerHTML = "<li><span style='font-size:0.8rem;color:rgba(148,163,184,0.9);'>該類別下無符合條件的附件。</span></li>";
+            container.appendChild(ul);
         }
     }
 
@@ -1665,9 +1648,9 @@ HTML
     }
 
     async function loadFiles() {
-      const statusEl = document.getElementById("download-status");
+      // Remove statusEl ref since we removed the element
+      const container = document.getElementById("file-area-container");
       try {
-        if (statusEl) statusEl.textContent = "正在載入附件列表…";
         const res = await fetch(API_LIST, { headers: { Accept: "application/json" } });
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
@@ -1676,14 +1659,11 @@ HTML
         allFilesCache = data.files || [];
         renderList(filterData(allFilesCache));
 
-        if (statusEl) statusEl.textContent = "";
       } catch (err) {
         console.error(err);
-        const listEl = document.getElementById("download-list");
-        if (listEl) {
-          listEl.innerHTML = "<li><span style='font-size:0.8rem;color:#fecaca;'>載入附件列表失敗。</span></li>";
+        if (container) {
+          container.innerHTML = "<div style='color:#fecaca;text-align:center;'>載入附件列表失敗。</div>";
         }
-        if (statusEl) statusEl.textContent = "";
       }
     }
 
@@ -1813,8 +1793,8 @@ HTML
     });
 
     document.getElementById("btn-refresh").addEventListener("click", () => {
-        activeCategoryFilter = null; 
-        document.getElementById("search-input").value = ""; // Clear search on refresh
+        // activeCategoryFilter = null; // Removed
+        document.getElementById("search-input").value = ""; 
         loadFiles();
     });
 
