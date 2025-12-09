@@ -18,7 +18,7 @@
 #
 
 set -Eeuo pipefail
-INSTALLER_VERSION="pan-install-2025-12-07-mod-full"
+INSTALLER_VERSION="pan-install-2025-12-09-mod-full"
 
 DOMAIN="pan.bdfz.net"
 APP_USER="panuser"
