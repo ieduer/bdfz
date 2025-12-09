@@ -247,6 +247,7 @@ from typing import Optional, List
 import aiosqlite
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
+from urllib.parse import quote
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -354,6 +355,19 @@ def format_size(num: int) -> str:
       return f"{num:.1f}{unit}" if unit != "B" else f"{num}{unit}"
     num /= step
   return f"{num:.1f}PB"
+
+def build_content_disposition(filename: str) -> str:
+  """Return a Content-Disposition header value safe for non-ASCII filenames."""
+  try:
+    # If this passes, we can safely use a simple filename="..." form
+    filename.encode("latin-1")
+  except UnicodeEncodeError:
+    # Use RFC 5987 encoding for non-ASCII
+    quoted = quote(filename)
+    return f"attachment; filename*=UTF-8''{quoted}"
+  else:
+    # ASCII / latin-1 only
+    return f'attachment; filename="{filename}"'
 
 def require_valid_upload_secret(secret: str):
   if not PAN_UPLOAD_SECRET:
@@ -554,7 +568,7 @@ async def download_file(file_id: str, file_name: str):
         yield chunk
 
   headers = {
-    "Content-Disposition": f'attachment; filename="{filename}"'
+    "Content-Disposition": build_content_disposition(filename)
   }
 
   return StreamingResponse(
