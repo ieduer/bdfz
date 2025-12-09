@@ -1315,23 +1315,15 @@ HTML
         <input type="file" id="files-normal" name="files" multiple style="display:none" />
         <input type="file" id="files-folder" name="files" multiple webkitdirectory directory style="display:none" />
 
-        <!-- 選擇模式：文件 or 文件夾 -->
-        <div style="display:flex; gap:16px; margin-top:12px; margin-bottom:8px; align-items:center;">
-           <label style="cursor:pointer; display:flex; gap:6px; align-items:center; font-size:0.9rem;">
-              <input type="radio" name="upload-mode" value="file" checked style="accent-color:var(--accent);">
-              <span>📄 上傳文件</span>
-           </label>
-           <label style="cursor:pointer; display:flex; gap:6px; align-items:center; font-size:0.9rem;">
-              <input type="radio" name="upload-mode" value="folder" style="accent-color:var(--accent);">
-              <span>� 上傳文件夾</span>
-           </label>
-        </div>
-
-        <div style="display:flex; gap:12px;">
-           <button type="button" id="btn-select-content" style="flex:1; justify-content: center;">
-             會先選擇文件...
-           </button>
+        <!-- 選擇按鈕組 (直接選擇) -->
+        <div style="display:flex; gap:12px; margin-top:16px;">
+           <!-- 文件/文件夾按鈕組 (佔比較大) -->
+           <div style="display:flex; gap:8px; flex:2;">
+               <button type="button" id="btn-sel-file" style="flex:1; font-size:0.9rem; justify-content:center;">📄 文件</button>
+               <button type="button" id="btn-sel-folder" style="flex:1; font-size:0.9rem; justify-content:center;">📂 資料夾</button>
+           </div>
            
+           <!-- 上傳按鈕 (佔比較小) -->
            <button id="btn-upload" type="submit" style="flex:1; justify-content: center;">開始上傳</button>
            <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;box-shadow:0 10px 24px rgba(239,68,68,0.75);flex:1;justify-content:center;">取消</button>
         </div>
@@ -1465,31 +1457,23 @@ HTML
     }
 
     // --- Unified Select Button Logic ---
-    const btnSelectContent = document.getElementById("btn-select-content");
+    const btnSelFile = document.getElementById("btn-sel-file");
+    const btnSelFolder = document.getElementById("btn-sel-folder");
     const inputNormal = document.getElementById("files-normal");
     const inputFolder = document.getElementById("files-folder");
     const preview = document.getElementById("file-preview");
 
-    if (btnSelectContent) {
-        const updateBtnText = () => {
-             const mode = document.querySelector('input[name="upload-mode"]:checked').value;
-             btnSelectContent.textContent = (mode === "folder") ? "📂 選擇文件夾" : "📄 選擇文件";
-        };
-        updateBtnText(); // Init
-
-        document.querySelectorAll('input[name="upload-mode"]').forEach(radio => {
-            radio.addEventListener("change", updateBtnText);
+    if (btnSelFile) {
+        btnSelFile.addEventListener("click", () => {
+            if(inputFolder) inputFolder.value = "";
+            if(inputNormal) inputNormal.click();
         });
-        
-        btnSelectContent.addEventListener("click", () => {
-            const mode = document.querySelector('input[name="upload-mode"]:checked').value;
-            if (mode === "folder") {
-                if(inputNormal) inputNormal.value = "";
-                if(inputFolder) inputFolder.click();
-            } else {
-                if(inputFolder) inputFolder.value = "";
-                if(inputNormal) inputNormal.click();
-            }
+    }
+
+    if (btnSelFolder) {
+        btnSelFolder.addEventListener("click", () => {
+            if(inputNormal) inputNormal.value = "";
+            if(inputFolder) inputFolder.click();
         });
     }
 
@@ -1536,7 +1520,7 @@ HTML
       return true;
     }
 
-    // --- Rendering List (Refactored for Areas) ---
+    // --- Rendering List (Fail-Safe) ---
     function renderList(files) {
         const container = document.getElementById("file-area-container");
         if (!container) return;
@@ -1552,24 +1536,18 @@ HTML
         fixedCategories.forEach(c => { groups[c] = []; });
         groups["未分類"] = []; // Extra bucket
 
-        if (files && files.length) {
+        if (files && Array.isArray(files)) {
             for (const f of files) {
                 let cat = (f.category || "").trim();
-                // Fix: map any unknown/empty category to "未分類" or strict mapping
-                if (!fixedCategories.includes(cat)) {
-                     // Maybe it has extra whitespace or case issues?
-                     // Try to match softly
-                     const match = fixedCategories.find(fc => fc === cat);
-                     if (match) {
-                        cat = match;
-                     } else {
-                        cat = "未分類";
-                     }
-                }
                 
+                // Try exact match
                 if (groups[cat]) {
                     groups[cat].push(f);
                 } else {
+                    // Try lazy match (if user manually typed category not in list)
+                    // check if 'cat' is in fixedCategories? No, we already inited groups with fixed keys.
+                    // So if groups[cat] is undefined, it's a new/unknown category.
+                    // We put it in "未分類".
                     groups["未分類"].push(f);
                 }
             }
@@ -1577,7 +1555,9 @@ HTML
         
         // Render each fixed category
         fixedCategories.forEach(name => {
-            renderCategorySection(container, name, groups[name]);
+            try {
+                renderCategorySection(container, name, groups[name]);
+            } catch(e) { console.error("Error rendering section " + name, e); }
         });
         
         // Render unknown categories if any
@@ -1658,6 +1638,7 @@ HTML
         container.appendChild(ul);
     }
 
+    // --- Search Filter ---
     function filterData(files) {
         if (!files) return [];
         const term = (document.getElementById("search-input").value || "").trim().toLowerCase();
@@ -1672,8 +1653,9 @@ HTML
     }
 
     async function loadFiles() {
-      // Remove statusEl ref since we removed the element
       const container = document.getElementById("file-area-container");
+      if(container) container.innerHTML = "<div style='text-align:center;padding:20px;color:rgba(255,255,255,0.5);'>正在載入...</div>";
+
       try {
         const res = await fetch(API_LIST, { headers: { Accept: "application/json" } });
         if (!res.ok) throw new Error("HTTP " + res.status);
@@ -1681,12 +1663,13 @@ HTML
         if (!data || !data.ok) throw new Error("服務器返回錯誤");
         
         allFilesCache = data.files || [];
+        console.log("Loaded " + allFilesCache.length + " files.");
         renderList(filterData(allFilesCache));
 
       } catch (err) {
         console.error(err);
         if (container) {
-          container.innerHTML = "<div style='color:#fecaca;text-align:center;'>載入附件列表失敗。</div>";
+          container.innerHTML = "<div style='color:#fecaca;text-align:center;'>載入附件列表失敗。<br><small>"+err.message+"</small></div>";
         }
       }
     }
