@@ -1174,7 +1174,7 @@ PY
 HTML
 
   # ---------------- templates/index.html ----------------
-  # 修改：移除備註，加入文件夾上傳複選框，加入取消按鈕，右側加載全部
+  # 修改：移除備註，加入文件夾上傳按鈕，加入取消按鈕，右側加載全部
   cat >"${APP_DIR}/templates/index.html" <<'HTML'
 {% extends "base.html" %}
 {% block content %}
@@ -1182,22 +1182,17 @@ HTML
   <!-- 左側：上傳區 -->
   <div class="card">
     <div class="card-inner">
-      <h2><span class="icon">⬆️</span> 上傳文件</h2>
 
       <!-- ID + 口令 -->
       <div class="slot-row">
         <label for="slot-id">ID</label>
         <div class="slot-input-wrap">
-          <input id="slot-id" name="slot-id" type="text" placeholder="例如：2025-CLASS-A" />
+          <input id="slot-id" name="slot-id" type="text" placeholder="" />
         </div>
         <label for="slot-secret">口令</label>
         <div class="slot-input-wrap">
-          <input id="slot-secret" name="slot-secret" type="password" placeholder="必填（由老師提供）" />
+          <input id="slot-secret" name="slot-secret" type="password" placeholder="" />
         </div>
-      </div>
-      <div class="row-between" style="margin-bottom:8px;">
-        <button id="btn-set-slot" type="button">設定 ID / 口令</button>
-        <span id="slot-status" class="status"></span>
       </div>
 
       <!-- 上傳表單 -->
@@ -1206,33 +1201,39 @@ HTML
         <input type="hidden" id="secret" name="secret" />
 
         <div class="slot-row" style="margin-top:4px;">
-          <label for="category">類別</label>
+          <label for="category">類別 <span style="color:#ef4444">*</span></label>
           <div class="slot-input-wrap">
-            <input
+            <select
               id="category"
               name="category"
-              type="text"
-              placeholder="可選：用於右側排序分類"
-            />
+              required
+              style="width:100%;padding:7px 9px;border-radius:999px;border:1px solid var(--border);font-size:0.9rem;outline:none;background:rgba(0,0,0,0.9);color:var(--fg);font-family:inherit;appearance:none;-webkit-appearance:none;"
+            >
+              <option value="" disabled selected>-- 請選擇分類 --</option>
+              <option value="高考">高考</option>
+              <option value="辭書">辭書</option>
+              <option value="課程">課程</option>
+              <option value="電影">電影</option>
+              <option value="音樂">音樂</option>
+              <option value="其他類">其他類</option>
+            </select>
           </div>
         </div>
-        <!-- 備註欄位已移除 -->
-
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;margin-bottom:4px;">
-            <label for="files" style="margin-bottom:0;">選擇文件</label>
-            <label style="font-size:0.82rem;display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--muted);">
-                <input type="checkbox" id="chk-folder"> 文件夾模式
-            </label>
-        </div>
         
-        <input type="file" id="files" name="files" multiple required />
+        <!-- 隱藏的實際文件輸入框 -->
+        <input type="file" id="files" name="files" multiple required style="display:none" />
 
-        <div id="file-preview" class="file-list-preview"></div>
+        <div style="display:flex; gap:10px; margin-top:12px;">
+            <button type="button" id="btn-trigger-files" style="flex:1; justify-content:center;">📄 選擇文件</button>
+            <button type="button" id="btn-trigger-folder" style="flex:1; justify-content:center; background:radial-gradient(circle at top, #0ea5e9, #0284c7); box-shadow:0 10px 24px rgba(14,165,233,0.75);">📂 選擇文件夾</button>
+        </div>
 
-        <div class="row-between" style="margin-top:10px;">
+        <div id="file-preview" class="file-list-preview" style="text-align:center; margin-top:8px;"></div>
+
+        <div class="row-between" style="margin-top:16px;">
           <div style="display:flex; gap:8px;">
              <button id="btn-upload" type="submit">開始上傳</button>
-             <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;">取消</button>
+             <button id="btn-cancel" type="button" style="display:none;background:#ef4444;color:white;box-shadow:0 10px 24px rgba(239,68,68,0.75);">取消</button>
           </div>
           <span id="upload-status" class="status"></span>
         </div>
@@ -1246,12 +1247,9 @@ HTML
   <!-- 右側：全部下載 -->
   <div class="card">
       <div class="card-inner">
-      <h2><span class="icon">⬇️</span> 全部文件</h2>
-      <p style="font-size:0.8rem;margin:0 0 6px;color:rgba(148,163,184,0.9);">
-        所有上傳記錄（按類別排序）。
-      </p>
-      <div style="margin-bottom:8px;">
+      <div style="margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
          <button id="btn-refresh" type="button" style="font-size:0.75rem;padding:4px 10px;">🔄 刷新列表</button>
+         <span style="font-size:0.75rem; color:var(--muted);">點擊類別可篩選</span>
       </div>
       <ul id="download-list" class="download-list"></ul>
       <div id="download-status" class="download-progress-text"></div>
@@ -1262,11 +1260,12 @@ HTML
 <script>
   (function () {
     const API_UPLOAD = "/upload";
-    const API_LIST = "/api/list"; // 獲取全部列表
+    const API_LIST = "/api/list"; 
 
     let currentId = "";
     let currentSecret = "";
-    let xhrUpload = null; // 用於取消
+    let xhrUpload = null; 
+    let activeCategoryFilter = null; // 當前篩選的類別
 
     function setStatus(id, msg, ok) {
       const el = document.getElementById(id);
@@ -1325,19 +1324,59 @@ HTML
       return "剩餘約 " + min + " 分 " + s + " 秒";
     }
 
-    // 文件夾模式切換
-    document.getElementById("chk-folder").addEventListener("change", function(e) {
-      const fileInput = document.getElementById("files");
-      if(e.target.checked) {
-        fileInput.setAttribute("webkitdirectory", "");
-        fileInput.setAttribute("directory", "");
-      } else {
-        fileInput.removeAttribute("webkitdirectory");
-        fileInput.removeAttribute("directory");
-      }
-      fileInput.value = "";
-      document.getElementById("file-preview").textContent = "";
-    });
+    function copyToClipboard(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(() => {
+                // show toast or brief feedback?
+                 const statusEl = document.getElementById("download-status");
+                 if(statusEl) {
+                     const orig = statusEl.textContent;
+                     statusEl.textContent = "已複製鏈接！";
+                     setTimeout(()=> statusEl.textContent=orig, 1500);
+                 }
+            }, () => {});
+        } else {
+            // Fallback
+            let textArea = document.createElement("textarea");
+            textArea.value = text;
+            textArea.style.position = "fixed";
+            textArea.style.left = "-9999px";
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            try {
+                document.execCommand('copy');
+                const statusEl = document.getElementById("download-status");
+                 if(statusEl) {
+                     const orig = statusEl.textContent;
+                     statusEl.textContent = "已複製鏈接！";
+                     setTimeout(()=> statusEl.textContent=orig, 1500);
+                 }
+            } catch (err) {}
+            document.body.removeChild(textArea);
+        }
+    }
+
+    // 文件選擇處理
+    const fileInput = document.getElementById("files");
+    const btnFiles = document.getElementById("btn-trigger-files");
+    const btnFolder = document.getElementById("btn-trigger-folder");
+
+    if(btnFiles && fileInput) {
+        btnFiles.addEventListener("click", () => {
+            fileInput.removeAttribute("webkitdirectory");
+            fileInput.removeAttribute("directory");
+            fileInput.click();
+        });
+    }
+
+    if(btnFolder && fileInput) {
+        btnFolder.addEventListener("click", () => {
+             fileInput.setAttribute("webkitdirectory", "");
+             fileInput.setAttribute("directory", "");
+             fileInput.click();
+        });
+    }
 
     function applySlot() {
       const idInput = document.getElementById("slot-id");
@@ -1359,18 +1398,17 @@ HTML
       upId.value = currentId;
       upSecret.value = currentSecret;
 
-      setStatus("slot-status", "當前 ID：" + currentId, true);
+      // setStatus("slot-status", "當前 ID：" + currentId, true);
       return true;
     }
 
-    // 載入右側列表 (全部)
+    // 載入列表
     async function loadFiles() {
       const listEl = document.getElementById("download-list");
       const statusEl = document.getElementById("download-status");
       
       try {
         if (statusEl) statusEl.textContent = "正在載入附件列表…";
-        // 不帶 upload_id 參數，後端會返回全部
         const res = await fetch(API_LIST, { headers: { Accept: "application/json" } });
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
@@ -1384,58 +1422,118 @@ HTML
           return;
         }
 
-        // 依類別分組顯示
         const groups = {};
         for (const f of files) {
           const cat = (f.category || "").trim();
-          const key = cat || "__UNCLASSIFIED__";
-          if (!groups[key]) groups[key] = { name: cat, items: [] };
+          const key = cat || "未分類";
+          if (!groups[key]) groups[key] = { name: key, items: [] };
           groups[key].items.push(f);
         }
 
         listEl.innerHTML = "";
-        const keys = Object.keys(groups).sort(); // 類別排序
+        const keys = Object.keys(groups).sort(); 
+        
+        let hasFilterMatch = false;
+
         for (const key of keys) {
-          const group = groups[key];
-          const heading = document.createElement("li");
-          heading.innerHTML =
-            "<div class='category-heading'>類別：" +
-            (group.name || "未分類") +
-            "</div>";
-          listEl.appendChild(heading);
+            // 如果有篩選且不匹配，則跳過
+            if (activeCategoryFilter && key !== activeCategoryFilter) {
+                continue;
+            }
+            hasFilterMatch = true;
+            
+            const group = groups[key];
+            const heading = document.createElement("li");
+            heading.style.cursor = "pointer";
+            heading.title = activeCategoryFilter ? "點擊取消篩選" : "點擊篩選此類別";
+            
+            // 標題顯示
+            const headingContent = document.createElement("div");
+            headingContent.className = "category-heading";
+            headingContent.textContent = "類別：" + group.name + (activeCategoryFilter ? " (篩選中 ✕)" : "");
+            
+            if (activeCategoryFilter) {
+               headingContent.style.color = "#4ade80"; // Highlight
+            }
 
-          for (const f of group.items) {
-            const li = document.createElement("li");
-            const a = document.createElement("a");
-            const left = document.createElement("div");
-            const right = document.createElement("div");
+            heading.appendChild(headingContent);
+            
+            heading.addEventListener("click", () => {
+                if (activeCategoryFilter === key) {
+                    activeCategoryFilter = null; // 取消
+                } else {
+                    activeCategoryFilter = key; // 設置
+                }
+                loadFiles(); // 重新渲染
+            });
 
-            left.className = "dl-left";
-            right.className = "dl-right";
+            listEl.appendChild(heading);
 
-            const nameSpan = document.createElement("span");
-            nameSpan.className = "dl-name";
-            // 如果文件名過長顯示...
-            let dispName = f.name || "(無名文件)";
-            if(dispName.length > 50) dispName = dispName.substring(0, 48) + "...";
-            nameSpan.textContent = dispName;
+            for (const f of group.items) {
+                const li = document.createElement("li");
+                
+                // 容器
+                const container = document.createElement("div");
+                container.style.display = "flex";
+                container.style.alignItems = "center";
+                container.style.justifyContent = "space-between";
+                container.style.gap = "8px";
+                
+                // 連結按鈕 (左側主要區域)
+                const a = document.createElement("a");
+                a.href = "/d/" + encodeURIComponent(f.id) + "/" + encodeURIComponent(f.name || "");
+                a.style.flex = "1";
+                // 覆蓋默認樣式微調
+                // a 的樣式已在CSS定義 (flex)，這裡只需確保內部結構
+                
+                const left = document.createElement("div");
+                left.className = "dl-left";
+                
+                const nameSpan = document.createElement("span");
+                nameSpan.className = "dl-name";
+                let dispName = f.name || "(無名文件)";
+                if(dispName.length > 40) dispName = dispName.substring(0, 38) + "...";
+                nameSpan.textContent = dispName;
+                left.appendChild(nameSpan);
 
-            const metaSpan = document.createElement("span");
-            metaSpan.className = "dl-meta";
-            let meta = f.size_human || formatBytes(f.size_bytes || 0);
-            metaSpan.textContent = meta;
+                const right = document.createElement("div");
+                right.className = "dl-right";
+                let meta = f.size_human || formatBytes(f.size_bytes || 0);
+                right.textContent = meta;
 
-            left.appendChild(nameSpan);
-            right.appendChild(metaSpan);
+                a.appendChild(left);
+                a.appendChild(right);
+                
+                // 分享按鈕
+                const shareBtn = document.createElement("button");
+                shareBtn.type = "button";
+                shareBtn.innerHTML = "🔗"; // Link icon
+                shareBtn.title = "複製分享鏈接";
+                shareBtn.style.padding = "6px 10px";
+                shareBtn.style.fontSize = "0.9rem";
+                shareBtn.style.background = "rgba(0,0,0,0.5)";
+                shareBtn.style.border = "1px solid var(--border)";
+                shareBtn.style.boxShadow = "none";
+                
+                shareBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    const fullUrl = window.location.origin + a.getAttribute("href");
+                    copyToClipboard(fullUrl);
+                };
 
-            a.href = "/d/" + encodeURIComponent(f.id) + "/" + encodeURIComponent(f.name || "");
-            a.dataset.fileName = f.name || "";
-            a.appendChild(left);
-            a.appendChild(right);
-
-            li.appendChild(a);
-            listEl.appendChild(li);
-          }
+                container.appendChild(a);
+                container.appendChild(shareBtn);
+                
+                li.appendChild(container); // 改為放入 div 容器
+                listEl.appendChild(li);
+            }
+        }
+        
+        if (activeCategoryFilter && !hasFilterMatch) {
+            // 篩選後無結果（可能該類別文件已被刪除）
+            activeCategoryFilter = null;
+            loadFiles();
+            return;
         }
 
         if (statusEl) statusEl.textContent = "";
@@ -1458,6 +1556,10 @@ HTML
         return;
       }
       preview.textContent = "已選擇 " + files.length + " 個項目";
+      
+      // 添加簡單動畫反饋
+      preview.style.transform = "scale(1.05)";
+      setTimeout(()=> preview.style.transform = "scale(1)", 150);
     }
 
     function uploadWithXHR(event) {
@@ -1471,9 +1573,19 @@ HTML
       const input = document.getElementById("files");
       const btn = document.getElementById("btn-upload");
       const btnCancel = document.getElementById("btn-cancel");
+      const btnFiles = document.getElementById("btn-trigger-files");
+      const btnFolder = document.getElementById("btn-trigger-folder");
+      const catSelect = document.getElementById("category");
+
+      // 手動檢查 category (雖有 required 但某些瀏覽器需顯式檢查)
+      if (!catSelect.value) {
+          setStatus("upload-status", "請選擇類別。", false);
+          catSelect.focus();
+          return;
+      }
 
       if (!input || !input.files || !input.files.length) {
-        setStatus("upload-status", "請先選擇至少一個文件。", false);
+        setStatus("upload-status", "請先選擇文件或文件夾。", false);
         return;
       }
 
@@ -1481,6 +1593,9 @@ HTML
       const totalBytes = files.reduce((sum, f) => sum + (f.size || 0), 0);
 
       btn.disabled = true;
+      if(btnFiles) btnFiles.disabled = true;
+      if(btnFolder) btnFolder.disabled = true;
+      
       btnCancel.style.display = "inline-flex";
       setStatus("upload-status", "準備上傳 " + files.length + " 個文件…", true);
       showProgress("upload-progress", "upload-progress-bar", 0);
@@ -1537,7 +1652,8 @@ HTML
             }
           }
           if (data.ok) {
-            setStatus("upload-status", "上傳成功，共 " + (data.files || []).length + " 個文件。", true);
+            // 成功提示
+            setStatus("upload-status", "上傳完成！共 " + (data.files || []).length + " 個文件。", true);
             try {
               input.value = "";
               document.getElementById("file-preview").textContent = "";
@@ -1563,20 +1679,25 @@ HTML
 
       function cleanupUpload() {
           btn.disabled = false;
+          if(btnFiles) btnFiles.disabled = false;
+          if(btnFolder) btnFolder.disabled = false;
+      
           btnCancel.style.display = "none";
           xhrUpload = null;
           hideProgress("upload-progress", "upload-progress-bar");
       }
     }
 
-    // 取消按鈕
     document.getElementById("btn-cancel").addEventListener("click", function() {
         if(xhrUpload) {
             xhrUpload.abort();
         }
     });
 
-    document.getElementById("btn-refresh").addEventListener("click", loadFiles);
+    document.getElementById("btn-refresh").addEventListener("click", () => {
+        activeCategoryFilter = null; // 刷新時重置篩選
+        loadFiles();
+    });
 
     document.addEventListener("DOMContentLoaded", function () {
       const btnSlot = document.getElementById("btn-set-slot");
@@ -1596,7 +1717,6 @@ HTML
         fileInput.addEventListener("change", onFileInputChange);
       }
       
-      // 初始加載
       loadFiles();
     });
   })();
