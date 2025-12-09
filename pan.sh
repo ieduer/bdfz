@@ -5,13 +5,13 @@
 #  - 流式上傳，避免整個文件讀入記憶體
 #  - 上傳/下載記錄到 SQLite
 #  - 上傳 & 下載 Telegram 通知 (httpx 異步)
-#  - 支援上傳口令 UPLOAD_SECRET（可選，全局口令）
+#  - 上傳口令「必須」配置
 #  - 每日自動清理過期文件 (systemd timer + cleanup.py)
-#  - 內建 Let's Encrypt + 443，自動檢測已有證書，不重複申請
+#  - 內建 Let's Encrypt + 443，分兩階段配置避免「證書/配置死鎖」
 #
 
 set -Eeuo pipefail
-INSTALLER_VERSION="pan-install-2025-12-08-v2"
+INSTALLER_VERSION="pan-install-2025-12-09-v6"
 
 DOMAIN="pan.bdfz.net"
 APP_USER="panuser"
@@ -44,7 +44,8 @@ require_root() {
 
 check_os() {
   if [[ -f /etc/os-release ]]; then
-    source /etc/os-release
+    # shellcheck disable=SC1091
+    . /etc/os-release
   else
     log ERROR "無法檢測系統版本（缺少 /etc/os-release）"
     exit 1
@@ -83,7 +84,7 @@ detect_existing_env() {
     log INFO "檢測到已存在的 ${APP_DIR}/.env，嘗試讀取配置以支援覆蓋安裝"
     set -a
     # shellcheck disable=SC1090
-    source "${APP_DIR}/.env"
+    . "${APP_DIR}/.env"
     set +a
 
     if [[ -n "${PAN_DOMAIN:-}" ]]; then
@@ -100,6 +101,17 @@ detect_existing_env() {
   else
     log INFO "未檢測到舊的 .env，將使用腳本內預設配置"
   fi
+}
+
+kill_previous_processes() {
+  log INFO "嘗試停止之前的服務與進程..."
+
+  if systemctl list-unit-files | grep -q "^${SERVICE_NAME}.service"; then
+    systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+  fi
+
+  pkill -f "${APP_DIR}/venv/bin/uvicorn app:app" 2>/dev/null || true
+  pkill -f "uvicorn app:app" 2>/dev/null || true
 }
 
 install_packages() {
@@ -145,11 +157,24 @@ write_env_file() {
   local secret_key upload_secret max_age telegram_chat telegram_token
   secret_key="$(openssl rand -hex 32)"
 
-  if [[ -n "${UPLOAD_SECRET:-}" ]]; then
+  # 上傳口令必須存在
+  if [[ -n "${PAN_UPLOAD_SECRET:-}" ]]; then
+    upload_secret="${PAN_UPLOAD_SECRET}"
+    log INFO "沿用現有 PAN_UPLOAD_SECRET。"
+  elif [[ -n "${UPLOAD_SECRET:-}" ]]; then
     upload_secret="${UPLOAD_SECRET}"
+    log INFO "從環境變量 UPLOAD_SECRET 讀取上傳口令。"
   else
     upload_secret=""
+    while [[ -z "${upload_secret}" ]]; do
+      read -r -s -p "請輸入上傳口令（必填，輸入後回車）： " upload_secret || true
+      echo
+      if [[ -z "${upload_secret}" ]]; then
+        log ERROR "上傳口令不可為空，請重新輸入。"
+      fi 
+    done
   fi
+  
 
   if [[ -n "${MAX_FILE_AGE_DAYS:-}" ]]; then
     max_age="${MAX_FILE_AGE_DAYS}"
@@ -157,8 +182,8 @@ write_env_file() {
     max_age="7"
   fi
 
-  telegram_chat="${TELEGRAM_CHAT_ID:-}"
-  telegram_token="${TELEGRAM_BOT_TOKEN:-}"
+  telegram_chat="${PAN_TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}"
+  telegram_token="${PAN_TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}"
 
   cat > "${APP_DIR}/.env" <<ENV
 PAN_DOMAIN="${DOMAIN}"
@@ -196,16 +221,17 @@ create_venv_and_install_deps() {
 
   "${pip_bin}" install --upgrade pip wheel
 
+  # ★ 這裡新增 python-multipart 依賴，解決 FastAPI 上傳解析錯誤 ★
   cat > "${APP_DIR}/requirements.txt" <<'REQ'
-fastapi==0.115.0
+fastapi>=0.115.0
 uvicorn[standard]==0.30.6
 python-dotenv==1.0.1
 aiosqlite==0.20.0
 httpx==0.27.2
+python-multipart==0.0.9
 REQ
 
   chown "${APP_USER}:${APP_USER}" "${APP_DIR}/requirements.txt"
-
   sudo -u "${APP_USER}" -H "${APP_DIR}/venv/bin/pip" install -r "${APP_DIR}/requirements.txt"
 }
 
@@ -215,17 +241,14 @@ write_app_main() {
   cat > "${APP_DIR}/app.py" <<'PY'
 import os
 import uuid
-import time
-import asyncio
-import aiosqlite
 from datetime import datetime, timedelta
 from typing import Optional, List
 
+import aiosqlite
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-
 from dotenv import load_dotenv
 import httpx
 
@@ -255,7 +278,7 @@ os.makedirs(os.path.dirname(PAN_LOG_PATH), exist_ok=True)
 app = FastAPI(
     title="SUEN Pan Service",
     description="公共上傳/下載服務",
-    version="1.0.0"
+    version="1.0.0",
 )
 
 app.add_middleware(
@@ -282,283 +305,284 @@ CREATE TABLE IF NOT EXISTS files (
 
 async def init_db():
   async with aiosqlite.connect(PAN_DB_PATH) as db:
-      await db.execute(UPLOAD_TABLE_SQL)
-      await db.execute("CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at)")
-      await db.execute("CREATE INDEX IF NOT EXISTS idx_files_category ON files(category)")
-      await db.commit()
-
-@app.on_event("startup")
-async def on_startup():
-    await init_db()
+    await db.execute(UPLOAD_TABLE_SQL)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_files_category ON files(category)")
+    await db.commit()
 
 class RollingLogger:
-    def __init__(self, path: str):
-        self.path = path
+  def __init__(self, path: str):
+    self.path = path
 
-    def log(self, level: str, msg: str):
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{now}] [{level}] {msg}\n"
-        try:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception:
-            pass
+  def log(self, level: str, msg: str):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{now}] [{level}] {msg}\n"
+    try:
+      with open(self.path, "a", encoding="utf-8") as f:
+        f.write(line)
+    except Exception:
+      pass
 
 logger = RollingLogger(PAN_LOG_PATH)
 
+@app.on_event("startup")
+async def on_startup():
+  await init_db()
+  if not PAN_UPLOAD_SECRET:
+    logger.log("ERROR", "PAN_UPLOAD_SECRET 未配置，上傳將被拒絕。")
+
 async def send_telegram_message(text: str):
-    if not PAN_TELEGRAM_BOT_TOKEN or not PAN_TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{PAN_TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": PAN_TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json=payload)
-    except Exception as e:
-        logger.log("WARN", f"Send TG failed: {e}")
+  if not PAN_TELEGRAM_BOT_TOKEN or not PAN_TELEGRAM_CHAT_ID:
+    return
+  url = f"https://api.telegram.org/bot{PAN_TELEGRAM_BOT_TOKEN}/sendMessage"
+  payload = {
+    "chat_id": PAN_TELEGRAM_CHAT_ID,
+    "text": text,
+    "parse_mode": "HTML",
+    "disable_web_page_preview": True,
+  }
+  try:
+    async with httpx.AsyncClient(timeout=10) as client:
+      await client.post(url, json=payload)
+  except Exception as e:
+    logger.log("WARN", f"Send TG failed: {e}")
 
 def format_size(num: int) -> str:
-    step = 1024.0
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if num < step:
-            return f"{num:.1f}{unit}" if unit != "B" else f"{num}{unit}"
-        num /= step
-    return f"{num:.1f}PB"
+  step = 1024.0
+  for unit in ["B", "KB", "MB", "GB", "TB"]:
+    if num < step:
+      return f"{num:.1f}{unit}" if unit != "B" else f"{num}{unit}"
+    num /= step
+  return f"{num:.1f}PB"
 
-def validate_upload_secret(secret: str) -> bool:
-    if not PAN_UPLOAD_SECRET:
-        return True
-    return secret == PAN_UPLOAD_SECRET
+def require_valid_upload_secret(secret: str):
+  if not PAN_UPLOAD_SECRET:
+    logger.log("ERROR", "嘗試上傳但 PAN_UPLOAD_SECRET 未配置。")
+    raise HTTPException(status_code=500, detail="服務未配置上傳口令")
+  if not secret or secret != PAN_UPLOAD_SECRET:
+    raise HTTPException(status_code=403, detail="UPLOAD_SECRET 不正確")
 
 async def insert_file_record(
-    file_id: str,
-    original_name: str,
-    stored_name: str,
-    size_bytes: int,
-    category: Optional[str],
-    uploader_ip: Optional[str],
+  file_id: str,
+  original_name: str,
+  stored_name: str,
+  size_bytes: int,
+  category: Optional[str],
+  uploader_ip: Optional[str],
 ):
-    now = datetime.utcnow()
-    async with aiosqlite.connect(PAN_DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO files (id, original_name, stored_name, size_bytes, category, created_at, last_access, uploader_ip, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (file_id, original_name, stored_name, size_bytes, category or "", now, now, uploader_ip or "", ""),
-        )
-        await db.commit()
+  now = datetime.utcnow()
+  async with aiosqlite.connect(PAN_DB_PATH) as db:
+    await db.execute(
+      "INSERT INTO files (id, original_name, stored_name, size_bytes, category, created_at, last_access, uploader_ip, notes) "
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      (file_id, original_name, stored_name, size_bytes, category or "", now, now, uploader_ip or "", ""),
+    )
+    await db.commit()
 
 async def mark_access(file_id: str):
-    now = datetime.utcnow()
-    async with aiosqlite.connect(PAN_DB_PATH) as db:
-        await db.execute(
-            "UPDATE files SET last_access=? WHERE id=?",
-            (now, file_id),
-        )
-        await db.commit()
+  now = datetime.utcnow()
+  async with aiosqlite.connect(PAN_DB_PATH) as db:
+    await db.execute(
+      "UPDATE files SET last_access=? WHERE id=?",
+      (now, file_id),
+    )
+    await db.commit()
 
 async def fetch_file_record(file_id: str):
-    async with aiosqlite.connect(PAN_DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM files WHERE id=?", (file_id,))
-        row = await cur.fetchone()
-        await cur.close()
-        return row
+  async with aiosqlite.connect(PAN_DB_PATH) as db:
+    db.row_factory = aiosqlite.Row
+    cur = await db.execute("SELECT * FROM files WHERE id=?", (file_id,))
+    row = await cur.fetchone()
+    await cur.close()
+    return row
 
 async def query_all_files():
-    async with aiosqlite.connect(PAN_DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM files ORDER BY created_at DESC")
-        rows = await cur.fetchall()
-        await cur.close()
-        return rows
+  async with aiosqlite.connect(PAN_DB_PATH) as db:
+    db.row_factory = aiosqlite.Row
+    cur = await db.execute("SELECT * FROM files ORDER BY created_at DESC")
+    rows = await cur.fetchall()
+    await cur.close()
+    return rows
 
 async def cleanup_expired_files():
-    if PAN_MAX_FILE_AGE_DAYS <= 0:
-        logger.log("INFO", "清理任務已禁用，因為 PAN_MAX_FILE_AGE_DAYS <= 0")
-        return
+  if PAN_MAX_FILE_AGE_DAYS <= 0:
+    logger.log("INFO", "清理任務已禁用，因為 PAN_MAX_FILE_AGE_DAYS <= 0")
+    return
 
-    cutoff = datetime.utcnow() - timedelta(days=PAN_MAX_FILE_AGE_DAYS)
-    deleted_count = 0
-    total_freed = 0
+  cutoff = datetime.utcnow() - timedelta(days=PAN_MAX_FILE_AGE_DAYS)
+  deleted_count = 0
+  total_freed = 0
 
-    async with aiosqlite.connect(PAN_DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM files WHERE created_at < ?",
-            (cutoff,),
-        )
-        rows = await cur.fetchall()
+  async with aiosqlite.connect(PAN_DB_PATH) as db:
+    db.row_factory = aiosqlite.Row
+    cur = await db.execute("SELECT * FROM files WHERE created_at < ?", (cutoff,))
+    rows = await cur.fetchall()
 
-        for row in rows:
-            fid = row["id"]
-            stored = row["stored_name"]
-            size_bytes = row["size_bytes"]
-            fpath = os.path.join(PAN_UPLOAD_DIR, stored)
-            if os.path.exists(fpath):
-                try:
-                    os.remove(fpath)
-                    deleted_count += 1
-                    total_freed += size_bytes
-                except Exception as e:
-                    logger.log("WARN", f"刪除文件失敗 {fpath}: {e}")
+    for row in rows:
+      fid = row["id"]
+      stored = row["stored_name"]
+      size_bytes = row["size_bytes"]
+      fpath = os.path.join(PAN_UPLOAD_DIR, stored)
+      if os.path.exists(fpath):
+        try:
+          os.remove(fpath)
+          deleted_count += 1
+          total_freed += size_bytes
+        except Exception as e:
+          logger.log("WARN", f"刪除文件失敗 {fpath}: {e}")
 
-        await db.execute("DELETE FROM files WHERE created_at < ?", (cutoff,))
-        await db.commit()
+    await db.execute("DELETE FROM files WHERE created_at < ?", (cutoff,))
+    await db.commit()
 
-    if deleted_count > 0:
-        msg = f"清理過期文件：共刪除 {deleted_count} 個，釋放 {format_size(total_freed)}。"
-        logger.log("INFO", msg)
-        await send_telegram_message(f"[清理任務完成]\n{msg}")
-    else:
-        logger.log("INFO", "清理任務結束：沒有過期文件。")
+  if deleted_count > 0:
+    msg = f"清理過期文件：共刪除 {deleted_count} 個，釋放 {format_size(total_freed)}。"
+    logger.log("INFO", msg)
+    await send_telegram_message(f"[清理任務完成]\n{msg}")
+  else:
+    logger.log("INFO", "清理任務結束：沒有過期文件。")
 
 @app.get("/ping")
 async def ping():
-    return {"status": "ok", "version": "1.0.0"}
+  return {"status": "ok", "version": "1.0.0"}
 
 def guess_category(filename: str) -> str:
-    lower = filename.lower()
-    if any(lower.endswith(ext) for ext in [".mp4", ".mkv", ".avi", ".mov", ".mp3", ".flac", ".wav"]):
-        return "影音資源"
-    if any(lower.endswith(ext) for ext in [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"]):
-        return "壓縮包"
-    if any(lower.endswith(ext) for ext in [".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]):
-        return "學術資料"
-    if any(lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff"]):
-        return "圖片圖像"
-    return "其他"
+  lower = filename.lower()
+  if any(lower.endswith(ext) for ext in [".mp4", ".mkv", ".avi", ".mov", ".mp3", ".flac", ".wav"]):
+    return "影音"
+  if any(lower.endswith(ext) for ext in [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"]):
+    return "壓縮包"
+  if any(lower.endswith(ext) for ext in [".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]):
+    return "學術"
+  if any(lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff"]):
+    return "圖片"
+  return "其他"
 
 @app.post("/upload")
 async def upload_files(
-    request: Request,
-    upload_secret: str = Form(""),
-    category: str = Form(""),
-    files: List[UploadFile] = File(...),
+  request: Request,
+  upload_secret: str = Form(""),
+  category: str = Form(""),
+  files: List[UploadFile] = File(...),
 ):
-    if not validate_upload_secret(upload_secret):
-        raise HTTPException(status_code=403, detail="UPLOAD_SECRET 不正確")
+  require_valid_upload_secret(upload_secret)
 
-    client_ip = request.client.host if request.client else ""
-    max_bytes = PAN_MAX_UPLOAD_SIZE_MB * 1024 * 1024
-    total_received = 0
+  client_ip = request.client.host if request.client else ""
+  max_bytes = PAN_MAX_UPLOAD_SIZE_MB * 1024 * 1024
+  total_received = 0
 
-    saved_items = []
+  saved_items = []
 
-    for upload in files:
-        orig_name = upload.filename or "unnamed"
-        cat = category or guess_category(orig_name)
+  for upload in files:
+    orig_name = upload.filename or "unnamed"
+    cat = category or guess_category(orig_name)
 
-        file_uuid = str(uuid.uuid4())
-        stored_name = f"{file_uuid}_{orig_name}"
-        dest_path = os.path.join(PAN_UPLOAD_DIR, stored_name)
+    file_uuid = str(uuid.uuid4())
+    stored_name = f"{file_uuid}_{orig_name}"
+    dest_path = os.path.join(PAN_UPLOAD_DIR, stored_name)
 
-        size_bytes = 0
-        with open(dest_path, "wb") as f:
-            while True:
-                chunk = await upload.read(1024 * 1024)
-                if not chunk:
-                    break
-                size_bytes += len(chunk)
-                total_received += len(chunk)
-                f.write(chunk)
+    size_bytes = 0
+    with open(dest_path, "wb") as f:
+      while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+          break
+        size_bytes += len(chunk)
+        total_received += len(chunk)
+        f.write(chunk)
 
-                if max_bytes > 0 and total_received > max_bytes:
-                    f.close()
-                    try:
-                        os.remove(dest_path)
-                    except Exception:
-                        pass
-                    raise HTTPException(status_code=413, detail="超過服務器上傳限制")
+        if max_bytes > 0 and total_received > max_bytes:
+          f.close()
+          try:
+            os.remove(dest_path)
+          except Exception:
+            pass
+          raise HTTPException(status_code=413, detail="超過服務器上傳限制")
 
-        await insert_file_record(
-            file_id=file_uuid,
-            original_name=orig_name,
-            stored_name=stored_name,
-            size_bytes=size_bytes,
-            category=cat,
-            uploader_ip=client_ip,
-        )
+    await insert_file_record(
+      file_id=file_uuid,
+      original_name=orig_name,
+      stored_name=stored_name,
+      size_bytes=size_bytes,
+      category=cat,
+      uploader_ip=client_ip,
+    )
 
-        saved_items.append({
-            "id": file_uuid,
-            "name": orig_name,
-            "size": size_bytes,
-            "category": cat,
-        })
+    saved_items.append({
+      "id": file_uuid,
+      "name": orig_name,
+      "size": size_bytes,
+      "category": cat,
+    })
 
-    if saved_items:
-        lines = [f"<b>新上傳 {len(saved_items)} 個文件</b>"]
-        for item in saved_items:
-            size_str = format_size(item["size"])
-            link = f"https://{PAN_DOMAIN}/d/{item['id']}/{item['name']}"
-            lines.append(f"• {item['name']} ({size_str})\n{link}")
-        await send_telegram_message("\n".join(lines))
+  if saved_items:
+    lines = [f"<b>新上傳 {len(saved_items)} 個文件</b>"]
+    for item in saved_items:
+      size_str = format_size(item["size"])
+      link = f"https://{PAN_DOMAIN}/d/{item['id']}/{item['name']}"
+      lines.append(f"• {item['name']} ({size_str})\n{link}")
+    await send_telegram_message("\n".join(lines))
 
-    return {"ok": True, "files": saved_items}
+  return {"ok": True, "files": saved_items}
 
 @app.get("/d/{file_id}/{file_name}")
 async def download_file(file_id: str, file_name: str):
-    row = await fetch_file_record(file_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="文件不存在")
+  row = await fetch_file_record(file_id)
+  if not row:
+    raise HTTPException(status_code=404, detail="文件不存在")
 
-    stored_name = row["stored_name"]
-    path = os.path.join(PAN_UPLOAD_DIR, stored_name)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="文件已被刪除")
+  stored_name = row["stored_name"]
+  path = os.path.join(PAN_UPLOAD_DIR, stored_name)
+  if not os.path.exists(path):
+    raise HTTPException(status_code=404, detail="文件已被刪除")
 
-    await mark_access(file_id)
+  await mark_access(file_id)
 
-    size_bytes = os.path.getsize(path)
-    if PAN_MAX_DOWNLOAD_SIZE_MB > 0:
-        max_dl_bytes = PAN_MAX_DOWNLOAD_SIZE_MB * 1024 * 1024
-        if size_bytes > max_dl_bytes:
-            raise HTTPException(status_code=413, detail="文件過大，暫不允許直接下載")
+  size_bytes = os.path.getsize(path)
+  if PAN_MAX_DOWNLOAD_SIZE_MB > 0:
+    max_dl_bytes = PAN_MAX_DOWNLOAD_SIZE_MB * 1024 * 1024
+    if size_bytes > max_dl_bytes:
+      raise HTTPException(status_code=413, detail="文件過大，暫不允許直接下載")
 
-    filename = row["original_name"] or file_name
+  filename = row["original_name"] or file_name
 
-    async def file_iterator(chunk_size: int = 1024 * 1024):
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                yield chunk
+  async def file_iterator(chunk_size: int = 1024 * 1024):
+    with open(path, "rb") as f:
+      while True:
+        chunk = f.read(chunk_size)
+        if not chunk:
+          break
+        yield chunk
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    }
-    return StreamingResponse(
-        file_iterator(),
-        media_type="application/octet-stream",
-        headers=headers
-    )
+  headers = {
+    "Content-Disposition": f'attachment; filename="{filename}"'
+  }
+
+  return StreamingResponse(
+    file_iterator(),
+    media_type="application/octet-stream",
+    headers=headers,
+  )
 
 @app.get("/list")
 async def list_files():
-    rows = await query_all_files()
-    files = []
-    for row in rows:
-        files.append({
-            "id": row["id"],
-            "name": row["original_name"],
-            "stored_name": row["stored_name"],
-            "size_bytes": row["size_bytes"],
-            "size_human": format_size(row["size_bytes"]),
-            "category": row["category"] or "",
-            "created_at": row["created_at"],
-        })
-    return {"files": files}
+  rows = await query_all_files()
+  files = []
+  for row in rows:
+    files.append({
+      "id": row["id"],
+      "name": row["original_name"],
+      "stored_name": row["stored_name"],
+      "size_bytes": row["size_bytes"],
+      "size_human": format_size(row["size_bytes"]),
+      "category": row["category"] or "",
+      "created_at": row["created_at"],
+    })
+  return {"files": files}
 
 @app.post("/cleanup")
 async def trigger_cleanup():
-    await cleanup_expired_files()
-    return {"ok": True}
+  await cleanup_expired_files()
+  return {"ok": True}
 
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -569,13 +593,13 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 INDEX_HTML_PATH = os.path.join(TEMPLATES_DIR, "index.html")
 if not os.path.exists(INDEX_HTML_PATH):
-    with open(INDEX_HTML_PATH, "w", encoding="utf-8") as f:
-        f.write("<!DOCTYPE html><html><body>初始模板尚未生成，請重新部署。</body></html>")
+  with open(INDEX_HTML_PATH, "w", encoding="utf-8") as f:
+    f.write("<!DOCTYPE html><html><body>初始模板尚未生成，請重新部署。</body></html>")
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    with open(INDEX_HTML_PATH, "r", encoding="utf-8") as f:
-        return HTMLResponse(content=f.read(), status_code=200)
+  with open(INDEX_HTML_PATH, "r", encoding="utf-8") as f:
+    return HTMLResponse(content=f.read(), status_code=200)
 PY
 
   chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/app.py"
@@ -635,33 +659,6 @@ write_templates_html() {
       font-size: 1.6rem;
       font-weight: 700;
       letter-spacing: 0.03em;
-    }
-
-    .title-tagline {
-      font-size: 0.9rem;
-      color: #9ca3af;
-    }
-
-    .meta-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      font-size: 0.8rem;
-      color: #9ca3af;
-    }
-
-    .meta-pill {
-      border-radius: 999px;
-      padding: 3px 10px;
-      background: rgba(148, 163, 184, 0.12);
-      border: 1px solid rgba(148, 163, 184, 0.35);
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-    }
-
-    .meta-pill span.icon {
-      font-size: 0.9rem;
     }
 
     .main-grid {
@@ -783,11 +780,6 @@ write_templates_html() {
 
     .upload-main-copy-sub {
       font-size: 0.8rem;
-      color: #9ca3af;
-    }
-
-    .upload-hint {
-      font-size: 0.75rem;
       color: #9ca3af;
     }
 
@@ -921,14 +913,9 @@ write_templates_html() {
     .upload-bottom-row {
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      justify-content: flex-end;
       gap: 10px;
       margin-top: 6px;
-    }
-
-    .upload-bottom-left {
-      font-size: 0.78rem;
-      color: #9ca3af;
     }
 
     .upload-bottom-right {
@@ -964,54 +951,6 @@ write_templates_html() {
     .btn-muted:hover {
       border-color: rgba(148, 163, 184, 0.9);
       color: #e5e7eb;
-    }
-
-    .list-header-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-
-    .search-box-wrap {
-      position: relative;
-      width: 100%;
-    }
-
-    .search-input {
-      width: 100%;
-      border-radius: 999px;
-      border: 1px solid rgba(148, 163, 184, 0.55);
-      padding: 6px 28px 6px 26px;
-      font-size: 0.82rem;
-      background: rgba(15, 23, 42, 0.95);
-      color: #e5e7eb;
-      outline: none;
-    }
-
-    .search-input::placeholder {
-      color: #6b7280;
-    }
-
-    .search-input:focus {
-      border-color: rgba(56, 189, 248, 0.9);
-      box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.5);
-    }
-
-    .search-icon-symbol {
-      position: absolute;
-      top: 50%;
-      left: 8px;
-      transform: translateY(-50%);
-      font-size: 0.85rem;
-      color: #6b7280;
-      pointer-events: none;
-    }
-
-    .row-between {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
     }
 
     .file-area {
@@ -1140,13 +1079,39 @@ write_templates_html() {
       padding: 6px 10px 8px;
     }
 
-    .dl-name {
-      min-width: 0;
-      word-break: break-all;
+    .search-box-wrap {
+      position: relative;
+      width: 100%;
     }
 
-    .mg-top-4 {
-      margin-top: 4px;
+    .search-input {
+      width: 100%;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.55);
+      padding: 6px 28px 6px 26px;
+      font-size: 0.82rem;
+      background: rgba(15, 23, 42, 0.95);
+      color: #e5e7eb;
+      outline: none;
+    }
+
+    .search-input::placeholder {
+      color: #6b7280;
+    }
+
+    .search-input:focus {
+      border-color: rgba(56, 189, 248, 0.9);
+      box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.5);
+    }
+
+    .search-icon-symbol {
+      position: absolute;
+      top: 50%;
+      left: 8px;
+      transform: translateY(-50%);
+      font-size: 0.85rem;
+      color: #6b7280;
+      pointer-events: none;
     }
   </style>
 </head>
@@ -1155,18 +1120,6 @@ write_templates_html() {
     <header class="page-header">
       <div class="title-row">
         <h1>SUEN の 網盤</h1>
-        <div class="title-tagline">一個乾淨的公共上傳 / 下載小站，給學生和同事用的大型檔案通道。</div>
-      </div>
-      <div class="meta-row">
-        <div class="meta-pill">
-          <span class="icon">☁️</span><span>後端 FastAPI + Uvicorn + SQLite</span>
-        </div>
-        <div class="meta-pill">
-          <span class="icon">🔒</span><span>可選上傳口令 · HTTPS</span>
-        </div>
-        <div class="meta-pill">
-          <span class="icon">🧹</span><span>自動清理過期文件 · Telegram 通知</span>
-        </div>
       </div>
     </header>
 
@@ -1177,7 +1130,6 @@ write_templates_html() {
             <div class="card-header">
               <div class="card-title">
                 <h2>上傳區</h2>
-                <div class="card-subtitle">選擇文件或資料夾，一鍵上傳到伺服器。</div>
               </div>
               <div class="pill-badge">STREAMING UPLOAD</div>
             </div>
@@ -1185,23 +1137,16 @@ write_templates_html() {
             <div id="upload-dropzone" class="upload-dropzone">
               <div class="upload-top-row">
                 <div class="upload-main-copy">
-                  <div class="upload-main-copy-title">拖曳到此處，或使用按鈕選擇</div>
-                  <div class="upload-main-copy-sub">
-                    支援單檔或整個資料夾，伺服器端限制由管理員設定（預設 10 GB）。
-                  </div>
                 </div>
               </div>
 
-              <div class="upload-buttons-row mg-top-4">
+              <div class="upload-buttons-row" style="margin-top:4px;">
                 <button type="button" class="btn" id="btn-sel-file">
                   <span class="btn-icon">📄</span><span>選擇文件</span>
                 </button>
                 <button type="button" class="btn secondary" id="btn-sel-folder">
                   <span class="btn-icon">📁</span><span>選擇資料夾</span>
                 </button>
-                <div class="upload-hint">
-                  也可以直接把文件 / 資料夾拖進來。重複選擇會累加。
-                </div>
               </div>
 
               <input type="file" id="file-input-files" multiple style="display:none;" />
@@ -1214,18 +1159,16 @@ write_templates_html() {
               <div class="upload-meta-row">
                 <label for="category-select">分類：</label>
                 <select id="category-select">
-                  <option value="">自動判斷</option>
-                  <option value="高考作文">高考作文</option>
-                  <option value="學術資料">學術資料</option>
-                  <option value="教學課件">教學課件</option>
-                  <option value="影音資源">影音資源</option>
+                  <option value="高考">高考</option>
+                  <option value="學術">學術</option>
+                  <option value="影音">影音</option>
                   <option value="壓縮包">壓縮包</option>
-                  <option value="圖片圖像">圖片圖像</option>
+                  <option value="圖片">圖片</option>
                   <option value="其他">其他</option>
                 </select>
 
                 <label for="upload-secret">上傳口令：</label>
-                <input type="password" id="upload-secret" placeholder="若未設定可留空" />
+                <input type="password" id="upload-secret" />
               </div>
             </div>
 
@@ -1239,9 +1182,6 @@ write_templates_html() {
             </div>
 
             <div class="upload-bottom-row">
-              <div class="upload-bottom-left">
-                檔案會在一定時間後自動清理（具體由管理員設定）。
-              </div>
               <div class="upload-bottom-right">
                 <button type="button" class="btn-muted" id="btn-refresh-list">刷新列表</button>
                 <button type="button" class="btn-cancel" id="btn-cancel">取消上傳</button>
@@ -1257,8 +1197,8 @@ write_templates_html() {
       <section>
         <div class="card">
           <div class="card-inner" style="position:relative;">
-            <div class="row-between" style="margin-bottom:12px;gap:8px;">
-              <div class="search-box-wrap" style="flex:1;margin-bottom:0;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+              <div class="search-box-wrap" style="flex:1;">
                 <span class="search-icon-symbol">🔍</span>
                 <input type="text" id="search-input" class="search-input" placeholder="全局搜索..." />
               </div>
@@ -1266,8 +1206,9 @@ write_templates_html() {
             </div>
 
             <div id="file-area-container">
-              <!-- Rendered content goes here -->
-              <div id="download-status" class="download-progress-text" style="text-align:center;">正在載入...</div>
+              <div class="file-area">
+                <div id="download-status" class="download-progress-text" style="text-align:center;">正在載入...</div>
+              </div>
             </div>
           </div>
         </div>
@@ -1276,502 +1217,394 @@ write_templates_html() {
   </div>
 
   <script>
-    const API_BASE = "";
-    let selectedFiles = [];
-    let currentUploadXHR = null;
+    (function () {
+      "use strict";
 
-    function formatBytes(bytes) {
-      if (bytes === 0) return "0B";
-      const k = 1024;
-      const sizes = ["B", "KB", "MB", "GB", "TB"];
-      const i = Math.floor(Math.log(bytes) / Math.log(k));
-      const v = bytes / Math.pow(k, i);
-      return (i === 0 ? v.toFixed(0) : v.toFixed(1)) + sizes[i];
-    }
+      const API_BASE = "";
+      let selectedFiles = [];
+      let currentUploadXHR = null;
+      let uploadStartTime = null;
+      let allFilesCache = [];
 
-    function formatSpeed(bytesPerSec) {
-      if (!bytesPerSec || bytesPerSec <= 0) return "0B/s";
-      return formatBytes(bytesPerSec) + "/s";
-    }
-
-    function formatETA(seconds) {
-      if (!seconds || seconds <= 0 || !isFinite(seconds)) return "剩餘時間未知";
-      const s = Math.round(seconds);
-      const m = Math.floor(s / 60);
-      const sec = s % 60;
-      if (m > 0) {
-        return `約 ${m} 分 ${sec} 秒`;
+      function formatBytes(bytes) {
+        if (!bytes || bytes <= 0) return "0B";
+        const k = 1024;
+        const sizes = ["B", "KB", "MB", "GB", "TB"];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        const v = bytes / Math.pow(k, i);
+        return (i === 0 ? v.toFixed(0) : v.toFixed(1)) + sizes[i];
       }
-      return `約 ${sec} 秒`;
-    }
 
-    function setStatus(id, text) {
-      const el = document.getElementById(id);
-      if (!el) return;
-      el.textContent = text;
-    }
-
-    function updateUploadPreview() {
-      const preview = document.getElementById("upload-preview");
-      if (!selectedFiles.length) {
-        preview.innerHTML = "尚未選擇文件。";
-        return;
+      function formatSpeed(bytesPerSec) {
+        if (!bytesPerSec || bytesPerSec <= 0) return "0B/s";
+        return formatBytes(bytesPerSec) + "/s";
       }
-      let totalSize = 0;
-      for (const f of selectedFiles) {
-        totalSize += f.size || 0;
-      }
-      const count = selectedFiles.length;
-      preview.innerHTML =
-        `已選擇 <strong>${count}</strong> 項，合計 <strong>${formatBytes(totalSize)}</strong>。` +
-        ` 當前選擇將在一次上傳任務中提交。`;
-    }
 
-    function attachFileInputHandlers() {
-      const fileInput = document.getElementById("file-input-files");
-      const folderInput = document.getElementById("file-input-folder");
-      const btnFile = document.getElementById("btn-sel-file");
-      const btnFolder = document.getElementById("btn-sel-folder");
-
-      btnFile.addEventListener("click", () => fileInput.click());
-      btnFolder.addEventListener("click", () => folderInput.click());
-
-      function handleFiles(e) {
-        const files = Array.from(e.target.files || []);
-        if (!files.length) return;
-
-        for (const f of files) {
-          selectedFiles.push(f);
+      function formatETA(seconds) {
+        if (!seconds || seconds <= 0 || !isFinite(seconds)) return "剩餘時間未知";
+        const s = Math.round(seconds);
+        const m = Math.floor(s / 60);
+        const sec = s % 60;
+        if (m > 0) {
+          return `約 ${m} 分 ${sec} 秒`;
         }
-        updateUploadPreview();
+        return `約 ${sec} 秒`;
       }
 
-      fileInput.addEventListener("change", handleFiles);
-      folderInput.addEventListener("change", handleFiles);
-    }
+      function setStatus(id, text) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = text;
+      }
 
-    function attachDropzoneHandlers() {
-      const dz = document.getElementById("upload-dropzone");
-
-      ["dragenter", "dragover"].forEach(evtName => {
-        dz.addEventListener(evtName, (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          dz.classList.add("dragover");
-        });
-      });
-
-      ["dragleave", "drop"].forEach(evtName => {
-        dz.addEventListener(evtName, (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          dz.classList.remove("dragover");
-        });
-      });
-
-      dz.addEventListener("drop", (e) => {
-        const dt = e.dataTransfer;
-        if (!dt) return;
-
-        const fileList = Array.from(dt.files || []);
-        if (!fileList.length) return;
-
-        for (const f of fileList) {
-          selectedFiles.push(f);
+      function updateUploadPreview() {
+        const preview = document.getElementById("upload-preview");
+        if (!selectedFiles.length) {
+          preview.innerHTML = "尚未選擇文件。";
+          return;
         }
-        updateUploadPreview();
-      });
-    }
+        let totalSize = 0;
+        for (const f of selectedFiles) {
+          totalSize += f.size || 0;
+        }
+        const count = selectedFiles.length;
+        preview.innerHTML =
+          `已選擇 <strong>${count}</strong> 項，合計 <strong>${formatBytes(totalSize)}</strong>。`;
+      }
 
-    async function loadFiles() {
-      try {
-        const resp = await fetch(`${API_BASE}/list`);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data = await resp.json();
+      function attachFileInputHandlers() {
+        const fileInput = document.getElementById("file-input-files");
+        const folderInput = document.getElementById("file-input-folder");
+        const btnFile = document.getElementById("btn-sel-file");
+        const btnFolder = document.getElementById("btn-sel-folder");
 
-        renderFileList(data.files || []);
-      } catch (err) {
-        console.error("loadFiles error:", err);
+        btnFile.addEventListener("click", () => fileInput.click());
+        btnFolder.addEventListener("click", () => folderInput.click());
+
+        function handleFiles(e) {
+          const files = Array.from(e.target.files || []);
+          if (!files.length) return;
+          for (const f of files) {
+            selectedFiles.push(f);
+          }
+          updateUploadPreview();
+        }
+
+        fileInput.addEventListener("change", handleFiles);
+        folderInput.addEventListener("change", handleFiles);
+      }
+
+      function attachDropzoneHandlers() {
+        const dz = document.getElementById("upload-dropzone");
+        ["dragenter", "dragover"].forEach(evtName => {
+          dz.addEventListener(evtName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dz.classList.add("dragover");
+          });
+        });
+
+        ["dragleave", "drop"].forEach(evtName => {
+          dz.addEventListener(evtName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dz.classList.remove("dragover");
+          });
+        });
+
+        dz.addEventListener("drop", (e) => {
+          const dt = e.dataTransfer;
+          if (!dt) return;
+          const fileList = Array.from(dt.files || []);
+          if (!fileList.length) return;
+          for (const f of fileList) {
+            selectedFiles.push(f);
+          }
+          updateUploadPreview();
+        });
+      }
+
+      async function loadFiles() {
+        try {
+          setStatus("download-status", "正在載入...");
+          const resp = await fetch(`${API_BASE}/list`);
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const data = await resp.json();
+          allFilesCache = data.files || [];
+          renderFileList(allFilesCache);
+          setStatus("download-status", `共 ${allFilesCache.length} 個附件。`);
+        } catch (err) {
+          console.error("loadFiles error:", err);
+          const container = document.getElementById("file-area-container");
+          container.innerHTML = `
+            <div class="file-area">
+              <div id="download-status" class="download-progress-text">載入列表時出錯，請稍後重試。</div>
+            </div>
+          `;
+        }
+      }
+
+      function renderFileList(files) {
         const container = document.getElementById("file-area-container");
-        container.innerHTML = `
-          <div class="file-area">
-            <div class="download-progress-text">載入列表時出錯，請稍後重試。</div>
-          </div>
-        `;
-      }
-    }
+        container.innerHTML = "";
 
-    function renderFileList(files) {
-      const container = document.getElementById("file-area-container");
-      container.innerHTML = "";
+        const searchInput = document.getElementById("search-input");
+        const searchVal = (searchInput && searchInput.value ? searchInput.value : "").trim().toLowerCase();
 
-      const searchVal = document.getElementById("search-input").value.trim().toLowerCase();
-      let filtered = files;
-      if (searchVal) {
-        filtered = files.filter(f => (f.name || "").toLowerCase().includes(searchVal));
-      }
+        let filtered = files;
+        if (searchVal) {
+          filtered = files.filter(f => (f.name || "").toLowerCase().includes(searchVal));
+        }
 
-      const byCat = {};
-      for (const f of filtered) {
-        const cat = f.category || "其他";
-        if (!byCat[cat]) byCat[cat] = [];
-        byCat[cat].push(f);
-      }
+        const byCat = {};
+        for (const f of filtered) {
+          const cat = f.category || "其他";
+          if (!byCat[cat]) byCat[cat] = [];
+          byCat[cat].push(f);
+        }
 
-      const fixedCategories = [
-        "高考作文",
-        "學術資料",
-        "教學課件",
-        "影音資源",
-        "壓縮包",
-        "圖片圖像",
-        "其他"
-      ];
+        const fixedCategories = ["高考", "學術", "影音", "壓縮包", "圖片", "其他"];
+        const orderCats = [];
 
-      const orderCats = [];
-      for (const c of fixedCategories) {
-        if (byCat[c] && byCat[c].length) orderCats.push(c);
-      }
+        for (const c of fixedCategories) {
+          if (byCat[c] && byCat[c].length) orderCats.push(c);
+        }
 
-      const uncategorized = filtered.filter(f => !f.category);
-      if (uncategorized.length) {
-        byCat["未分類"] = uncategorized;
-        orderCats.push("未分類");
-      }
+        const extraCats = Object.keys(byCat)
+          .filter(c => !fixedCategories.includes(c));
+        extraCats.sort();
+        for (const c of extraCats) {
+          orderCats.push(c);
+        }
 
-      const area = document.createElement("div");
-      area.className = "file-area";
+        const area = document.createElement("div");
+        area.className = "file-area";
 
-      for (const cat of orderCats) {
-        const list = byCat[cat];
-        area.appendChild(renderCategorySection(cat, list));
-      }
+        if (!orderCats.length) {
+          const empty = document.createElement("div");
+          empty.className = "download-progress-text";
+          empty.style.textAlign = "center";
+          empty.textContent = "目前沒有可用附件。";
+          area.appendChild(empty);
+        } else {
+          for (const cat of orderCats) {
+            const list = byCat[cat];
+            area.appendChild(renderCategorySection(cat, list));
+          }
+        }
 
-      if (!orderCats.length) {
-        area.innerHTML = `
-          <div class="download-progress-text">
-            暫無文件。當有人上傳後，這裡會顯示所有分類下的附件清單。
-          </div>
-        `;
+        const statusBar = document.createElement("div");
+        statusBar.id = "download-status";
+        statusBar.className = "download-progress-text";
+        statusBar.textContent = "";
+
+        container.appendChild(area);
+        container.appendChild(statusBar);
       }
 
-      const existingStatus = document.getElementById("download-status");
-      const statusBar = document.createElement("div");
-      statusBar.id = "download-status";
-      statusBar.className = "download-progress-text";
-      statusBar.textContent = existingStatus ? existingStatus.textContent : "提示：點擊文件名下載，右側按鈕可複製分享鏈接。";
+      function renderCategorySection(catName, fileList) {
+        const block = document.createElement("div");
+        block.className = "category-block";
 
-      container.appendChild(area);
-      container.appendChild(statusBar);
-    }
+        const header = document.createElement("div");
+        header.className = "category-header";
 
-    function renderCategorySection(catName, fileList) {
-      const block = document.createElement("div");
-      block.className = "category-block";
+        const title = document.createElement("div");
+        title.className = "category-title";
+        title.textContent = catName;
 
-      const header = document.createElement("div");
-      header.className = "category-header";
+        const count = document.createElement("div");
+        count.className = "category-count";
+        count.textContent = `${fileList.length} 項`;
 
-      const title = document.createElement("div");
-      title.className = "category-title";
-      title.textContent = catName;
+        header.appendChild(title);
+        header.appendChild(count);
 
-      const count = document.createElement("div");
-      count.className = "category-count";
-      count.textContent = `${fileList.length} 個附件`;
+        const ul = document.createElement("ul");
+        ul.className = "category-list";
 
-      header.appendChild(title);
-      header.appendChild(count);
-      block.appendChild(header);
+        fileList.forEach(f => {
+          const li = document.createElement("li");
+          li.className = "category-list-item";
 
-      const ul = document.createElement("ul");
-      ul.className = "category-list";
+          const main = document.createElement("div");
+          main.className = "item-main";
 
-      fileList.forEach(f => {
-        const li = document.createElement("li");
-        li.className = "category-list-item";
+          const link = document.createElement("a");
+          const name = f.name || f.stored_name || f.id;
+          const encodedName = encodeURIComponent(name);
+          link.href = `/d/${encodeURIComponent(f.id)}/${encodedName}`;
+          link.textContent = name;
+          link.target = "_blank";
+          main.appendChild(link);
 
-        const main = document.createElement("div");
-        main.className = "item-main";
+          const meta = document.createElement("div");
+          meta.className = "item-meta";
+          const sizeSpan = document.createElement("span");
+          sizeSpan.textContent = f.size_human || formatBytes(f.size_bytes || 0);
+          meta.appendChild(sizeSpan);
 
-        const a = document.createElement("a");
-        a.href = `/d/${encodeURIComponent(f.id)}/${encodeURIComponent(f.name || "download")}`;
-        const nameSpan = document.createElement("span");
-        nameSpan.className = "dl-name";
-        const dispName = f.name || "(無名文件)";
-        nameSpan.textContent = dispName;
-        a.appendChild(nameSpan);
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "btn-share";
+          btn.textContent = "複製";
+          btn.addEventListener("click", () => {
+            const fullUrl = `${location.protocol}//${location.host}/d/${encodeURIComponent(f.id)}/${encodeURIComponent(name)}`;
+            navigator.clipboard.writeText(fullUrl)
+              .then(() => setStatus("download-status", "已複製分享鏈接。"))
+              .catch(() => setStatus("download-status", "複製失敗，請手動複製。"));
+          });
 
-        main.appendChild(a);
+          li.appendChild(main);
+          li.appendChild(meta);
+          li.appendChild(btn);
 
-        const meta = document.createElement("div");
-        meta.className = "item-meta";
-
-        const sizeSpan = document.createElement("span");
-        sizeSpan.textContent = f.size_human || "";
-        meta.appendChild(sizeSpan);
-
-        const shareBtn = document.createElement("button");
-        shareBtn.type = "button";
-        shareBtn.className = "btn-share";
-        shareBtn.textContent = "複製分享鏈接";
-        shareBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          e.preventDefault();
-          const link = `${window.location.origin}/d/${encodeURIComponent(f.id)}/${encodeURIComponent(f.name || "download")}`;
-          copyToClipboard(link);
+          ul.appendChild(li);
         });
-        meta.appendChild(shareBtn);
 
-        li.appendChild(main);
-        li.appendChild(meta);
-        ul.appendChild(li);
-      });
-
-      block.appendChild(ul);
-      return block;
-    }
-
-    function copyToClipboard(text) {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(() => {
-          setStatus("download-status", "已複製分享鏈接到剪貼簿。");
-        }).catch(() => {
-          fallbackCopy(text);
-        });
-      } else {
-        fallbackCopy(text);
+        block.appendChild(header);
+        block.appendChild(ul);
+        return block;
       }
-    }
 
-    function fallbackCopy(text) {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.top = "-9999px";
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand("copy");
-        setStatus("download-status", "已複製分享鏈接到剪貼簿。");
-      } catch (e) {
-        setStatus("download-status", "無法自動複製，請手動選取地址。");
-      } finally {
-        document.body.removeChild(ta);
+      function resetProgress() {
+        const bar = document.getElementById("progress-bar-fill");
+        if (bar) bar.style.width = "0%";
+        setStatus("upload-progress-text", "暫無上傳任務。");
       }
-    }
 
-    // --- Download with progress & ETA ---
-    function startDownloadWithProgress(urlStr, filenameHint) {
-      const statusEl = document.getElementById("download-status");
-      if (!statusEl) {
-        window.location.href = urlStr;
-        return;
-      }
-      const MAX_BLOB_BYTES = 2 * 1024 * 1024 * 1024;
-
-      statusEl.textContent = "正在準備下載...";
-
-      fetch(urlStr, { method: "HEAD" }).then((res) => {
-        const lenHeader = res.headers.get("Content-Length") || res.headers.get("content-length");
-        const total = lenHeader ? parseInt(lenHeader, 10) : NaN;
-
-        if (!Number.isFinite(total) || total <= 0 || total > MAX_BLOB_BYTES) {
-          statusEl.textContent = "已開始下載（大文件或未知大小，請查看瀏覽器下載進度）。";
-          window.location.href = urlStr;
+      function startUpload() {
+        if (currentUploadXHR) {
+          alert("已有上傳任務正在進行。");
           return;
         }
 
-        const xhr = new XMLHttpRequest();
-        xhr.open("GET", urlStr, true);
-        xhr.responseType = "blob";
-        const startedAt = Date.now();
-
-        xhr.onprogress = function (evt) {
-          if (!evt.lengthComputable) return;
-          const loaded = evt.loaded;
-          const totalBytes = evt.total || total;
-          const elapsedSec = (Date.now() - startedAt) / 1000;
-          const speed = elapsedSec > 0 ? loaded / elapsedSec : 0;
-          const remainBytes = Math.max(0, totalBytes - loaded);
-          const eta = speed > 0 ? remainBytes / speed : 0;
-
-          const msg =
-            "下載 " +
-            formatBytes(loaded) +
-            " / " +
-            formatBytes(totalBytes) +
-            " · " +
-            formatSpeed(speed) +
-            " · " +
-            formatETA(eta);
-          statusEl.textContent = msg;
-        };
-
-        xhr.onerror = function () {
-          statusEl.textContent = "下載失敗，請稍後重試。";
-        };
-
-        xhr.onload = function () {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            const blob = xhr.response;
-            const totalBytes = blob ? blob.size : total;
-            let filename = filenameHint || "";
-            if (!filename) {
-              try {
-                const urlObj = new URL(urlStr);
-                filename = decodeURIComponent(urlObj.pathname.split("/").pop() || "");
-              } catch (e) {
-                filename = "download.bin";
-              }
-            }
-            const blobUrl = URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = blobUrl;
-            a.download = filename || "download.bin";
-            document.body.appendChild(a);
-            a.click();
-            setTimeout(() => {
-              URL.revokeObjectURL(blobUrl);
-              document.body.removeChild(a);
-            }, 1000);
-            statusEl.textContent =
-              "下載完成：" +
-              filename +
-              (Number.isFinite(totalBytes) ? "（" + formatBytes(totalBytes) + "）" : "");
-          } else {
-            statusEl.textContent = "下載失敗：HTTP " + xhr.status;
-          }
-        };
-
-        xhr.send();
-      }).catch(() => {
-        statusEl.textContent = "已開始下載（無法預估大小，請查看瀏覽器下載進度）。";
-        window.location.href = urlStr;
-      });
-    }
-
-    // --- Unified Select Button Logic is above; now hook global download handler ---
-    document.addEventListener("click", function (e) {
-      const a = e.target.closest("a");
-      if (!a) return;
-      const href = a.getAttribute("href");
-      if (!href) return;
-      let urlObj;
-      try {
-        urlObj = new URL(href, window.location.origin);
-      } catch (err) {
-        return;
-      }
-      if (!urlObj.pathname || !urlObj.pathname.startsWith("/d/")) return;
-      e.preventDefault();
-      const filenameHint = decodeURIComponent(urlObj.pathname.split("/").pop() || "");
-      startDownloadWithProgress(urlObj.toString(), filenameHint);
-    });
-
-    function uploadWithXHR() {
-      if (!selectedFiles.length) {
-        alert("請先選擇文件或資料夾。");
-        return;
-      }
-
-      const formData = new FormData();
-      const cat = document.getElementById("category-select").value;
-      const secret = document.getElementById("upload-secret").value;
-
-      formData.append("category", cat);
-      formData.append("upload_secret", secret);
-
-      selectedFiles.forEach((f) => {
-        formData.append("files", f, f.webkitRelativePath || f.name);
-      });
-
-      const xhr = new XMLHttpRequest();
-      currentUploadXHR = xhr;
-
-      xhr.open("POST", `${API_BASE}/upload`, true);
-
-      const progressFill = document.getElementById("progress-bar-fill");
-      const progressText = document.getElementById("upload-progress-text");
-
-      const startTime = Date.now();
-
-      xhr.upload.onprogress = function (e) {
-        if (!e.lengthComputable) return;
-        const percent = (e.loaded / e.total) * 100;
-        const elapsedSec = (Date.now() - startTime) / 1000;
-        const speed = e.loaded / (elapsedSec || 1);
-        const remainingBytes = e.total - e.loaded;
-        const etaSec = remainingBytes / (speed || 1);
-
-        progressFill.style.width = `${percent.toFixed(1)}%`;
-        progressText.textContent =
-          `已上傳 ${formatBytes(e.loaded)} / ${formatBytes(e.total)} · ` +
-          `${formatSpeed(speed)} · ${formatETA(etaSec)}`;
-      };
-
-      xhr.onload = function () {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          progressFill.style.width = "100%";
-          progressText.textContent = "上傳完成。正在刷新列表...";
-          selectedFiles = [];
-          updateUploadPreview();
-          loadFiles();
-        } else {
-          progressText.textContent = `上傳失敗：HTTP ${xhr.status}`;
+        if (!selectedFiles.length) {
+          alert("請先選擇文件或資料夾。");
+          return;
         }
-        currentUploadXHR = null;
-      };
 
-      xhr.onerror = function () {
-        progressText.textContent = "上傳過程中出現錯誤。";
-        currentUploadXHR = null;
-      };
+        const secretInput = document.getElementById("upload-secret");
+        const categorySelect = document.getElementById("category-select");
 
-      progressFill.style.width = "0%";
-      progressText.textContent = "開始上傳...";
-      xhr.send(formData);
-    }
+        const secret = secretInput ? secretInput.value.trim() : "";
+        if (!secret) {
+          alert("請先輸入口令。");
+          return;
+        }
 
-    document.getElementById("btn-cancel").addEventListener("click", () => {
-      if (currentUploadXHR) {
-        currentUploadXHR.abort();
-        currentUploadXHR = null;
-        setStatus("upload-progress-text", "已中止當前上傳。");
-      } else {
-        setStatus("upload-progress-text", "當前沒有進行中的上傳任務。");
+        const category = categorySelect ? categorySelect.value : "";
+
+        const formData = new FormData();
+        formData.append("upload_secret", secret);
+        formData.append("category", category);
+        for (const f of selectedFiles) {
+          formData.append("files", f);
+        }
+
+        const xhr = new XMLHttpRequest();
+        currentUploadXHR = xhr;
+        uploadStartTime = Date.now();
+
+        const bar = document.getElementById("progress-bar-fill");
+
+        xhr.upload.onprogress = (event) => {
+          if (!event.lengthComputable) return;
+          const loaded = event.loaded;
+          const total = event.total;
+          const now = Date.now();
+          const elapsedSec = (now - uploadStartTime) / 1000;
+          const speed = elapsedSec > 0 ? loaded / elapsedSec : 0;
+          const remaining = total - loaded;
+          const etaSec = speed > 0 ? remaining / speed : 0;
+
+          const percent = total > 0 ? (loaded / total) * 100 : 0;
+          if (bar) {
+            bar.style.width = `${percent.toFixed(1)}%`;
+          }
+
+          setStatus(
+            "upload-progress-text",
+            `已上傳 ${percent.toFixed(1)}% · ${formatBytes(loaded)} / ${formatBytes(total)} · ${formatSpeed(speed)} · ${formatETA(etaSec)}`
+          );
+        };
+
+        xhr.onreadystatechange = () => {
+          if (xhr.readyState !== XMLHttpRequest.DONE) return;
+          const ok = xhr.status >= 200 && xhr.status < 300;
+          if (ok) {
+            try {
+              const data = JSON.parse(xhr.responseText || "{}");
+              const count = (data.files || []).length;
+              setStatus("upload-progress-text", count > 0 ? `上傳完成，共 ${count} 項。` : "上傳完成。");
+            } catch {
+              setStatus("upload-progress-text", "上傳完成。");
+            }
+            selectedFiles = [];
+            updateUploadPreview();
+            loadFiles();
+          } else {
+            let msg = "上傳失敗。";
+            try {
+              const data = JSON.parse(xhr.responseText || "{}");
+              if (data.detail) msg = `上傳失敗：${data.detail}`;
+            } catch (_) {}
+            setStatus("upload-progress-text", msg);
+          }
+          currentUploadXHR = null;
+          uploadStartTime = null;
+          if (bar) bar.style.width = "0%";
+        };
+
+        xhr.onerror = () => {
+          setStatus("upload-progress-text", "上傳出錯，請稍後重試。");
+          currentUploadXHR = null;
+          uploadStartTime = null;
+          if (bar) bar.style.width = "0%";
+        };
+
+        xhr.open("POST", `${API_BASE}/upload`);
+        xhr.send(formData);
+        setStatus("upload-progress-text", "開始上傳...");
       }
-    });
 
-    document.getElementById("btn-refresh").addEventListener("click", () => {
-      document.getElementById("search-input").value = "";
-      loadFiles();
-    });
+      function cancelUpload() {
+        if (currentUploadXHR) {
+          currentUploadXHR.abort();
+          currentUploadXHR = null;
+          uploadStartTime = null;
+          resetProgress();
+          setStatus("upload-progress-text", "已取消上傳。");
+        }
+      }
 
-    document.addEventListener("DOMContentLoaded", function () {
-      attachFileInputHandlers();
-      attachDropzoneHandlers();
+      document.addEventListener("DOMContentLoaded", () => {
+        attachFileInputHandlers();
+        attachDropzoneHandlers();
 
-      const searchInput = document.getElementById("search-input");
-      searchInput.addEventListener("input", () => {
+        const btnUpload = document.getElementById("btn-upload");
+        const btnCancel = document.getElementById("btn-cancel");
+        const btnRefresh = document.getElementById("btn-refresh");
+        const btnRefreshList = document.getElementById("btn-refresh-list");
+        const searchInput = document.getElementById("search-input");
+
+        if (btnUpload) btnUpload.addEventListener("click", startUpload);
+        if (btnCancel) btnCancel.addEventListener("click", cancelUpload);
+        if (btnRefresh) btnRefresh.addEventListener("click", loadFiles);
+        if (btnRefreshList) btnRefreshList.addEventListener("click", loadFiles);
+        if (searchInput) {
+          searchInput.addEventListener("input", () => {
+            renderFileList(allFilesCache);
+          });
+        }
+
         loadFiles();
       });
-
-      document.getElementById("btn-refresh-list").addEventListener("click", () => {
-        document.getElementById("search-input").value = "";
-        loadFiles();
-      });
-
-      document.getElementById("btn-upload").addEventListener("click", uploadWithXHR);
-
-      loadFiles();
-    });
+    })();
   </script>
 </body>
 </html>
 HTML
-
-  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/templates"
 }
 
 write_cleanup_script() {
@@ -1780,19 +1613,91 @@ write_cleanup_script() {
   cat > "${APP_DIR}/cleanup.py" <<'PY'
 import os
 import asyncio
+from datetime import datetime, timedelta
+
+import aiosqlite
+import httpx
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOTENV_PATH = os.path.join(BASE_DIR, ".env")
 load_dotenv(DOTENV_PATH)
 
-from app import cleanup_expired_files
+PAN_UPLOAD_DIR = os.getenv("PAN_UPLOAD_DIR", "/srv/pan/uploads")
+PAN_DB_PATH = os.getenv("PAN_DB_PATH", "/srv/pan/db/pan.db")
+PAN_MAX_FILE_AGE_DAYS = int(os.getenv("PAN_MAX_FILE_AGE_DAYS", "7"))
+
+PAN_TELEGRAM_BOT_TOKEN = os.getenv("PAN_TELEGRAM_BOT_TOKEN", "")
+PAN_TELEGRAM_CHAT_ID = os.getenv("PAN_TELEGRAM_CHAT_ID", "")
+
+def format_size(num: int) -> str:
+  step = 1024.0
+  for unit in ["B", "KB", "MB", "GB", "TB"]:
+    if num < step:
+      return f"{num:.1f}{unit}" if unit != "B" else f"{num}{unit}"
+    num /= step
+  return f"{num:.1f}PB"
+
+async def send_telegram_message(text: str):
+  if not PAN_TELEGRAM_BOT_TOKEN or not PAN_TELEGRAM_CHAT_ID:
+    return
+  url = f"https://api.telegram.org/bot{PAN_TELEGRAM_BOT_TOKEN}/sendMessage"
+  payload = {
+    "chat_id": PAN_TELEGRAM_CHAT_ID,
+    "text": text,
+    "parse_mode": "HTML",
+    "disable_web_page_preview": True,
+  }
+  try:
+    async with httpx.AsyncClient(timeout=10) as client:
+      await client.post(url, json=payload)
+  except Exception:
+    pass
+
+async def cleanup():
+  if PAN_MAX_FILE_AGE_DAYS <= 0:
+    print("[cleanup] PAN_MAX_FILE_AGE_DAYS <= 0, 不執行清理。")
+    return
+
+  cutoff = datetime.utcnow() - timedelta(days=PAN_MAX_FILE_AGE_DAYS)
+  deleted_count = 0
+  total_freed = 0
+
+  async with aiosqlite.connect(PAN_DB_PATH) as db:
+    db.row_factory = aiosqlite.Row
+    cur = await db.execute("SELECT * FROM files WHERE created_at < ?", (cutoff,))
+    rows = await cur.fetchall()
+
+    for row in rows:
+      fid = row["id"]
+      stored = row["stored_name"]
+      size_bytes = row["size_bytes"]
+      path = os.path.join(PAN_UPLOAD_DIR, stored)
+      if os.path.exists(path):
+        try:
+          os.remove(path)
+          deleted_count += 1
+          total_freed += size_bytes
+          print(f"[cleanup] 刪除 {path}")
+        except Exception as e:
+          print(f"[cleanup] 刪除失敗 {path}: {e}")
+
+    await db.execute("DELETE FROM files WHERE created_at < ?", (cutoff,))
+    await db.commit()
+
+  if deleted_count > 0:
+    msg = f"清理過期文件：共刪除 {deleted_count} 個，釋放 {format_size(total_freed)}。"
+    print("[cleanup]", msg)
+    await send_telegram_message(f"[清理任務完成]\n{msg}")
+  else:
+    print("[cleanup] 無過期文件。")
 
 if __name__ == "__main__":
-    asyncio.run(cleanup_expired_files())
+  asyncio.run(cleanup())
 PY
 
   chown "${APP_USER}:${APP_USER}" "${APP_DIR}/cleanup.py"
+  chmod 750 "${APP_DIR}/cleanup.py"
 }
 
 write_systemd_service() {
@@ -1800,27 +1705,27 @@ write_systemd_service() {
 
   cat > "${SYSTEMD_SERVICE}" <<SERVICE
 [Unit]
-Description=SUEN Pan FastAPI Service
+Description=SUEN Net Drive (pan.bdfz.net) FastAPI Service
 After=network.target
 
 [Service]
+Type=simple
 User=${APP_USER}
 Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
-Environment="PYTHONUNBUFFERED=1"
 Environment="PATH=${APP_DIR}/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=${APP_DIR}/venv/bin/uvicorn app:app --host 127.0.0.1 --port 9001 --proxy-headers --forwarded-allow-ips='*'
-Restart=always
+EnvironmentFile=${APP_DIR}/.env
+ExecStart=${APP_DIR}/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips '*'
+Restart=on-failure
 RestartSec=3
-StandardOutput=journal
-StandardError=journal
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 SERVICE
 
-  systemctl daemon-reload
-  systemctl enable "${SERVICE_NAME}.service"
+  chown root:root "${SYSTEMD_SERVICE}"
+  chmod 644 "${SYSTEMD_SERVICE}"
 }
 
 write_cleanup_systemd() {
@@ -1828,7 +1733,7 @@ write_cleanup_systemd() {
 
   cat > "${SYSTEMD_CLEANUP_SERVICE}" <<SERVICE
 [Unit]
-Description=Cleanup expired files for SUEN Pan
+Description=SUEN Net Drive (pan.bdfz.net) Cleanup Service
 
 [Service]
 Type=oneshot
@@ -1836,29 +1741,42 @@ User=${APP_USER}
 Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
 Environment="PATH=${APP_DIR}/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=${APP_DIR}/venv/bin/python cleanup.py
+ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/cleanup.py
 SERVICE
 
   cat > "${SYSTEMD_CLEANUP_TIMER}" <<TIMER
 [Unit]
-Description=Daily cleanup for SUEN Pan
+Description=每日清理 SUEN Net Drive 過期文件
 
 [Timer]
-OnCalendar=*-*-* 03:00:00
+OnCalendar=daily
 Persistent=true
-Unit=${SERVICE_NAME}-cleanup.service
 
 [Install]
 WantedBy=timers.target
 TIMER
 
-  systemctl daemon-reload
-  systemctl enable "${SERVICE_NAME}-cleanup.timer"
-  systemctl start "${SERVICE_NAME}-cleanup.timer"
+  chown root:root "${SYSTEMD_CLEANUP_SERVICE}" "${SYSTEMD_CLEANUP_TIMER}"
+  chmod 644 "${SYSTEMD_CLEANUP_SERVICE}" "${SYSTEMD_CLEANUP_TIMER}"
 }
 
-write_nginx_conf() {
-  log INFO "寫入 Nginx 配置：${NGINX_SITE_AVAIL}"
+disable_legacy_nginx_sites() {
+  if [[ -L /etc/nginx/sites-enabled/pan.bdfz.net ]]; then
+    log INFO "檢測到舊的 Nginx 站點 pan.bdfz.net，將禁用以避免衝突"
+    rm -f /etc/nginx/sites-enabled/pan.bdfz.net
+  fi
+
+  if [[ -f /etc/nginx/sites-available/pan.bdfz.net ]]; then
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    log INFO "備份舊的 /etc/nginx/sites-available/pan.bdfz.net -> .bak-${ts}"
+    cp -a /etc/nginx/sites-available/pan.bdfz.net "/etc/nginx/sites-available/pan.bdfz.net.bak-${ts}"
+  fi
+}
+
+write_nginx_http_conf() {
+  log INFO "寫入初始 Nginx HTTP 配置 (用於申請證書)..."
+  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
 
   cat > "${NGINX_SITE_AVAIL}" <<NGINX
 server {
@@ -1867,12 +1785,70 @@ server {
     server_name ${DOMAIN};
 
     location /.well-known/acme-challenge/ {
-        root /var/www/html;
+        root /var/www/letsencrypt;
     }
 
     location / {
         return 301 https://\$host\$request_uri;
     }
+}
+NGINX
+
+  ln -sf "${NGINX_SITE_AVAIL}" "${NGINX_SITE_ENABLED}"
+
+  if nginx -t; then
+    systemctl reload nginx
+  else
+    log WARN "Nginx 配置測試失敗，嘗試重啟服務..."
+    systemctl restart nginx || true
+  fi
+}
+
+obtain_certificate_if_needed() {
+  if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+    log INFO "已檢測到現有證書，跳過申請步驟。"
+    return
+  fi
+
+  log INFO "未檢測到現有證書，準備申請 Let's Encrypt 證書..."
+  mkdir -p /var/www/letsencrypt
+
+  local email
+  if [[ -n "${CERTBOT_EMAIL:-}" ]]; then
+    email="${CERTBOT_EMAIL}"
+  else
+    read -r -p "請輸入用於 Let's Encrypt 的電子郵件地址: " email || true
+  fi
+
+  if [[ -z "${email}" ]]; then
+    log ERROR "未提供電子郵件，無法自動申請證書。"
+    return
+  fi
+
+  certbot certonly --webroot -w /var/www/letsencrypt \
+    -d "${DOMAIN}" \
+    --email "${email}" \
+    --agree-tos \
+    --non-interactive || {
+      log ERROR "Certbot 申請失敗。請檢查域名解析是否正確指向本機。"
+      exit 1
+    }
+}
+
+write_nginx_ssl_conf() {
+  log INFO "證書已就緒，寫入 Nginx HTTPS 配置..."
+
+  cat > "${NGINX_SITE_AVAIL}" <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+    }
+
+    return 301 https://\$host\$request_uri;
 }
 
 server {
@@ -1884,64 +1860,53 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
     ssl_trusted_certificate /etc/letsencrypt/live/${DOMAIN}/chain.pem;
 
-    ssl_session_timeout 1d;
-    ssl_session_cache shared:SSL:50m;
-    ssl_session_tickets off;
-
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers off;
+    ssl_prefer_server_ciphers on;
 
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-
-    client_max_body_size 100g;
+    client_max_body_size 10240m;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
 
     location / {
-        proxy_pass http://127.0.0.1:9001;
+        proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        proxy_connect_timeout 600;
-        proxy_send_timeout 600;
-        proxy_read_timeout 600;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
 
         proxy_request_buffering off;
-        proxy_buffering off;
     }
 }
 NGINX
-
-  if [[ ! -e "${NGINX_SITE_ENABLED}" ]]; then
-    ln -s "${NGINX_SITE_AVAIL}" "${NGINX_SITE_ENABLED}"
-  fi
 }
 
-obtain_or_ensure_cert() {
-  if [[ ! -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
-    log INFO "未找到現有證書，準備使用 certbot 申請..."
-    mkdir -p /var/www/html
-    certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "admin@${DOMAIN}" || {
-      log ERROR "certbot 申請證書失敗，請手動檢查 DNS / 防火牆配置。"
-    }
-  else
-    log INFO "已檢測到現有證書，跳過申請步驟。"
-  fi
-}
-
-restart_services() {
+reload_services() {
   log INFO "重啟/啟動 Nginx 與應用服務..."
-  nginx -t
-  systemctl restart nginx
+
+  systemctl daemon-reload
+
+  systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+  systemctl enable "${SERVICE_NAME}-cleanup.timer" >/dev/null 2>&1 || true
+
   systemctl restart "${SERVICE_NAME}.service"
+  systemctl restart "${SERVICE_NAME}-cleanup.timer" || true
+
+  nginx -t
+  systemctl reload nginx
+
+  systemctl status "${SERVICE_NAME}.service" --no-pager || true
 }
 
 main() {
   require_root
   check_os
+  log INFO "開始部署 SUEN の 網盤..."
   detect_existing_env
+  kill_previous_processes
   install_packages
   create_app_user_and_dirs
   write_env_file
@@ -1951,9 +1916,13 @@ main() {
   write_cleanup_script
   write_systemd_service
   write_cleanup_systemd
-  write_nginx_conf
-  obtain_or_ensure_cert
-  restart_services
+
+  disable_legacy_nginx_sites
+
+  write_nginx_http_conf
+  obtain_certificate_if_needed
+  write_nginx_ssl_conf
+  reload_services
 
   log INFO "============================================="
   log INFO " SUEN の 網盤 已部署完成。"
