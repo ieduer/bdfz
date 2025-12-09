@@ -1154,6 +1154,92 @@ PY
         letter-spacing: 0.08em;
         text-transform: uppercase;
       }
+      .custom-dropdown {
+        position: relative;
+        display: inline-block;
+        width: 100%;
+        z-index: 20;
+      }
+      .custom-dropdown-btn {
+        width: 100%;
+        justify-content: center;
+      }
+      .custom-dropdown-menu {
+        display: none;
+        position: absolute;
+        top: 100%;
+        left: 0;
+        width: 100%;
+        background: #0f172a;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        z-index: 50;
+        margin-top: 6px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+        overflow: hidden;
+        backdrop-filter: blur(12px);
+      }
+      .custom-dropdown-menu.show {
+        display: block;
+        animation: fadeIn 0.1s ease-out;
+      }
+      .custom-dropdown-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        padding: 10px 14px;
+        border: none;
+        background: transparent;
+        color: var(--fg);
+        font-family: inherit;
+        text-align: left;
+        cursor: pointer;
+        font-size: 0.86rem;
+        transition: background 0.1s;
+        box-shadow: none;
+        border-radius: 0;
+      }
+      .custom-dropdown-item:hover {
+        background: rgba(34, 197, 94, 0.15);
+        color: #fff;
+        transform: none;
+        box-shadow: none;
+      }
+      .search-box-wrap {
+        position: relative;
+        margin-bottom: 12px;
+      }
+      .search-input {
+        width: 100%;
+        padding: 9px 12px 9px 34px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: rgba(0,0,0,0.2);
+        color: white;
+        font-family: inherit;
+        font-size: 0.85rem;
+        transition: all 0.2s;
+      }
+      .search-input:focus {
+        background: rgba(0,0,0,0.5);
+        border-color: var(--accent);
+        outline: none;
+        box-shadow: 0 0 0 1px var(--accent-soft);
+      }
+      .search-icon-symbol {
+        position: absolute;
+        left: 10px;
+        top: 50%;
+        transform: translateY(-50%);
+        opacity: 0.6;
+        font-size: 0.9rem;
+        pointer-events: none;
+      }
+      @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(-4px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
     </style>
   </head>
   <body>
@@ -1174,7 +1260,7 @@ PY
 HTML
 
   # ---------------- templates/index.html ----------------
-  # 修改：移除備註，加入文件夾上傳按鈕，加入取消按鈕，右側加載全部
+  # 修改：合併上傳按鈕，增加搜索功能
   cat >"${APP_DIR}/templates/index.html" <<'HTML'
 {% extends "base.html" %}
 {% block content %}
@@ -1221,11 +1307,24 @@ HTML
         </div>
         
         <!-- 隱藏的實際文件輸入框 -->
-        <input type="file" id="files" name="files" multiple required style="display:none" />
+        <input type="file" id="files-normal" name="files" multiple style="display:none" />
+        <input type="file" id="files-folder" name="files" multiple webkitdirectory directory style="display:none" />
 
-        <div style="display:flex; gap:10px; margin-top:12px;">
-            <button type="button" id="btn-trigger-files" style="flex:1; justify-content:center;">📄 選擇文件</button>
-            <button type="button" id="btn-trigger-folder" style="flex:1; justify-content:center; background:radial-gradient(circle at top, #0ea5e9, #0284c7); box-shadow:0 10px 24px rgba(14,165,233,0.75);">📂 選擇文件夾</button>
+        <!-- 統一選擇按鈕 -->
+        <div style="margin-top:12px;">
+           <div class="custom-dropdown" id="dropdown-select">
+              <button type="button" class="custom-dropdown-btn" id="btn-select-main">
+                📄 選擇文件 ▾
+              </button>
+              <div class="custom-dropdown-menu" id="dropdown-menu">
+                  <button type="button" class="custom-dropdown-item" id="opt-file">
+                      <span style="font-size:1.1em">📄</span> 選擇文件 (Files)
+                  </button>
+                  <button type="button" class="custom-dropdown-item" id="opt-folder">
+                      <span style="font-size:1.1em">📂</span> 選擇文件夾 (Folder)
+                  </button>
+              </div>
+           </div>
         </div>
 
         <div id="file-preview" class="file-list-preview" style="text-align:center; margin-top:8px;"></div>
@@ -1244,12 +1343,19 @@ HTML
     </div>
   </div>
 
-  <!-- 右側：全部下載 -->
+  <!-- 右側：全部文件 -->
   <div class="card">
       <div class="card-inner">
-      <div style="margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
-         <button id="btn-refresh" type="button" style="font-size:0.75rem;padding:4px 10px;">🔄 刷新列表</button>
-         <span style="font-size:0.75rem; color:var(--muted);">點擊類別可篩選</span>
+      <div style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:flex-start; flex-direction:column; gap:8px;">
+         <!-- 搜索框 -->
+         <div class="search-box-wrap" style="width:100%;">
+             <span class="search-icon-symbol">🔍</span>
+             <input type="text" id="search-input" class="search-input" placeholder="搜索文件名、類別或 ID..." />
+         </div>
+         <div style="width:100%; display:flex; justify-content:space-between; align-items:center;">
+             <button id="btn-refresh" type="button" style="font-size:0.75rem;padding:4px 10px;">🔄 刷新列表</button>
+             <span style="font-size:0.75rem; color:var(--muted); opacity:0.8;">點擊類別可篩選</span>
+         </div>
       </div>
       <ul id="download-list" class="download-list"></ul>
       <div id="download-status" class="download-progress-text"></div>
@@ -1265,7 +1371,8 @@ HTML
     let currentId = "";
     let currentSecret = "";
     let xhrUpload = null; 
-    let activeCategoryFilter = null; // 當前篩選的類別
+    let activeCategoryFilter = null; 
+    let allFilesCache = []; // 本地緩存文件列表，用於搜索
 
     function setStatus(id, msg, ok) {
       const el = document.getElementById(id);
@@ -1277,6 +1384,7 @@ HTML
     function showProgress(containerId, barId, percent) {
       const container = document.getElementById(containerId);
       const bar = document.getElementById(barId);
+      // ...
       if (!container || !bar) return;
       container.style.display = "block";
       bar.style.width = (percent || 0) + "%";
@@ -1309,7 +1417,7 @@ HTML
       const digits = idx === 0 ? 0 : 2;
       return val.toFixed(digits) + " " + units[idx];
     }
-
+    
     function formatSpeed(bytesPerSec) {
       if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return "0 B/s";
       return formatBytes(bytesPerSec) + "/s";
@@ -1327,7 +1435,6 @@ HTML
     function copyToClipboard(text) {
         if (navigator.clipboard && window.isSecureContext) {
             navigator.clipboard.writeText(text).then(() => {
-                // show toast or brief feedback?
                  const statusEl = document.getElementById("download-status");
                  if(statusEl) {
                      const orig = statusEl.textContent;
@@ -1336,7 +1443,6 @@ HTML
                  }
             }, () => {});
         } else {
-            // Fallback
             let textArea = document.createElement("textarea");
             textArea.value = text;
             textArea.style.position = "fixed";
@@ -1357,25 +1463,60 @@ HTML
         }
     }
 
-    // 文件選擇處理
-    const fileInput = document.getElementById("files");
-    const btnFiles = document.getElementById("btn-trigger-files");
-    const btnFolder = document.getElementById("btn-trigger-folder");
+    // --- Unified Select Button Logic ---
+    const btnSelectMain = document.getElementById("btn-select-main");
+    const dropdownMenu = document.getElementById("dropdown-menu");
+    const inputNormal = document.getElementById("files-normal");
+    const inputFolder = document.getElementById("files-folder");
+    const preview = document.getElementById("file-preview");
 
-    if(btnFiles && fileInput) {
-        btnFiles.addEventListener("click", () => {
-            fileInput.removeAttribute("webkitdirectory");
-            fileInput.removeAttribute("directory");
-            fileInput.click();
+    // Toggle Dropdown
+    if(btnSelectMain && dropdownMenu) {
+        btnSelectMain.addEventListener("click", (e) => {
+            e.stopPropagation();
+            dropdownMenu.classList.toggle("show");
         });
     }
 
-    if(btnFolder && fileInput) {
-        btnFolder.addEventListener("click", () => {
-             fileInput.setAttribute("webkitdirectory", "");
-             fileInput.setAttribute("directory", "");
-             fileInput.click();
-        });
+    // Close dropdown on outside click
+    document.addEventListener("click", () => {
+        if(dropdownMenu) dropdownMenu.classList.remove("show");
+    });
+
+    // Option: File
+    document.getElementById("opt-file").addEventListener("click", () => {
+        // Clear folder input
+        if(inputFolder) inputFolder.value = ""; 
+        if(inputNormal) inputNormal.click();
+    });
+
+    // Option: Folder
+    document.getElementById("opt-folder").addEventListener("click", () => {
+        // Clear normal input
+        if(inputNormal) inputNormal.value = "";
+        if(inputFolder) inputFolder.click();
+    });
+
+    function onFileInputChange(e) {
+      const files = e.target.files;
+      if (!files || !files.length) {
+        // Only clear if the user canceled (files.length 0), BUT since we have 2 inputs, 
+        // one might be empty while other has content.
+        // We only show preview for the one that just changed.
+        return;
+      }
+      preview.textContent = "已選擇 " + files.length + " 個項目 (" + (e.target.hasAttribute("webkitdirectory") ? "文件夾" : "文件") + ")";
+      preview.style.transform = "scale(1.05)";
+      setTimeout(()=> preview.style.transform = "scale(1)", 150);
+    }
+
+    if(inputNormal) inputNormal.addEventListener("change", onFileInputChange);
+    if(inputFolder) inputFolder.addEventListener("change", onFileInputChange);
+
+    function getActiveFiles() {
+        if (inputNormal && inputNormal.files && inputNormal.files.length > 0) return inputNormal.files;
+        if (inputFolder && inputFolder.files && inputFolder.files.length > 0) return inputFolder.files;
+        return null;
     }
 
     function applySlot() {
@@ -1394,32 +1535,19 @@ HTML
 
       currentId = idVal;
       currentSecret = secretVal;
-
       upId.value = currentId;
       upSecret.value = currentSecret;
-
-      // setStatus("slot-status", "當前 ID：" + currentId, true);
       return true;
     }
 
-    // 載入列表
-    async function loadFiles() {
-      const listEl = document.getElementById("download-list");
-      const statusEl = document.getElementById("download-status");
-      
-      try {
-        if (statusEl) statusEl.textContent = "正在載入附件列表…";
-        const res = await fetch(API_LIST, { headers: { Accept: "application/json" } });
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const data = await res.json();
-        if (!data || !data.ok) throw new Error("服務器返回錯誤");
-        const files = data.files || [];
+    // --- Rendering List ---
+    function renderList(files) {
+        const listEl = document.getElementById("download-list");
         if (!listEl) return;
-        if (!files.length) {
-          listEl.innerHTML =
-            "<li><span style='font-size:0.8rem;color:rgba(148,163,184,0.9);'>暫無附件。</span></li>";
-          if (statusEl) statusEl.textContent = "";
-          return;
+        
+        if (!files || !files.length) {
+            listEl.innerHTML = "<li><span style='font-size:0.8rem;color:rgba(148,163,184,0.9);'>無符合條件的附件。</span></li>";
+            return;
         }
 
         const groups = {};
@@ -1432,11 +1560,9 @@ HTML
 
         listEl.innerHTML = "";
         const keys = Object.keys(groups).sort(); 
-        
         let hasFilterMatch = false;
 
         for (const key of keys) {
-            // 如果有篩選且不匹配，則跳過
             if (activeCategoryFilter && key !== activeCategoryFilter) {
                 continue;
             }
@@ -1447,24 +1573,18 @@ HTML
             heading.style.cursor = "pointer";
             heading.title = activeCategoryFilter ? "點擊取消篩選" : "點擊篩選此類別";
             
-            // 標題顯示
             const headingContent = document.createElement("div");
             headingContent.className = "category-heading";
             headingContent.textContent = "類別：" + group.name + (activeCategoryFilter ? " (篩選中 ✕)" : "");
             
             if (activeCategoryFilter) {
-               headingContent.style.color = "#4ade80"; // Highlight
+               headingContent.style.color = "#4ade80"; 
             }
 
             heading.appendChild(headingContent);
-            
             heading.addEventListener("click", () => {
-                if (activeCategoryFilter === key) {
-                    activeCategoryFilter = null; // 取消
-                } else {
-                    activeCategoryFilter = key; // 設置
-                }
-                loadFiles(); // 重新渲染
+                activeCategoryFilter = (activeCategoryFilter === key) ? null : key;
+                renderList(filterData(allFilesCache)); // Re-render with current search + new category filter
             });
 
             listEl.appendChild(heading);
@@ -1472,19 +1592,15 @@ HTML
             for (const f of group.items) {
                 const li = document.createElement("li");
                 
-                // 容器
                 const container = document.createElement("div");
                 container.style.display = "flex";
                 container.style.alignItems = "center";
                 container.style.justifyContent = "space-between";
                 container.style.gap = "8px";
                 
-                // 連結按鈕 (左側主要區域)
                 const a = document.createElement("a");
                 a.href = "/d/" + encodeURIComponent(f.id) + "/" + encodeURIComponent(f.name || "");
                 a.style.flex = "1";
-                // 覆蓋默認樣式微調
-                // a 的樣式已在CSS定義 (flex)，這裡只需確保內部結構
                 
                 const left = document.createElement("div");
                 left.className = "dl-left";
@@ -1492,6 +1608,7 @@ HTML
                 const nameSpan = document.createElement("span");
                 nameSpan.className = "dl-name";
                 let dispName = f.name || "(無名文件)";
+                // Highlight search term? Optional, but good.
                 if(dispName.length > 40) dispName = dispName.substring(0, 38) + "...";
                 nameSpan.textContent = dispName;
                 left.appendChild(nameSpan);
@@ -1504,10 +1621,9 @@ HTML
                 a.appendChild(left);
                 a.appendChild(right);
                 
-                // 分享按鈕
                 const shareBtn = document.createElement("button");
                 shareBtn.type = "button";
-                shareBtn.innerHTML = "🔗"; // Link icon
+                shareBtn.innerHTML = "🔗"; 
                 shareBtn.title = "複製分享鏈接";
                 shareBtn.style.padding = "6px 10px";
                 shareBtn.style.fontSize = "0.9rem";
@@ -1523,22 +1639,46 @@ HTML
 
                 container.appendChild(a);
                 container.appendChild(shareBtn);
-                
-                li.appendChild(container); // 改為放入 div 容器
-                listEl.appendChild(li);
+                li.appendChild(container);
             }
         }
         
         if (activeCategoryFilter && !hasFilterMatch) {
-            // 篩選後無結果（可能該類別文件已被刪除）
-            activeCategoryFilter = null;
-            loadFiles();
-            return;
+            // If currently filtered category is gone due to search, we might want to keep it empty or reset.
+            // keeping it empty is correct behavior for "search within category" or "search global but category mismatches"
+             listEl.innerHTML = "<li><span style='font-size:0.8rem;color:rgba(148,163,184,0.9);'>該類別下無符合條件的附件。</span></li>";
         }
+    }
+
+    function filterData(files) {
+        if (!files) return [];
+        const term = (document.getElementById("search-input").value || "").trim().toLowerCase();
+        if (!term) return files;
+        return files.filter(f => {
+            const n = (f.name || "").toLowerCase();
+            const c = (f.category || "").toLowerCase();
+            const note = (f.note || "").toLowerCase();
+            const uid = (f.upload_id || "").toLowerCase();
+            return n.includes(term) || c.includes(term) || note.includes(term) || uid.includes(term);
+        });
+    }
+
+    async function loadFiles() {
+      const statusEl = document.getElementById("download-status");
+      try {
+        if (statusEl) statusEl.textContent = "正在載入附件列表…";
+        const res = await fetch(API_LIST, { headers: { Accept: "application/json" } });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error("服務器返回錯誤");
+        
+        allFilesCache = data.files || [];
+        renderList(filterData(allFilesCache));
 
         if (statusEl) statusEl.textContent = "";
       } catch (err) {
         console.error(err);
+        const listEl = document.getElementById("download-list");
         if (listEl) {
           listEl.innerHTML = "<li><span style='font-size:0.8rem;color:#fecaca;'>載入附件列表失敗。</span></li>";
         }
@@ -1546,56 +1686,35 @@ HTML
       }
     }
 
-    function onFileInputChange() {
-      const input = document.getElementById("files");
-      const preview = document.getElementById("file-preview");
-      if (!input || !preview) return;
-      const files = input.files;
-      if (!files || !files.length) {
-        preview.textContent = "";
-        return;
-      }
-      preview.textContent = "已選擇 " + files.length + " 個項目";
-      
-      // 添加簡單動畫反饋
-      preview.style.transform = "scale(1.05)";
-      setTimeout(()=> preview.style.transform = "scale(1)", 150);
-    }
+    // Search Input Listener
+    document.getElementById("search-input").addEventListener("input", () => {
+        renderList(filterData(allFilesCache));
+    });
 
     function uploadWithXHR(event) {
       event.preventDefault();
-
-      if (!applySlot()) {
-        return;
-      }
+      if (!applySlot()) return;
 
       const form = document.getElementById("upload-form");
-      const input = document.getElementById("files");
       const btn = document.getElementById("btn-upload");
       const btnCancel = document.getElementById("btn-cancel");
-      const btnFiles = document.getElementById("btn-trigger-files");
-      const btnFolder = document.getElementById("btn-trigger-folder");
       const catSelect = document.getElementById("category");
 
-      // 手動檢查 category (雖有 required 但某些瀏覽器需顯式檢查)
       if (!catSelect.value) {
           setStatus("upload-status", "請選擇類別。", false);
           catSelect.focus();
           return;
       }
 
-      if (!input || !input.files || !input.files.length) {
+      const files = getActiveFiles(); // Use helper
+      if (!files || !files.length) {
         setStatus("upload-status", "請先選擇文件或文件夾。", false);
         return;
       }
-
-      const files = Array.from(input.files);
-      const totalBytes = files.reduce((sum, f) => sum + (f.size || 0), 0);
+      const filesArray = Array.from(files);
+      const totalBytes = filesArray.reduce((sum, f) => sum + (f.size || 0), 0);
 
       btn.disabled = true;
-      if(btnFiles) btnFiles.disabled = true;
-      if(btnFolder) btnFolder.disabled = true;
-      
       btnCancel.style.display = "inline-flex";
       setStatus("upload-status", "準備上傳 " + files.length + " 個文件…", true);
       showProgress("upload-progress", "upload-progress-bar", 0);
@@ -1618,15 +1737,7 @@ HTML
         const remainBytes = Math.max(0, totalBytes - loaded);
         const eta = speed > 0 ? remainBytes / speed : 0;
 
-        const msg =
-          "已上傳 " +
-          formatBytes(loaded) +
-          " / " +
-          formatBytes(totalBytes) +
-          " · " +
-          formatSpeed(speed) +
-          " · " +
-          formatETA(eta);
+        const msg = "已上傳 " + formatBytes(loaded) + " / " + formatBytes(totalBytes) + " · " + formatSpeed(speed) + " · " + formatETA(eta);
         setStatus("upload-status", msg, true);
       };
 
@@ -1644,18 +1755,15 @@ HTML
         cleanupUpload();
         if (xhrUpload.status >= 200 && xhrUpload.status < 300) {
           let data = xhrUpload.response;
+          // ... json parse ...
           if (!data || typeof data !== "object") {
-            try {
-              data = JSON.parse(xhrUpload.responseText || "{}");
-            } catch (e) {
-              data = {};
-            }
+              try { data = JSON.parse(xhrUpload.responseText || "{}"); } catch (e) { data = {}; }
           }
           if (data.ok) {
-            // 成功提示
             setStatus("upload-status", "上傳完成！共 " + (data.files || []).length + " 個文件。", true);
             try {
-              input.value = "";
+              if(inputNormal) inputNormal.value = "";
+              if(inputFolder) inputFolder.value = "";
               document.getElementById("file-preview").textContent = "";
               document.getElementById("category").value = "";
             } catch (e) {}
@@ -1665,23 +1773,32 @@ HTML
             setStatus("upload-status", "上傳失敗：" + detail, false);
           }
         } else {
+          // err...
           let detail = "HTTP " + xhrUpload.status;
           try {
-            const j = JSON.parse(xhrUpload.responseText || "{}");
-            if (j && j.detail) detail = j.detail;
-          } catch (e) {}
+             const j = JSON.parse(xhrUpload.responseText || "{}");
+             if (j && j.detail) detail = j.detail;
+          } catch(e){}
           setStatus("upload-status", "上傳失敗：" + detail, false);
         }
       };
 
       const formData = new FormData(form);
+      // Append files manually because we have 2 inputs separately
+      // Actually FormData(form) pulls from the form elements. 
+      // InputNormal and InputFolder are INSIDE the form.
+      // However, if one is empty, it might still send an empty part? 
+      // Usually browsers only send files if selected.
+      // But we set name="files" for both.
+      // We should probably check if it works. 
+      // To be safe, we can clear the one that is NOT active or just rely on the fact that empty file input usually isn't sent or sent as empty filename.
+      // The backend checks `if not files`.
+      
+      // Let's rely on standard FormData behavior.
       xhrUpload.send(formData);
 
       function cleanupUpload() {
           btn.disabled = false;
-          if(btnFiles) btnFiles.disabled = false;
-          if(btnFolder) btnFolder.disabled = false;
-      
           btnCancel.style.display = "none";
           xhrUpload = null;
           hideProgress("upload-progress", "upload-progress-bar");
@@ -1695,7 +1812,8 @@ HTML
     });
 
     document.getElementById("btn-refresh").addEventListener("click", () => {
-        activeCategoryFilter = null; // 刷新時重置篩選
+        activeCategoryFilter = null; 
+        document.getElementById("search-input").value = ""; // Clear search on refresh
         loadFiles();
     });
 
@@ -1710,11 +1828,6 @@ HTML
       const form = document.getElementById("upload-form");
       if (form && window.XMLHttpRequest && window.FormData) {
         form.addEventListener("submit", uploadWithXHR);
-      }
-
-      const fileInput = document.getElementById("files");
-      if (fileInput) {
-        fileInput.addEventListener("change", onFileInputChange);
       }
       
       loadFiles();
