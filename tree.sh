@@ -791,50 +791,37 @@ INDEX_HTML = """<!DOCTYPE html>
               <svg viewBox="0 0 96 64" aria-hidden="true">
                 <!-- MEOW bubble -->
                 <g class="pixel-cat-meow">
-                  <rect x="6" y="6" width="44" height="16" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                  <rect x="18" y="22" width="6" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                  <text x="14" y="17" font-family="monospace" font-size="7" fill="#e5e7eb">MEOW!</text>
+                  <rect x="8" y="6" width="48" height="18" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                  <rect x="22" y="24" width="8" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                  <text x="14" y="18" font-family="monospace" font-size="8" fill="#e5e7eb">MEOW!</text>
                 </g>
 
-                <!-- Tail -->
-                <rect x="64" y="32" width="14" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <rect x="76" y="28" width="6" height="12" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <!-- Head background -->
+                <rect x="30" y="18" width="32" height="26" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <!-- Inner face -->
+                <rect x="32" y="20" width="28" height="22" fill="#020617" stroke="#1f2937" stroke-width="1" />
 
-                <!-- Body -->
-                <rect x="22" y="28" width="44" height="18" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <rect x="24" y="30" width="40" height="14" fill="#020617" stroke="#1f2937" stroke-width="1" />
-
-                <!-- Head + ears -->
-                <rect x="24" y="12" width="8" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <rect x="40" y="12" width="8" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <rect x="24" y="16" width="24" height="16" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <rect x="26" y="18" width="20" height="12" fill="#020617" stroke="#1f2937" stroke-width="1" />
+                <!-- Ears -->
+                <rect x="30" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <rect x="54" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
 
                 <!-- Eyes -->
-                <rect class="pixel-cat-eye" x="29" y="21" width="4" height="4" fill="#a7f3d0" />
-                <rect class="pixel-cat-eye" x="39" y="21" width="4" height="4" fill="#a7f3d0" />
+                <rect class="pixel-cat-eye" x="36" y="26" width="4" height="5" fill="#a7f3d0" />
+                <rect class="pixel-cat-eye" x="52" y="26" width="4" height="5" fill="#a7f3d0" />
 
                 <!-- Nose -->
-                <rect x="34" y="25" width="3" height="2" fill="#22c55e" />
+                <rect x="44" y="31" width="4" height="2" fill="#22c55e" />
 
                 <!-- Cheeks -->
-                <rect x="28" y="24" width="3" height="2" fill="#10b981" />
-                <rect x="41" y="24" width="3" height="2" fill="#10b981" />
+                <rect x="38" y="31" width="3" height="2" fill="#10b981" />
+                <rect x="51" y="31" width="3" height="2" fill="#10b981" />
 
                 <!-- Mouth -->
-                <rect x="33" y="27" width="1" height="1" fill="#22c55e" />
-                <rect x="36" y="27" width="1" height="1" fill="#22c55e" />
+                <rect x="43" y="34" width="2" height="1" fill="#22c55e" />
+                <rect x="47" y="34" width="2" height="1" fill="#22c55e" />
 
-                <!-- Front paws -->
-                <rect x="30" y="36" width="4" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <rect x="38" y="36" width="4" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-
-                <!-- Back paws -->
-                <rect x="52" y="36" width="4" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <rect x="58" y="36" width="4" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-
-                <!-- Shadow -->
-                <rect x="24" y="48" width="56" height="4" fill="#020617" opacity="0.9" />
+                <!-- Small chin shadow -->
+                <rect x="42" y="36" width="8" height="2" fill="#020617" opacity="0.9" />
               </svg>
             </div>
           </div>
