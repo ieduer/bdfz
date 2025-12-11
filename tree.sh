@@ -694,13 +694,13 @@ INDEX_HTML = """<!DOCTYPE html>
 </style>
   <style>
     .pixel-cat {
-        margin-top: 18px;
+        margin-top: 22px;
         width: 100%;
         display: flex;
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        gap: 6px;
+        gap: 8px;
         font-size: 0.75rem;
         color: var(--text-dim);
         opacity: 0.98;
@@ -712,8 +712,8 @@ INDEX_HTML = """<!DOCTYPE html>
         white-space: pre;
     }
     .pixel-cat-art svg {
-        width: 88px;
-        height: 88px;
+        width: 140px;
+        height: 64px;
         image-rendering: pixelated;
         filter: drop-shadow(0 6px 16px rgba(15, 23, 42, 0.95));
         animation: catFloat 3.4s ease-in-out infinite;
@@ -766,37 +766,50 @@ INDEX_HTML = """<!DOCTYPE html>
         </form>
         <div class="pixel-cat" aria-hidden="true">
           <div class="pixel-cat-art">
-            <svg viewBox="0 0 64 64" aria-hidden="true">
+            <svg viewBox="0 0 120 48" aria-hidden="true">
+              <!-- Tail (long to the right) -->
+              <rect x="76" y="26" width="24" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <rect x="98" y="24" width="6" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
+
+              <!-- Body (long bar) -->
+              <rect x="20" y="24" width="60" height="14" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <!-- Body glow -->
+              <rect x="22" y="26" width="56" height="10" fill="#020617" stroke="#1f2937" stroke-width="1" />
+
+              <!-- Head with big ears -->
               <!-- Ears -->
-              <rect x="10" y="8" width="10" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <rect x="44" y="8" width="10" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <rect x="14" y="8" width="8" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <rect x="30" y="8" width="8" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
               <!-- Head -->
-              <rect x="12" y="12" width="40" height="28" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <!-- Inner face glow -->
-              <rect x="14" y="14" width="36" height="24" fill="#020617" stroke="#1f2937" stroke-width="1" />
-              <!-- Eyes -->
-              <rect class="pixel-cat-eye" x="22" y="22" width="5" height="5" fill="#a7f3d0" />
-              <rect class="pixel-cat-eye" x="37" y="22" width="5" height="5" fill="#a7f3d0" />
+              <rect x="14" y="14" width="24" height="16" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <!-- Face inner -->
+              <rect x="16" y="16" width="20" height="12" fill="#020617" stroke="#1f2937" stroke-width="1" />
+
+              <!-- Eyes (blink with animation) -->
+              <rect class="pixel-cat-eye" x="19" y="19" width="4" height="4" fill="#a7f3d0" />
+              <rect class="pixel-cat-eye" x="29" y="19" width="4" height="4" fill="#a7f3d0" />
+
               <!-- Nose -->
-              <rect x="30" y="29" width="4" height="2" fill="#22c55e" />
+              <rect x="24" y="23" width="3" height="2" fill="#22c55e" />
+
               <!-- Cheeks -->
-              <rect x="20" y="28" width="3" height="2" fill="#10b981" />
-              <rect x="41" y="28" width="3" height="2" fill="#10b981" />
-              <!-- Whiskers -->
-              <rect x="16" y="26" width="4" height="1" fill="#1f2937" />
-              <rect x="44" y="26" width="4" height="1" fill="#1f2937" />
-              <!-- Tiny mouth -->
-              <rect x="30" y="31" width="1" height="1" fill="#22c55e" />
-              <rect x="33" y="31" width="1" height="1" fill="#22c55e" />
-              <!-- Laptop body -->
-              <rect x="16" y="36" width="32" height="10" fill="#020617" stroke="#22c55e" stroke-width="1" />
-              <!-- Laptop screen "code" -->
-              <rect x="18" y="38" width="28" height="6" fill="#020617" />
-              <rect x="19" y="39" width="6" height="1" fill="#22c55e" />
-              <rect x="19" y="41" width="10" height="1" fill="#16a34a" />
-              <rect x="31" y="39" width="8" height="1" fill="#4ade80" />
-              <!-- Body shadow -->
-              <rect x="18" y="48" width="28" height="3" fill="#020617" opacity="0.95" />
+              <rect x="18" y="22" width="3" height="2" fill="#10b981" />
+              <rect x="31" y="22" width="3" height="2" fill="#10b981" />
+
+              <!-- Mouth (tiny pixels) -->
+              <rect x="23" y="25" width="1" height="1" fill="#22c55e" />
+              <rect x="26" y="25" width="1" height="1" fill="#22c55e" />
+
+              <!-- Front paws -->
+              <rect x="26" y="30" width="4" height="4" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <rect x="20" y="30" width="4" height="4" fill="#020617" stroke="#4b5563" stroke-width="1" />
+
+              <!-- Back paws -->
+              <rect x="60" y="30" width="4" height="4" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <rect x="66" y="30" width="4" height="4" fill="#020617" stroke="#4b5563" stroke-width="1" />
+
+              <!-- Under shadow -->
+              <rect x="22" y="38" width="58" height="3" fill="#020617" opacity="0.9" />
             </svg>
           </div>
           <div class="small">樹洞守護貓在線值班。</div>
