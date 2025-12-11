@@ -306,7 +306,7 @@ def hash_ip(ip: str) -> str:
 def enforce_rate_limit(db: Session, ip_hash: str) -> None:
     if POSTS_PER_MINUTE <= 0:
         return
-    now = datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+    now = datetime.utcnow()
     window_start = now - timedelta(seconds=60)
     count = (
         db.query(func.count(Post.id))
@@ -691,19 +691,23 @@ INDEX_HTML = """<!DOCTYPE html>
       background: rgba(15, 23, 42, 0.8);
     }
   </style>
+</style>
   <style>
-    /* animated code cat */
-    .code-cat-container {
-      position: fixed;
-      left: 18px;
-      bottom: 14px;
-      z-index: 9999;
-      pointer-events: none;
-      opacity: 0.82;
-      transition: opacity 0.25s;
+    .pixel-cat {
+        margin-top: 10px;
+        display: inline-flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+        font-size: 0.75rem;
+        color: var(--text-dim);
+        opacity: 0.9;
     }
-    .code-cat-container:hover {
-      opacity: 1;
+    .pixel-cat-art {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 11px;
+        line-height: 1.1;
+        white-space: pre;
     }
   </style>
 </head>
@@ -738,6 +742,14 @@ INDEX_HTML = """<!DOCTYPE html>
             </div>
           </div>
         </form>
+        <div class="pixel-cat" aria-hidden="true">
+          <div class="pixel-cat-art">
+/\_/\\
+( o.o )
+ > ^ <
+          </div>
+          <div class="small">樹洞守護貓在線值班。</div>
+        </div>
         <div id="status" class="status"></div>
         <div class="small" style="margin-top: 4px;">
           系統會做簡單的頻率限制與內容長度限制，避免被機器刷爆。
@@ -773,36 +785,6 @@ INDEX_HTML = """<!DOCTYPE html>
     </section>
   </main>
 
-  <div class="code-cat-container" title="喵~">
-    <svg width="78" height="54" viewBox="0 0 78 54" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <g>
-        <ellipse cx="39" cy="44" rx="24" ry="7" fill="#24292f" opacity="0.18"/>
-        <g id="cat">
-          <ellipse cx="39" cy="28" rx="18" ry="15" fill="#24292f"/>
-          <ellipse cx="39" cy="30" rx="16" ry="12" fill="#fff"/>
-          <!-- ears -->
-          <polygon points="24,18 19,8 29,16" fill="#24292f"/>
-          <polygon points="54,18 59,8 49,16" fill="#24292f"/>
-          <!-- face -->
-          <ellipse cx="32" cy="30" rx="2.6" ry="2.2" fill="#24292f"/>
-          <ellipse cx="46" cy="30" rx="2.6" ry="2.2" fill="#24292f"/>
-          <ellipse id="cat-eye-left" cx="32" cy="30" rx="1.1" ry="0.9" fill="#fff"/>
-          <ellipse id="cat-eye-right" cx="46" cy="30" rx="1.1" ry="0.9" fill="#fff"/>
-          <ellipse cx="39" cy="34" rx="2.2" ry="1.1" fill="#24292f"/>
-          <!-- whiskers -->
-          <rect x="18" y="32" width="7" height="1" rx="0.5" fill="#24292f" transform="rotate(-10 18 32)"/>
-          <rect x="18" y="36" width="7" height="1" rx="0.5" fill="#24292f" transform="rotate(8 18 36)"/>
-          <rect x="53" y="32" width="7" height="1" rx="0.5" fill="#24292f" transform="rotate(10 53 32)"/>
-          <rect x="53" y="36" width="7" height="1" rx="0.5" fill="#24292f" transform="rotate(-8 53 36)"/>
-        </g>
-        <!-- code bubble -->
-        <g>
-          <rect x="53" y="10" rx="5" width="20" height="16" fill="#fff" stroke="#24292f" stroke-width="1.2"/>
-          <text x="63" y="22" font-size="8" font-family="monospace" fill="#24292f">&lt;/&gt;</text>
-        </g>
-      </g>
-    </svg>
-  </div>
   <script>
     const statusEl = document.getElementById("status");
     const postsEl = document.getElementById("posts");
