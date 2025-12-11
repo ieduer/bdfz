@@ -705,31 +705,52 @@ INDEX_HTML = """<!DOCTYPE html>
         color: var(--text-dim);
         opacity: 0.98;
         text-align: center;
+        pointer-events: none;
+    }
+    .pixel-cat-walk {
+        display: inline-block;
+        animation: catWalk 9s ease-in-out infinite alternate;
     }
     .pixel-cat-art {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                     "Liberation Mono", "Courier New", monospace;
         line-height: 1.1;
         white-space: pre;
     }
     .pixel-cat-art svg {
-        width: 140px;
-        height: 64px;
+        width: 120px;
+        height: 96px;
         image-rendering: pixelated;
         filter: drop-shadow(0 6px 16px rgba(15, 23, 42, 0.95));
-        animation: catFloat 3.4s ease-in-out infinite;
+        animation: catFloat 3.8s ease-in-out infinite;
     }
     .pixel-cat-eye {
         transform-origin: center center;
-        animation: catBlink 4s infinite;
+        animation: catBlink 4.2s infinite;
+    }
+    .pixel-cat-meow {
+        opacity: 0;
+        transform-origin: left bottom;
+        animation: catMeow 11s ease-in-out infinite;
     }
     @keyframes catFloat {
         0%, 100% { transform: translateY(0); }
-        50% { transform: translateY(-2px); }
+        50% { transform: translateY(-3px); }
     }
     @keyframes catBlink {
-        0%, 88%, 100% { transform: scaleY(1); }
-        90% { transform: scaleY(0.1); }
-        93% { transform: scaleY(1); }
+        0%, 86%, 100% { transform: scaleY(1); }
+        88% { transform: scaleY(0.15); }
+        92% { transform: scaleY(1); }
+    }
+    @keyframes catWalk {
+        0% { transform: translateX(-14px); }
+        50% { transform: translateX(14px); }
+        100% { transform: translateX(-6px); }
+    }
+    @keyframes catMeow {
+        0%, 58% { opacity: 0; transform: scale(0.95) translateY(0); }
+        62%, 72% { opacity: 1; transform: scale(1) translateY(-2px); }
+        78%, 100% { opacity: 0; transform: scale(0.96) translateY(0); }
     }
   </style>
 </head>
@@ -765,52 +786,57 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
         </form>
         <div class="pixel-cat" aria-hidden="true">
-          <div class="pixel-cat-art">
-            <svg viewBox="0 0 120 48" aria-hidden="true">
-              <!-- Tail (long to the right) -->
-              <rect x="76" y="26" width="24" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <rect x="98" y="24" width="6" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
+          <div class="pixel-cat-walk">
+            <div class="pixel-cat-art">
+              <svg viewBox="0 0 96 64" aria-hidden="true">
+                <!-- MEOW bubble -->
+                <g class="pixel-cat-meow">
+                  <rect x="6" y="6" width="44" height="16" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                  <rect x="18" y="22" width="6" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                  <text x="14" y="17" font-family="monospace" font-size="7" fill="#e5e7eb">MEOW!</text>
+                </g>
 
-              <!-- Body (long bar) -->
-              <rect x="20" y="24" width="60" height="14" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <!-- Body glow -->
-              <rect x="22" y="26" width="56" height="10" fill="#020617" stroke="#1f2937" stroke-width="1" />
+                <!-- Tail -->
+                <rect x="64" y="32" width="14" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <rect x="76" y="28" width="6" height="12" fill="#020617" stroke="#4b5563" stroke-width="1" />
 
-              <!-- Head with big ears -->
-              <!-- Ears -->
-              <rect x="14" y="8" width="8" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <rect x="30" y="8" width="8" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <!-- Head -->
-              <rect x="14" y="14" width="24" height="16" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <!-- Face inner -->
-              <rect x="16" y="16" width="20" height="12" fill="#020617" stroke="#1f2937" stroke-width="1" />
+                <!-- Body -->
+                <rect x="22" y="28" width="44" height="18" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <rect x="24" y="30" width="40" height="14" fill="#020617" stroke="#1f2937" stroke-width="1" />
 
-              <!-- Eyes (blink with animation) -->
-              <rect class="pixel-cat-eye" x="19" y="19" width="4" height="4" fill="#a7f3d0" />
-              <rect class="pixel-cat-eye" x="29" y="19" width="4" height="4" fill="#a7f3d0" />
+                <!-- Head + ears -->
+                <rect x="24" y="12" width="8" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <rect x="40" y="12" width="8" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <rect x="24" y="16" width="24" height="16" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <rect x="26" y="18" width="20" height="12" fill="#020617" stroke="#1f2937" stroke-width="1" />
 
-              <!-- Nose -->
-              <rect x="24" y="23" width="3" height="2" fill="#22c55e" />
+                <!-- Eyes -->
+                <rect class="pixel-cat-eye" x="29" y="21" width="4" height="4" fill="#a7f3d0" />
+                <rect class="pixel-cat-eye" x="39" y="21" width="4" height="4" fill="#a7f3d0" />
 
-              <!-- Cheeks -->
-              <rect x="18" y="22" width="3" height="2" fill="#10b981" />
-              <rect x="31" y="22" width="3" height="2" fill="#10b981" />
+                <!-- Nose -->
+                <rect x="34" y="25" width="3" height="2" fill="#22c55e" />
 
-              <!-- Mouth (tiny pixels) -->
-              <rect x="23" y="25" width="1" height="1" fill="#22c55e" />
-              <rect x="26" y="25" width="1" height="1" fill="#22c55e" />
+                <!-- Cheeks -->
+                <rect x="28" y="24" width="3" height="2" fill="#10b981" />
+                <rect x="41" y="24" width="3" height="2" fill="#10b981" />
 
-              <!-- Front paws -->
-              <rect x="26" y="30" width="4" height="4" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <rect x="20" y="30" width="4" height="4" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <!-- Mouth -->
+                <rect x="33" y="27" width="1" height="1" fill="#22c55e" />
+                <rect x="36" y="27" width="1" height="1" fill="#22c55e" />
 
-              <!-- Back paws -->
-              <rect x="60" y="30" width="4" height="4" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <rect x="66" y="30" width="4" height="4" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <!-- Front paws -->
+                <rect x="30" y="36" width="4" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <rect x="38" y="36" width="4" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
 
-              <!-- Under shadow -->
-              <rect x="22" y="38" width="58" height="3" fill="#020617" opacity="0.9" />
-            </svg>
+                <!-- Back paws -->
+                <rect x="52" y="36" width="4" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                <rect x="58" y="36" width="4" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+
+                <!-- Shadow -->
+                <rect x="24" y="48" width="56" height="4" fill="#020617" opacity="0.9" />
+              </svg>
+            </div>
           </div>
           <div class="small">樹洞守護貓在線值班。</div>
         </div>
