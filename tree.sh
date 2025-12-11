@@ -21,7 +21,7 @@
 #
 
 set -Eeuo pipefail
-INSTALLER_VERSION="treehole-install-2025-12-11-v7-anon"
+INSTALLER_VERSION="treehole-install-2025-12-11-v10-cat"
 
 # ==== 可按需修改的變量 ======================================
 
@@ -68,7 +68,7 @@ ensure_ubuntu() {
 }
 
 install_packages() {
-  log "安裝/更新必要套件 (python3-venv, python3-pip, nginx, sqlite3, build-essential, openssl, certbot)..."
+  log "安裝/更新必要套件 (python3-venv, python3-pip, nginx, sqlite3, build-essential, openssl, certbot, ca-certificates)..."
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     "${PYTHON_BIN}" \
@@ -79,6 +79,7 @@ install_packages() {
     sqlite3 \
     build-essential \
     openssl \
+    ca-certificates \
     certbot \
     python3-certbot-nginx
 }
@@ -284,6 +285,8 @@ class PostOut(BaseModel):
 
 class PostsList(BaseModel):
     total: int
+    offset: int
+    limit: int
     posts: List[PostOut]
 
 
@@ -303,7 +306,7 @@ def hash_ip(ip: str) -> str:
 def enforce_rate_limit(db: Session, ip_hash: str) -> None:
     if POSTS_PER_MINUTE <= 0:
         return
-    now = datetime.utcnow()
+    now = datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
     window_start = now - timedelta(seconds=60)
     count = (
         db.query(func.count(Post.id))
@@ -673,6 +676,35 @@ INDEX_HTML = """<!DOCTYPE html>
       font-size: 0.75rem;
       color: var(--text-dim);
     }
+    .footer-note {
+      margin-top: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+    .footer-note-item {
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px dashed rgba(148, 163, 184, 0.35);
+      background: rgba(15, 23, 42, 0.8);
+    }
+  </style>
+  <style>
+    /* animated code cat */
+    .code-cat-container {
+      position: fixed;
+      left: 18px;
+      bottom: 14px;
+      z-index: 9999;
+      pointer-events: none;
+      opacity: 0.82;
+      transition: opacity 0.25s;
+    }
+    .code-cat-container:hover {
+      opacity: 1;
+    }
   </style>
 </head>
 <body>
@@ -710,6 +742,11 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="small" style="margin-top: 4px;">
           系統會做簡單的頻率限制與內容長度限制，避免被機器刷爆。
         </div>
+        <div class="footer-note">
+          <div class="footer-note-item">不記名 · 僅存 IP 雜湊</div>
+          <div class="footer-note-item">純文本 · 不支援圖片 / 附件</div>
+          <div class="footer-note-item">請避免輸入真實姓名、電話等敏感資訊</div>
+        </div>
       </div>
     </section>
 
@@ -736,6 +773,36 @@ INDEX_HTML = """<!DOCTYPE html>
     </section>
   </main>
 
+  <div class="code-cat-container" title="喵~">
+    <svg width="78" height="54" viewBox="0 0 78 54" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <g>
+        <ellipse cx="39" cy="44" rx="24" ry="7" fill="#24292f" opacity="0.18"/>
+        <g id="cat">
+          <ellipse cx="39" cy="28" rx="18" ry="15" fill="#24292f"/>
+          <ellipse cx="39" cy="30" rx="16" ry="12" fill="#fff"/>
+          <!-- ears -->
+          <polygon points="24,18 19,8 29,16" fill="#24292f"/>
+          <polygon points="54,18 59,8 49,16" fill="#24292f"/>
+          <!-- face -->
+          <ellipse cx="32" cy="30" rx="2.6" ry="2.2" fill="#24292f"/>
+          <ellipse cx="46" cy="30" rx="2.6" ry="2.2" fill="#24292f"/>
+          <ellipse id="cat-eye-left" cx="32" cy="30" rx="1.1" ry="0.9" fill="#fff"/>
+          <ellipse id="cat-eye-right" cx="46" cy="30" rx="1.1" ry="0.9" fill="#fff"/>
+          <ellipse cx="39" cy="34" rx="2.2" ry="1.1" fill="#24292f"/>
+          <!-- whiskers -->
+          <rect x="18" y="32" width="7" height="1" rx="0.5" fill="#24292f" transform="rotate(-10 18 32)"/>
+          <rect x="18" y="36" width="7" height="1" rx="0.5" fill="#24292f" transform="rotate(8 18 36)"/>
+          <rect x="53" y="32" width="7" height="1" rx="0.5" fill="#24292f" transform="rotate(10 53 32)"/>
+          <rect x="53" y="36" width="7" height="1" rx="0.5" fill="#24292f" transform="rotate(-8 53 36)"/>
+        </g>
+        <!-- code bubble -->
+        <g>
+          <rect x="53" y="10" rx="5" width="20" height="16" fill="#fff" stroke="#24292f" stroke-width="1.2"/>
+          <text x="63" y="22" font-size="8" font-family="monospace" fill="#24292f">&lt;/&gt;</text>
+        </g>
+      </g>
+    </svg>
+  </div>
   <script>
     const statusEl = document.getElementById("status");
     const postsEl = document.getElementById("posts");
@@ -768,7 +835,11 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
-    function renderPosts(list) {
+    // Pagination support (new)
+    let currentOffset = 0;
+    let currentLimit = 50;
+    let totalPosts = 0;
+    function renderPosts(list, total, offset, limit) {
       postsEl.innerHTML = "";
       if (!Array.isArray(list) || list.length === 0) {
         const div = document.createElement("div");
@@ -815,18 +886,56 @@ INDEX_HTML = """<!DOCTYPE html>
 
         postsEl.appendChild(card);
       }
+      // Pagination controls
+      const controls = document.createElement("div");
+      controls.style.display = "flex";
+      controls.style.justifyContent = "center";
+      controls.style.alignItems = "center";
+      controls.style.marginTop = "10px";
+      controls.style.gap = "10px";
+      controls.className = "small";
+      if (total > limit) {
+        const prevBtn = document.createElement("button");
+        prevBtn.textContent = "上一頁";
+        prevBtn.type = "button";
+        prevBtn.className = "muted-button";
+        prevBtn.disabled = offset <= 0;
+        prevBtn.onclick = async () => {
+          await loadRecent(offset - limit, limit);
+        };
+
+        const nextBtn = document.createElement("button");
+        nextBtn.textContent = "下一頁";
+        nextBtn.type = "button";
+        nextBtn.className = "muted-button";
+        nextBtn.disabled = offset + limit >= total;
+        nextBtn.onclick = async () => {
+          await loadRecent(offset + limit, limit);
+        };
+
+        const pageInfo = document.createElement("span");
+        pageInfo.textContent = `第 ${Math.floor(offset/limit)+1} 頁 / 共 ${Math.ceil(total/limit)} 頁`;
+
+        controls.appendChild(prevBtn);
+        controls.appendChild(pageInfo);
+        controls.appendChild(nextBtn);
+        postsEl.appendChild(controls);
+      }
     }
 
-    async function loadRecent() {
+    async function loadRecent(offset = 0, limit = 50) {
       try {
-        const res = await fetch("/api/posts/recent?limit=50", {
+        const res = await fetch(`/api/posts/recent?limit=${limit}&offset=${offset}`, {
           headers: { "Accept": "application/json" },
         });
         if (!res.ok) {
           throw new Error("載入失敗");
         }
         const data = await res.json();
-        renderPosts(data.posts || []);
+        currentOffset = data.offset || 0;
+        currentLimit = data.limit || 50;
+        totalPosts = data.total || 0;
+        renderPosts(data.posts || [], totalPosts, currentOffset, currentLimit);
       } catch (err) {
         console.error(err);
         setStatus("載入最新樹洞失敗。", "error");
@@ -836,7 +945,8 @@ INDEX_HTML = """<!DOCTYPE html>
     async function loadRandom() {
       try {
         const res = await fetch("/api/posts/random", {
-          headers: { "Accept": "application/json" },
+          headers: { "Accept": "application/json",
+          },
         });
         if (res.status === 404) {
           randomContentEl.textContent = "暫時沒有樹洞。";
@@ -915,13 +1025,28 @@ INDEX_HTML = """<!DOCTYPE html>
     });
 
     refreshBtn.addEventListener("click", async () => {
-      await loadRecent();
+      await loadRecent(currentOffset, currentLimit);
       await loadRandom();
     });
 
     (async function init() {
       await loadRecent();
       await loadRandom();
+      // Animate cat eyes (blink)
+      const leftEye = document.getElementById("cat-eye-left");
+      const rightEye = document.getElementById("cat-eye-right");
+      function blink() {
+        if (leftEye && rightEye) {
+          leftEye.setAttribute("ry", "0.1");
+          rightEye.setAttribute("ry", "0.1");
+          setTimeout(() => {
+            leftEye.setAttribute("ry", "0.9");
+            rightEye.setAttribute("ry", "0.9");
+          }, 160);
+        }
+        setTimeout(blink, 2500 + Math.random()*2000);
+      }
+      setTimeout(blink, 1500);
     })();
   </script>
 </body>
@@ -974,19 +1099,26 @@ def create_post(payload: PostCreate, request: Request, background_tasks: Backgro
 
 
 @app.get("/api/posts/recent", response_model=PostsList)
-def get_recent(limit: int = RECENT_LIMIT_DEFAULT) -> PostsList:
+def get_recent(
+    limit: int = RECENT_LIMIT_DEFAULT,
+    offset: int = 0,
+) -> PostsList:
     db = get_db()
     try:
         safe_limit = max(1, min(limit, 200))
+        safe_offset = max(0, offset)
         q = (
             db.query(Post)
             .order_by(Post.created_at.desc(), Post.id.desc())
+            .offset(safe_offset)
             .limit(safe_limit)
         )
         posts = q.all()
         total = db.query(func.count(Post.id)).scalar() or 0
         return PostsList(
             total=total,
+            offset=safe_offset,
+            limit=safe_limit,
             posts=[PostOut.from_orm(p) for p in posts],
         )
     finally:
@@ -1038,7 +1170,7 @@ Type=simple
 User=${APP_USER}
 Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
-ExecStart=${VENV_DIR}/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --proxy-headers --no-access-log
+ExecStart=${VENV_DIR}/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips='*' --no-access-log
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
@@ -1067,6 +1199,8 @@ server {
     listen [::]:80;
     server_name DOMAIN_PLACEHOLDER;
 
+    server_tokens off;
+
     # 關閉 access_log 以最大化匿名性（即便只是 301）
     access_log off;
     error_log  /var/log/nginx/treehole_error.log;
@@ -1075,17 +1209,25 @@ server {
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
-    return 301 https://$host$request_uri;
+
+    # 其他路徑全部跳轉 HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
 }
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name DOMAIN_PLACEHOLDER;
+
+    server_tokens off;
+
     ssl_certificate /etc/letsencrypt/live/DOMAIN_PLACEHOLDER/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/DOMAIN_PLACEHOLDER/privkey.pem;
     # 關閉 access_log 以最大化匿名性
     access_log off;
     error_log  /var/log/nginx/treehole_error.log;
+
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
@@ -1107,12 +1249,17 @@ server {
     listen 80;
     listen [::]:80;
     server_name DOMAIN_PLACEHOLDER;
+
+    server_tokens off;
+
     access_log off;
     error_log  /var/log/nginx/treehole_error.log;
+
     # 為證書申請預留 webroot
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
+
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
@@ -1128,7 +1275,7 @@ server {
 }
 NGINX
   fi
-  sed -i "s/DOMAIN_PLACEHOLDER/${DOMAIN}/g" "${NGINX_SITE_AVAILABLE}"
+  sed -i "s|DOMAIN_PLACEHOLDER|${DOMAIN}|g" "${NGINX_SITE_AVAILABLE}"
   ln -sf "${NGINX_SITE_AVAILABLE}" "${NGINX_SITE_ENABLED}"
   # 不動其他站點，只刪 default
   if [[ -f /etc/nginx/sites-enabled/default ]]; then
