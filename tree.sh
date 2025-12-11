@@ -694,14 +694,17 @@ INDEX_HTML = """<!DOCTYPE html>
 </style>
   <style>
     .pixel-cat {
-        margin-top: 10px;
-        display: inline-flex;
+        margin-top: 18px;
+        width: 100%;
+        display: flex;
         flex-direction: column;
         align-items: center;
-        gap: 4px;
+        justify-content: center;
+        gap: 6px;
         font-size: 0.75rem;
         color: var(--text-dim);
-        opacity: 0.95;
+        opacity: 0.98;
+        text-align: center;
     }
     .pixel-cat-art {
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
@@ -709,10 +712,10 @@ INDEX_HTML = """<!DOCTYPE html>
         white-space: pre;
     }
     .pixel-cat-art svg {
-        width: 64px;
-        height: 64px;
+        width: 88px;
+        height: 88px;
         image-rendering: pixelated;
-        filter: drop-shadow(0 4px 10px rgba(15, 23, 42, 0.9));
+        filter: drop-shadow(0 6px 16px rgba(15, 23, 42, 0.95));
         animation: catFloat 3.4s ease-in-out infinite;
     }
     .pixel-cat-eye {
@@ -752,7 +755,7 @@ INDEX_HTML = """<!DOCTYPE html>
           <div class="row">
             <div class="tag-col">
               <label for="tag">標籤（可選）</label>
-              <input id="tag" name="tag" type="text" placeholder="心情 / 校園 /工作…" />
+              <input id="tag" name="tag" type="text" placeholder="心情晴輕清青傾…" />
             </div>
             <div style="text-align: right; margin-top: 14px;">
               <button type="submit" id="submitBtn">
@@ -763,32 +766,44 @@ INDEX_HTML = """<!DOCTYPE html>
         </form>
         <div class="pixel-cat" aria-hidden="true">
           <div class="pixel-cat-art">
-            <svg viewBox="0 0 32 32" aria-hidden="true">
+            <svg viewBox="0 0 64 64" aria-hidden="true">
               <!-- Ears -->
-              <rect x="4" y="6" width="6" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-              <rect x="22" y="6" width="6" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <rect x="10" y="8" width="10" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <rect x="44" y="8" width="10" height="10" fill="#020617" stroke="#4b5563" stroke-width="1" />
               <!-- Head -->
-              <rect x="6" y="8" width="20" height="16" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <rect x="12" y="12" width="40" height="28" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <!-- Inner face glow -->
+              <rect x="14" y="14" width="36" height="24" fill="#020617" stroke="#1f2937" stroke-width="1" />
               <!-- Eyes -->
-              <rect class="pixel-cat-eye" x="11" y="15" width="3" height="3" fill="#a7f3d0" />
-              <rect class="pixel-cat-eye" x="18" y="15" width="3" height="3" fill="#a7f3d0" />
-              <!-- Nose / mouth line -->
-              <rect x="15" y="19" width="2" height="1" fill="#22c55e" />
+              <rect class="pixel-cat-eye" x="22" y="22" width="5" height="5" fill="#a7f3d0" />
+              <rect class="pixel-cat-eye" x="37" y="22" width="5" height="5" fill="#a7f3d0" />
+              <!-- Nose -->
+              <rect x="30" y="29" width="4" height="2" fill="#22c55e" />
               <!-- Cheeks -->
-              <rect x="9" y="18" width="2" height="1" fill="#10b981" />
-              <rect x="21" y="18" width="2" height="1" fill="#10b981" />
+              <rect x="20" y="28" width="3" height="2" fill="#10b981" />
+              <rect x="41" y="28" width="3" height="2" fill="#10b981" />
               <!-- Whiskers -->
-              <rect x="7" y="17" width="3" height="1" fill="#1f2937" />
-              <rect x="22" y="17" width="3" height="1" fill="#1f2937" />
+              <rect x="16" y="26" width="4" height="1" fill="#1f2937" />
+              <rect x="44" y="26" width="4" height="1" fill="#1f2937" />
+              <!-- Tiny mouth -->
+              <rect x="30" y="31" width="1" height="1" fill="#22c55e" />
+              <rect x="33" y="31" width="1" height="1" fill="#22c55e" />
+              <!-- Laptop body -->
+              <rect x="16" y="36" width="32" height="10" fill="#020617" stroke="#22c55e" stroke-width="1" />
+              <!-- Laptop screen "code" -->
+              <rect x="18" y="38" width="28" height="6" fill="#020617" />
+              <rect x="19" y="39" width="6" height="1" fill="#22c55e" />
+              <rect x="19" y="41" width="10" height="1" fill="#16a34a" />
+              <rect x="31" y="39" width="8" height="1" fill="#4ade80" />
               <!-- Body shadow -->
-              <rect x="8" y="22" width="16" height="2" fill="#020617" opacity="0.9" />
+              <rect x="18" y="48" width="28" height="3" fill="#020617" opacity="0.95" />
             </svg>
           </div>
           <div class="small">樹洞守護貓在線值班。</div>
         </div>
         <div id="status" class="status"></div>
         <div class="small" style="margin-top: 4px;">
-          系統會做簡單的頻率限制與內容長度限制，避免被機器刷爆。
+          系統會做簡單的頻率限制與內容長度限制。
         </div>
         <div class="footer-note">
           <div class="footer-note-item">不記名 · 僅存 IP 雜湊</div>
@@ -840,9 +855,12 @@ INDEX_HTML = """<!DOCTYPE html>
       try {
         const d = new Date(iso);
         if (Number.isNaN(d.getTime())) return "";
-        // 相對時間
         const now = new Date();
-        const diff = Math.floor((now - d) / 1000);
+        const diff = Math.floor((now.getTime() - d.getTime()) / 1000);
+        // 如果時間在未來（本地時間比伺服器落後或資料異常），直接顯示具體時間
+        if (!Number.isFinite(diff) || diff < 0) {
+          return d.toLocaleString();
+        }
         if (diff < 60) return "剛剛";
         if (diff < 3600) return `${Math.floor(diff / 60)} 分鐘前`;
         if (diff < 86400) return `${Math.floor(diff / 3600)} 小時前`;
