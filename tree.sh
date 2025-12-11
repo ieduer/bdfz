@@ -701,13 +701,32 @@ INDEX_HTML = """<!DOCTYPE html>
         gap: 4px;
         font-size: 0.75rem;
         color: var(--text-dim);
-        opacity: 0.9;
+        opacity: 0.95;
     }
     .pixel-cat-art {
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        font-size: 11px;
         line-height: 1.1;
         white-space: pre;
+    }
+    .pixel-cat-art svg {
+        width: 64px;
+        height: 64px;
+        image-rendering: pixelated;
+        filter: drop-shadow(0 4px 10px rgba(15, 23, 42, 0.9));
+        animation: catFloat 3.4s ease-in-out infinite;
+    }
+    .pixel-cat-eye {
+        transform-origin: center center;
+        animation: catBlink 4s infinite;
+    }
+    @keyframes catFloat {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-2px); }
+    }
+    @keyframes catBlink {
+        0%, 88%, 100% { transform: scaleY(1); }
+        90% { transform: scaleY(0.1); }
+        93% { transform: scaleY(1); }
     }
   </style>
 </head>
@@ -744,9 +763,26 @@ INDEX_HTML = """<!DOCTYPE html>
         </form>
         <div class="pixel-cat" aria-hidden="true">
           <div class="pixel-cat-art">
-/\_/\\
-( o.o )
- > ^ <
+            <svg viewBox="0 0 32 32" aria-hidden="true">
+              <!-- Ears -->
+              <rect x="4" y="6" width="6" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <rect x="22" y="6" width="6" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <!-- Head -->
+              <rect x="6" y="8" width="20" height="16" fill="#020617" stroke="#4b5563" stroke-width="1" />
+              <!-- Eyes -->
+              <rect class="pixel-cat-eye" x="11" y="15" width="3" height="3" fill="#a7f3d0" />
+              <rect class="pixel-cat-eye" x="18" y="15" width="3" height="3" fill="#a7f3d0" />
+              <!-- Nose / mouth line -->
+              <rect x="15" y="19" width="2" height="1" fill="#22c55e" />
+              <!-- Cheeks -->
+              <rect x="9" y="18" width="2" height="1" fill="#10b981" />
+              <rect x="21" y="18" width="2" height="1" fill="#10b981" />
+              <!-- Whiskers -->
+              <rect x="7" y="17" width="3" height="1" fill="#1f2937" />
+              <rect x="22" y="17" width="3" height="1" fill="#1f2937" />
+              <!-- Body shadow -->
+              <rect x="8" y="22" width="16" height="2" fill="#020617" opacity="0.9" />
+            </svg>
           </div>
           <div class="small">樹洞守護貓在線值班。</div>
         </div>
@@ -1014,21 +1050,6 @@ INDEX_HTML = """<!DOCTYPE html>
     (async function init() {
       await loadRecent();
       await loadRandom();
-      // Animate cat eyes (blink)
-      const leftEye = document.getElementById("cat-eye-left");
-      const rightEye = document.getElementById("cat-eye-right");
-      function blink() {
-        if (leftEye && rightEye) {
-          leftEye.setAttribute("ry", "0.1");
-          rightEye.setAttribute("ry", "0.1");
-          setTimeout(() => {
-            leftEye.setAttribute("ry", "0.9");
-            rightEye.setAttribute("ry", "0.9");
-          }, 160);
-        }
-        setTimeout(blink, 2500 + Math.random()*2000);
-      }
-      setTimeout(blink, 1500);
     })();
   </script>
 </body>
