@@ -1,0 +1,1048 @@
+#!/usr/bin/env bash
+#
+# treehole.sh - 一鍵部署「極簡匿名樹洞」(FastAPI + SQLite + Nginx)
+#
+# 功能概覽：
+#   - FastAPI 提供匿名發帖 / 隨機樹洞 / 最新樹洞 API + 簡單前端
+#   - SQLite 單檔資料庫，超輕量
+#   - 每 IP 每分鐘發帖次數限制，避免被灌爆
+#   - 不需要登入、不記名，僅存 IP 雜湊（帶 salt）
+#   - systemd 常駐 + Nginx 反向代理 (HTTP 80)
+#   - 可選 Telegram 通知（新貼文推送到指定 chat）
+#
+# 重新執行腳本：
+#   - 會覆蓋 app.py / systemd / nginx 配置
+#   - 會重啟 treehole.service，重載 Nginx
+#   - 不覆蓋已存在的 .env（配置請自行手動改）
+#
+
+set -Eeuo pipefail
+INSTALLER_VERSION="treehole-install-2025-12-11-v3"
+
+# ==== 可按需修改的變量 ======================================
+
+DOMAIN="tree.bdfz.net"  # TODO: 換成你真的域名，比如 tree.bdfz.net
+APP_USER="treehole"
+APP_DIR="/opt/treehole-app"
+DATA_DIR="/srv/treehole"
+SERVICE_NAME="treehole"
+PYTHON_BIN="python3"
+
+# ==== 基本設定 =============================================
+
+VENV_DIR="${APP_DIR}/venv"
+NGINX_SITE_AVAILABLE="/etc/nginx/sites-available/${SERVICE_NAME}.conf"
+NGINX_SITE_ENABLED="/etc/nginx/sites-enabled/${SERVICE_NAME}.conf"
+
+log() {
+  echo "[treehole] $*"
+}
+
+ensure_root() {
+  if [[ "${EUID:-0}" -ne 0 ]]; then
+    echo "請用 root 執行此腳本" >&2
+    exit 1
+  fi
+}
+
+print_version() {
+  log "installer version: ${INSTALLER_VERSION}"
+}
+
+ensure_ubuntu() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    if [[ "${ID:-}" != "ubuntu" ]]; then
+      log "警告：檢測到的系統不是 Ubuntu (${ID:-unknown})，腳本未必完全適配。"
+      log "繼續執行，如出現問題請自行調整。"
+    fi
+  else
+    log "警告：無法檢測系統版本 (/etc/os-release 不存在)，將繼續執行。"
+  fi
+}
+
+install_packages() {
+  log "安裝/更新必要套件 (python3-venv, python3-pip, nginx, sqlite3, build-essential, openssl)..."
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    "${PYTHON_BIN}" \
+    python3-venv \
+    python3-pip \
+    python3-dev \
+    nginx \
+    sqlite3 \
+    build-essential \
+    openssl
+}
+
+create_app_user() {
+  if id "${APP_USER}" >/dev/null 2>&1; then
+    log "系統用戶 ${APP_USER} 已存在，略過建立。"
+  else
+    log "建立系統用戶 ${APP_USER}（無登入 shell）..."
+    useradd --system --create-home --home-dir "/home/${APP_USER}" --shell /usr/sbin/nologin "${APP_USER}"
+  fi
+}
+
+create_dirs() {
+  log "建立應用與資料目錄..."
+  mkdir -p "${APP_DIR}"
+  mkdir -p "${DATA_DIR}"
+  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}" "${DATA_DIR}"
+}
+
+write_env_if_missing() {
+  local env_file="${APP_DIR}/.env"
+  if [[ -f "${env_file}" ]]; then
+    log ".env 已存在，保持不變（如需修改請手動編輯 ${env_file}）。"
+    return
+  fi
+
+  log "首次部署，將寫入預設 .env 並詢問 Telegram 配置（可留空）..."
+
+  # 生成默認 salt
+  local default_salt
+  default_salt="$(openssl rand -hex 16 2>/dev/null || echo 'change-me-salt')"
+
+  # 交互收集 Telegram 配置（可選）
+  local tg_token tg_chat
+  read -r -p "Telegram bot token (可選，留空則不啟用通知): " tg_token || true
+  read -r -p "Telegram chat ID (可選，留空則不啟用通知): " tg_chat || true
+
+  cat >"${env_file}" <<ENV
+# ===== treehole 環境配置 =====
+# 資料庫位置
+TREEHOLE_DB_PATH="${DATA_DIR}/treehole.db"
+
+# IP 雜湊用的 salt（建議改成更長更隨機的字符串）
+TREEHOLE_SECRET_SALT="${default_salt}"
+
+# 發帖字數限制
+TREEHOLE_MIN_POST_LENGTH=5
+TREEHOLE_MAX_POST_LENGTH=1000
+
+# 頻率限制：每 IP 每分鐘最多幾則貼文
+TREEHOLE_POSTS_PER_MINUTE=5
+
+# 最新列表默認顯示多少條
+TREEHOLE_RECENT_LIMIT=50
+
+# (可選) 你的域名（僅作記錄）
+TREEHOLE_DOMAIN="${DOMAIN}"
+
+# (可選) Telegram 通知配置：
+#  - 如果兩個都非空，則每條新樹洞會推送到該 chat
+TREEHOLE_TELEGRAM_BOT_TOKEN="${tg_token}"
+TREEHOLE_TELEGRAM_CHAT_ID="${tg_chat}"
+ENV
+
+  chown "${APP_USER}:${APP_USER}" "${env_file}"
+  chmod 600 "${env_file}"
+}
+
+write_app_code() {
+  log "寫入 FastAPI 應用程式碼到 ${APP_DIR}/app.py ..."
+  cat >"${APP_DIR}/app.py" <<'PYCODE'
+import os
+import hashlib
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Integer,
+    String,
+    create_engine,
+    func,
+    text,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    # 允許沒有 python-dotenv（但安裝腳本會裝）
+    def load_dotenv(path: str) -> None:
+        return
+
+import httpx
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(str(BASE_DIR / ".env"))
+
+DB_PATH = os.getenv("TREEHOLE_DB_PATH", str(BASE_DIR / "treehole.db"))
+SECRET_SALT = os.getenv("TREEHOLE_SECRET_SALT", "change-me-salt")
+MIN_POST_LENGTH = int(os.getenv("TREEHOLE_MIN_POST_LENGTH", "5"))
+MAX_POST_LENGTH = int(os.getenv("TREEHOLE_MAX_POST_LENGTH", "1000"))
+POSTS_PER_MINUTE = int(os.getenv("TREEHOLE_POSTS_PER_MINUTE", "5"))
+RECENT_LIMIT_DEFAULT = int(os.getenv("TREEHOLE_RECENT_LIMIT", "50"))
+
+TELEGRAM_BOT_TOKEN = os.getenv("TREEHOLE_TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TREEHOLE_TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False},
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(String(2000), nullable=False)
+    tag = Column(String(64), nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    ip_hash = Column(String(64), nullable=False, index=True)
+
+
+def init_db() -> None:
+    DB_PATH_DIR = Path(DB_PATH).parent
+    DB_PATH_DIR.mkdir(parents=True, exist_ok=True)
+    # 開啟 WAL 模式，提高併發寫入能力
+    with engine.connect() as connection:
+        try:
+            connection.execute(text("PRAGMA journal_mode=WAL;"))
+        except Exception:
+            # 如果失敗就默默忽略，退回默認模式
+            pass
+    Base.metadata.create_all(bind=engine)
+
+
+def get_db() -> Session:
+    return SessionLocal()
+
+
+class PostCreate(BaseModel):
+    content: str
+    tag: Optional[str] = None
+
+
+class PostOut(BaseModel):
+    id: int
+    content: str
+    tag: Optional[str]
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class PostsList(BaseModel):
+    total: int
+    posts: List[PostOut]
+
+
+app = FastAPI(title="Treehole", version="0.1.0")
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    init_db()
+
+
+def hash_ip(ip: str) -> str:
+    data = f"{ip}|{SECRET_SALT}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(data).hexdigest()[:32]
+
+
+def enforce_rate_limit(db: Session, ip_hash: str) -> None:
+    if POSTS_PER_MINUTE <= 0:
+        return
+    now = datetime.utcnow()
+    window_start = now - timedelta(seconds=60)
+    count = (
+        db.query(func.count(Post.id))
+        .filter(Post.ip_hash == ip_hash, Post.created_at >= window_start)
+        .scalar()
+    )
+    if count >= POSTS_PER_MINUTE:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many posts from this IP. Please slow down.",
+        )
+
+
+def validate_content(content: str) -> str:
+    stripped = content.strip()
+    if len(stripped) < MIN_POST_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content is too short (min {MIN_POST_LENGTH} characters).",
+        )
+    if len(stripped) > MAX_POST_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content is too long (max {MAX_POST_LENGTH} characters).",
+        )
+    # 可以在這裡加簡單敏感詞過濾（當前不做，保留鉤子）
+    return stripped
+
+
+# 修改點 1：Telegram 通知接收 Pydantic 模型 PostOut，而不是 ORM 物件
+def send_telegram_notification(post: PostOut) -> None:
+    if not TELEGRAM_ENABLED:
+        return
+    try:
+        created_str = (
+            post.created_at.isoformat(sep=" ", timespec="seconds")
+            if post.created_at
+            else ""
+        )
+        tag = post.tag or "無標籤"
+        content = post.content
+        if len(content) > 500:
+            content = content[:480] + "…"
+
+        lines = [
+            "🌲 新匿名樹洞",
+            f"[{tag}]",
+            "",
+            content,
+            "",
+            f"於 {created_str}",
+        ]
+        text_msg = "\n".join(lines)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text_msg,
+            "disable_web_page_preview": True,
+        }
+        # 簡單同步請求，放在 BackgroundTasks 中，不阻塞主流程
+        httpx.post(url, json=payload, timeout=5.0)
+    except Exception:
+        # 不讓 Telegram 失敗影響主流程
+        pass
+
+
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="UTF-8" />
+  <title>匿名樹洞 · Treehole</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #050608;
+      --bg-panel: #111827;
+      --bg-panel-light: #161e2e;
+      --border: #1f2937;
+      --text: #e5e7eb;
+      --text-dim: #9ca3af;
+      --accent: #22c55e;
+      --accent-soft: rgba(34, 197, 94, 0.12);
+      --danger: #f97373;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                   "Helvetica Neue", sans-serif;
+      background: radial-gradient(circle at top, #0f172a 0, #020617 55%, #000 100%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+    }
+    .page {
+      width: 100%;
+      max-width: 1120px;
+      margin: 24px auto;
+      padding: 0 16px;
+      display: grid;
+      grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+      gap: 16px;
+    }
+    @media (max-width: 800px) {
+      .page {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+    .panel {
+      background: linear-gradient(135deg, var(--bg-panel), #020617);
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      padding: 16px 18px 18px;
+      box-shadow:
+        0 24px 60px rgba(15, 23, 42, 0.75),
+        0 0 0 1px rgba(15, 23, 42, 0.8);
+      position: relative;
+      overflow: hidden;
+    }
+    .panel::before {
+      content: "";
+      position: absolute;
+      inset: -120px;
+      background:
+        radial-gradient(circle at 0 0, rgba(45, 212, 191, 0.08), transparent 55%),
+        radial-gradient(circle at 100% 100%, rgba(56, 189, 248, 0.12), transparent 60%);
+      opacity: 0.7;
+      pointer-events: none;
+    }
+    .panel-inner {
+      position: relative;
+      z-index: 1;
+    }
+    h1, h2 {
+      margin: 0 0 10px;
+      letter-spacing: 0.03em;
+    }
+    h1 {
+      font-size: 1.1rem;
+      font-weight: 650;
+      text-transform: uppercase;
+    }
+    h2 {
+      font-size: 0.9rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+    .subtitle {
+      font-size: 0.85rem;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+    label {
+      display: block;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+    }
+    textarea {
+      width: 100%;
+      min-height: 140px;
+      resize: vertical;
+      padding: 10px 11px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: linear-gradient(135deg, #020617, #020617);
+      color: var(--text);
+      font-size: 0.9rem;
+      line-height: 1.5;
+      outline: none;
+    }
+    textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.7);
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 7px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #020617;
+      color: var(--text);
+      font-size: 0.85rem;
+      outline: none;
+    }
+    input[type="text"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.7);
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 8px;
+    }
+    .row > * {
+      flex: 1;
+    }
+    .row > .tag-col {
+      max-width: 150px;
+      flex: 0 0 150px;
+    }
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 8px 16px;
+      font-size: 0.85rem;
+      font-weight: 550;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      cursor: pointer;
+      background: radial-gradient(circle at 0 0, #4ade80 0, #16a34a 50%, #22c55e 100%);
+      color: #022c22;
+      box-shadow: 0 10px 30px rgba(34, 197, 94, 0.4);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button:disabled {
+      opacity: 0.65;
+      cursor: default;
+      box-shadow: none;
+    }
+    .muted-button {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      box-shadow: none;
+    }
+    .status {
+      margin-top: 8px;
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      min-height: 1.2em;
+      white-space: pre-wrap;
+    }
+    .status-error {
+      color: var(--danger);
+    }
+    .status-ok {
+      color: var(--accent);
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.78rem;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      background: rgba(15, 23, 42, 0.85);
+      color: var(--text-dim);
+    }
+    .pill-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 10px rgba(34, 197, 94, 0.9);
+    }
+    .layout-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .posts-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .posts-header small {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+    .posts-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 420px;
+      overflow-y: auto;
+      padding-right: 4px;
+      margin-right: -4px;
+      margin-top: 2px;
+    }
+    .post-card {
+      border-radius: 10px;
+      padding: 9px 10px;
+      background: linear-gradient(135deg, var(--bg-panel-light), #020617);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      position: relative;
+    }
+    .post-card-tag {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+    }
+    .post-card-content {
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+    }
+    .post-card-meta {
+      margin-top: 4px;
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid rgba(34, 197, 94, 0.35);
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+    .chip-dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 999px;
+      background: var(--accent);
+    }
+    .random-box {
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px dashed rgba(148, 163, 184, 0.5);
+      background: radial-gradient(circle at 0 0, rgba(34, 197, 94, 0.1), transparent 55%);
+      font-size: 0.85rem;
+    }
+    .random-box-title {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+    }
+    .random-box-content {
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+    }
+    .random-box-empty {
+      color: var(--text-dim);
+    }
+    .small {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="panel">
+      <div class="panel-inner">
+        <div class="layout-title">
+          <div>
+            <h1>匿名樹洞</h1>
+            <div class="subtitle">說給樹聽就好，這裡不需要暱稱。</div>
+          </div>
+          <div class="pill">
+            <span class="pill-dot"></span>
+            <span>LIVE · 即時寫、即時看</span>
+          </div>
+        </div>
+        <form id="postForm">
+          <label for="content">對樹說點什麼</label>
+          <textarea id="content" name="content" maxlength="4000"
+            placeholder="這裡不記名、不追問，只代你保管片刻的情緒。"></textarea>
+
+          <div class="row">
+            <div class="tag-col">
+              <label for="tag">標籤（可選）</label>
+              <input id="tag" name="tag" type="text" placeholder="心情 / 校園 /工作…" />
+            </div>
+            <div style="text-align: right; margin-top: 14px;">
+              <button type="submit" id="submitBtn">
+                <span>投進樹洞</span>
+              </button>
+            </div>
+          </div>
+        </form>
+        <div id="status" class="status"></div>
+        <div class="small" style="margin-top: 4px;">
+          系統會做簡單的頻率限制與內容長度限制，避免被機器刷爆。
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-inner">
+        <div class="posts-header">
+          <div>
+            <h2>最新樹洞</h2>
+            <small>按時間倒序顯示最近的樹洞。</small>
+          </div>
+          <div>
+            <button type="button" class="muted-button" id="refreshBtn">刷新</button>
+          </div>
+        </div>
+        <div id="posts" class="posts-list"></div>
+
+        <div class="random-box" id="randomBox">
+          <div class="random-box-title">隨機一則樹洞</div>
+          <div id="randomContent" class="random-box-content random-box-empty">
+            暫無內容，等你先說一句。
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const statusEl = document.getElementById("status");
+    const postsEl = document.getElementById("posts");
+    const randomContentEl = document.getElementById("randomContent");
+    const formEl = document.getElementById("postForm");
+    const submitBtn = document.getElementById("submitBtn");
+    const refreshBtn = document.getElementById("refreshBtn");
+
+    function setStatus(msg, type) {
+      statusEl.textContent = msg || "";
+      statusEl.classList.remove("status-error", "status-ok");
+      if (type === "error") statusEl.classList.add("status-error");
+      if (type === "ok") statusEl.classList.add("status-ok");
+    }
+
+    function formatTime(iso) {
+      try {
+        const d = new Date(iso);
+        if (Number.isNaN(d.getTime())) return "";
+        return d.toLocaleString();
+      } catch (_) {
+        return "";
+      }
+    }
+
+    function renderPosts(list) {
+      postsEl.innerHTML = "";
+      if (!Array.isArray(list) || list.length === 0) {
+        const div = document.createElement("div");
+        div.className = "small";
+        div.textContent = "暫無內容。可以試著先對樹說一句。";
+        postsEl.appendChild(div);
+        return;
+      }
+      for (const p of list) {
+        const card = document.createElement("article");
+        card.className = "post-card";
+
+        if (p.tag) {
+          const tag = document.createElement("div");
+          tag.className = "post-card-tag";
+          tag.textContent = p.tag;
+          card.appendChild(tag);
+        }
+
+        const content = document.createElement("div");
+        content.className = "post-card-content";
+        content.textContent = p.content || "";
+        card.appendChild(content);
+
+        const meta = document.createElement("div");
+        meta.className = "post-card-meta";
+
+        const left = document.createElement("span");
+        left.className = "small";
+        left.textContent = formatTime(p.created_at);
+
+        const right = document.createElement("span");
+        right.className = "chip";
+        const dot = document.createElement("span");
+        dot.className = "chip-dot";
+        const label = document.createElement("span");
+        label.textContent = "ANON";
+        right.appendChild(dot);
+        right.appendChild(label);
+
+        meta.appendChild(left);
+        meta.appendChild(right);
+        card.appendChild(meta);
+
+        postsEl.appendChild(card);
+      }
+    }
+
+    async function loadRecent() {
+      try {
+        const res = await fetch("/api/posts/recent?limit=50", {
+          headers: { "Accept": "application/json" },
+        });
+        if (!res.ok) {
+          throw new Error("載入失敗");
+        }
+        const data = await res.json();
+        renderPosts(data.posts || []);
+      } catch (err) {
+        console.error(err);
+        setStatus("載入最新樹洞失敗。", "error");
+      }
+    }
+
+    async function loadRandom() {
+      try {
+        const res = await fetch("/api/posts/random", {
+          headers: { "Accept": "application/json" },
+        });
+        if (res.status === 404) {
+          randomContentEl.textContent = "暫時沒有樹洞。";
+          randomContentEl.classList.add("random-box-empty");
+          return;
+        }
+        if (!res.ok) {
+          throw new Error("載入失敗");
+        }
+        const data = await res.json();
+        randomContentEl.textContent = data.content || "";
+        randomContentEl.classList.remove("random-box-empty");
+      } catch (err) {
+        console.error(err);
+        randomContentEl.textContent = "載入隨機樹洞失敗。";
+        randomContentEl.classList.add("random-box-empty");
+      }
+    }
+
+    formEl.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const content = document.getElementById("content").value;
+      const tag = document.getElementById("tag").value;
+      const payload = { content, tag: tag || null };
+      submitBtn.disabled = true;
+      setStatus("正在投遞樹洞…", "");
+      try {
+        const res = await fetch("/api/posts", {
+          method: "POST",
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const msg = (data && data.detail) || "提交失敗。";
+          throw new Error(msg);
+        }
+        document.getElementById("content").value = "";
+        document.getElementById("tag").value = "";
+        setStatus("已投進樹洞。", "ok");
+        await loadRecent();
+        await loadRandom();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || "提交失敗。", "error");
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+
+    refreshBtn.addEventListener("click", async () => {
+      await loadRecent();
+      await loadRandom();
+    });
+
+    (async function init() {
+      await loadRecent();
+      await loadRandom();
+    })();
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    return HTMLResponse(INDEX_HTML)
+
+
+@app.get("/api/health")
+def health() -> dict:
+    return {"status": "ok", "version": "0.1.0"}
+
+
+# 修改點 2：create_post 先構造 PostOut，再傳給背景任務，避免 DetachedInstanceError
+@app.post("/api/posts", response_model=PostOut)
+def create_post(payload: PostCreate, request: Request, background_tasks: BackgroundTasks) -> PostOut:
+    db = get_db()
+    try:
+        client_ip = request.client.host or "0.0.0.0"
+        ip_hash = hash_ip(client_ip)
+        content = validate_content(payload.content)
+        tag = (payload.tag or "").strip() or None
+
+        enforce_rate_limit(db, ip_hash)
+
+        now = datetime.utcnow()
+        post = Post(
+            content=content,
+            tag=tag,
+            created_at=now,
+            ip_hash=ip_hash,
+        )
+        db.add(post)
+        db.commit()
+        db.refresh(post)
+
+        # 將 ORM 物件轉成 Pydantic 模型，與 DB Session 解耦
+        post_out = PostOut.from_orm(post)
+
+        # Telegram 通知：傳 Pydantic 模型，避免 DetachedInstanceError
+        if TELEGRAM_ENABLED:
+            background_tasks.add_task(send_telegram_notification, post_out)
+
+        return post_out
+    finally:
+        db.close()
+
+
+@app.get("/api/posts/recent", response_model=PostsList)
+def get_recent(limit: int = RECENT_LIMIT_DEFAULT) -> PostsList:
+    db = get_db()
+    try:
+        safe_limit = max(1, min(limit, 200))
+        q = (
+            db.query(Post)
+            .order_by(Post.created_at.desc(), Post.id.desc())
+            .limit(safe_limit)
+        )
+        posts = q.all()
+        total = db.query(func.count(Post.id)).scalar() or 0
+        return PostsList(
+            total=total,
+            posts=[PostOut.from_orm(p) for p in posts],
+        )
+    finally:
+        db.close()
+
+
+@app.get("/api/posts/random", response_model=PostOut)
+def get_random() -> PostOut:
+    db = get_db()
+    try:
+        # SQLite 支援 RANDOM()
+        p = db.query(Post).order_by(func.random()).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="No posts yet.")
+        return PostOut.from_orm(p)
+    finally:
+        db.close()
+PYCODE
+
+  chown "${APP_USER}:${APP_USER}" "${APP_DIR}/app.py"
+}
+
+setup_venv_and_deps() {
+  log "建立 Python 虛擬環境並安裝依賴..."
+  if [[ ! -d "${VENV_DIR}" ]]; then
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+  fi
+  "${VENV_DIR}/bin/pip" install --upgrade pip
+  "${VENV_DIR}/bin/pip" install \
+    fastapi \
+    "pydantic<2.0" \
+    "uvicorn[standard]" \
+    SQLAlchemy \
+    python-dotenv \
+    httpx
+  chown -R "${APP_USER}:${APP_USER}" "${VENV_DIR}"
+}
+
+write_systemd_unit() {
+  log "寫入 systemd 服務單元到 /etc/systemd/system/${SERVICE_NAME}.service ..."
+  cat >/etc/systemd/system/"${SERVICE_NAME}.service" <<UNIT
+[Unit]
+Description=Treehole Anonymous Service (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=${APP_USER}
+Group=${APP_USER}
+WorkingDirectory=${APP_DIR}
+ExecStart=${VENV_DIR}/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --proxy-headers
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+write_nginx_conf() {
+  log "寫入 Nginx 站點配置 (${NGINX_SITE_AVAILABLE}) ..."
+  cat >"${NGINX_SITE_AVAILABLE}" <<'NGINX'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name DOMAIN_PLACEHOLDER;
+
+    access_log /var/log/nginx/treehole_access.log;
+    error_log  /var/log/nginx/treehole_error.log;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 120s;
+        proxy_read_timeout 120s;
+
+        proxy_request_buffering off;
+    }
+}
+NGINX
+
+  sed -i "s/DOMAIN_PLACEHOLDER/${DOMAIN}/g" "${NGINX_SITE_AVAILABLE}"
+
+  ln -sf "${NGINX_SITE_AVAILABLE}" "${NGINX_SITE_ENABLED}"
+
+  if [[ -f /etc/nginx/sites-enabled/default ]]; then
+    rm -f /etc/nginx/sites-enabled/default
+  fi
+}
+
+reload_services() {
+  log "重新載入 systemd 並啟動服務..."
+  systemctl daemon-reload
+  systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+  systemctl restart "${SERVICE_NAME}.service"
+
+  log "測試 Nginx 配置..."
+  nginx -t
+  log "重載 Nginx..."
+  systemctl reload nginx
+}
+
+main() {
+  print_version
+  ensure_root
+  ensure_ubuntu
+  install_packages
+  create_app_user
+  create_dirs
+  write_env_if_missing
+  write_app_code
+  setup_venv_and_deps
+  write_systemd_unit
+  write_nginx_conf
+  reload_services
+
+  log "部署完成。請在 DNS 中將 ${DOMAIN} 指向本機 IP，"
+  log "然後在瀏覽器訪問 http://${DOMAIN}/ 即可使用匿名樹洞。"
+  log "如果需要調整 Telegram 通知，請編輯 ${APP_DIR}/.env 然後：systemctl restart ${SERVICE_NAME}"
+}
+
+main "$@"
