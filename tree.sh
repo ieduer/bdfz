@@ -10,6 +10,9 @@
 #   - systemd 常駐 + Nginx 反向代理 (HTTP 80 / 可升級到 HTTPS 443)
 #   - 內建 certbot + webroot 簽發 / 續期（若已有證書則不重複申請）
 #   - 可選 Telegram 通知（新貼文推送到指定 chat）
+#   - 最大限度匿名：
+#       * Nginx 對該站點關閉 access_log（不在 Nginx 日誌中記錄 IP）
+#       * Uvicorn 關閉 access log（不在 systemd/journal 中輸出客戶端 IP）
 #
 # 重新執行腳本：
 #   - 會覆蓋 app.py / systemd / nginx 配置
@@ -18,7 +21,7 @@
 #
 
 set -Eeuo pipefail
-INSTALLER_VERSION="treehole-install-2025-12-11-v5-https-certbot"
+INSTALLER_VERSION="treehole-install-2025-12-11-v7-anon"
 
 # ==== 可按需修改的變量 ======================================
 
@@ -65,7 +68,7 @@ ensure_ubuntu() {
 }
 
 install_packages() {
-  log "安裝/更新必要套件 (python3-venv, python3-pip, nginx, sqlite3, build-essential, openssl)..."
+  log "安裝/更新必要套件 (python3-venv, python3-pip, nginx, sqlite3, build-essential, openssl, certbot)..."
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     "${PYTHON_BIN}" \
@@ -79,14 +82,13 @@ install_packages() {
     certbot \
     python3-certbot-nginx
 }
+
 stop_previous() {
   log "停止舊的 ${SERVICE_NAME} 服務與殘留 uvicorn 進程（如有）..."
-  # 停掉 systemd 服務（若已存在）
   systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
-  # 停掉手工啟動的 uvicorn app:app 進程（避免佔用 8000 端口）
-  pkill -f "uvicorn app:app" 2>/dev/null || true
+  # 僅殺死指定用戶的 uvicorn app:app，避免誤殺其它服務
+  pkill -u "${APP_USER}" -f "uvicorn app:app" 2>/dev/null || true
 }
-
 
 create_app_user() {
   if id "${APP_USER}" >/dev/null 2>&1; then
@@ -99,30 +101,28 @@ create_app_user() {
 
 obtain_certificate_if_needed() {
   local cert_dir="/etc/letsencrypt/live/${DOMAIN}"
-
   if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]]; then
     log "已檢測到 ${DOMAIN} 的現有 Let's Encrypt 證書，略過重新申請。"
     return
   fi
-
   log "尚未檢測到 /etc/letsencrypt/live/${DOMAIN}/fullchain.pem。"
   log "如需啟用 HTTPS，可透過 certbot 使用 webroot 模式申請證書。"
   read -r -p "是否現在使用 certbot 為 ${DOMAIN} 申請證書？ [y/N]: " answer || true
   case "${answer}" in
     y|Y)
-      local email
+      local email=""
       read -r -p "請輸入用於 Let's Encrypt 的管理員郵箱（必填）： " email || true
       if [[ -z "${email}" ]]; then
         log "未提供郵箱，無法自動申請證書，略過。"
         return
       fi
       log "使用 webroot 模式申請證書（certbot certonly --webroot）..."
-      # 使用事先在 write_nginx_conf 中配置好的 ACME webroot
       if certbot certonly --webroot -w "${CERTBOT_WEBROOT}" \
         -d "${DOMAIN}" \
         --email "${email}" \
-        --agree-tos --non-interactive --expand; then
-        log "certbot 申請證書成功。"
+        --agree-tos --non-interactive --expand \
+        --deploy-hook "systemctl reload nginx"; then
+        log "certbot 申請證書成功，已配置 deploy-hook 自動 reload nginx。"
       else
         log "certbot 申請證書失敗，請稍後手動檢查原因。"
       fi
@@ -147,18 +147,12 @@ write_env_if_missing() {
     log ".env 已存在，保持不變（如需修改請手動編輯 ${env_file}）。"
     return
   fi
-
   log "首次部署，將寫入預設 .env 並詢問 Telegram 配置（可留空）..."
-
-  # 生成默認 salt
   local default_salt
   default_salt="$(openssl rand -hex 16 2>/dev/null || echo 'change-me-salt')"
-
-  # 交互收集 Telegram 配置（可選）
-  local tg_token tg_chat
+  local tg_token="" tg_chat=""
   read -r -p "Telegram bot token (可選，留空則不啟用通知): " tg_token || true
   read -r -p "Telegram chat ID (可選，留空則不啟用通知): " tg_chat || true
-
   cat >"${env_file}" <<ENV
 # ===== treehole 環境配置 =====
 # 資料庫位置
@@ -185,7 +179,6 @@ TREEHOLE_DOMAIN="${DOMAIN}"
 TREEHOLE_TELEGRAM_BOT_TOKEN="${tg_token}"
 TREEHOLE_TELEGRAM_CHAT_ID="${tg_chat}"
 ENV
-
   chown "${APP_USER}:${APP_USER}" "${env_file}"
   chmod 600 "${env_file}"
 }
@@ -342,38 +335,38 @@ def validate_content(content: str) -> str:
 
 # Telegram 通知接收 Pydantic 模型 PostOut，而不是 ORM 物件，避免 DetachedInstanceError
 def send_telegram_notification(post: PostOut) -> None:
-  if not TELEGRAM_ENABLED:
-      return
-  try:
-      created_str = (
-          post.created_at.isoformat(sep=" ", timespec="seconds")
-          if post.created_at
-          else ""
-      )
-      tag = post.tag or "無標籤"
-      content = post.content
-      if len(content) > 500:
-          content = content[:480] + "…"
+    if not TELEGRAM_ENABLED:
+        return
+    try:
+        created_str = (
+            post.created_at.isoformat(sep=" ", timespec="seconds")
+            if post.created_at
+            else ""
+        )
+        tag = post.tag or "無標籤"
+        content = post.content
+        if len(content) > 500:
+            content = content[:480] + "…"
 
-      lines = [
-          "🌲 新匿名樹洞",
-          f"[{tag}]",
-          "",
-          content,
-          "",
-          f"於 {created_str}",
-      ]
-      text_msg = "\n".join(lines)
-      url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-      payload = {
-          "chat_id": TELEGRAM_CHAT_ID,
-          "text": text_msg,
-          "disable_web_page_preview": True,
-      }
-      httpx.post(url, json=payload, timeout=5.0)
-  except Exception:
-      # 不讓 Telegram 失敗影響主流程
-      pass
+        lines = [
+            "🌲 新匿名樹洞",
+            f"[{tag}]",
+            "",
+            content,
+            "",
+            f"於 {created_str}",
+        ]
+        text_msg = "\n".join(lines)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text_msg,
+            "disable_web_page_preview": True,
+        }
+        httpx.post(url, json=payload, timeout=5.0)
+    except Exception:
+        # 不讓 Telegram 失敗影響主流程
+        pass
 
 
 INDEX_HTML = """<!DOCTYPE html>
@@ -762,6 +755,13 @@ INDEX_HTML = """<!DOCTYPE html>
       try {
         const d = new Date(iso);
         if (Number.isNaN(d.getTime())) return "";
+        // 相對時間
+        const now = new Date();
+        const diff = Math.floor((now - d) / 1000);
+        if (diff < 60) return "剛剛";
+        if (diff < 3600) return `${Math.floor(diff / 60)} 分鐘前`;
+        if (diff < 86400) return `${Math.floor(diff / 3600)} 小時前`;
+        if (diff < 2592000) return `${Math.floor(diff / 86400)} 天前`;
         return d.toLocaleString();
       } catch (_) {
         return "";
@@ -856,6 +856,29 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
+    // 字數統計
+    const contentInput = document.getElementById("content");
+    let counterEl;
+    function updateCounter() {
+      if (!counterEl) return;
+      const val = contentInput.value || "";
+      counterEl.textContent = `${val.length}/1000`;
+      if (val.length > 1000) counterEl.style.color = "var(--danger)";
+      else counterEl.style.color = "var(--text-dim)";
+    }
+    function setupCounter() {
+      counterEl = document.createElement("span");
+      counterEl.style.float = "right";
+      counterEl.style.fontSize = "0.78rem";
+      counterEl.style.marginTop = "-22px";
+      counterEl.style.marginBottom = "2px";
+      counterEl.style.color = "var(--text-dim)";
+      contentInput.parentNode.insertBefore(counterEl, contentInput.nextSibling);
+      contentInput.addEventListener("input", updateCounter);
+      updateCounter();
+    }
+    setupCounter();
+
     formEl.addEventListener("submit", async (e) => {
       e.preventDefault();
       const content = document.getElementById("content").value;
@@ -880,6 +903,7 @@ INDEX_HTML = """<!DOCTYPE html>
         document.getElementById("content").value = "";
         document.getElementById("tag").value = "";
         setStatus("已投進樹洞。", "ok");
+        updateCounter();
         await loadRecent();
         await loadRandom();
       } catch (err) {
@@ -991,8 +1015,9 @@ setup_venv_and_deps() {
     "${PYTHON_BIN}" -m venv "${VENV_DIR}"
   fi
   "${VENV_DIR}/bin/pip" install --upgrade pip
+  # 鎖 fastapi<0.100.0 與 pydantic<2.0，對齊目前 v1 風格代碼，避免依賴衝突
   "${VENV_DIR}/bin/pip" install \
-    fastapi \
+    "fastapi<0.100.0" \
     "pydantic<2.0" \
     "uvicorn[standard]" \
     SQLAlchemy \
@@ -1013,7 +1038,7 @@ Type=simple
 User=${APP_USER}
 Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
-ExecStart=${VENV_DIR}/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --proxy-headers
+ExecStart=${VENV_DIR}/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --proxy-headers --no-access-log
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
@@ -1025,7 +1050,6 @@ UNIT
 
 write_nginx_conf() {
   log "寫入 Nginx 站點配置 (${NGINX_SITE_AVAILABLE}) ..."
-
   local has_le_cert="no"
   if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" && -f "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" ]]; then
     has_le_cert="yes"
@@ -1034,9 +1058,7 @@ write_nginx_conf() {
     log "尚未檢測到 /etc/letsencrypt/live/${DOMAIN}/fullchain.pem，暫時僅配置 HTTP。"
     log "之後可用 certbot 簽發證書後重新執行本腳本切換為 HTTPS。"
   fi
-
   mkdir -p "${CERTBOT_WEBROOT}"
-
   if [[ "${has_le_cert}" == "yes" ]]; then
     # HTTP -> HTTPS 轉向 + HTTPS 反代
     cat >"${NGINX_SITE_AVAILABLE}" <<'NGINX'
@@ -1045,38 +1067,36 @@ server {
     listen [::]:80;
     server_name DOMAIN_PLACEHOLDER;
 
+    # 關閉 access_log 以最大化匿名性（即便只是 301）
+    access_log off;
+    error_log  /var/log/nginx/treehole_error.log;
+
     # ACME 挑戰路徑，方便日後續期
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
-
     return 301 https://$host$request_uri;
 }
-
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
     server_name DOMAIN_PLACEHOLDER;
-
     ssl_certificate /etc/letsencrypt/live/DOMAIN_PLACEHOLDER/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/DOMAIN_PLACEHOLDER/privkey.pem;
-
-    access_log /var/log/nginx/treehole_access.log;
+    # 關閉 access_log 以最大化匿名性
+    access_log off;
     error_log  /var/log/nginx/treehole_error.log;
-
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
-
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-
         proxy_connect_timeout 10s;
         proxy_send_timeout 120s;
         proxy_read_timeout 120s;
-
         proxy_request_buffering off;
     }
 }
@@ -1088,39 +1108,30 @@ server {
     listen 80;
     listen [::]:80;
     server_name DOMAIN_PLACEHOLDER;
-
-    access_log /var/log/nginx/treehole_access.log;
+    access_log off;
     error_log  /var/log/nginx/treehole_error.log;
-
     # 為證書申請預留 webroot
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
-
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
-
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-
         proxy_connect_timeout 10s;
         proxy_send_timeout 120s;
         proxy_read_timeout 120s;
-
         proxy_request_buffering off;
     }
 }
 NGINX
   fi
-
   sed -i "s/DOMAIN_PLACEHOLDER/${DOMAIN}/g" "${NGINX_SITE_AVAILABLE}"
-
   ln -sf "${NGINX_SITE_AVAILABLE}" "${NGINX_SITE_ENABLED}"
-
-  # 不動 pan.conf，只刪 default
+  # 不動其他站點，只刪 default
   if [[ -f /etc/nginx/sites-enabled/default ]]; then
     rm -f /etc/nginx/sites-enabled/default
   fi
