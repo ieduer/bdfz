@@ -21,7 +21,7 @@
 #
 
 set -Eeuo pipefail
-INSTALLER_VERSION="treehole-install-2025-12-11-v10-cat"
+INSTALLER_VERSION="treehole-install-2025-12-13-v11-scroll-perf"
 
 # ==== 可按需修改的變量 ======================================
 
@@ -252,14 +252,13 @@ class Post(Base):
 
 
 def init_db() -> None:
-    DB_PATH_DIR = Path(DB_PATH).parent
-    DB_PATH_DIR.mkdir(parents=True, exist_ok=True)
+    db_path_dir = Path(DB_PATH).parent
+    db_path_dir.mkdir(parents=True, exist_ok=True)
     # 開啟 WAL 模式，提高併發寫入能力
     with engine.connect() as connection:
         try:
             connection.execute(text("PRAGMA journal_mode=WAL;"))
         except Exception:
-            # 如果失敗就默默忽略，退回默認模式
             pass
     Base.metadata.create_all(bind=engine)
 
@@ -332,11 +331,9 @@ def validate_content(content: str) -> str:
             status_code=400,
             detail=f"Content is too long (max {MAX_POST_LENGTH} characters).",
         )
-    # 可以在這裡加簡單敏感詞過濾（當前不做，保留鉤子）
     return stripped
 
 
-# Telegram 通知接收 Pydantic 模型 PostOut，而不是 ORM 物件，避免 DetachedInstanceError
 def send_telegram_notification(post: PostOut) -> None:
     if not TELEGRAM_ENABLED:
         return
@@ -368,7 +365,6 @@ def send_telegram_notification(post: PostOut) -> None:
         }
         httpx.post(url, json=payload, timeout=5.0)
     except Exception:
-        # 不讓 Telegram 失敗影響主流程
         pass
 
 
@@ -591,22 +587,32 @@ INDEX_HTML = """<!DOCTYPE html>
       font-size: 0.75rem;
       color: var(--text-dim);
     }
+
+    /* ✅ 性能/體感：右欄列表高度跟視窗走，滾動更自然，不像被“限速” */
     .posts-list {
       display: flex;
       flex-direction: column;
       gap: 8px;
-      max-height: 420px;
+      max-height: calc(100vh - 220px);
       overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
       padding-right: 4px;
       margin-right: -4px;
       margin-top: 2px;
+      contain: content;
     }
+
     .post-card {
       border-radius: 10px;
       padding: 9px 10px;
       background: linear-gradient(135deg, var(--bg-panel-light), #020617);
       border: 1px solid rgba(148, 163, 184, 0.25);
       position: relative;
+
+      /* ✅ 長列表更順：讓瀏覽器延後渲染不可見卡片 */
+      content-visibility: auto;
+      contain-intrinsic-size: 120px;
     }
     .post-card-tag {
       font-size: 0.75rem;
@@ -690,9 +696,7 @@ INDEX_HTML = """<!DOCTYPE html>
       border: 1px dashed rgba(148, 163, 184, 0.35);
       background: rgba(15, 23, 42, 0.8);
     }
-  </style>
-</style>
-  <style>
+
     .pixel-cat {
         margin-top: 22px;
         width: 100%;
@@ -785,48 +789,41 @@ INDEX_HTML = """<!DOCTYPE html>
             </div>
           </div>
         </form>
+
         <div class="pixel-cat" aria-hidden="true">
           <div class="pixel-cat-walk">
             <div class="pixel-cat-art">
               <svg viewBox="0 0 96 64" aria-hidden="true">
-                <!-- MEOW bubble -->
                 <g class="pixel-cat-meow">
                   <rect x="8" y="6" width="48" height="18" fill="#020617" stroke="#4b5563" stroke-width="1" />
                   <rect x="22" y="24" width="8" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
                   <text x="14" y="18" font-family="monospace" font-size="8" fill="#e5e7eb">MEOW!</text>
                 </g>
 
-                <!-- Head background -->
                 <rect x="30" y="18" width="32" height="26" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <!-- Inner face -->
                 <rect x="32" y="20" width="28" height="22" fill="#020617" stroke="#1f2937" stroke-width="1" />
 
-                <!-- Ears -->
                 <rect x="30" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
                 <rect x="54" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
 
-                <!-- Eyes -->
                 <rect class="pixel-cat-eye" x="36" y="26" width="4" height="5" fill="#a7f3d0" />
                 <rect class="pixel-cat-eye" x="52" y="26" width="4" height="5" fill="#a7f3d0" />
 
-                <!-- Nose -->
                 <rect x="44" y="31" width="4" height="2" fill="#22c55e" />
 
-                <!-- Cheeks -->
                 <rect x="38" y="31" width="3" height="2" fill="#10b981" />
                 <rect x="51" y="31" width="3" height="2" fill="#10b981" />
 
-                <!-- Mouth -->
                 <rect x="43" y="34" width="2" height="1" fill="#22c55e" />
                 <rect x="47" y="34" width="2" height="1" fill="#22c55e" />
 
-                <!-- Small chin shadow -->
                 <rect x="42" y="36" width="8" height="2" fill="#020617" opacity="0.9" />
               </svg>
             </div>
           </div>
           <div class="small">樹洞守護貓在線值班。</div>
         </div>
+
         <div id="status" class="status"></div>
         <div class="small" style="margin-top: 4px;">
           系統會做簡單的頻率限制與內容長度限制。
@@ -883,10 +880,7 @@ INDEX_HTML = """<!DOCTYPE html>
         if (Number.isNaN(d.getTime())) return "";
         const now = new Date();
         const diff = Math.floor((now.getTime() - d.getTime()) / 1000);
-        // 如果時間在未來（本地時間比伺服器落後或資料異常），直接顯示具體時間
-        if (!Number.isFinite(diff) || diff < 0) {
-          return d.toLocaleString();
-        }
+        if (!Number.isFinite(diff) || diff < 0) return d.toLocaleString();
         if (diff < 60) return "剛剛";
         if (diff < 3600) return `${Math.floor(diff / 60)} 分鐘前`;
         if (diff < 86400) return `${Math.floor(diff / 3600)} 小時前`;
@@ -897,19 +891,22 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
-    // Pagination support (new)
     let currentOffset = 0;
     let currentLimit = 50;
     let totalPosts = 0;
+
     function renderPosts(list, total, offset, limit) {
-      postsEl.innerHTML = "";
+      const frag = document.createDocumentFragment();
+
       if (!Array.isArray(list) || list.length === 0) {
         const div = document.createElement("div");
         div.className = "small";
         div.textContent = "暫無內容。可以試著先對樹說一句。";
-        postsEl.appendChild(div);
+        frag.appendChild(div);
+        postsEl.replaceChildren(frag);
         return;
       }
+
       for (const p of list) {
         const card = document.createElement("article");
         card.className = "post-card";
@@ -946,17 +943,18 @@ INDEX_HTML = """<!DOCTYPE html>
         meta.appendChild(right);
         card.appendChild(meta);
 
-        postsEl.appendChild(card);
+        frag.appendChild(card);
       }
-      // Pagination controls
-      const controls = document.createElement("div");
-      controls.style.display = "flex";
-      controls.style.justifyContent = "center";
-      controls.style.alignItems = "center";
-      controls.style.marginTop = "10px";
-      controls.style.gap = "10px";
-      controls.className = "small";
+
       if (total > limit) {
+        const controls = document.createElement("div");
+        controls.style.display = "flex";
+        controls.style.justifyContent = "center";
+        controls.style.alignItems = "center";
+        controls.style.marginTop = "10px";
+        controls.style.gap = "10px";
+        controls.className = "small";
+
         const prevBtn = document.createElement("button");
         prevBtn.textContent = "上一頁";
         prevBtn.type = "button";
@@ -981,18 +979,19 @@ INDEX_HTML = """<!DOCTYPE html>
         controls.appendChild(prevBtn);
         controls.appendChild(pageInfo);
         controls.appendChild(nextBtn);
-        postsEl.appendChild(controls);
+        frag.appendChild(controls);
       }
+
+      postsEl.replaceChildren(frag);
     }
 
     async function loadRecent(offset = 0, limit = 50) {
+      refreshBtn.disabled = true;
       try {
         const res = await fetch(`/api/posts/recent?limit=${limit}&offset=${offset}`, {
           headers: { "Accept": "application/json" },
         });
-        if (!res.ok) {
-          throw new Error("載入失敗");
-        }
+        if (!res.ok) throw new Error("載入失敗");
         const data = await res.json();
         currentOffset = data.offset || 0;
         currentLimit = data.limit || 50;
@@ -1001,23 +1000,22 @@ INDEX_HTML = """<!DOCTYPE html>
       } catch (err) {
         console.error(err);
         setStatus("載入最新樹洞失敗。", "error");
+      } finally {
+        refreshBtn.disabled = false;
       }
     }
 
     async function loadRandom() {
       try {
         const res = await fetch("/api/posts/random", {
-          headers: { "Accept": "application/json",
-          },
+          headers: { "Accept": "application/json" },
         });
         if (res.status === 404) {
           randomContentEl.textContent = "暫時沒有樹洞。";
           randomContentEl.classList.add("random-box-empty");
           return;
         }
-        if (!res.ok) {
-          throw new Error("載入失敗");
-        }
+        if (!res.ok) throw new Error("載入失敗");
         const data = await res.json();
         randomContentEl.textContent = data.content || "";
         randomContentEl.classList.remove("random-box-empty");
@@ -1028,9 +1026,9 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
-    // 字數統計
     const contentInput = document.getElementById("content");
     let counterEl;
+
     function updateCounter() {
       if (!counterEl) return;
       const val = contentInput.value || "";
@@ -1038,6 +1036,7 @@ INDEX_HTML = """<!DOCTYPE html>
       if (val.length > 1000) counterEl.style.color = "var(--danger)";
       else counterEl.style.color = "var(--text-dim)";
     }
+
     function setupCounter() {
       counterEl = document.createElement("span");
       counterEl.style.float = "right";
@@ -1076,7 +1075,7 @@ INDEX_HTML = """<!DOCTYPE html>
         document.getElementById("tag").value = "";
         setStatus("已投進樹洞。", "ok");
         updateCounter();
-        await loadRecent();
+        await loadRecent(0, currentLimit);
         await loadRandom();
       } catch (err) {
         console.error(err);
@@ -1133,10 +1132,8 @@ def create_post(payload: PostCreate, request: Request, background_tasks: Backgro
         db.commit()
         db.refresh(post)
 
-        # 將 ORM 物件轉成 Pydantic 模型，與 DB Session 解耦
         post_out = PostOut.from_orm(post)
 
-        # Telegram 通知：傳 Pydantic 模型，避免 DetachedInstanceError
         if TELEGRAM_ENABLED:
             background_tasks.add_task(send_telegram_notification, post_out)
 
@@ -1176,7 +1173,6 @@ def get_recent(
 def get_random() -> PostOut:
     db = get_db()
     try:
-        # SQLite 支援 RANDOM()
         p = db.query(Post).order_by(func.random()).first()
         if not p:
             raise HTTPException(status_code=404, detail="No posts yet.")
@@ -1194,7 +1190,6 @@ setup_venv_and_deps() {
     "${PYTHON_BIN}" -m venv "${VENV_DIR}"
   fi
   "${VENV_DIR}/bin/pip" install --upgrade pip
-  # 鎖 fastapi<0.100.0 與 pydantic<2.0，對齊目前 v1 風格代碼，避免依賴衝突
   "${VENV_DIR}/bin/pip" install \
     "fastapi<0.100.0" \
     "pydantic<2.0" \
@@ -1239,7 +1234,6 @@ write_nginx_conf() {
   fi
   mkdir -p "${CERTBOT_WEBROOT}"
   if [[ "${has_le_cert}" == "yes" ]]; then
-    # HTTP -> HTTPS 轉向 + HTTPS 反代
     cat >"${NGINX_SITE_AVAILABLE}" <<'NGINX'
 server {
     listen 80;
@@ -1248,16 +1242,13 @@ server {
 
     server_tokens off;
 
-    # 關閉 access_log 以最大化匿名性（即便只是 301）
     access_log off;
     error_log  /var/log/nginx/treehole_error.log;
 
-    # ACME 挑戰路徑，方便日後續期
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
 
-    # 其他路徑全部跳轉 HTTPS
     location / {
         return 301 https://$host$request_uri;
     }
@@ -1271,7 +1262,6 @@ server {
 
     ssl_certificate /etc/letsencrypt/live/DOMAIN_PLACEHOLDER/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/DOMAIN_PLACEHOLDER/privkey.pem;
-    # 關閉 access_log 以最大化匿名性
     access_log off;
     error_log  /var/log/nginx/treehole_error.log;
 
@@ -1290,7 +1280,6 @@ server {
 }
 NGINX
   else
-    # 暫時只開 HTTP，保留 ACME webroot，等你先簽證書
     cat >"${NGINX_SITE_AVAILABLE}" <<'NGINX'
 server {
     listen 80;
@@ -1302,7 +1291,6 @@ server {
     access_log off;
     error_log  /var/log/nginx/treehole_error.log;
 
-    # 為證書申請預留 webroot
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
@@ -1324,7 +1312,6 @@ NGINX
   fi
   sed -i "s|DOMAIN_PLACEHOLDER|${DOMAIN}|g" "${NGINX_SITE_AVAILABLE}"
   ln -sf "${NGINX_SITE_AVAILABLE}" "${NGINX_SITE_ENABLED}"
-  # 不動其他站點，只刪 default
   if [[ -f /etc/nginx/sites-enabled/default ]]; then
     rm -f /etc/nginx/sites-enabled/default
   fi
@@ -1347,7 +1334,6 @@ main() {
   ensure_root
   ensure_ubuntu
 
-  # 每次重裝前先清理舊進程與服務，避免殘留 uvicorn 佔用 8000 端口
   stop_previous
 
   install_packages
@@ -1358,18 +1344,11 @@ main() {
   setup_venv_and_deps
   write_systemd_unit
 
-  # 第一次寫入 Nginx 配置：
-  #  - 若已有證書 -> 直接產生 HTTPS 反代
-  #  - 若尚無證書 -> 暫時只開 HTTP + ACME webroot，方便 certbot 挑戰
   write_nginx_conf
-
-  # 啟動後端 + 讓 Nginx 使用新配置
   reload_services
 
-  # 若尚無證書，這裡會提示是否透過 certbot 簽發；已有證書則直接略過
   obtain_certificate_if_needed
 
-  # certbot 成功簽到證書後，再次重寫 Nginx 配置，使其切換為 HTTPS
   write_nginx_conf
   reload_services
 
