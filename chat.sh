@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env bash
 #
 # chat.sh - One-shot installer/updater for chat.bdfz.net (Anonymous Hourly-Wipe Chat)
@@ -21,7 +19,7 @@
 
 set -euo pipefail
 
-CHAT_VERSION="v1.0.0"
+CHAT_VERSION="v1.0.1"
 
 DOMAIN="${DOMAIN:-chat.bdfz.net}"
 APP_PORT="${APP_PORT:-8080}"
@@ -70,7 +68,6 @@ ensure_pkgs() {
 
   systemctl enable --now nginx
   systemctl enable --now redis-server
-  # certbot.timer handles renewals
   systemctl enable --now certbot.timer || true
 }
 
@@ -89,7 +86,6 @@ ensure_node20() {
     log "Node.js not found; installing Node.js 20.x via NodeSource."
   fi
 
-  # NodeSource setup for Ubuntu
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
 
@@ -104,18 +100,17 @@ ensure_node20() {
 stop_previous() {
   log "Stopping previous install (systemd + stray processes)..."
 
-  # Stop systemd unit if exists
   if systemctl list-unit-files | awk '{print $1}' | grep -qx "${SYSTEMD_UNIT}"; then
     systemctl stop "${SYSTEMD_UNIT}" || true
     systemctl disable "${SYSTEMD_UNIT}" || true
   fi
 
-  # Kill any stray node processes pointing at our app dir
+  systemctl reset-failed "${SYSTEMD_UNIT}" 2>/dev/null || true
+
   pkill -f "${APP_DIR}/server.js" 2>/dev/null || true
   pkill -f "${SERVER_DIR}/server.js" 2>/dev/null || true
   pkill -f "${APP_NAME}" 2>/dev/null || true
 
-  # Ensure port is free
   if have_cmd ss; then
     ss -ltnp | grep -q ":${APP_PORT} " && warn "Port ${APP_PORT} still appears in use; continuing (it may be nginx/other)." || true
   fi
@@ -189,7 +184,6 @@ function clampText(s, maxLen) {
 }
 
 function safeRoom(room) {
-  // letters, numbers, dash, underscore
   const r = String(room || '').trim();
   if (!r) return 'lobby';
   const cleaned = r.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
@@ -197,11 +191,11 @@ function safeRoom(room) {
 }
 
 function kRoomMessages(room) {
-  return `${CHAT_KEY_PREFIX}room:${room}:messages`; // Redis list
+  return `${CHAT_KEY_PREFIX}room:${room}:messages`;
 }
 
 function kRoomMeta(room) {
-  return `${CHAT_KEY_PREFIX}room:${room}:meta`; // hash
+  return `${CHAT_KEY_PREFIX}room:${room}:meta`;
 }
 
 async function scanDelByPrefix(redis, prefix) {
@@ -477,14 +471,12 @@ JS
       if (e.key === 'Enter') document.getElementById('send').click();
     });
 
-    // auto-join
     socket.emit('join', { room: roomEl.value, nick: nickEl.value });
   </script>
 </body>
 </html>
 HTML
 
-  # install deps
   pushd "${SERVER_DIR}" >/dev/null
   npm install --omit=dev
   popd >/dev/null
@@ -515,8 +507,6 @@ Environment=MAX_MSG_LEN=800
 ExecStart=/usr/bin/node ${SERVER_DIR}/server.js
 Restart=always
 RestartSec=2
-
-# Hardening (kept minimal to avoid surprises)
 NoNewPrivileges=true
 PrivateTmp=true
 
@@ -531,7 +521,6 @@ UNIT
 
 write_nginx_http_only() {
   log "Writing Nginx HTTP-only config (for first-time ACME + temporary service)..."
-
   mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge"
 
   cat > "${NGINX_AVAIL}" <<NGINX
@@ -544,19 +533,16 @@ server {
     default_type text/plain;
   }
 
-  # Temporary: serve app over HTTP until cert exists.
-  # Once cert exists, we will rewrite config to force HTTPS.
   location / {
     proxy_pass http://127.0.0.1:${APP_PORT};
     proxy_http_version 1.1;
 
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
 
-    # WebSocket
-    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
 
     proxy_read_timeout 120s;
@@ -573,7 +559,6 @@ NGINX
 
 write_nginx_https_force() {
   log "Writing Nginx HTTPS config (force HTTPS; keep ACME path on 80)..."
-
   mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge"
 
   cat > "${NGINX_AVAIL}" <<NGINX
@@ -587,7 +572,7 @@ server {
   }
 
   location / {
-    return 301 https://$host$request_uri;
+    return 301 https://\$host\$request_uri;
   }
 }
 
@@ -598,25 +583,22 @@ server {
   ssl_certificate     ${LE_FULLCHAIN};
   ssl_certificate_key ${LE_PRIVKEY};
 
-  # Reasonable modern TLS defaults (kept conservative)
   ssl_session_timeout 1d;
   ssl_session_cache shared:SSL:10m;
   ssl_session_tickets off;
 
-  # HSTS (comment out if you ever need to serve HTTP again)
   add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
   location / {
     proxy_pass http://127.0.0.1:${APP_PORT};
     proxy_http_version 1.1;
 
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto https;
 
-    # WebSocket
-    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
 
     proxy_read_timeout 120s;
@@ -640,10 +622,8 @@ obtain_cert_if_needed() {
   log "No existing cert found. Obtaining Let's Encrypt cert for ${DOMAIN} (webroot)..."
   mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge"
 
-  # Ensure HTTP vhost is active for ACME
   write_nginx_http_only
 
-  # certonly avoids rewriting nginx config; --keep-until-expiring avoids needless reissue
   certbot certonly \
     --non-interactive --agree-tos \
     --email "${LE_EMAIL}" \
@@ -691,7 +671,6 @@ main() {
 
   obtain_cert_if_needed
 
-  # Now enforce HTTPS (requires cert to exist)
   if [[ -f "${LE_FULLCHAIN}" && -f "${LE_PRIVKEY}" ]]; then
     write_nginx_https_force
   else
