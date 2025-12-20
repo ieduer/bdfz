@@ -1,146 +1,171 @@
 #!/usr/bin/env bash
-#
-# chat.sh - One-shot installer/updater for chat.bdfz.net (Anonymous Hourly-Wipe Chat)
-#
-# Target:
-#   - Ubuntu 24.04+ (root)
-#   - Domain: chat.bdfz.net
-#   - HTTPS required
-#   - Overwrite previous install & kill prior processes on every run
-#   - Do NOT overwrite existing TLS certs (skip issuance if cert exists)
-#
-# Usage:
-#   sudo bash chat.sh
-# Optional env overrides:
-#   DOMAIN=chat.bdfz.net
-#   APP_PORT=8080
-#   LE_EMAIL=admin@bdfz.net
-#
-
 set -euo pipefail
 
-CHAT_VERSION="v1.0.1"
+# anon-hourly-chat installer (FastAPI-free; Node + Socket.IO + Redis + Nginx)
+# - Anonymous multi-room chat
+# - Redis stores per-room message history (1 hour TTL)
+# - Wipes ALL chat:* keys every hour at the top of the hour (server-side scheduler)
+# - Nginx reverse proxy + optional TLS with certbot (webroot)
+# - systemd service
+#
+# Usage:
+#   sudo bash chat.sh install --domain chat.example.com
+#   sudo bash chat.sh uninstall --domain chat.example.com
+#   sudo bash chat.sh status
+#   sudo bash chat.sh logs
+#
+# Notes:
+# - This script will NOT overwrite existing cert files if already present.
+# - Default: listens on 127.0.0.1:8080 behind Nginx.
 
-DOMAIN="${DOMAIN:-chat.bdfz.net}"
-APP_PORT="${APP_PORT:-8080}"
-LE_EMAIL="${LE_EMAIL:-admin@bdfz.net}"
+CHAT_VERSION="v1.2.0"
 
 APP_NAME="anon-hourly-chat"
-APP_USER="chat"
-APP_DIR="/opt/${APP_NAME}"
-SERVER_DIR="${APP_DIR}/server"
+APP_USER="anonchat"
+APP_GROUP="anonchat"
+
+BASE_DIR="/opt/${APP_NAME}"
+SERVER_DIR="${BASE_DIR}/server"
 PUBLIC_DIR="${SERVER_DIR}/public"
 
-SYSTEMD_UNIT="${APP_NAME}.service"
-NGINX_SITE="${DOMAIN}"
-NGINX_AVAIL="/etc/nginx/sites-available/${NGINX_SITE}"
-NGINX_ENABLED="/etc/nginx/sites-enabled/${NGINX_SITE}"
+SERVICE_NAME="${APP_NAME}.service"
 
-LE_LIVE_DIR="/etc/letsencrypt/live/${DOMAIN}"
-LE_FULLCHAIN="${LE_LIVE_DIR}/fullchain.pem"
-LE_PRIVKEY="${LE_LIVE_DIR}/privkey.pem"
+NGINX_SITE_AVAIL="/etc/nginx/sites-available/${APP_NAME}.conf"
+NGINX_SITE_ENABLED="/etc/nginx/sites-enabled/${APP_NAME}.conf"
 
-ACME_WEBROOT="/var/www/letsencrypt"
+DEFAULT_PORT="8080"
+DEFAULT_DOMAIN=""
 
-log()  { echo -e "[chat.sh ${CHAT_VERSION}] $*"; }
-warn() { echo -e "[chat.sh ${CHAT_VERSION}] [WARN] $*" >&2; }
-err()  { echo -e "[chat.sh ${CHAT_VERSION}] [ERR]  $*" >&2; }
+REDIS_URL_DEFAULT="redis://127.0.0.1:6379"
+CHAT_KEY_PREFIX_DEFAULT="chat:"
+MAX_MSG_LEN_DEFAULT="800"
 
-die() { err "$*"; exit 1; }
+usage() {
+  cat <<EOF
+${APP_NAME} ${CHAT_VERSION}
 
-need_root() {
+Commands:
+  install   --domain <domain> [--port 8080] [--redis-url redis://127.0.0.1:6379] [--prefix chat:] [--max-len 800]
+  uninstall --domain <domain>
+  status
+  logs
+
+Examples:
+  sudo bash chat.sh install --domain chat.example.com
+  sudo bash chat.sh install --domain chat.example.com --port 8080 --prefix chat:
+  sudo bash chat.sh logs
+EOF
+}
+
+log() { echo -e "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*"; }
+die() { echo -e "ERROR: $*" >&2; exit 1; }
+
+require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    die "Please run as root: sudo bash chat.sh"
+    die "Please run as root: sudo bash $0 ..."
   fi
 }
 
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
+parse_args_install() {
+  DOMAIN="${DEFAULT_DOMAIN}"
+  PORT="${DEFAULT_PORT}"
+  REDIS_URL="${REDIS_URL_DEFAULT}"
+  CHAT_KEY_PREFIX="${CHAT_KEY_PREFIX_DEFAULT}"
+  MAX_MSG_LEN="${MAX_MSG_LEN_DEFAULT}"
 
-ensure_pkgs() {
-  log "Updating apt + installing base packages..."
-  export DEBIAN_FRONTEND=noninteractive
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --domain) DOMAIN="${2:-}"; shift 2 ;;
+      --port) PORT="${2:-}"; shift 2 ;;
+      --redis-url) REDIS_URL="${2:-}"; shift 2 ;;
+      --prefix) CHAT_KEY_PREFIX="${2:-}"; shift 2 ;;
+      --max-len) MAX_MSG_LEN="${2:-}"; shift 2 ;;
+      *) die "Unknown arg: $1" ;;
+    esac
+  done
+
+  [[ -n "${DOMAIN}" ]] || die "--domain is required"
+  [[ "${PORT}" =~ ^[0-9]+$ ]] || die "--port must be numeric"
+  [[ "${MAX_MSG_LEN}" =~ ^[0-9]+$ ]] || die "--max-len must be numeric"
+}
+
+parse_args_uninstall() {
+  DOMAIN="${DEFAULT_DOMAIN}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --domain) DOMAIN="${2:-}"; shift 2 ;;
+      *) die "Unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "${DOMAIN}" ]] || die "--domain is required"
+}
+
+ensure_packages() {
+  log "Installing system packages..."
   apt-get update -y
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg lsb-release \
+  apt-get install -y \
+    curl ca-certificates gnupg \
     nginx redis-server \
     certbot python3-certbot-nginx \
     jq
 
-  systemctl enable --now nginx
-  systemctl enable --now redis-server
-  systemctl enable --now certbot.timer || true
+  systemctl enable --now redis-server >/dev/null 2>&1 || true
+  systemctl enable --now nginx >/dev/null 2>&1 || true
 }
 
 ensure_node20() {
-  if have_cmd node; then
+  if command -v node >/dev/null 2>&1; then
     local v
-    v="$(node -v | sed 's/^v//' || true)"
-    local major
-    major="${v%%.*}"
-    if [[ "${major}" =~ ^[0-9]+$ ]] && (( major >= 20 )); then
-      log "Node.js already present (v${v})."
-      return 0
+    v="$(node -v | sed 's/^v//')"
+    local major="${v%%.*}"
+    if [[ "${major}" -ge 20 ]]; then
+      log "Node.js already present: node v${v}"
+      return
     fi
-    warn "Node.js present but <20 (v${v}); upgrading to Node.js 20.x via NodeSource."
-  else
-    log "Node.js not found; installing Node.js 20.x via NodeSource."
   fi
 
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  log "Installing Node.js 20 (NodeSource)..."
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+  apt-get update -y
   apt-get install -y nodejs
 
-  if ! have_cmd node; then
-    die "Node.js install failed."
-  fi
-
-  log "Node version: $(node -v)"
-  log "npm  version: $(npm -v)"
+  node -v || die "Node install failed"
+  npm -v || die "npm install failed"
 }
 
-stop_previous() {
-  log "Stopping previous install (systemd + stray processes)..."
-
-  if systemctl list-unit-files | awk '{print $1}' | grep -qx "${SYSTEMD_UNIT}"; then
-    systemctl stop "${SYSTEMD_UNIT}" || true
-    systemctl disable "${SYSTEMD_UNIT}" || true
-  fi
-
-  systemctl reset-failed "${SYSTEMD_UNIT}" 2>/dev/null || true
-
-  pkill -f "${APP_DIR}/server.js" 2>/dev/null || true
-  pkill -f "${SERVER_DIR}/server.js" 2>/dev/null || true
-  pkill -f "${APP_NAME}" 2>/dev/null || true
-
-  if have_cmd ss; then
-    ss -ltnp | grep -q ":${APP_PORT} " && warn "Port ${APP_PORT} still appears in use; continuing (it may be nginx/other)." || true
-  fi
-}
-
-create_user() {
+ensure_user() {
   if id -u "${APP_USER}" >/dev/null 2>&1; then
-    log "User '${APP_USER}' already exists."
+    log "User exists: ${APP_USER}"
   else
-    log "Creating system user '${APP_USER}'..."
-    useradd --system --no-create-home --shell /usr/sbin/nologin "${APP_USER}"
+    log "Creating user: ${APP_USER}"
+    useradd --system --home-dir "${BASE_DIR}" --create-home --shell /usr/sbin/nologin "${APP_USER}"
   fi
+
+  if getent group "${APP_GROUP}" >/dev/null 2>&1; then
+    :
+  else
+    groupadd --system "${APP_GROUP}"
+  fi
+
+  usermod -a -G "${APP_GROUP}" "${APP_USER}" >/dev/null 2>&1 || true
 }
 
 write_app_files() {
-  log "Writing application files to ${APP_DIR} (full overwrite)..."
+  log "Writing app files to ${SERVER_DIR} ..."
 
-  rm -rf "${APP_DIR}"
   mkdir -p "${PUBLIC_DIR}"
+  chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}"
+  chmod 755 "${BASE_DIR}" "${SERVER_DIR}" "${PUBLIC_DIR}"
 
   cat > "${SERVER_DIR}/package.json" <<'JSON'
 {
   "name": "anon-hourly-chat",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "Anonymous web chat that wipes all content every hour (Redis-backed).",
+  "type": "commonjs",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
   "dependencies": {
     "express": "^4.19.2",
     "ioredis": "^5.4.1",
@@ -157,6 +182,8 @@ JSON
  * - Anonymous rooms (no login)
  * - Messages stored in Redis with a prefix
  * - Wipes ALL chat:* keys every hour at the top of the hour
+ * - Presence: room online counts + top rooms
+ * - /me action messages (client renders differently)
  */
 
 const path = require('path');
@@ -165,13 +192,14 @@ const express = require('express');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
 
-const VERSION = 'v1.0.1';
+const VERSION = 'v1.2.0';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const CHAT_KEY_PREFIX = process.env.CHAT_KEY_PREFIX || 'chat:';
 const WIPE_EVERY_HOUR = (process.env.WIPE_EVERY_HOUR || '1') === '1';
 const MAX_MSG_LEN = parseInt(process.env.MAX_MSG_LEN || '800', 10);
+const PRESENCE_DEBOUNCE_MS = parseInt(process.env.PRESENCE_DEBOUNCE_MS || '350', 10);
 
 function nowIso() {
   return new Date().toISOString();
@@ -181,6 +209,14 @@ function clampText(s, maxLen) {
   const t = String(s || '');
   if (t.length <= maxLen) return t;
   return t.slice(0, maxLen);
+}
+
+function safeNick(nick) {
+  const t = String(nick || '').trim();
+  if (!t) return 'anon';
+  // allow a-zA-Z0-9_.- and keep it short
+  const cleaned = t.replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 24);
+  return cleaned || 'anon';
 }
 
 function safeRoom(room) {
@@ -248,6 +284,60 @@ async function startHourlyWipe(redis) {
   setTimeout(schedule, firstDelay);
 }
 
+function listPublicRooms(io) {
+  const rooms = [];
+  const adapter = io.sockets.adapter;
+  // In Socket.IO, private rooms are socket ids. adapter.sids holds socket ids.
+  for (const [name, sockets] of adapter.rooms) {
+    if (adapter.sids && adapter.sids.has(name)) continue; // skip private room
+    const online = sockets ? sockets.size : 0;
+    if (online <= 0) continue;
+    rooms.push({ room: name, online });
+  }
+  rooms.sort((a, b) => (b.online - a.online) || a.room.localeCompare(b.room));
+  return rooms;
+}
+
+function buildPresencePayload(io) {
+  return {
+    ts: nowIso(),
+    rooms: listPublicRooms(io).slice(0, 30)
+  };
+}
+
+function mkPresenceBroadcaster(io) {
+  let timer = null;
+  let lastSentAt = 0;
+
+  const flush = () => {
+    timer = null;
+    lastSentAt = Date.now();
+    io.emit('presence', buildPresencePayload(io));
+  };
+
+  return () => {
+    if (timer) return;
+    const elapsed = Date.now() - lastSentAt;
+    const delay = Math.max(0, PRESENCE_DEBOUNCE_MS - elapsed);
+    timer = setTimeout(flush, delay);
+  };
+}
+
+function parseMessageText(raw) {
+  const t = clampText(raw, MAX_MSG_LEN).trim();
+  if (!t) return null;
+
+  if (t.startsWith('/me ')) {
+    const action = t.slice(4).trim();
+    if (!action) return null;
+    return { type: 'action', text: action };
+  }
+
+  if (t === '/me') return null;
+
+  return { type: 'text', text: t };
+}
+
 (async () => {
   console.log(`anon-hourly-chat ${VERSION} starting...`);
   console.log(`PORT=${PORT}`);
@@ -268,9 +358,13 @@ async function startHourlyWipe(redis) {
 
   const app = express();
   const server = http.createServer(app);
+
   const io = new Server(server, {
-    cors: { origin: false }
+    cors: { origin: false },
+    transports: ['websocket']
   });
+
+  const broadcastPresence = mkPresenceBroadcaster(io);
 
   app.get('/healthz', (req, res) => {
     res.json({ ok: true, ts: nowIso(), version: VERSION });
@@ -279,42 +373,58 @@ async function startHourlyWipe(redis) {
   app.use('/', express.static(path.join(__dirname, 'public')));
 
   io.on('connection', (socket) => {
-    socket.on('join', async (payload) => {
-      const room = safeRoom(payload && payload.room);
-      const nick = clampText((payload && payload.nick) || 'anon', 24);
+    // send initial presence snapshot
+    socket.emit('presence', buildPresencePayload(io));
+    broadcastPresence();
 
-      socket.data.room = room;
+    socket.on('join', async (payload) => {
+      const nextRoom = safeRoom(payload && payload.room);
+      const nick = safeNick((payload && payload.nick) || 'anon');
+
+      const prevRoomRaw = socket.data.room || '';
+      const prevRoom = prevRoomRaw ? safeRoom(prevRoomRaw) : '';
+
+      if (prevRoom && prevRoom !== nextRoom) {
+        socket.leave(prevRoom);
+      }
+
+      socket.data.room = nextRoom;
       socket.data.nick = nick;
-      socket.join(room);
+      socket.join(nextRoom);
 
       try {
-        const key = kRoomMessages(room);
+        const key = kRoomMessages(nextRoom);
         const items = await redis.lrange(key, -100, -1);
-        const history = items.map((s) => {
-          try { return JSON.parse(s); } catch { return null; }
-        }).filter(Boolean);
+        const history = items
+          .map((s) => {
+            try { return JSON.parse(s); } catch { return null; }
+          })
+          .filter(Boolean);
 
-        socket.emit('history', { room, history });
+        socket.emit('history', { room: nextRoom, history });
 
-        await redis.hset(kRoomMeta(room), 'last_active', nowIso());
-        await redis.expire(kRoomMeta(room), 3600);
+        await redis.hset(kRoomMeta(nextRoom), 'last_active', nowIso());
+        await redis.expire(kRoomMeta(nextRoom), 3600);
       } catch (e) {
         socket.emit('error_msg', { message: 'Failed to load history.' });
       }
 
-      io.to(room).emit('system', { room, message: `${nick} joined`, ts: nowIso() });
+      io.to(nextRoom).emit('system', { room: nextRoom, message: `${nick} joined`, ts: nowIso() });
+      broadcastPresence();
     });
 
     socket.on('msg', async (payload) => {
       const room = safeRoom(socket.data.room || 'lobby');
-      const nick = clampText(socket.data.nick || 'anon', 24);
-      const text = clampText(payload && payload.text, MAX_MSG_LEN).trim();
-      if (!text) return;
+      const nick = safeNick(socket.data.nick || 'anon');
+
+      const parsed = parseMessageText(payload && payload.text);
+      if (!parsed) return;
 
       const msg = {
         id: socket.id + ':' + Date.now(),
         nick,
-        text,
+        text: parsed.text,
+        type: parsed.type,
         ts: nowIso()
       };
 
@@ -332,14 +442,8 @@ async function startHourlyWipe(redis) {
       io.to(room).emit('msg', { room, msg });
     });
 
-    socket.on('clear_room', async () => {
-      const room = safeRoom(socket.data.room || 'lobby');
-      try {
-        await redis.del(kRoomMessages(room), kRoomMeta(room));
-        io.to(room).emit('system', { room, message: `Room cleared`, ts: nowIso() });
-      } catch (e) {
-        socket.emit('error_msg', { message: 'Failed to clear room.' });
-      }
+    socket.on('disconnect', () => {
+      broadcastPresence();
     });
   });
 
@@ -370,30 +474,34 @@ JS
       --border:#1f2a37;
       --muted:rgba(230,237,243,.72);
       --text:#e6edf3;
-      --green:#2ea043;
-      --green2:#3ddc97;
-      --warn:#f2cc60;
-      --red:#ff6b6b;
       --shadow: 0 10px 30px rgba(0,0,0,.35);
       --r:14px;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       --sans: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+
+      /* per-room theme */
+      --accent: hsl(150 72% 52%);
+      --accent2: hsl(150 72% 60%);
+      --accentSoft: hsla(150, 72%, 52%, .16);
+
+      --warn:#f2cc60;
+      --red:#ff6b6b;
     }
 
     *{ box-sizing:border-box; }
     html,body{ height:100%; }
     body{
       margin:0;
-      background: radial-gradient(1100px 700px at 30% 0%, rgba(46,160,67,.12), transparent 60%),
-                  radial-gradient(900px 600px at 100% 10%, rgba(61,220,151,.10), transparent 55%),
-                  var(--bg);
+      background:
+        radial-gradient(1100px 700px at 30% 0%, var(--accentSoft), transparent 60%),
+        radial-gradient(900px 600px at 100% 10%, hsla(190, 72%, 52%, .10), transparent 55%),
+        var(--bg);
       color:var(--text);
       font-family: var(--sans);
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
     }
 
-    /* Layout */
     .app{
       height:100vh;
       height:100dvh;
@@ -467,7 +575,7 @@ JS
       box-shadow: 0 0 0 2px rgba(255,255,255,.06) inset;
     }
 
-    .dot.ok{ background: var(--green); box-shadow: 0 0 12px rgba(46,160,67,.55); }
+    .dot.ok{ background: var(--accent); box-shadow: 0 0 14px var(--accentSoft); }
     .dot.warn{ background: var(--warn); box-shadow: 0 0 12px rgba(242,204,96,.45); }
     .dot.bad{ background: var(--red); box-shadow: 0 0 12px rgba(255,107,107,.45); }
 
@@ -489,15 +597,59 @@ JS
     }
     .btn:hover{ background: rgba(15,23,32,.85); }
     .btn:active{ transform: translateY(1px); }
-    .btn.primary{ border-color: rgba(46,160,67,.8); }
-    .btn.danger{ border-color: rgba(255,107,107,.65); }
+    .btn.primary{ border-color: color-mix(in srgb, var(--accent) 65%, rgba(31,42,55,.9)); }
 
-    .main{
-      flex:1;
-      min-height:0;
-      display:flex;
-      justify-content:center;
+    /* room tabs */
+    .tabs-wrap{
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 14px 10px 14px;
     }
+
+    .tabs{
+      display:flex;
+      gap:8px;
+      overflow:auto;
+      padding-bottom: 2px;
+      scrollbar-width: none;
+    }
+    .tabs::-webkit-scrollbar{ display:none; }
+
+    .tab{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(31,42,55,.88);
+      background: rgba(11,15,20,.62);
+      font-family: var(--mono);
+      font-size: 12px;
+      color: rgba(230,237,243,.86);
+      white-space:nowrap;
+      cursor:pointer;
+      user-select:none;
+      transition: transform .06s ease, background .15s ease, border-color .15s ease;
+    }
+
+    .tab:hover{ background: rgba(15,23,32,.78); }
+    .tab:active{ transform: translateY(1px); }
+
+    .tab .badge{
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid rgba(35,48,65,.9);
+      background: rgba(15,23,32,.78);
+      color: rgba(230,237,243,.78);
+      font-size: 11px;
+    }
+
+    .tab.active{
+      border-color: color-mix(in srgb, var(--accent) 70%, rgba(31,42,55,.88));
+      box-shadow: 0 0 0 2px var(--accentSoft) inset;
+    }
+
+    .main{ flex:1; min-height:0; display:flex; justify-content:center; }
 
     .frame{
       width: 100%;
@@ -524,19 +676,9 @@ JS
       flex-wrap: wrap;
     }
 
-    .field{
-      display:flex;
-      flex-direction:column;
-      gap:6px;
-      min-width: 160px;
-      flex: 1;
-    }
+    .field{ display:flex; flex-direction:column; gap:6px; min-width: 160px; flex: 1; }
 
-    .field label{
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--muted);
-    }
+    .field label{ font-family: var(--mono); font-size: 11px; color: var(--muted); }
 
     .field input{
       width:100%;
@@ -551,8 +693,8 @@ JS
     }
 
     .field input:focus{
-      border-color: rgba(61,220,151,.55);
-      box-shadow: 0 0 0 3px rgba(61,220,151,.15);
+      border-color: color-mix(in srgb, var(--accent) 60%, rgba(35,48,65,.9));
+      box-shadow: 0 0 0 3px var(--accentSoft);
     }
 
     .hint{
@@ -563,14 +705,7 @@ JS
       line-height: 1.35;
     }
 
-    /* Chat log */
-    .log{
-      flex:1;
-      min-height: 0;
-      padding: 12px;
-      overflow:auto;
-      scroll-behavior: smooth;
-    }
+    .log{ flex:1; min-height: 0; padding: 12px; overflow:auto; scroll-behavior: smooth; }
 
     .row{ margin: 10px 0; display:flex; gap:10px; }
 
@@ -589,10 +724,7 @@ JS
       flex: 0 0 auto;
     }
 
-    .msgbox{
-      flex:1;
-      min-width:0;
-    }
+    .msgbox{ flex:1; min-width:0; }
 
     .meta{
       font-family: var(--mono);
@@ -625,11 +757,29 @@ JS
     }
 
     .me .bubble{
-      border-color: rgba(46,160,67,.8);
-      box-shadow: 0 0 0 2px rgba(46,160,67,.10) inset;
+      border-color: color-mix(in srgb, var(--accent) 70%, rgba(35,48,65,.9));
+      box-shadow: 0 0 0 2px var(--accentSoft) inset;
     }
 
-    /* Composer */
+    .action .bubble{
+      background: rgba(11,15,20,.55);
+      border-color: color-mix(in srgb, var(--accent) 60%, rgba(35,48,65,.9));
+      font-style: italic;
+    }
+
+    .mention{
+      padding: 1px 4px;
+      border-radius: 8px;
+      border: 1px solid rgba(35,48,65,.9);
+      background: rgba(11,15,20,.55);
+      color: rgba(230,237,243,.92);
+    }
+
+    .mention.self{
+      border-color: color-mix(in srgb, var(--accent) 80%, rgba(35,48,65,.9));
+      box-shadow: 0 0 0 2px var(--accentSoft) inset;
+    }
+
     .composer{
       position:sticky;
       bottom:0;
@@ -646,7 +796,7 @@ JS
       padding: 12px 14px;
       display:flex;
       gap:10px;
-      align-items:flex-end;
+      align-items: stretch; /* keep send aligned with textarea */
     }
 
     .inputwrap{ flex:1; min-width:0; }
@@ -668,8 +818,8 @@ JS
     }
 
     textarea:focus{
-      border-color: rgba(61,220,151,.55);
-      box-shadow: 0 0 0 3px rgba(61,220,151,.15);
+      border-color: color-mix(in srgb, var(--accent) 60%, rgba(35,48,65,.95));
+      box-shadow: 0 0 0 3px var(--accentSoft);
     }
 
     .subhint{
@@ -684,16 +834,21 @@ JS
 
     .kbd{ border:1px solid rgba(35,48,65,.9); border-bottom-width:2px; border-radius:8px; padding:2px 6px; background: rgba(11,15,20,.65); }
 
-    .rightbtns{ display:flex; gap:10px; }
+    #send{
+      min-height: 44px;
+      padding: 10px 14px;
+      align-self: stretch;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+    }
 
-    /* Mobile */
     @media (max-width: 720px){
       .topbar-inner{ padding-left: 12px; padding-right: 12px; }
+      .tabs-wrap{ padding-left: 12px; padding-right: 12px; }
       .frame{ padding: 10px 12px; }
       .join{ padding: 10px; }
       .field{ min-width: 0; flex: 1 1 100%; }
-      .rightbtns{ width: 100%; }
-      .rightbtns .btn{ flex: 1; }
       .pill{ display:none; }
       .bubble{ max-width: 100%; }
       .composer-inner{ padding-left: 12px; padding-right: 12px; }
@@ -702,6 +857,7 @@ JS
     @media (prefers-reduced-motion: reduce){
       .log{ scroll-behavior:auto; }
       .btn{ transition:none; }
+      .tab{ transition:none; }
     }
   </style>
 </head>
@@ -711,7 +867,7 @@ JS
       <div class="topbar-inner">
         <div class="brand">
           <h1>Anon Hourly Chat</h1>
-          <div class="tag" id="roomTag">room:lobby</div>
+          <div class="tag" id="roomTag">room:lobby • online:0</div>
         </div>
 
         <div class="pill" title="Connection status">
@@ -726,7 +882,11 @@ JS
 
         <div class="spacer"></div>
 
-        <button class="btn danger" id="clear">clear room</button>
+        <button class="btn" id="bottom">bottom</button>
+      </div>
+
+      <div class="tabs-wrap">
+        <div class="tabs" id="tabs" aria-label="rooms"></div>
       </div>
     </div>
 
@@ -742,12 +902,9 @@ JS
               <label for="nick">nickname</label>
               <input id="nick" autocomplete="off" spellcheck="false" placeholder="anon_fox" />
             </div>
-            <div class="rightbtns">
-              <button class="btn primary" id="join">join</button>
-              <button class="btn" id="bottom">bottom</button>
-            </div>
+            <button class="btn primary" id="join">join</button>
           </div>
-          <div class="hint">Anonymous. No accounts. Server wipes all chat data every hour. <span style="opacity:.8">(UI inspired by terminal-ish “hacker” aesthetics — but with readable spacing.)</span></div>
+          <div class="hint">Anonymous. No accounts. Server wipes all chat data every hour. <span style="opacity:.8">Tips: use <b>/me</b> for actions; ping with <b>@nick</b>.</span></div>
         </div>
 
         <div class="panel" style="flex:1; min-height:0;">
@@ -766,15 +923,15 @@ JS
             <span id="len">0/800</span>
           </div>
         </div>
-        <button class="btn primary" id="send" style="padding:12px 14px;">send</button>
+        <button class="btn primary" id="send">send</button>
       </div>
     </div>
   </div>
 
-  <!-- use local socket.io client served by the same origin -->
   <script src="/socket.io/socket.io.js"></script>
   <script>
     const logEl = document.getElementById('log');
+    const tabsEl = document.getElementById('tabs');
     const roomEl = document.getElementById('room');
     const nickEl = document.getElementById('nick');
     const textEl = document.getElementById('text');
@@ -786,6 +943,9 @@ JS
 
     let currentRoom = 'lobby';
     let currentNick = '';
+    let currentOnline = 0;
+
+    const visitedRooms = new Map(); // room -> lastTs
 
     function nowIso(){ return new Date().toISOString(); }
 
@@ -804,10 +964,7 @@ JS
       return String(m).padStart(2,'0') + ':' + String(r).padStart(2,'0');
     }
 
-    function tickWipe(){
-      wipeCountdown.textContent = fmtCountdown(msUntilNextHour());
-    }
-
+    function tickWipe(){ wipeCountdown.textContent = fmtCountdown(msUntilNextHour()); }
     setInterval(tickWipe, 500);
     tickWipe();
 
@@ -822,16 +979,58 @@ JS
       return ch;
     }
 
-    function pruneDom(max=300){
+    function pruneDom(max=350){
       const nodes = logEl.children;
       if (nodes.length <= max) return;
       const removeCount = nodes.length - max;
-      for (let i=0;i<removeCount;i++){
-        logEl.removeChild(logEl.firstElementChild);
-      }
+      for (let i=0;i<removeCount;i++) logEl.removeChild(logEl.firstElementChild);
     }
 
-    function addLine(kind, nick, text, ts){
+    function hashHue(str){
+      const s = String(str || 'lobby');
+      let h = 0;
+      for (let i=0;i<s.length;i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+      return h % 360;
+    }
+
+    function applyRoomTheme(room){
+      const hue = hashHue(room);
+      const root = document.documentElement;
+      root.style.setProperty('--accent', `hsl(${hue} 72% 52%)`);
+      root.style.setProperty('--accent2', `hsl(${hue} 72% 60%)`);
+      root.style.setProperty('--accentSoft', `hsla(${hue}, 72%, 52%, .16)`);
+    }
+
+    function setRoomTag(r){
+      roomTag.textContent = `room:${r} • online:${currentOnline}`;
+    }
+
+    function normalizeRoom(r){
+      const t = String(r || '').trim();
+      return t ? t : 'lobby';
+    }
+
+    function randNick(){
+      const a = ['anon','quiet','wild','moss','cloud','fox','owl','cat','byte','leaf','null','root','kilo','hex'];
+      const b = Math.floor(Math.random()*10000).toString().padStart(4,'0');
+      return a[Math.floor(Math.random()*a.length)] + '_' + b;
+    }
+
+    function autoGrow(){
+      textEl.style.height = 'auto';
+      textEl.style.height = Math.min(textEl.scrollHeight, 160) + 'px';
+    }
+
+    function updateLen(){
+      const n = (textEl.value || '').length;
+      lenEl.textContent = n + '/800';
+      autoGrow();
+    }
+
+    textEl.addEventListener('input', updateLen);
+    updateLen();
+
+    function addLine(kind, nick, text, ts, msgType){
       const row = document.createElement('div');
       row.className = 'row ' + (kind || '');
 
@@ -857,7 +1056,27 @@ JS
 
       const bubble = document.createElement('div');
       bubble.className = 'bubble';
-      bubble.textContent = text;
+
+      if (msgType === 'action') {
+        bubble.textContent = `* ${nick || 'anon'} ${text}`;
+      } else {
+        // mention highlighting without innerHTML (XSS-safe)
+        const parts = String(text || '').split(/(@[a-zA-Z0-9_.-]{1,24})/g);
+        for (const p of parts) {
+          if (p && p.startsWith('@') && p.length > 1) {
+            const span = document.createElement('span');
+            span.className = 'mention';
+            const target = p.slice(1);
+            if (currentNick && target.toLowerCase() === currentNick.toLowerCase()) {
+              span.classList.add('self');
+            }
+            span.textContent = p;
+            bubble.appendChild(span);
+          } else {
+            bubble.appendChild(document.createTextNode(p));
+          }
+        }
+      }
 
       box.appendChild(meta);
       box.appendChild(bubble);
@@ -866,88 +1085,118 @@ JS
       row.appendChild(box);
 
       logEl.appendChild(row);
-      pruneDom(400);
+      pruneDom(420);
       logEl.scrollTop = logEl.scrollHeight;
+
+      // vibrate on self mention
+      if (kind !== 'sys' && msgType !== 'action' && currentNick) {
+        const escaped = currentNick.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+        const re = new RegExp('(^|\\s)@' + escaped + '(\\b)', 'i');
+        if (re.test(String(text || '')) && navigator.vibrate) navigator.vibrate([12, 30, 12]);
+      }
     }
 
-    function randNick(){
-      const a = ['anon','quiet','wild','moss','cloud','fox','owl','cat','byte','leaf','null','root','kilo','hex'];
-      const b = Math.floor(Math.random()*10000).toString().padStart(4,'0');
-      return a[Math.floor(Math.random()*a.length)] + '_' + b;
-    }
+    function updateTabs(rooms){
+      const list = Array.isArray(rooms) ? rooms.slice() : [];
 
-    function setRoomTag(r){
-      roomTag.textContent = 'room:' + r;
-    }
+      // merge with visited rooms to keep tabs useful even when empty
+      const merged = new Map();
+      for (const r of list) merged.set(r.room, r.online);
+      for (const [r, _ts] of visitedRooms.entries()) {
+        if (!merged.has(r)) merged.set(r, 0);
+      }
 
-    function normalizeRoom(r){
-      const t = String(r || '').trim();
-      return t ? t : 'lobby';
-    }
+      const items = Array.from(merged.entries()).map(([room, online]) => ({ room, online }));
 
-    function autoGrow(){
-      textEl.style.height = 'auto';
-      textEl.style.height = Math.min(textEl.scrollHeight, 160) + 'px';
-    }
+      // sort: current first, then online desc, then recently visited
+      items.sort((a, b) => {
+        if (a.room === currentRoom) return -1;
+        if (b.room === currentRoom) return 1;
+        if (b.online !== a.online) return b.online - a.online;
+        const at = visitedRooms.get(a.room) || 0;
+        const bt = visitedRooms.get(b.room) || 0;
+        return bt - at;
+      });
 
-    function updateLen(){
-      const n = (textEl.value || '').length;
-      lenEl.textContent = n + '/800';
-      autoGrow();
-    }
+      tabsEl.innerHTML = '';
+      items.slice(0, 16).forEach(({room, online}) => {
+        const t = document.createElement('div');
+        t.className = 'tab' + (room === currentRoom ? ' active' : '');
 
-    textEl.addEventListener('input', updateLen);
-    updateLen();
+        const name = document.createElement('span');
+        name.textContent = room;
+
+        const badge = document.createElement('span');
+        badge.className = 'badge';
+        badge.textContent = String(online);
+
+        t.appendChild(name);
+        t.appendChild(badge);
+
+        t.onclick = () => {
+          roomEl.value = room;
+          doJoin();
+        };
+
+        tabsEl.appendChild(t);
+      });
+    }
 
     if (!nickEl.value) nickEl.value = randNick();
     if (!roomEl.value) roomEl.value = 'lobby';
 
-    currentNick = nickEl.value.trim() || 'anon';
+    currentNick = (nickEl.value || '').trim() || 'anon';
     currentRoom = normalizeRoom(roomEl.value);
-    setRoomTag(currentRoom);
+    visitedRooms.set(currentRoom, Date.now());
+    applyRoomTheme(currentRoom);
 
     const socket = io({ transports: ['websocket'] });
 
-    socket.on('connect', () => {
-      setStatus('ok', 'online');
-    });
-
+    socket.on('connect', () => { setStatus('ok', 'online'); });
     socket.on('disconnect', (reason) => {
       setStatus('bad', 'offline');
       addLine('sys', '', 'Disconnected: ' + reason, nowIso());
     });
+    socket.on('connect_error', () => { setStatus('warn', 'reconnecting…'); });
 
-    socket.on('connect_error', () => {
-      setStatus('warn', 'reconnecting…');
+    socket.on('presence', (payload) => {
+      const rooms = (payload && payload.rooms) || [];
+      const hit = rooms.find(r => r.room === currentRoom);
+      currentOnline = hit ? hit.online : currentOnline;
+      setRoomTag(currentRoom);
+      updateTabs(rooms);
     });
 
     socket.on('history', (payload) => {
       logEl.innerHTML = '';
       (payload.history || []).forEach(m => {
         const k = (m.nick === currentNick) ? 'me' : 'msg';
-        addLine(k, m.nick, m.text, m.ts);
+        const kind = (m.type === 'action') ? 'action' : k;
+        addLine(kind, m.nick, m.text, m.ts, m.type);
       });
       addLine('sys', '', 'Joined room: ' + payload.room, nowIso());
-      setRoomTag(payload.room);
       currentRoom = payload.room;
+      visitedRooms.set(currentRoom, Date.now());
+      applyRoomTheme(currentRoom);
+      setRoomTag(currentRoom);
     });
 
-    socket.on('system', (payload) => {
-      addLine('sys', '', payload.message, payload.ts);
-    });
+    socket.on('system', (payload) => { addLine('sys', '', payload.message, payload.ts); });
 
     socket.on('msg', (payload) => {
-      const k = (payload.msg && payload.msg.nick === currentNick) ? 'me' : 'msg';
-      addLine(k, payload.msg.nick, payload.msg.text, payload.msg.ts);
+      const msg = payload && payload.msg;
+      const k = (msg && msg.nick === currentNick) ? 'me' : 'msg';
+      const kind = (msg && msg.type === 'action') ? 'action' : k;
+      addLine(kind, msg.nick, msg.text, msg.ts, msg.type);
     });
 
-    socket.on('error_msg', (payload) => {
-      addLine('sys', '', payload.message || 'Error', nowIso());
-    });
+    socket.on('error_msg', (payload) => { addLine('sys', '', payload.message || 'Error', nowIso()); });
 
     function doJoin(){
       currentNick = (nickEl.value || '').trim() || 'anon';
       currentRoom = normalizeRoom(roomEl.value);
+      visitedRooms.set(currentRoom, Date.now());
+      applyRoomTheme(currentRoom);
       setRoomTag(currentRoom);
       socket.emit('join', { room: currentRoom, nick: currentNick });
       if (navigator.vibrate) navigator.vibrate(10);
@@ -955,8 +1204,8 @@ JS
     }
 
     function doSend(){
-      const t = (textEl.value || '').trim();
-      if (!t) return;
+      const t = (textEl.value || '');
+      if (!t.trim()) return;
       socket.emit('msg', { text: t });
       textEl.value = '';
       updateLen();
@@ -966,11 +1215,6 @@ JS
 
     document.getElementById('join').onclick = doJoin;
     document.getElementById('send').onclick = doSend;
-
-    document.getElementById('clear').onclick = () => {
-      socket.emit('clear_room');
-      if (navigator.vibrate) navigator.vibrate([8,20,8]);
-    };
 
     document.getElementById('bottom').onclick = () => {
       logEl.scrollTop = logEl.scrollHeight;
@@ -991,64 +1235,69 @@ JS
 </html>
 HTML
 
-  pushd "${SERVER_DIR}" >/dev/null
-  npm install --omit=dev
-  popd >/dev/null
+  chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}"
 
-  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+  log "Installing npm deps..."
+  pushd "${SERVER_DIR}" >/dev/null
+  mkdir -p "${SERVER_DIR}/.npm-cache"
+  chown -R "${APP_USER}:${APP_GROUP}" "${SERVER_DIR}/.npm-cache" || true
+  sudo -u "${APP_USER}" -g "${APP_GROUP}" env NPM_CONFIG_CACHE="${SERVER_DIR}/.npm-cache" npm install --omit=dev
+  popd >/dev/null
 }
 
 write_systemd_unit() {
-  log "Writing systemd unit: ${SYSTEMD_UNIT}"
-
-  cat > "/etc/systemd/system/${SYSTEMD_UNIT}" <<UNIT
+  log "Writing systemd unit: ${SERVICE_NAME}"
+  cat > "/etc/systemd/system/${SERVICE_NAME}" <<EOF
 [Unit]
-Description=Anon Hourly Chat (wipes every hour) for ${DOMAIN}
-After=network-online.target redis-server.service
-Wants=network-online.target
+Description=Anon Hourly Chat (${APP_NAME})
+After=network.target redis-server.service
+Wants=redis-server.service
 
 [Service]
 Type=simple
 User=${APP_USER}
-Group=${APP_USER}
+Group=${APP_GROUP}
 WorkingDirectory=${SERVER_DIR}
-Environment=NODE_ENV=production
-Environment=PORT=${APP_PORT}
-Environment=REDIS_URL=redis://127.0.0.1:6379
-Environment=CHAT_KEY_PREFIX=chat:
+Environment=PORT=${PORT}
+Environment=REDIS_URL=${REDIS_URL}
+Environment=CHAT_KEY_PREFIX=${CHAT_KEY_PREFIX}
 Environment=WIPE_EVERY_HOUR=1
-Environment=MAX_MSG_LEN=800
+Environment=MAX_MSG_LEN=${MAX_MSG_LEN}
+Environment=PRESENCE_DEBOUNCE_MS=350
+
 ExecStart=/usr/bin/node ${SERVER_DIR}/server.js
 Restart=always
 RestartSec=2
+
 NoNewPrivileges=true
 PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+EOF
 
   systemctl daemon-reload
-  systemctl enable --now "${SYSTEMD_UNIT}"
-  systemctl restart "${SYSTEMD_UNIT}"
+  systemctl enable --now "${SERVICE_NAME}"
 }
 
-write_nginx_http_only() {
-  log "Writing Nginx HTTP-only config (for first-time ACME + temporary service)..."
-  mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge"
+write_nginx_conf() {
+  local domain="$1"
+  log "Writing Nginx site config for ${domain} ..."
 
-  cat > "${NGINX_AVAIL}" <<NGINX
+  cat > "${NGINX_SITE_AVAIL}" <<EOF
 server {
   listen 80;
-  server_name ${DOMAIN};
+  listen [::]:80;
+  server_name ${domain};
 
+  # ACME challenge
   location ^~ /.well-known/acme-challenge/ {
-    root ${ACME_WEBROOT};
-    default_type text/plain;
+    root /var/www/html;
+    allow all;
   }
 
   location / {
-    proxy_pass http://127.0.0.1:${APP_PORT};
+    proxy_pass http://127.0.0.1:${PORT};
     proxy_http_version 1.1;
 
     proxy_set_header Host \$host;
@@ -1059,30 +1308,41 @@ server {
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
 
-    proxy_read_timeout 120s;
+    proxy_read_timeout 60s;
+    proxy_send_timeout 60s;
   }
 }
-NGINX
+EOF
 
-  ln -sf "${NGINX_AVAIL}" "${NGINX_ENABLED}"
-  rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+  ln -sf "${NGINX_SITE_AVAIL}" "${NGINX_SITE_ENABLED}"
 
   nginx -t
   systemctl reload nginx
 }
 
-write_nginx_https_force() {
-  log "Writing Nginx HTTPS config (force HTTPS; keep ACME path on 80)..."
-  mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge"
+obtain_certificate_if_needed() {
+  local domain="$1"
+  local cert_dir="/etc/letsencrypt/live/${domain}"
 
-  cat > "${NGINX_AVAIL}" <<NGINX
+  if [[ -d "${cert_dir}" ]] && [[ -s "${cert_dir}/fullchain.pem" ]] && [[ -s "${cert_dir}/privkey.pem" ]]; then
+    log "Cert already exists for ${domain}, skipping certbot."
+    return
+  fi
+
+  log "Obtaining TLS certificate via certbot (webroot) for ${domain} ..."
+  mkdir -p /var/www/html
+  certbot certonly --webroot -w /var/www/html -d "${domain}" --agree-tos --register-unsafely-without-email --non-interactive || die "certbot failed"
+
+  log "Updating Nginx config to enable TLS..."
+  cat > "${NGINX_SITE_AVAIL}" <<EOF
 server {
   listen 80;
-  server_name ${DOMAIN};
+  listen [::]:80;
+  server_name ${domain};
 
   location ^~ /.well-known/acme-challenge/ {
-    root ${ACME_WEBROOT};
-    default_type text/plain;
+    root /var/www/html;
+    allow all;
   }
 
   location / {
@@ -1092,19 +1352,23 @@ server {
 
 server {
   listen 443 ssl http2;
-  server_name ${DOMAIN};
+  listen [::]:443 ssl http2;
+  server_name ${domain};
 
-  ssl_certificate     ${LE_FULLCHAIN};
-  ssl_certificate_key ${LE_PRIVKEY};
+  ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
 
   ssl_session_timeout 1d;
   ssl_session_cache shared:SSL:10m;
   ssl_session_tickets off;
 
-  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_prefer_server_ciphers off;
+
+  add_header Strict-Transport-Security "max-age=31536000" always;
 
   location / {
-    proxy_pass http://127.0.0.1:${APP_PORT};
+    proxy_pass http://127.0.0.1:${PORT};
     proxy_http_version 1.1;
 
     proxy_set_header Host \$host;
@@ -1115,83 +1379,102 @@ server {
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
 
-    proxy_read_timeout 120s;
+    proxy_read_timeout 60s;
+    proxy_send_timeout 60s;
   }
 }
-NGINX
+EOF
 
-  ln -sf "${NGINX_AVAIL}" "${NGINX_ENABLED}"
-  rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-
+  ln -sf "${NGINX_SITE_AVAIL}" "${NGINX_SITE_ENABLED}"
   nginx -t
   systemctl reload nginx
 }
 
-obtain_cert_if_needed() {
-  if [[ -f "${LE_FULLCHAIN}" && -f "${LE_PRIVKEY}" ]]; then
-    log "Existing cert found at ${LE_LIVE_DIR}; NOT overwriting."
-    return 0
-  fi
+post_checks() {
+  local domain="$1"
+  log "Post-checks..."
+  systemctl --no-pager status "${SERVICE_NAME}" || true
 
-  log "No existing cert found. Obtaining Let's Encrypt cert for ${DOMAIN} (webroot)..."
-  mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge"
+  log "Health check (local):"
+  curl -fsS "http://127.0.0.1:${PORT}/healthz" | jq . || true
 
-  write_nginx_http_only
+  log "Nginx test:"
+  curl -I "http://${domain}/" --connect-timeout 5 || true
+  curl -Ik "https://${domain}/" --connect-timeout 5 || true
 
-  certbot certonly \
-    --non-interactive --agree-tos \
-    --email "${LE_EMAIL}" \
-    --webroot -w "${ACME_WEBROOT}" \
-    -d "${DOMAIN}" \
-    --keep-until-expiring
-
-  if [[ ! -f "${LE_FULLCHAIN}" || ! -f "${LE_PRIVKEY}" ]]; then
-    die "Cert issuance did not produce expected files under ${LE_LIVE_DIR}."
-  fi
-
-  log "Cert obtained: ${LE_FULLCHAIN}"
+  log "Done."
 }
 
-post_checks() {
-  log "Post-checks..."
-  systemctl --no-pager --full status "${SYSTEMD_UNIT}" || true
-  nginx -t
+install() {
+  require_root
+  parse_args_install "$@"
 
-  log "Local health check (HTTP to localhost):"
-  curl -fsS "http://127.0.0.1:${APP_PORT}/healthz" | jq . || true
+  log "${APP_NAME} ${CHAT_VERSION} install begin"
+  log "DOMAIN=${DOMAIN}"
+  log "PORT=${PORT}"
+  log "REDIS_URL=${REDIS_URL}"
+  log "CHAT_KEY_PREFIX=${CHAT_KEY_PREFIX}"
+  log "MAX_MSG_LEN=${MAX_MSG_LEN}"
 
-  if [[ -f "${LE_FULLCHAIN}" && -f "${LE_PRIVKEY}" ]]; then
-    log "Nginx HTTPS endpoint check (SNI to localhost):"
-    curl -kfsS "https://127.0.0.1/healthz" -H "Host: ${DOMAIN}" | jq . || true
-  else
-    warn "No cert detected yet; HTTPS check skipped."
-  fi
+  ensure_packages
+  ensure_node20
+  ensure_user
 
-  log "Done. Open: https://${DOMAIN}/"
-  log "Logs: journalctl -u ${SYSTEMD_UNIT} -f --no-pager"
+  mkdir -p "${BASE_DIR}"
+  chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}"
+
+  write_app_files
+  write_systemd_unit
+  write_nginx_conf "${DOMAIN}"
+  obtain_certificate_if_needed "${DOMAIN}"
+  post_checks "${DOMAIN}"
+}
+
+uninstall() {
+  require_root
+  parse_args_uninstall "$@"
+
+  log "${APP_NAME} ${CHAT_VERSION} uninstall begin"
+
+  systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${SERVICE_NAME}"
+  systemctl daemon-reload || true
+
+  rm -f "${NGINX_SITE_ENABLED}" "${NGINX_SITE_AVAIL}"
+  nginx -t && systemctl reload nginx || true
+
+  rm -rf "${BASE_DIR}" || true
+
+  log "Uninstall done. (Certificates left intact under /etc/letsencrypt/)"
+}
+
+status_cmd() {
+  require_root
+  systemctl --no-pager status "${SERVICE_NAME}" || true
+  echo
+  nginx -t || true
+}
+
+logs_cmd() {
+  require_root
+  journalctl -u "${SERVICE_NAME}" -n 300 --no-pager || true
 }
 
 main() {
-  need_root
-  log "Installing ${APP_NAME} on ${DOMAIN} (HTTPS required)"
-
-  ensure_pkgs
-  ensure_node20
-
-  stop_previous
-  create_user
-  write_app_files
-  write_systemd_unit
-
-  obtain_cert_if_needed
-
-  if [[ -f "${LE_FULLCHAIN}" && -f "${LE_PRIVKEY}" ]]; then
-    write_nginx_https_force
-  else
-    die "HTTPS is required but no cert exists. Fix DNS/80 reachability and rerun."
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
   fi
 
-  post_checks
+  local cmd="$1"; shift || true
+  case "${cmd}" in
+    install) install "$@" ;;
+    uninstall) uninstall "$@" ;;
+    status) status_cmd ;;
+    logs) logs_cmd ;;
+    -h|--help|help) usage ;;
+    *) die "Unknown command: ${cmd}" ;;
+  esac
 }
 
 main "$@"
