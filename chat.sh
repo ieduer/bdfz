@@ -8,6 +8,9 @@ set -euo pipefail
 # - Nginx reverse proxy + optional TLS with certbot (webroot)
 # - systemd service
 #
+# Usage (recommended; avoids process-substitution /dev/fd issues under sudo):
+#   curl -fsSL https://raw.githubusercontent.com/ieduer/bdfz/main/chat.sh | sudo bash -s -- install --domain chat.example.com
+#
 # Usage:
 #   sudo bash chat.sh install --domain chat.example.com
 #   sudo bash chat.sh uninstall --domain chat.example.com
@@ -18,7 +21,7 @@ set -euo pipefail
 # - This script will NOT overwrite existing cert files if already present.
 # - Default: listens on 127.0.0.1:8080 behind Nginx.
 
-CHAT_VERSION="v1.2.0"
+CHAT_VERSION="v1.2.2"
 
 APP_NAME="anon-hourly-chat"
 APP_USER="anonchat"
@@ -40,13 +43,18 @@ REDIS_URL_DEFAULT="redis://127.0.0.1:6379"
 CHAT_KEY_PREFIX_DEFAULT="chat:"
 MAX_MSG_LEN_DEFAULT="800"
 
+# uninstall behavior (defaults)
+PURGE_DATA_DEFAULT="1"       # remove /opt/anon-hourly-chat
+PURGE_USER_DEFAULT="0"       # keep system user/group by default
+PURGE_CERT_DEFAULT="0"       # keep /etc/letsencrypt live dir by default
+
 usage() {
   cat <<EOF
 ${APP_NAME} ${CHAT_VERSION}
 
 Commands:
   install   --domain <domain> [--port 8080] [--redis-url redis://127.0.0.1:6379] [--prefix chat:] [--max-len 800]
-  uninstall --domain <domain>
+  uninstall --domain <domain> [--purge-data 0|1] [--purge-user 0|1] [--purge-cert 0|1]
   status
   logs
 
@@ -54,6 +62,9 @@ Examples:
   sudo bash chat.sh install --domain chat.example.com
   sudo bash chat.sh install --domain chat.example.com --port 8080 --prefix chat:
   sudo bash chat.sh logs
+
+Tip (recommended):
+  curl -fsSL https://raw.githubusercontent.com/ieduer/bdfz/main/chat.sh | sudo bash -s -- install --domain chat.example.com
 EOF
 }
 
@@ -91,13 +102,24 @@ parse_args_install() {
 
 parse_args_uninstall() {
   DOMAIN="${DEFAULT_DOMAIN}"
+  PURGE_DATA="${PURGE_DATA_DEFAULT}"
+  PURGE_USER="${PURGE_USER_DEFAULT}"
+  PURGE_CERT="${PURGE_CERT_DEFAULT}"
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --domain) DOMAIN="${2:-}"; shift 2 ;;
+      --purge-data) PURGE_DATA="${2:-}"; shift 2 ;;
+      --purge-user) PURGE_USER="${2:-}"; shift 2 ;;
+      --purge-cert) PURGE_CERT="${2:-}"; shift 2 ;;
       *) die "Unknown arg: $1" ;;
     esac
   done
+
   [[ -n "${DOMAIN}" ]] || die "--domain is required"
+  [[ "${PURGE_DATA}" == "0" || "${PURGE_DATA}" == "1" ]] || die "--purge-data must be 0 or 1"
+  [[ "${PURGE_USER}" == "0" || "${PURGE_USER}" == "1" ]] || die "--purge-user must be 0 or 1"
+  [[ "${PURGE_CERT}" == "0" || "${PURGE_CERT}" == "1" ]] || die "--purge-cert must be 0 or 1"
 }
 
 ensure_packages() {
@@ -106,7 +128,7 @@ ensure_packages() {
   apt-get install -y \
     curl ca-certificates gnupg \
     nginx redis-server \
-    certbot python3-certbot-nginx \
+    certbot \
     jq
 
   systemctl enable --now redis-server >/dev/null 2>&1 || true
@@ -152,17 +174,24 @@ ensure_user() {
   usermod -a -G "${APP_GROUP}" "${APP_USER}" >/dev/null 2>&1 || true
 }
 
+stop_service_if_running() {
+  if systemctl list-units --full -all | grep -q "^${SERVICE_NAME}"; then
+    systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  fi
+}
+
 write_app_files() {
   log "Writing app files to ${SERVER_DIR} ..."
 
   mkdir -p "${PUBLIC_DIR}"
-  chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}"
-  chmod 755 "${BASE_DIR}" "${SERVER_DIR}" "${PUBLIC_DIR}"
+  chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}" || true
+  chmod 755 "${BASE_DIR}" "${SERVER_DIR}" "${PUBLIC_DIR}" || true
 
   cat > "${SERVER_DIR}/package.json" <<'JSON'
 {
   "name": "anon-hourly-chat",
-  "version": "1.2.0",
+  "version": "1.2.2",
   "private": true,
   "type": "commonjs",
   "main": "server.js",
@@ -192,7 +221,7 @@ const express = require('express');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
 
-const VERSION = 'v1.2.0';
+const VERSION = 'v1.2.2';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
@@ -458,6 +487,7 @@ function parseMessageText(raw) {
 });
 JS
 
+  # HTML is generated here on every install to ${PUBLIC_DIR}/index.html
   cat > "${PUBLIC_DIR}/index.html" <<'HTML'
 <!doctype html>
 <html lang="en">
@@ -486,6 +516,8 @@ JS
 
       --warn:#f2cc60;
       --red:#ff6b6b;
+
+      --composerH: 44px;
     }
 
     *{ box-sizing:border-box; }
@@ -642,6 +674,13 @@ JS
       background: rgba(15,23,32,.78);
       color: rgba(230,237,243,.78);
       font-size: 11px;
+      line-height: 1.2;
+    }
+
+    .tab .badge.unread{
+      border-color: color-mix(in srgb, var(--accent) 70%, rgba(35,48,65,.9));
+      color: rgba(230,237,243,.92);
+      box-shadow: 0 0 0 2px var(--accentSoft) inset;
     }
 
     .tab.active{
@@ -796,7 +835,7 @@ JS
       padding: 12px 14px;
       display:flex;
       gap:10px;
-      align-items: stretch; /* keep send aligned with textarea */
+      align-items: stretch;
     }
 
     .inputwrap{ flex:1; min-width:0; }
@@ -804,8 +843,9 @@ JS
     textarea{
       width:100%;
       resize: none;
-      max-height: 160px;
-      min-height: 44px;
+      height: var(--composerH);
+      min-height: var(--composerH);
+      max-height: var(--composerH);
       background: rgba(15,23,32,.92);
       color: var(--text);
       border: 1px solid rgba(35,48,65,.95);
@@ -815,6 +855,7 @@ JS
       font-family: var(--mono);
       font-size: 13px;
       line-height: 1.35;
+      overflow: hidden;
     }
 
     textarea:focus{
@@ -822,20 +863,9 @@ JS
       box-shadow: 0 0 0 3px var(--accentSoft);
     }
 
-    .subhint{
-      margin-top: 6px;
-      font-family: var(--mono);
-      font-size: 11px;
-      color: rgba(230,237,243,.55);
-      display:flex;
-      gap:10px;
-      flex-wrap:wrap;
-    }
-
-    .kbd{ border:1px solid rgba(35,48,65,.9); border-bottom-width:2px; border-radius:8px; padding:2px 6px; background: rgba(11,15,20,.65); }
-
     #send{
-      min-height: 44px;
+      height: var(--composerH);
+      min-height: var(--composerH);
       padding: 10px 14px;
       align-self: stretch;
       display:flex;
@@ -917,11 +947,6 @@ JS
       <div class="composer-inner">
         <div class="inputwrap">
           <textarea id="text" placeholder="Type a message…" maxlength="800" rows="1"></textarea>
-          <div class="subhint">
-            <span><span class="kbd">Enter</span> send</span>
-            <span><span class="kbd">Shift</span>+<span class="kbd">Enter</span> newline</span>
-            <span id="len">0/800</span>
-          </div>
         </div>
         <button class="btn primary" id="send">send</button>
       </div>
@@ -939,13 +964,17 @@ JS
     const dot = document.getElementById('dot');
     const statusText = document.getElementById('statusText');
     const wipeCountdown = document.getElementById('wipeCountdown');
-    const lenEl = document.getElementById('len');
 
     let currentRoom = 'lobby';
     let currentNick = '';
     let currentOnline = 0;
 
-    const visitedRooms = new Map(); // room -> lastTs
+    // Isolation: keep per-room message buffers, render ONLY current room
+    const roomLogs = new Map();      // room -> [{kind,nick,text,ts,msgType}]
+    const roomUnread = new Map();    // room -> unread count
+    let lastPresenceRooms = [];      // last presence snapshot
+
+    const visitedRooms = new Map();  // room -> lastVisitedTs
 
     function nowIso(){ return new Date().toISOString(); }
 
@@ -979,13 +1008,6 @@ JS
       return ch;
     }
 
-    function pruneDom(max=350){
-      const nodes = logEl.children;
-      if (nodes.length <= max) return;
-      const removeCount = nodes.length - max;
-      for (let i=0;i<removeCount;i++) logEl.removeChild(logEl.firstElementChild);
-    }
-
     function hashHue(str){
       const s = String(str || 'lobby');
       let h = 0;
@@ -1016,21 +1038,46 @@ JS
       return a[Math.floor(Math.random()*a.length)] + '_' + b;
     }
 
-    function autoGrow(){
-      textEl.style.height = 'auto';
-      textEl.style.height = Math.min(textEl.scrollHeight, 160) + 'px';
+    function getRoomLog(room){
+      const r = normalizeRoom(room);
+      if (!roomLogs.has(r)) roomLogs.set(r, []);
+      return roomLogs.get(r);
     }
 
-    function updateLen(){
-      const n = (textEl.value || '').length;
-      lenEl.textContent = n + '/800';
-      autoGrow();
+    function setRoomLog(room, entries){
+      const r = normalizeRoom(room);
+      roomLogs.set(r, Array.isArray(entries) ? entries.slice() : []);
     }
 
-    textEl.addEventListener('input', updateLen);
-    updateLen();
+    function bumpUnread(room, n){
+      const r = normalizeRoom(room);
+      const cur = roomUnread.get(r) || 0;
+      roomUnread.set(r, Math.max(0, cur + (n || 0)));
+    }
 
-    function addLine(kind, nick, text, ts, msgType){
+    function clearUnread(room){
+      const r = normalizeRoom(room);
+      roomUnread.set(r, 0);
+    }
+
+    function getUnread(room){
+      const r = normalizeRoom(room);
+      return roomUnread.get(r) || 0;
+    }
+
+    function pruneRoomLog(room, max=420){
+      const arr = getRoomLog(room);
+      if (arr.length <= max) return;
+      arr.splice(0, arr.length - max);
+    }
+
+    function renderEntry(entry){
+      const kind = entry.kind || 'msg';
+      const nick = entry.nick || '';
+      const text = entry.text || '';
+      const ts = entry.ts || '';
+      const msgType = entry.msgType || 'text';
+
       const row = document.createElement('div');
       row.className = 'row ' + (kind || '');
 
@@ -1085,10 +1132,16 @@ JS
       row.appendChild(box);
 
       logEl.appendChild(row);
-      pruneDom(420);
+
+      // keep DOM light
+      const maxDom = 420;
+      while (logEl.children.length > maxDom) {
+        logEl.removeChild(logEl.firstElementChild);
+      }
+
       logEl.scrollTop = logEl.scrollHeight;
 
-      // vibrate on self mention
+      // vibrate on self mention (only in current room render)
       if (kind !== 'sys' && msgType !== 'action' && currentNick) {
         const escaped = currentNick.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
         const re = new RegExp('(^|\\s)@' + escaped + '(\\b)', 'i');
@@ -1096,10 +1149,25 @@ JS
       }
     }
 
+    function pushEntry(room, entry){
+      const r = normalizeRoom(room);
+      const arr = getRoomLog(r);
+      arr.push(entry);
+      pruneRoomLog(r, 420);
+    }
+
+    function renderRoom(room){
+      const r = normalizeRoom(room);
+      logEl.innerHTML = '';
+      const arr = getRoomLog(r);
+      for (const e of arr) renderEntry(e);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
     function updateTabs(rooms){
       const list = Array.isArray(rooms) ? rooms.slice() : [];
 
-      // merge with visited rooms to keep tabs useful even when empty
+      // merge with visited rooms so tabs remain clickable
       const merged = new Map();
       for (const r of list) merged.set(r.room, r.online);
       for (const [r, _ts] of visitedRooms.entries()) {
@@ -1126,12 +1194,20 @@ JS
         const name = document.createElement('span');
         name.textContent = room;
 
-        const badge = document.createElement('span');
-        badge.className = 'badge';
-        badge.textContent = String(online);
+        const badgeOnline = document.createElement('span');
+        badgeOnline.className = 'badge';
+        badgeOnline.textContent = String(online);
 
         t.appendChild(name);
-        t.appendChild(badge);
+        t.appendChild(badgeOnline);
+
+        const unread = getUnread(room);
+        if (unread > 0 && room !== currentRoom) {
+          const badgeUnread = document.createElement('span');
+          badgeUnread.className = 'badge unread';
+          badgeUnread.textContent = '+' + String(Math.min(unread, 99));
+          t.appendChild(badgeUnread);
+        }
 
         t.onclick = () => {
           roomEl.value = room;
@@ -1149,55 +1225,105 @@ JS
     currentRoom = normalizeRoom(roomEl.value);
     visitedRooms.set(currentRoom, Date.now());
     applyRoomTheme(currentRoom);
+    clearUnread(currentRoom);
 
     const socket = io({ transports: ['websocket'] });
 
     socket.on('connect', () => { setStatus('ok', 'online'); });
     socket.on('disconnect', (reason) => {
       setStatus('bad', 'offline');
-      addLine('sys', '', 'Disconnected: ' + reason, nowIso());
+      pushEntry(currentRoom, { kind: 'sys', nick: '', text: 'Disconnected: ' + reason, ts: nowIso(), msgType: 'text' });
+      renderRoom(currentRoom);
     });
     socket.on('connect_error', () => { setStatus('warn', 'reconnecting…'); });
 
     socket.on('presence', (payload) => {
-      const rooms = (payload && payload.rooms) || [];
-      const hit = rooms.find(r => r.room === currentRoom);
+      lastPresenceRooms = (payload && payload.rooms) || [];
+      const hit = lastPresenceRooms.find(r => r.room === currentRoom);
       currentOnline = hit ? hit.online : currentOnline;
       setRoomTag(currentRoom);
-      updateTabs(rooms);
+      updateTabs(lastPresenceRooms);
     });
 
     socket.on('history', (payload) => {
-      logEl.innerHTML = '';
-      (payload.history || []).forEach(m => {
-        const k = (m.nick === currentNick) ? 'me' : 'msg';
-        const kind = (m.type === 'action') ? 'action' : k;
-        addLine(kind, m.nick, m.text, m.ts, m.type);
-      });
-      addLine('sys', '', 'Joined room: ' + payload.room, nowIso());
-      currentRoom = payload.room;
+      const room = normalizeRoom(payload && payload.room);
+      const history = (payload && payload.history) || [];
+
+      const entries = [];
+      for (const m of history) {
+        const me = (m.nick === currentNick);
+        const kind = (m.type === 'action') ? 'action' : (me ? 'me' : 'msg');
+        entries.push({ kind, nick: m.nick, text: m.text, ts: m.ts, msgType: m.type || 'text' });
+      }
+      entries.push({ kind: 'sys', nick: '', text: 'Joined room: ' + room, ts: nowIso(), msgType: 'text' });
+
+      setRoomLog(room, entries);
+      currentRoom = room;
       visitedRooms.set(currentRoom, Date.now());
       applyRoomTheme(currentRoom);
+      clearUnread(currentRoom);
+
+      // refresh online number from last presence
+      const hit = lastPresenceRooms.find(r => r.room === currentRoom);
+      if (hit) currentOnline = hit.online;
+
       setRoomTag(currentRoom);
+      renderRoom(currentRoom);
+      updateTabs(lastPresenceRooms);
     });
 
-    socket.on('system', (payload) => { addLine('sys', '', payload.message, payload.ts); });
+    socket.on('system', (payload) => {
+      const room = normalizeRoom(payload && payload.room);
+      pushEntry(room, { kind: 'sys', nick: '', text: (payload && payload.message) || 'system', ts: (payload && payload.ts) || nowIso(), msgType: 'text' });
+
+      if (room === currentRoom) {
+        renderRoom(currentRoom);
+      } else {
+        bumpUnread(room, 1);
+        updateTabs(lastPresenceRooms);
+      }
+    });
 
     socket.on('msg', (payload) => {
+      const room = normalizeRoom(payload && payload.room);
       const msg = payload && payload.msg;
-      const k = (msg && msg.nick === currentNick) ? 'me' : 'msg';
-      const kind = (msg && msg.type === 'action') ? 'action' : k;
-      addLine(kind, msg.nick, msg.text, msg.ts, msg.type);
+      if (!msg) return;
+
+      const me = (msg.nick === currentNick);
+      const kind = (msg.type === 'action') ? 'action' : (me ? 'me' : 'msg');
+      pushEntry(room, { kind, nick: msg.nick, text: msg.text, ts: msg.ts, msgType: msg.type || 'text' });
+
+      if (room === currentRoom) {
+        renderRoom(currentRoom);
+      } else {
+        bumpUnread(room, 1);
+        updateTabs(lastPresenceRooms);
+      }
     });
 
-    socket.on('error_msg', (payload) => { addLine('sys', '', payload.message || 'Error', nowIso()); });
+    socket.on('error_msg', (payload) => {
+      pushEntry(currentRoom, { kind: 'sys', nick: '', text: (payload && payload.message) || 'Error', ts: nowIso(), msgType: 'text' });
+      renderRoom(currentRoom);
+    });
 
     function doJoin(){
       currentNick = (nickEl.value || '').trim() || 'anon';
-      currentRoom = normalizeRoom(roomEl.value);
+      const nextRoom = normalizeRoom(roomEl.value);
+
+      // UI switches immediately to isolate view (no mixing even if late events arrive)
+      currentRoom = nextRoom;
       visitedRooms.set(currentRoom, Date.now());
       applyRoomTheme(currentRoom);
+      clearUnread(currentRoom);
+
+      // best-effort online count
+      const hit = lastPresenceRooms.find(r => r.room === currentRoom);
+      if (hit) currentOnline = hit.online;
+
       setRoomTag(currentRoom);
+      renderRoom(currentRoom);
+      updateTabs(lastPresenceRooms);
+
       socket.emit('join', { room: currentRoom, nick: currentNick });
       if (navigator.vibrate) navigator.vibrate(10);
       textEl.focus();
@@ -1208,7 +1334,6 @@ JS
       if (!t.trim()) return;
       socket.emit('msg', { text: t });
       textEl.value = '';
-      updateLen();
       textEl.focus();
       if (navigator.vibrate) navigator.vibrate(8);
     }
@@ -1235,7 +1360,7 @@ JS
 </html>
 HTML
 
-  chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}"
+  chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}" || true
 
   log "Installing npm deps..."
   pushd "${SERVER_DIR}" >/dev/null
@@ -1277,7 +1402,8 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}"
+  systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || systemctl start "${SERVICE_NAME}" >/dev/null 2>&1 || true
 }
 
 write_nginx_conf() {
@@ -1402,6 +1528,10 @@ post_checks() {
   curl -I "http://${domain}/" --connect-timeout 5 || true
   curl -Ik "https://${domain}/" --connect-timeout 5 || true
 
+  log "App files sanity:"
+  ls -la "${SERVER_DIR}" || true
+  ls -la "${PUBLIC_DIR}" | head -n 50 || true
+
   log "Done."
 }
 
@@ -1421,8 +1551,9 @@ install() {
   ensure_user
 
   mkdir -p "${BASE_DIR}"
-  chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}"
+  chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}" || true
 
+  stop_service_if_running
   write_app_files
   write_systemd_unit
   write_nginx_conf "${DOMAIN}"
@@ -1435,44 +1566,62 @@ uninstall() {
   parse_args_uninstall "$@"
 
   log "${APP_NAME} ${CHAT_VERSION} uninstall begin"
+  log "DOMAIN=${DOMAIN}"
+  log "PURGE_DATA=${PURGE_DATA} PURGE_USER=${PURGE_USER} PURGE_CERT=${PURGE_CERT}"
 
   systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/${SERVICE_NAME}"
-  systemctl daemon-reload || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
 
-  rm -f "${NGINX_SITE_ENABLED}" "${NGINX_SITE_AVAIL}"
-  nginx -t && systemctl reload nginx || true
+  rm -f "${NGINX_SITE_ENABLED}" || true
+  rm -f "${NGINX_SITE_AVAIL}" || true
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
 
-  rm -rf "${BASE_DIR}" || true
+  if [[ "${PURGE_DATA}" == "1" ]]; then
+    rm -rf "${BASE_DIR}" || true
+  fi
 
-  log "Uninstall done. (Certificates left intact under /etc/letsencrypt/)"
+  if [[ "${PURGE_CERT}" == "1" ]]; then
+    rm -rf "/etc/letsencrypt/live/${DOMAIN}" "/etc/letsencrypt/archive/${DOMAIN}" "/etc/letsencrypt/renewal/${DOMAIN}.conf" || true
+  fi
+
+  if [[ "${PURGE_USER}" == "1" ]]; then
+    userdel "${APP_USER}" >/dev/null 2>&1 || true
+    groupdel "${APP_GROUP}" >/dev/null 2>&1 || true
+  fi
+
+  log "Uninstall done."
 }
 
 status_cmd() {
-  require_root
+  echo "${APP_NAME} ${CHAT_VERSION}"
+  echo
   systemctl --no-pager status "${SERVICE_NAME}" || true
   echo
-  nginx -t || true
+  echo "Listening ports:";
+  ss -ltnp | grep -E ":(${DEFAULT_PORT})\s" || true
+  echo
+  echo "Local health:";
+  curl -fsS "http://127.0.0.1:${DEFAULT_PORT}/healthz" | jq . || true
 }
 
 logs_cmd() {
-  require_root
-  journalctl -u "${SERVICE_NAME}" -n 300 --no-pager || true
+  echo "${APP_NAME} ${CHAT_VERSION}"
+  echo
+  journalctl -u "${SERVICE_NAME}" -n 250 --no-pager || true
 }
 
 main() {
-  if [[ $# -lt 1 ]]; then
-    usage
-    exit 1
-  fi
+  local cmd="${1:-}"
+  shift || true
 
-  local cmd="$1"; shift || true
   case "${cmd}" in
     install) install "$@" ;;
     uninstall) uninstall "$@" ;;
     status) status_cmd ;;
     logs) logs_cmd ;;
-    -h|--help|help) usage ;;
+    -h|--help|help|"") usage ;;
     *) die "Unknown command: ${cmd}" ;;
   esac
 }
