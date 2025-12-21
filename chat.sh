@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# anon-hourly-chat installer (FastAPI-free; Node + Socket.IO + Redis + Nginx)
+# anon-hourly-chat installer (Node + Socket.IO + Redis + Nginx)
 # - Anonymous multi-room chat
 # - Redis stores per-room message history (1 hour TTL)
 # - Wipes ALL chat:* keys every hour at the top of the hour (server-side scheduler)
@@ -21,7 +21,7 @@ set -euo pipefail
 # - This script will NOT overwrite existing cert files if already present.
 # - Default: listens on 127.0.0.1:8080 behind Nginx.
 
-CHAT_VERSION="v1.2.2"
+CHAT_VERSION="v1.2.3"
 
 APP_NAME="anon-hourly-chat"
 APP_USER="anonchat"
@@ -43,10 +43,9 @@ REDIS_URL_DEFAULT="redis://127.0.0.1:6379"
 CHAT_KEY_PREFIX_DEFAULT="chat:"
 MAX_MSG_LEN_DEFAULT="800"
 
-# uninstall behavior (defaults)
-PURGE_DATA_DEFAULT="1"       # remove /opt/anon-hourly-chat
-PURGE_USER_DEFAULT="0"       # keep system user/group by default
-PURGE_CERT_DEFAULT="0"       # keep /etc/letsencrypt live dir by default
+PURGE_DATA_DEFAULT="1"
+PURGE_USER_DEFAULT="0"
+PURGE_CERT_DEFAULT="0"
 
 usage() {
   cat <<EOF
@@ -191,7 +190,7 @@ write_app_files() {
   cat > "${SERVER_DIR}/package.json" <<'JSON'
 {
   "name": "anon-hourly-chat",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "private": true,
   "type": "commonjs",
   "main": "server.js",
@@ -212,7 +211,8 @@ JSON
  * - Messages stored in Redis with a prefix
  * - Wipes ALL chat:* keys every hour at the top of the hour
  * - Presence: room online counts + top rooms
- * - /me action messages (client renders differently)
+ * - /me action messages
+ * - client_id support for optimistic UI de-dup on client
  */
 
 const path = require('path');
@@ -221,7 +221,7 @@ const express = require('express');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
 
-const VERSION = 'v1.2.2';
+const VERSION = 'v1.2.3';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
@@ -243,7 +243,6 @@ function clampText(s, maxLen) {
 function safeNick(nick) {
   const t = String(nick || '').trim();
   if (!t) return 'anon';
-  // allow a-zA-Z0-9_.- and keep it short
   const cleaned = t.replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 24);
   return cleaned || 'anon';
 }
@@ -253,6 +252,13 @@ function safeRoom(room) {
   if (!r) return 'lobby';
   const cleaned = r.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
   return cleaned || 'lobby';
+}
+
+function safeClientId(x) {
+  const t = String(x || '').trim();
+  if (!t) return '';
+  const cleaned = t.replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 80);
+  return cleaned;
 }
 
 function kRoomMessages(room) {
@@ -316,9 +322,8 @@ async function startHourlyWipe(redis) {
 function listPublicRooms(io) {
   const rooms = [];
   const adapter = io.sockets.adapter;
-  // In Socket.IO, private rooms are socket ids. adapter.sids holds socket ids.
   for (const [name, sockets] of adapter.rooms) {
-    if (adapter.sids && adapter.sids.has(name)) continue; // skip private room
+    if (adapter.sids && adapter.sids.has(name)) continue;
     const online = sockets ? sockets.size : 0;
     if (online <= 0) continue;
     rooms.push({ room: name, online });
@@ -402,7 +407,6 @@ function parseMessageText(raw) {
   app.use('/', express.static(path.join(__dirname, 'public')));
 
   io.on('connection', (socket) => {
-    // send initial presence snapshot
     socket.emit('presence', buildPresencePayload(io));
     broadcastPresence();
 
@@ -449,8 +453,11 @@ function parseMessageText(raw) {
       const parsed = parseMessageText(payload && payload.text);
       if (!parsed) return;
 
+      const client_id = safeClientId(payload && payload.client_id);
+
       const msg = {
         id: socket.id + ':' + Date.now(),
+        client_id,
         nick,
         text: parsed.text,
         type: parsed.type,
@@ -487,7 +494,6 @@ function parseMessageText(raw) {
 });
 JS
 
-  # HTML is generated here on every install to ${PUBLIC_DIR}/index.html
   cat > "${PUBLIC_DIR}/index.html" <<'HTML'
 <!doctype html>
 <html lang="en">
@@ -509,7 +515,6 @@ JS
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       --sans: system-ui, -apple-system, Segoe UI, Roboto, Arial;
 
-      /* per-room theme */
       --accent: hsl(150 72% 52%);
       --accent2: hsl(150 72% 60%);
       --accentSoft: hsla(150, 72%, 52%, .16);
@@ -534,12 +539,7 @@ JS
       -moz-osx-font-smoothing: grayscale;
     }
 
-    .app{
-      height:100vh;
-      height:100dvh;
-      display:flex;
-      flex-direction:column;
-    }
+    .app{ height:100vh; height:100dvh; display:flex; flex-direction:column; }
 
     .topbar{
       position:sticky;
@@ -560,12 +560,7 @@ JS
       margin: 0 auto;
     }
 
-    .brand{
-      display:flex;
-      align-items:baseline;
-      gap:10px;
-      min-width: 0;
-    }
+    .brand{ display:flex; align-items:baseline; gap:10px; min-width: 0; }
 
     .brand h1{
       margin:0;
@@ -600,13 +595,10 @@ JS
     }
 
     .dot{
-      width:8px;
-      height:8px;
-      border-radius:99px;
+      width:8px; height:8px; border-radius:99px;
       background: rgba(255,255,255,.25);
       box-shadow: 0 0 0 2px rgba(255,255,255,.06) inset;
     }
-
     .dot.ok{ background: var(--accent); box-shadow: 0 0 14px var(--accentSoft); }
     .dot.warn{ background: var(--warn); box-shadow: 0 0 12px rgba(242,204,96,.45); }
     .dot.bad{ background: var(--red); box-shadow: 0 0 12px rgba(255,107,107,.45); }
@@ -631,18 +623,10 @@ JS
     .btn:active{ transform: translateY(1px); }
     .btn.primary{ border-color: color-mix(in srgb, var(--accent) 65%, rgba(31,42,55,.9)); }
 
-    /* room tabs */
-    .tabs-wrap{
-      max-width: 1100px;
-      margin: 0 auto;
-      padding: 0 14px 10px 14px;
-    }
+    .tabs-wrap{ max-width: 1100px; margin: 0 auto; padding: 0 14px 10px 14px; }
 
     .tabs{
-      display:flex;
-      gap:8px;
-      overflow:auto;
-      padding-bottom: 2px;
+      display:flex; gap:8px; overflow:auto; padding-bottom: 2px;
       scrollbar-width: none;
     }
     .tabs::-webkit-scrollbar{ display:none; }
@@ -716,7 +700,6 @@ JS
     }
 
     .field{ display:flex; flex-direction:column; gap:6px; min-width: 160px; flex: 1; }
-
     .field label{ font-family: var(--mono); font-size: 11px; color: var(--muted); }
 
     .field input{
@@ -749,14 +732,11 @@ JS
     .row{ margin: 10px 0; display:flex; gap:10px; }
 
     .avatar{
-      width: 22px;
-      height: 22px;
+      width: 22px; height: 22px;
       border-radius: 6px;
       border: 1px solid rgba(31,42,55,.9);
       background: rgba(15,23,32,.95);
-      display:flex;
-      align-items:center;
-      justify-content:center;
+      display:flex; align-items:center; justify-content:center;
       font-family: var(--mono);
       font-size: 12px;
       color: rgba(230,237,243,.85);
@@ -804,6 +784,11 @@ JS
       background: rgba(11,15,20,.55);
       border-color: color-mix(in srgb, var(--accent) 60%, rgba(35,48,65,.9));
       font-style: italic;
+    }
+
+    .pending .bubble{
+      opacity: .78;
+      border-style: dashed;
     }
 
     .mention{
@@ -969,12 +954,12 @@ JS
     let currentNick = '';
     let currentOnline = 0;
 
-    // Isolation: keep per-room message buffers, render ONLY current room
-    const roomLogs = new Map();      // room -> [{kind,nick,text,ts,msgType}]
-    const roomUnread = new Map();    // room -> unread count
-    let lastPresenceRooms = [];      // last presence snapshot
+    const roomLogs = new Map();      // room -> [{...}]
+    const roomUnread = new Map();    // room -> unread
+    let lastPresenceRooms = [];
 
-    const visitedRooms = new Map();  // room -> lastVisitedTs
+    const visitedRooms = new Map();  // room -> ts
+    const pendingByClientId = new Map(); // client_id -> { room, idx }
 
     function nowIso(){ return new Date().toISOString(); }
 
@@ -1002,6 +987,22 @@ JS
       statusText.textContent = text;
     }
 
+    function safeRoomName(r){
+      const t = String(r || '').trim();
+      if (!t) return 'lobby';
+      const cleaned = t.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+      return cleaned || 'lobby';
+    }
+
+    function safeNickName(n){
+      const t = String(n || '').trim();
+      if (!t) return 'anon';
+      const cleaned = t.replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 24);
+      return cleaned || 'anon';
+    }
+
+    function normalizeRoom(r){ return safeRoomName(r); }
+
     function avatarChar(nick){
       const t = String(nick || 'a');
       const ch = (t.trim()[0] || 'a').toUpperCase();
@@ -1025,11 +1026,6 @@ JS
 
     function setRoomTag(r){
       roomTag.textContent = `room:${r} • online:${currentOnline}`;
-    }
-
-    function normalizeRoom(r){
-      const t = String(r || '').trim();
-      return t ? t : 'lobby';
     }
 
     function randNick(){
@@ -1077,9 +1073,11 @@ JS
       const text = entry.text || '';
       const ts = entry.ts || '';
       const msgType = entry.msgType || 'text';
+      const pending = !!entry.pending;
 
       const row = document.createElement('div');
-      row.className = 'row ' + (kind || '');
+      row.className = 'row ' + (kind || '') + (pending ? ' pending' : '');
+      if (entry.client_id) row.dataset.clientId = entry.client_id;
 
       const av = document.createElement('div');
       av.className = 'avatar';
@@ -1107,7 +1105,6 @@ JS
       if (msgType === 'action') {
         bubble.textContent = `* ${nick || 'anon'} ${text}`;
       } else {
-        // mention highlighting without innerHTML (XSS-safe)
         const parts = String(text || '').split(/(@[a-zA-Z0-9_.-]{1,24})/g);
         for (const p of parts) {
           if (p && p.startsWith('@') && p.length > 1) {
@@ -1133,7 +1130,6 @@ JS
 
       logEl.appendChild(row);
 
-      // keep DOM light
       const maxDom = 420;
       while (logEl.children.length > maxDom) {
         logEl.removeChild(logEl.firstElementChild);
@@ -1141,7 +1137,6 @@ JS
 
       logEl.scrollTop = logEl.scrollHeight;
 
-      // vibrate on self mention (only in current room render)
       if (kind !== 'sys' && msgType !== 'action' && currentNick) {
         const escaped = currentNick.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
         const re = new RegExp('(^|\\s)@' + escaped + '(\\b)', 'i');
@@ -1154,6 +1149,7 @@ JS
       const arr = getRoomLog(r);
       arr.push(entry);
       pruneRoomLog(r, 420);
+      return arr.length - 1;
     }
 
     function renderRoom(room){
@@ -1167,7 +1163,6 @@ JS
     function updateTabs(rooms){
       const list = Array.isArray(rooms) ? rooms.slice() : [];
 
-      // merge with visited rooms so tabs remain clickable
       const merged = new Map();
       for (const r of list) merged.set(r.room, r.online);
       for (const [r, _ts] of visitedRooms.entries()) {
@@ -1176,7 +1171,6 @@ JS
 
       const items = Array.from(merged.entries()).map(([room, online]) => ({ room, online }));
 
-      // sort: current first, then online desc, then recently visited
       items.sort((a, b) => {
         if (a.room === currentRoom) return -1;
         if (b.room === currentRoom) return 1;
@@ -1218,11 +1212,19 @@ JS
       });
     }
 
+    function genClientId(){
+      const r = Math.random().toString(16).slice(2, 10);
+      return 'c:' + Date.now().toString(16) + ':' + r;
+    }
+
     if (!nickEl.value) nickEl.value = randNick();
     if (!roomEl.value) roomEl.value = 'lobby';
 
-    currentNick = (nickEl.value || '').trim() || 'anon';
-    currentRoom = normalizeRoom(roomEl.value);
+    currentNick = safeNickName(nickEl.value);
+    currentRoom = safeRoomName(roomEl.value);
+    nickEl.value = currentNick;
+    roomEl.value = currentRoom;
+
     visitedRooms.set(currentRoom, Date.now());
     applyRoomTheme(currentRoom);
     clearUnread(currentRoom);
@@ -1246,34 +1248,43 @@ JS
     });
 
     socket.on('history', (payload) => {
-      const room = normalizeRoom(payload && payload.room);
+      const room = safeRoomName(payload && payload.room);
       const history = (payload && payload.history) || [];
 
       const entries = [];
       for (const m of history) {
         const me = (m.nick === currentNick);
         const kind = (m.type === 'action') ? 'action' : (me ? 'me' : 'msg');
-        entries.push({ kind, nick: m.nick, text: m.text, ts: m.ts, msgType: m.type || 'text' });
+        entries.push({
+          kind,
+          nick: m.nick,
+          text: m.text,
+          ts: m.ts,
+          msgType: m.type || 'text',
+          client_id: m.client_id || ''
+        });
       }
       entries.push({ kind: 'sys', nick: '', text: 'Joined room: ' + room, ts: nowIso(), msgType: 'text' });
 
       setRoomLog(room, entries);
+
       currentRoom = room;
+      roomEl.value = room;
       visitedRooms.set(currentRoom, Date.now());
       applyRoomTheme(currentRoom);
       clearUnread(currentRoom);
 
-      // refresh online number from last presence
       const hit = lastPresenceRooms.find(r => r.room === currentRoom);
       if (hit) currentOnline = hit.online;
 
       setRoomTag(currentRoom);
       renderRoom(currentRoom);
       updateTabs(lastPresenceRooms);
+      textEl.focus();
     });
 
     socket.on('system', (payload) => {
-      const room = normalizeRoom(payload && payload.room);
+      const room = safeRoomName(payload && payload.room);
       pushEntry(room, { kind: 'sys', nick: '', text: (payload && payload.message) || 'system', ts: (payload && payload.ts) || nowIso(), msgType: 'text' });
 
       if (room === currentRoom) {
@@ -1285,16 +1296,46 @@ JS
     });
 
     socket.on('msg', (payload) => {
-      const room = normalizeRoom(payload && payload.room);
+      const room = safeRoomName(payload && payload.room);
       const msg = payload && payload.msg;
       if (!msg) return;
 
+      // de-dup optimistic message
+      const cid = String(msg.client_id || '').trim();
+      if (cid && pendingByClientId.has(cid)) {
+        const ref = pendingByClientId.get(cid);
+        pendingByClientId.delete(cid);
+
+        // update in-memory buffer
+        const arr = getRoomLog(ref.room);
+        const e = arr[ref.idx];
+        if (e) {
+          e.pending = false;
+          e.ts = msg.ts || e.ts;
+          e.msgType = msg.type || e.msgType;
+          e.text = msg.text || e.text;
+          e.nick = msg.nick || e.nick;
+          e.kind = (msg.type === 'action') ? 'action' : ((msg.nick === currentNick) ? 'me' : 'msg');
+          e.client_id = cid;
+        }
+
+        // best-effort: remove dashed style in DOM if this room is current
+        if (ref.room === currentRoom) {
+          const node = logEl.querySelector('[data-client-id="' + cid.replace(/"/g,'') + '"]');
+          if (node) node.classList.remove('pending');
+        }
+        return;
+      }
+
       const me = (msg.nick === currentNick);
       const kind = (msg.type === 'action') ? 'action' : (me ? 'me' : 'msg');
-      pushEntry(room, { kind, nick: msg.nick, text: msg.text, ts: msg.ts, msgType: msg.type || 'text' });
+
+      const entry = { kind, nick: msg.nick, text: msg.text, ts: msg.ts, msgType: msg.type || 'text', client_id: cid, pending: false };
+      pushEntry(room, entry);
 
       if (room === currentRoom) {
-        renderRoom(currentRoom);
+        // append-only for real-time feel
+        renderEntry(entry);
       } else {
         bumpUnread(room, 1);
         updateTabs(lastPresenceRooms);
@@ -1302,21 +1343,24 @@ JS
     });
 
     socket.on('error_msg', (payload) => {
-      pushEntry(currentRoom, { kind: 'sys', nick: '', text: (payload && payload.message) || 'Error', ts: nowIso(), msgType: 'text' });
-      renderRoom(currentRoom);
+      const entry = { kind: 'sys', nick: '', text: (payload && payload.message) || 'Error', ts: nowIso(), msgType: 'text' };
+      pushEntry(currentRoom, entry);
+      renderEntry(entry);
     });
 
     function doJoin(){
-      currentNick = (nickEl.value || '').trim() || 'anon';
-      const nextRoom = normalizeRoom(roomEl.value);
+      currentNick = safeNickName(nickEl.value || 'anon');
+      const nextRoom = safeRoomName(roomEl.value);
 
-      // UI switches immediately to isolate view (no mixing even if late events arrive)
+      nickEl.value = currentNick;
+      roomEl.value = nextRoom;
+
+      // UI switches immediately (isolate view)
       currentRoom = nextRoom;
       visitedRooms.set(currentRoom, Date.now());
       applyRoomTheme(currentRoom);
       clearUnread(currentRoom);
 
-      // best-effort online count
       const hit = lastPresenceRooms.find(r => r.room === currentRoom);
       if (hit) currentOnline = hit.online;
 
@@ -1331,8 +1375,30 @@ JS
 
     function doSend(){
       const t = (textEl.value || '');
-      if (!t.trim()) return;
-      socket.emit('msg', { text: t });
+      const trimmed = t.trim();
+      if (!trimmed) return;
+
+      const cid = genClientId();
+
+      // optimistic append so user always sees it immediately
+      const action = trimmed.startsWith('/me ') ? true : false;
+      const entry = {
+        kind: action ? 'action' : 'me',
+        nick: currentNick || safeNickName(nickEl.value || 'anon'),
+        text: action ? trimmed.slice(4).trim() : trimmed,
+        ts: nowIso(),
+        msgType: action ? 'action' : 'text',
+        client_id: cid,
+        pending: true
+      };
+
+      const idx = pushEntry(currentRoom, entry);
+      pendingByClientId.set(cid, { room: currentRoom, idx });
+
+      renderEntry(entry);
+
+      socket.emit('msg', { text: trimmed, client_id: cid });
+
       textEl.value = '';
       textEl.focus();
       if (navigator.vibrate) navigator.vibrate(8);
@@ -1416,7 +1482,6 @@ server {
   listen [::]:80;
   server_name ${domain};
 
-  # ACME challenge
   location ^~ /.well-known/acme-challenge/ {
     root /var/www/html;
     allow all;
@@ -1615,6 +1680,8 @@ logs_cmd() {
 main() {
   local cmd="${1:-}"
   shift || true
+
+  echo "${APP_NAME} ${CHAT_VERSION}"
 
   case "${cmd}" in
     install) install "$@" ;;
