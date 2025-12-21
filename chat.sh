@@ -689,6 +689,8 @@ JS
       border-radius: var(--r);
       box-shadow: var(--shadow);
       overflow:hidden;
+      display:flex;
+      flex-direction:column;
     }
 
     .join{
@@ -727,7 +729,15 @@ JS
       line-height: 1.35;
     }
 
-    .log{ flex:1; min-height: 0; padding: 12px; overflow:auto; scroll-behavior: smooth; }
+    .log{
+      flex:1;
+      min-height: 0;
+      padding: 12px;
+      overflow:auto;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+      scroll-behavior: smooth;
+    }
 
     .row{ margin: 10px 0; display:flex; gap:10px; }
 
