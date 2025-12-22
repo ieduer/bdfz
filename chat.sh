@@ -8,6 +8,14 @@ set -euo pipefail
 # - Nginx reverse proxy + optional TLS with certbot (webroot)
 # - systemd service
 #
+# Update v1.2.4:
+# - Default room "lobby" is the main channel (no code needed).
+# - Any non-lobby room becomes "protected":
+#   * First join to a room sets its room-code (creates room password hash).
+#   * Later joins require the correct code to enter and see history.
+# - Rooms remain isolated: without correct code, you cannot see/receive that room's content.
+# - Presence shows room count (online rooms), but content stays hidden until verified.
+#
 # Usage (recommended; avoids process-substitution /dev/fd issues under sudo):
 #   curl -fsSL https://raw.githubusercontent.com/ieduer/bdfz/main/chat.sh | sudo bash -s -- install --domain chat.example.com
 #
@@ -21,7 +29,7 @@ set -euo pipefail
 # - This script will NOT overwrite existing cert files if already present.
 # - Default: listens on 127.0.0.1:8080 behind Nginx.
 
-CHAT_VERSION="v1.2.3"
+CHAT_VERSION="v1.2.4"
 
 APP_NAME="anon-hourly-chat"
 APP_USER="anonchat"
@@ -41,6 +49,7 @@ DEFAULT_DOMAIN=""
 
 REDIS_URL_DEFAULT="redis://127.0.0.1:6379"
 CHAT_KEY_PREFIX_DEFAULT="chat:"
+ROOM_PASS_PREFIX_DEFAULT="chatpass:"   # IMPORTANT: not wiped by hourly "chat:*" wipe
 MAX_MSG_LEN_DEFAULT="800"
 
 PURGE_DATA_DEFAULT="1"
@@ -128,7 +137,8 @@ ensure_packages() {
     curl ca-certificates gnupg \
     nginx redis-server \
     certbot \
-    jq
+    jq \
+    openssl
 
   systemctl enable --now redis-server >/dev/null 2>&1 || true
   systemctl enable --now nginx >/dev/null 2>&1 || true
@@ -180,6 +190,24 @@ stop_service_if_running() {
   fi
 }
 
+ensure_room_salt() {
+  mkdir -p "${BASE_DIR}"
+  local salt_file="${BASE_DIR}/.room_salt"
+  if [[ -s "${salt_file}" ]]; then
+    ROOM_CODE_SALT="$(cat "${salt_file}" | tr -d '\r\n' | head -c 128)"
+    if [[ -z "${ROOM_CODE_SALT}" ]]; then
+      die "ROOM_CODE_SALT file exists but empty: ${salt_file}"
+    fi
+    log "Found existing room salt: ${salt_file}"
+  else
+    ROOM_CODE_SALT="$(openssl rand -hex 32)"
+    echo -n "${ROOM_CODE_SALT}" > "${salt_file}"
+    chmod 600 "${salt_file}" || true
+    chown "${APP_USER}:${APP_GROUP}" "${salt_file}" || true
+    log "Generated new room salt: ${salt_file}"
+  fi
+}
+
 write_app_files() {
   log "Writing app files to ${SERVER_DIR} ..."
 
@@ -190,7 +218,7 @@ write_app_files() {
   cat > "${SERVER_DIR}/package.json" <<'JSON'
 {
   "name": "anon-hourly-chat",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "private": true,
   "type": "commonjs",
   "main": "server.js",
@@ -210,25 +238,37 @@ JSON
  * - Anonymous rooms (no login)
  * - Messages stored in Redis with a prefix
  * - Wipes ALL chat:* keys every hour at the top of the hour
- * - Presence: room online counts + top rooms
+ * - Presence: room online counts + top rooms + room_count
  * - /me action messages
  * - client_id support for optimistic UI de-dup on client
+ *
+ * v1.2.4 room-code protection:
+ * - Default room "lobby" is open (no code).
+ * - Non-lobby rooms require a code.
+ *   * If the room has no code yet, the first join sets it.
+ *   * Otherwise, join must provide the correct code.
+ * - Room code is stored as a salted SHA-256 hash (not plaintext) under ROOM_PASS_PREFIX (not wiped hourly).
  */
 
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
 const express = require('express');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
 
-const VERSION = 'v1.2.3';
+const VERSION = 'v1.2.4';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const CHAT_KEY_PREFIX = process.env.CHAT_KEY_PREFIX || 'chat:';
+const ROOM_PASS_PREFIX = process.env.ROOM_PASS_PREFIX || 'chatpass:';
+const ROOM_CODE_SALT = process.env.ROOM_CODE_SALT || '';
 const WIPE_EVERY_HOUR = (process.env.WIPE_EVERY_HOUR || '1') === '1';
 const MAX_MSG_LEN = parseInt(process.env.MAX_MSG_LEN || '800', 10);
 const PRESENCE_DEBOUNCE_MS = parseInt(process.env.PRESENCE_DEBOUNCE_MS || '350', 10);
+
+const MAIN_ROOM = 'lobby';
 
 function nowIso() {
   return new Date().toISOString();
@@ -249,9 +289,9 @@ function safeNick(nick) {
 
 function safeRoom(room) {
   const r = String(room || '').trim();
-  if (!r) return 'lobby';
+  if (!r) return MAIN_ROOM;
   const cleaned = r.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-  return cleaned || 'lobby';
+  return cleaned || MAIN_ROOM;
 }
 
 function safeClientId(x) {
@@ -261,12 +301,71 @@ function safeClientId(x) {
   return cleaned;
 }
 
+function safeRoomCode(code) {
+  const t = String(code || '').trim();
+  if (!t) return '';
+  // Allow any printable-ish input (client may send unicode); just clamp length.
+  return t.slice(0, 128);
+}
+
 function kRoomMessages(room) {
   return `${CHAT_KEY_PREFIX}room:${room}:messages`;
 }
 
 function kRoomMeta(room) {
   return `${CHAT_KEY_PREFIX}room:${room}:meta`;
+}
+
+function kRoomPass(room) {
+  return `${ROOM_PASS_PREFIX}room:${room}:passhash`;
+}
+
+function hashRoomCode(room, code) {
+  // Include room in hash derivation to prevent re-use across rooms.
+  const material = `${ROOM_CODE_SALT}|${room}|${code}`;
+  return crypto.createHash('sha256').update(material, 'utf8').digest('hex');
+}
+
+async function verifyOrSetRoomCode(redis, room, providedCode) {
+  // MAIN_ROOM is always open.
+  if (room === MAIN_ROOM) return { ok: true, created: false };
+
+  if (!ROOM_CODE_SALT) {
+    // Fail closed: if salt missing, we cannot verify safely.
+    return { ok: false, message: 'Server misconfigured (ROOM_CODE_SALT missing).' };
+  }
+
+  const code = safeRoomCode(providedCode);
+  if (!code) {
+    return { ok: false, message: 'Room code required.' };
+  }
+
+  const key = kRoomPass(room);
+  const want = hashRoomCode(room, code);
+
+  const existing = await redis.get(key);
+  if (!existing) {
+    // First join sets the code. Use NX to avoid races.
+    await redis.set(key, want, 'NX');
+    const final = await redis.get(key);
+    if (final === want) {
+      return { ok: true, created: true };
+    }
+    // Race: someone else set a different code first.
+    return { ok: false, message: 'Room code already set; please use the existing code.' };
+  }
+
+  // Constant-time-ish compare
+  try {
+    const a = Buffer.from(existing, 'utf8');
+    const b = Buffer.from(want, 'utf8');
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      return { ok: true, created: false };
+    }
+  } catch (_) {
+    // ignore
+  }
+  return { ok: false, message: 'Invalid room code.' };
 }
 
 async function scanDelByPrefix(redis, prefix) {
@@ -333,9 +432,11 @@ function listPublicRooms(io) {
 }
 
 function buildPresencePayload(io) {
+  const rooms = listPublicRooms(io);
   return {
     ts: nowIso(),
-    rooms: listPublicRooms(io).slice(0, 30)
+    room_count: rooms.length,
+    rooms: rooms.slice(0, 30)
   };
 }
 
@@ -377,7 +478,9 @@ function parseMessageText(raw) {
   console.log(`PORT=${PORT}`);
   console.log(`REDIS_URL=${REDIS_URL}`);
   console.log(`CHAT_KEY_PREFIX=${CHAT_KEY_PREFIX}`);
+  console.log(`ROOM_PASS_PREFIX=${ROOM_PASS_PREFIX}`);
   console.log(`WIPE_EVERY_HOUR=${WIPE_EVERY_HOUR ? '1' : '0'}`);
+  console.log(`MAIN_ROOM=${MAIN_ROOM}`);
 
   const redis = new Redis(REDIS_URL, {
     maxRetriesPerRequest: 2,
@@ -401,7 +504,12 @@ function parseMessageText(raw) {
   const broadcastPresence = mkPresenceBroadcaster(io);
 
   app.get('/healthz', (req, res) => {
-    res.json({ ok: true, ts: nowIso(), version: VERSION });
+    res.json({
+      ok: true,
+      ts: nowIso(),
+      version: VERSION,
+      main_room: MAIN_ROOM
+    });
   });
 
   app.use('/', express.static(path.join(__dirname, 'public')));
@@ -413,6 +521,22 @@ function parseMessageText(raw) {
     socket.on('join', async (payload) => {
       const nextRoom = safeRoom(payload && payload.room);
       const nick = safeNick((payload && payload.nick) || 'anon');
+      const code = safeRoomCode(payload && payload.code);
+
+      // IMPORTANT: verify first; do NOT leave the previous room if verification fails
+      try {
+        const verdict = await verifyOrSetRoomCode(redis, nextRoom, code);
+        if (!verdict.ok) {
+          socket.emit('join_denied', { room: nextRoom, message: verdict.message || 'Denied.' });
+          return;
+        }
+        if (verdict.created) {
+          socket.emit('system', { room: nextRoom, message: `Room code set for "${nextRoom}". Share the code to allow others in.`, ts: nowIso() });
+        }
+      } catch (e) {
+        socket.emit('join_denied', { room: nextRoom, message: 'Verification failed.' });
+        return;
+      }
 
       const prevRoomRaw = socket.data.room || '';
       const prevRoom = prevRoomRaw ? safeRoom(prevRoomRaw) : '';
@@ -447,7 +571,7 @@ function parseMessageText(raw) {
     });
 
     socket.on('msg', async (payload) => {
-      const room = safeRoom(socket.data.room || 'lobby');
+      const room = safeRoom(socket.data.room || MAIN_ROOM);
       const nick = safeNick(socket.data.nick || 'anon');
 
       const parsed = parseMessageText(payload && payload.text);
@@ -622,6 +746,7 @@ JS
     .btn:hover{ background: rgba(15,23,32,.85); }
     .btn:active{ transform: translateY(1px); }
     .btn.primary{ border-color: color-mix(in srgb, var(--accent) 65%, rgba(31,42,55,.9)); }
+    .btn[disabled]{ opacity:.6; cursor:not-allowed; }
 
     .tabs-wrap{ max-width: 1100px; margin: 0 auto; padding: 0 14px 10px 14px; }
 
@@ -892,7 +1017,7 @@ JS
       <div class="topbar-inner">
         <div class="brand">
           <h1>Anon Hourly Chat</h1>
-          <div class="tag" id="roomTag">room:lobby • online:0</div>
+          <div class="tag" id="roomTag">room:lobby • online:0 • rooms:0</div>
         </div>
 
         <div class="pill" title="Connection status">
@@ -924,12 +1049,22 @@ JS
               <input id="room" autocomplete="off" spellcheck="false" placeholder="lobby / mathclub / …" />
             </div>
             <div class="field">
+              <label for="code">room code (required if room != lobby)</label>
+              <input id="code" type="password" autocomplete="off" spellcheck="false" placeholder="(empty for lobby)" />
+            </div>
+            <div class="field">
               <label for="nick">nickname</label>
               <input id="nick" autocomplete="off" spellcheck="false" placeholder="anon_fox" />
             </div>
             <button class="btn primary" id="join">join</button>
           </div>
-          <div class="hint">Anonymous. No accounts. Server wipes all chat data every hour. <span style="opacity:.8">Tips: use <b>/me</b> for actions; ping with <b>@nick</b>.</span></div>
+          <div class="hint">
+            Default room is <b>lobby</b> (open).
+            Any other room is protected:
+            <b>first join sets the room code</b>, later joins must use the same code.
+            Server wipes chat data hourly, but room codes persist.
+            <span style="opacity:.8">Tips: use <b>/me</b> for actions; ping with <b>@nick</b>.</span>
+          </div>
         </div>
 
         <div class="panel" style="flex:1; min-height:0;">
@@ -953,16 +1088,21 @@ JS
     const logEl = document.getElementById('log');
     const tabsEl = document.getElementById('tabs');
     const roomEl = document.getElementById('room');
+    const codeEl = document.getElementById('code');
     const nickEl = document.getElementById('nick');
     const textEl = document.getElementById('text');
+    const sendBtn = document.getElementById('send');
     const roomTag = document.getElementById('roomTag');
     const dot = document.getElementById('dot');
     const statusText = document.getElementById('statusText');
     const wipeCountdown = document.getElementById('wipeCountdown');
 
-    let currentRoom = 'lobby';
+    const MAIN_ROOM = 'lobby';
+
+    let currentRoom = MAIN_ROOM;
     let currentNick = '';
     let currentOnline = 0;
+    let currentRoomCount = 0;
 
     const roomLogs = new Map();      // room -> [{...}]
     const roomUnread = new Map();    // room -> unread
@@ -970,6 +1110,9 @@ JS
 
     const visitedRooms = new Map();  // room -> ts
     const pendingByClientId = new Map(); // client_id -> { room, idx }
+
+    const unlockedRooms = new Map(); // room -> true/false
+    const roomCodes = new Map();     // room -> code (in-memory only; not persisted)
 
     function nowIso(){ return new Date().toISOString(); }
 
@@ -999,9 +1142,9 @@ JS
 
     function safeRoomName(r){
       const t = String(r || '').trim();
-      if (!t) return 'lobby';
+      if (!t) return MAIN_ROOM;
       const cleaned = t.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-      return cleaned || 'lobby';
+      return cleaned || MAIN_ROOM;
     }
 
     function safeNickName(n){
@@ -1020,7 +1163,7 @@ JS
     }
 
     function hashHue(str){
-      const s = String(str || 'lobby');
+      const s = String(str || MAIN_ROOM);
       let h = 0;
       for (let i=0;i<s.length;i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
       return h % 360;
@@ -1034,8 +1177,27 @@ JS
       root.style.setProperty('--accentSoft', `hsla(${hue}, 72%, 52%, .16)`);
     }
 
+    function isUnlocked(room){
+      const r = normalizeRoom(room);
+      if (r === MAIN_ROOM) return true;
+      return unlockedRooms.get(r) === true;
+    }
+
+    function updateComposerState(){
+      const locked = !isUnlocked(currentRoom);
+      textEl.disabled = locked;
+      sendBtn.disabled = locked;
+      if (locked) {
+        textEl.placeholder = 'Locked room. Enter correct room code and join to view/send…';
+      } else {
+        textEl.placeholder = 'Type a message…';
+      }
+    }
+
     function setRoomTag(r){
-      roomTag.textContent = `room:${r} • online:${currentOnline}`;
+      const lockMark = (r === MAIN_ROOM) ? 'open' : (isUnlocked(r) ? 'unlocked' : 'locked');
+      roomTag.textContent = `room:${r} • online:${currentOnline} • rooms:${currentRoomCount} • ${lockMark}`;
+      updateComposerState();
     }
 
     function randNick(){
@@ -1170,6 +1332,15 @@ JS
       logEl.scrollTop = logEl.scrollHeight;
     }
 
+    function renderLocked(room, msg){
+      logEl.innerHTML = '';
+      const r = normalizeRoom(room);
+      const text = msg || (r === MAIN_ROOM ? 'Joined.' : 'Locked room. Enter correct room code and join to view.');
+      const entry = { kind: 'sys', nick: '', text, ts: nowIso(), msgType: 'text' };
+      setRoomLog(r, [entry]);
+      renderRoom(r);
+    }
+
     function updateTabs(rooms){
       const list = Array.isArray(rooms) ? rooms.slice() : [];
 
@@ -1215,6 +1386,8 @@ JS
 
         t.onclick = () => {
           roomEl.value = room;
+          // Auto-fill known code (in-memory). Still locked unless join success.
+          if (roomCodes.has(room)) codeEl.value = roomCodes.get(room);
           doJoin();
         };
 
@@ -1228,7 +1401,7 @@ JS
     }
 
     if (!nickEl.value) nickEl.value = randNick();
-    if (!roomEl.value) roomEl.value = 'lobby';
+    if (!roomEl.value) roomEl.value = MAIN_ROOM;
 
     currentNick = safeNickName(nickEl.value);
     currentRoom = safeRoomName(roomEl.value);
@@ -1238,6 +1411,9 @@ JS
     visitedRooms.set(currentRoom, Date.now());
     applyRoomTheme(currentRoom);
     clearUnread(currentRoom);
+    unlockedRooms.set(MAIN_ROOM, true);
+    setRoomTag(currentRoom);
+    renderLocked(currentRoom, 'Joining…');
 
     const socket = io({ transports: ['websocket'] });
 
@@ -1251,10 +1427,29 @@ JS
 
     socket.on('presence', (payload) => {
       lastPresenceRooms = (payload && payload.rooms) || [];
+      currentRoomCount = (payload && payload.room_count) || lastPresenceRooms.length || 0;
+
       const hit = lastPresenceRooms.find(r => r.room === currentRoom);
-      currentOnline = hit ? hit.online : currentOnline;
+      if (hit) currentOnline = hit.online;
+
       setRoomTag(currentRoom);
       updateTabs(lastPresenceRooms);
+    });
+
+    socket.on('join_denied', (payload) => {
+      const room = safeRoomName(payload && payload.room);
+      const message = (payload && payload.message) || 'Denied.';
+      // keep view locked
+      unlockedRooms.set(room, false);
+      if (room === currentRoom) {
+        renderLocked(room, 'Access denied: ' + message);
+        setRoomTag(room);
+      } else {
+        bumpUnread(room, 1);
+        updateTabs(lastPresenceRooms);
+      }
+      // focus code input for convenience
+      if (room !== MAIN_ROOM) codeEl.focus();
     });
 
     socket.on('history', (payload) => {
@@ -1278,11 +1473,20 @@ JS
 
       setRoomLog(room, entries);
 
+      // mark unlocked
+      unlockedRooms.set(room, true);
+
       currentRoom = room;
       roomEl.value = room;
       visitedRooms.set(currentRoom, Date.now());
       applyRoomTheme(currentRoom);
       clearUnread(currentRoom);
+
+      // remember code in-memory if non-lobby and user typed it
+      if (room !== MAIN_ROOM) {
+        const typed = String(codeEl.value || '').trim();
+        if (typed) roomCodes.set(room, typed);
+      }
 
       const hit = lastPresenceRooms.find(r => r.room === currentRoom);
       if (hit) currentOnline = hit.online;
@@ -1295,6 +1499,9 @@ JS
 
     socket.on('system', (payload) => {
       const room = safeRoomName(payload && payload.room);
+      // only show if we've unlocked; otherwise, keep it hidden (content should not leak)
+      if (room !== MAIN_ROOM && !isUnlocked(room)) return;
+
       pushEntry(room, { kind: 'sys', nick: '', text: (payload && payload.message) || 'system', ts: (payload && payload.ts) || nowIso(), msgType: 'text' });
 
       if (room === currentRoom) {
@@ -1310,13 +1517,15 @@ JS
       const msg = payload && payload.msg;
       if (!msg) return;
 
+      // only accept messages for rooms we are unlocked in (prevents leakage in UI buffers)
+      if (room !== MAIN_ROOM && !isUnlocked(room)) return;
+
       // de-dup optimistic message
       const cid = String(msg.client_id || '').trim();
       if (cid && pendingByClientId.has(cid)) {
         const ref = pendingByClientId.get(cid);
         pendingByClientId.delete(cid);
 
-        // update in-memory buffer
         const arr = getRoomLog(ref.room);
         const e = arr[ref.idx];
         if (e) {
@@ -1329,7 +1538,6 @@ JS
           e.client_id = cid;
         }
 
-        // best-effort: remove dashed style in DOM if this room is current
         if (ref.room === currentRoom) {
           const node = logEl.querySelector('[data-client-id="' + cid.replace(/"/g,'') + '"]');
           if (node) node.classList.remove('pending');
@@ -1344,7 +1552,6 @@ JS
       pushEntry(room, entry);
 
       if (room === currentRoom) {
-        // append-only for real-time feel
         renderEntry(entry);
       } else {
         bumpUnread(room, 1);
@@ -1361,36 +1568,66 @@ JS
     function doJoin(){
       currentNick = safeNickName(nickEl.value || 'anon');
       const nextRoom = safeRoomName(roomEl.value);
+      const code = String(codeEl.value || '').trim();
 
       nickEl.value = currentNick;
       roomEl.value = nextRoom;
 
-      // UI switches immediately (isolate view)
+      // switching view immediately, but LOCK the room until server confirms (history event)
       currentRoom = nextRoom;
       visitedRooms.set(currentRoom, Date.now());
       applyRoomTheme(currentRoom);
       clearUnread(currentRoom);
 
+      // lock non-lobby rooms by default until success
+      if (nextRoom !== MAIN_ROOM) {
+        unlockedRooms.set(nextRoom, false);
+        if (!code && roomCodes.has(nextRoom)) {
+          codeEl.value = roomCodes.get(nextRoom);
+        }
+      } else {
+        unlockedRooms.set(MAIN_ROOM, true);
+      }
+
       const hit = lastPresenceRooms.find(r => r.room === currentRoom);
       if (hit) currentOnline = hit.online;
 
       setRoomTag(currentRoom);
-      renderRoom(currentRoom);
+
+      // If protected room and no code, don't even ask server yet
+      if (nextRoom !== MAIN_ROOM) {
+        const finalCode = String(codeEl.value || '').trim();
+        if (!finalCode) {
+          renderLocked(nextRoom, 'Locked room. Enter room code, then click join.');
+          codeEl.focus();
+          updateTabs(lastPresenceRooms);
+          return;
+        }
+        renderLocked(nextRoom, 'Verifying room code…');
+      } else {
+        renderLocked(nextRoom, 'Joining…');
+      }
+
       updateTabs(lastPresenceRooms);
 
-      socket.emit('join', { room: currentRoom, nick: currentNick });
+      socket.emit('join', { room: currentRoom, nick: currentNick, code: (currentRoom === MAIN_ROOM ? '' : String(codeEl.value || '').trim()) });
       if (navigator.vibrate) navigator.vibrate(10);
       textEl.focus();
     }
 
     function doSend(){
+      if (!isUnlocked(currentRoom)) {
+        renderLocked(currentRoom, 'Locked room. Enter correct room code and join to view/send.');
+        codeEl.focus();
+        return;
+      }
+
       const t = (textEl.value || '');
       const trimmed = t.trim();
       if (!trimmed) return;
 
       const cid = genClientId();
 
-      // optimistic append so user always sees it immediately
       const action = trimmed.startsWith('/me ') ? true : false;
       const entry = {
         kind: action ? 'action' : 'me',
@@ -1429,7 +1666,9 @@ JS
       }
     });
 
-    // initial join
+    // initial join: MAIN_ROOM open
+    roomEl.value = MAIN_ROOM;
+    codeEl.value = '';
     doJoin();
   </script>
 </body>
@@ -1462,6 +1701,8 @@ WorkingDirectory=${SERVER_DIR}
 Environment=PORT=${PORT}
 Environment=REDIS_URL=${REDIS_URL}
 Environment=CHAT_KEY_PREFIX=${CHAT_KEY_PREFIX}
+Environment=ROOM_PASS_PREFIX=${ROOM_PASS_PREFIX_DEFAULT}
+Environment=ROOM_CODE_SALT=${ROOM_CODE_SALT}
 Environment=WIPE_EVERY_HOUR=1
 Environment=MAX_MSG_LEN=${MAX_MSG_LEN}
 Environment=PRESENCE_DEBOUNCE_MS=350
@@ -1627,6 +1868,8 @@ install() {
 
   mkdir -p "${BASE_DIR}"
   chown -R "${APP_USER}:${APP_GROUP}" "${BASE_DIR}" || true
+
+  ensure_room_salt
 
   stop_service_if_running
   write_app_files
