@@ -154,51 +154,93 @@ apply_acme(){
     # 确保 v4 已初始化，提示里不再是空值
     v4v6
 
-    # 检查 80 端口是否被占用，避免与已有 Web 服务冲突
-    if ss -tulnp 2>/dev/null | awk '{print $5}' | grep -qE '(:|])80$'; then
-        red "检测到 80 端口已被其他进程占用，请先停止现有 Web 服务 (如 nginx/apache) 后再运行本脚本。"
-        exit 1
-    fi
-
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     green "必须使用真实域名进行安装 (自动申请证书)"
     green "请确保您的域名已解析到本机 IP: ${v4}"
     readp "请输入您的域名 (例如: example.com): " domain_name
-    
+
     if [[ -z "$domain_name" ]]; then
         red "域名不能为空！" && exit 1
     fi
-    
-    # 临时开放 80 端口用于 ACME 验证
-    ufw allow 80/tcp >/dev/null 2>&1
-    
-    green "安装 acme.sh..."
-    curl https://get.acme.sh | sh
+
+    mkdir -p /etc/s-box
+
+    # 安装/更新 acme.sh
+    green "安装/更新 acme.sh..."
+    if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+        curl https://get.acme.sh | sh
+    fi
 
     # 优先选择 Let's Encrypt 作为默认 CA，避免 ZeroSSL 需要 EAB 的问题
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade
+    /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    /root/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
 
-    green "正在申请证书 (Stand-alone 模式，CA: Let's Encrypt)..."
-    ~/.acme.sh/acme.sh --register-account -m "admin@$domain_name" --server letsencrypt
-    ~/.acme.sh/acme.sh --issue -d "$domain_name" --standalone -k ec-256 --server letsencrypt
-    
-    if [[ $? -ne 0 ]]; then
-        red "证书申请失败！请检查域名解析是否正确，或 80 端口是否被占用。"
-        exit 1
+    # --- helper: 尝试把现有证书直接安装到 /etc/s-box ---
+    # 说明：很多机器上证书“已存在”，但 --issue 会返回非 0（例如 Skipping / Domains not changed），
+    # 这不是失败。我们优先尝试 installcert：
+    #   1) 先尝试 ECC（--ecc）
+    #   2) 再尝试 RSA（不带 --ecc）
+    acme_install_existing(){
+        local d="$1"
+        # ECC
+        /root/.acme.sh/acme.sh --installcert -d "$d" \
+            --fullchainpath /etc/s-box/cert.crt \
+            --keypath /etc/s-box/private.key \
+            --ecc >/dev/null 2>&1 && return 0
+        # RSA
+        /root/.acme.sh/acme.sh --installcert -d "$d" \
+            --fullchainpath /etc/s-box/cert.crt \
+            --keypath /etc/s-box/private.key \
+            >/dev/null 2>&1 && return 0
+        return 1
+    }
+
+    # 1) 若证书已存在（acme.sh 已签发过），直接安装即可；不需要占用/释放 80。
+    if acme_install_existing "$domain_name"; then
+        green "检测到 acme.sh 已存在证书，已直接安装到 /etc/s-box（无需重新签发）。"
+    else
+        # 2) 若不存在，则需要 Standalone 验证：此时才检查 80 端口占用。
+        if ss -tulnp 2>/dev/null | awk '{print $5}' | grep -qE '(:|])80$'; then
+            red "检测到 80 端口已被其他进程占用，Standalone 申请证书需要临时占用 80。"
+            red "请先停止现有 Web 服务 (如 nginx/apache/caddy) 后再运行本脚本，或确保该域名证书已在 acme.sh 中存在。"
+            exit 1
+        fi
+
+        # 临时开放 80 端口用于 ACME 验证（若启用了 UFW）
+        ufw allow 80/tcp >/dev/null 2>&1 || true
+
+        green "正在申请证书 (Stand-alone 模式，CA: Let's Encrypt)..."
+        /root/.acme.sh/acme.sh --register-account -m "admin@$domain_name" --server letsencrypt >/dev/null 2>&1 || true
+
+        # 使用 ECC 证书（ec-256）。注意：acme.sh 可能在“Domains not changed / Skipping”时返回非 0。
+        /root/.acme.sh/acme.sh --issue -d "$domain_name" --standalone -k ec-256 --server letsencrypt
+        issue_rc=$?
+
+        if [[ $issue_rc -ne 0 ]]; then
+            # 这里不立刻判失败：只要证书确实存在，就继续安装。
+            if acme_install_existing "$domain_name"; then
+                yellow "acme.sh --issue 返回非 0（可能是 Skipping/未到续期时间），但证书已存在，继续安装。"
+            else
+                red "证书申请失败！请检查域名解析是否正确、80 端口是否可被外网访问、以及防火墙/云厂商安全组。"
+                exit 1
+            fi
+        else
+            # issue 成功后再安装到 /etc/s-box
+            if ! acme_install_existing "$domain_name"; then
+                red "证书安装失败！(acme.sh 已签发但 installcert 失败)" && exit 1
+            fi
+        fi
     fi
-    
-    green "证书安装中..."
-    ~/.acme.sh/acme.sh --installcert -d "$domain_name" --fullchainpath /etc/s-box/cert.crt --keypath /etc/s-box/private.key --ecc
-    
-    if [[ ! -f /etc/s-box/cert.crt ]]; then
-        red "证书安装失败！" && exit 1
+
+    # 二次检查
+    if [[ ! -s /etc/s-box/cert.crt || ! -s /etc/s-box/private.key ]]; then
+        red "证书安装失败！未找到 /etc/s-box/cert.crt 或 /etc/s-box/private.key" && exit 1
     fi
 
     # 确保已安装自动续期计划任务
-    ~/.acme.sh/acme.sh --install-cronjob >/dev/null 2>&1
+    /root/.acme.sh/acme.sh --install-cronjob >/dev/null 2>&1 || true
     green "已为 acme.sh 安装/更新自动续期任务 (cron)。"
-    
+
     # 记录域名
     echo "$domain_name" > /etc/s-box/domain.log
 }
