@@ -7,7 +7,7 @@
 
 export LANG=en_US.UTF-8
 
-SBG_VERSION="v0.1.0-game-accel"
+SBG_VERSION="v0.1.1-game-accel"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -310,13 +310,14 @@ gen_server_config(){
 
   # Pick IP strategy based on v4 availability
   v4v6
+  local ipv
   if [[ -n "${v4}" ]]; then
     ipv="prefer_ipv4"
   else
     ipv="prefer_ipv6"
   fi
 
-  # Save public info (no secrets beyond what you already need)
+  # Save public info (credentials you will use on client)
   cat > "${SBG_PUBLIC_INFO}" <<EOF
 DOMAIN=${domain_name}
 PORT_HY2=${PORT_HY2}
@@ -328,86 +329,189 @@ TUIC_PASSWORD=${tuic_pass}
 EOF
   chmod 600 "${SBG_PUBLIC_INFO}"
 
-  # sing-box server config
-  # For game accel: prioritize UDP protocols (Hysteria2 + optional TUIC)
-  # Masquerade: proxy to a normal HTTPS site
-  cat > "${SBG_CONF}" <<EOF
-{
-  "log": {
-    "disabled": false,
-    "level": "info",
-    "timestamp": true
-  },
+  # Build JSON config via python to avoid heredoc-templating pitfalls
+  DOMAIN_NAME="${domain_name}" \
+  PORT_HY2="${PORT_HY2}" \
+  HY2_PASS="${hy2_pass}" \
+  ENABLE_TUIC="${ENABLE_TUIC}" \
+  PORT_TUIC="${PORT_TUIC}" \
+  TUIC_UUID="${tuic_uuid}" \
+  TUIC_PASS="${tuic_pass}" \
+  SBG_CERT="${SBG_CERT}" \
+  SBG_KEY="${SBG_KEY}" \
+  IPV_STRATEGY="${ipv}" \
+  python3 - <<'PY'
+import json, os
+
+domain = os.environ.get("DOMAIN_NAME", "")
+port_hy2 = int(os.environ.get("PORT_HY2", "0") or 0)
+hy2_pass = os.environ.get("HY2_PASS", "")
+enable_tuic = os.environ.get("ENABLE_TUIC", "0") == "1"
+port_tuic = int(os.environ.get("PORT_TUIC", "0") or 0)
+tuic_uuid = os.environ.get("TUIC_UUID", "")
+tuic_pass = os.environ.get("TUIC_PASS", "")
+cert = os.environ.get("SBG_CERT", "/etc/sbg/cert.crt")
+key = os.environ.get("SBG_KEY", "/etc/sbg/private.key")
+ipv = os.environ.get("IPV_STRATEGY", "prefer_ipv4")
+
+conf = {
+  "log": {"disabled": False, "level": "info", "timestamp": True},
   "inbounds": [
     {
       "type": "hysteria2",
       "tag": "hy2-in",
       "listen": "::",
-      "listen_port": ${PORT_HY2},
-      "users": [
-        { "password": "${hy2_pass}" }
-      ],
+      "listen_port": port_hy2,
+      "users": [{"password": hy2_pass}],
       "tls": {
-        "enabled": true,
+        "enabled": True,
         "alpn": ["h3"],
-        "certificate_path": "${SBG_CERT}",
-        "key_path": "${SBG_KEY}"
+        "certificate_path": cert,
+        "key_path": key,
       },
       "masquerade": {
         "type": "proxy",
         "proxy": {
           "url": "https://www.cloudflare.com/",
-          "rewrite_host": true
-        }
-      }
-    }$( [[ "${ENABLE_TUIC}" == "1" ]] && cat <<'JSON_TUIC'
-,
+          "rewrite_host": True,
+        },
+      },
+    }
+  ],
+  "outbounds": [
+    {"type": "direct", "tag": "direct", "domain_strategy": ipv},
+    {"type": "block", "tag": "block"},
+  ],
+}
+
+if enable_tuic:
+  conf["inbounds"].append(
     {
       "type": "tuic",
       "tag": "tuic-in",
       "listen": "::",
-      "listen_port": __PORT_TUIC__,
-      "users": [
-        { "uuid": "__TUIC_UUID__", "password": "__TUIC_PASS__" }
-      ],
+      "listen_port": port_tuic,
+      "users": [{"uuid": tuic_uuid, "password": tuic_pass}],
       "congestion_control": "bbr",
       "tls": {
-        "enabled": true,
+        "enabled": True,
         "alpn": ["h3"],
-        "certificate_path": "__CERT__",
-        "key_path": "__KEY__"
-      }
+        "certificate_path": cert,
+        "key_path": key,
+      },
     }
-JSON_TUIC
- ) 
-  ],
-  "outbounds": [
-    { "type": "direct", "tag": "direct", "domain_strategy": "${ipv}" },
-    { "type": "block", "tag": "block" }
-  ]
-}
-EOF
+  )
 
-  if [[ "${ENABLE_TUIC}" == "1" ]]; then
-    # Replace placeholders safely (no sed regex pitfalls)
-    python3 - <<PY
-import json, pathlib
-p = pathlib.Path("${SBG_CONF}")
-data = json.loads(p.read_text())
-# Find tuic-in inbound and fill values
-for ib in data.get("inbounds", []):
-    if ib.get("tag") == "tuic-in":
-        ib["listen_port"] = int("${PORT_TUIC}")
-        ib["users"][0]["uuid"] = "${tuic_uuid}"
-        ib["users"][0]["password"] = "${tuic_pass}"
-        ib["tls"]["certificate_path"] = "${SBG_CERT}"
-        ib["tls"]["key_path"] = "${SBG_KEY}"
-p.write_text(json.dumps(data, indent=2))
+path = "/etc/sbg/sbg.json"
+with open(path, "w", encoding="utf-8") as f:
+  json.dump(conf, f, indent=2)
 PY
-  fi
 
   chmod 600 "${SBG_CONF}"
   _green "Server config generated: ${SBG_CONF}"
+}
+
+# ---- regenerate config from public.info ----
+regen_server_config_from_public_info(){
+  if [[ ! -s "${SBG_PUBLIC_INFO}" || ! -s "${SBG_DOMAIN_LOG}" ]]; then
+    _red "Missing ${SBG_PUBLIC_INFO} or ${SBG_DOMAIN_LOG}. Cannot regenerate config."
+    return 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "${SBG_PUBLIC_INFO}"
+  domain_name="$(head -n1 "${SBG_DOMAIN_LOG}" | tr -d '\r\n ')"
+
+  # Pick IP strategy based on v4 availability
+  v4v6
+  local ipv
+  if [[ -n "${v4}" ]]; then
+    ipv="prefer_ipv4"
+  else
+    ipv="prefer_ipv6"
+  fi
+
+  # Rebuild config using stored credentials (no changes to passwords/UUID)
+  DOMAIN_NAME="${DOMAIN}" \
+  PORT_HY2="${PORT_HY2}" \
+  HY2_PASS="${HY2_PASSWORD}" \
+  ENABLE_TUIC="${ENABLE_TUIC}" \
+  PORT_TUIC="${PORT_TUIC:-0}" \
+  TUIC_UUID="${TUIC_UUID}" \
+  TUIC_PASS="${TUIC_PASSWORD}" \
+  SBG_CERT="${SBG_CERT}" \
+  SBG_KEY="${SBG_KEY}" \
+  IPV_STRATEGY="${ipv}" \
+  python3 - <<'PY'
+import json, os
+
+domain = os.environ.get("DOMAIN_NAME", "")
+port_hy2 = int(os.environ.get("PORT_HY2", "0") or 0)
+hy2_pass = os.environ.get("HY2_PASS", "")
+enable_tuic = os.environ.get("ENABLE_TUIC", "0") == "1"
+port_tuic = int(os.environ.get("PORT_TUIC", "0") or 0)
+tuic_uuid = os.environ.get("TUIC_UUID", "")
+tuic_pass = os.environ.get("TUIC_PASS", "")
+cert = os.environ.get("SBG_CERT", "/etc/sbg/cert.crt")
+key = os.environ.get("SBG_KEY", "/etc/sbg/private.key")
+ipv = os.environ.get("IPV_STRATEGY", "prefer_ipv4")
+
+conf = {
+  "log": {"disabled": False, "level": "info", "timestamp": True},
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": port_hy2,
+      "users": [{"password": hy2_pass}],
+      "tls": {
+        "enabled": True,
+        "alpn": ["h3"],
+        "certificate_path": cert,
+        "key_path": key,
+      },
+      "masquerade": {
+        "type": "proxy",
+        "proxy": {
+          "url": "https://www.cloudflare.com/",
+          "rewrite_host": True,
+        },
+      },
+    }
+  ],
+  "outbounds": [
+    {"type": "direct", "tag": "direct", "domain_strategy": ipv},
+    {"type": "block", "tag": "block"},
+  ],
+}
+
+if enable_tuic:
+  conf["inbounds"].append(
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": port_tuic,
+      "users": [{"uuid": tuic_uuid, "password": tuic_pass}],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": True,
+        "alpn": ["h3"],
+        "certificate_path": cert,
+        "key_path": key,
+      },
+    }
+  )
+
+path = "/etc/sbg/sbg.json"
+with open(path, "w", encoding="utf-8") as f:
+  json.dump(conf, f, indent=2)
+PY
+
+  chmod 600 "${SBG_CONF}"
+  _green "Regenerated server config: ${SBG_CONF}"
+  return 0
 }
 
 # ---- systemd service ----
@@ -759,7 +863,7 @@ install_sbg(){
 
   ensure_domain_and_cert
   setup_firewall
-  gen_server_config
+  gen_server_config || { _red "Failed to generate config."; exit 1; }
   sbg_service_install
   lnsbg
 
@@ -784,6 +888,7 @@ _green " 5. View logs"
 _green " 6. Restart service"
 _green " 7. Update sing-box core"
 _green " 8. Show game-only client config (TUN)"
+_green " 9. Regenerate server config (fix broken JSON)"
 _red   "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
 readp "Select: " Input
@@ -796,5 +901,6 @@ case "$Input" in
   6) restart_sbg ;;
   7) update_core ;;
   8) client_conf ;;
+  9) regen_server_config_from_public_info && restart_sbg ;;
   *) exit 0 ;;
 esac
