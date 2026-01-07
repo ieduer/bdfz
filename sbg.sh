@@ -1,10 +1,4 @@
 #!/bin/bash
-# sbg.sh — sing-box Game Accelerator (Server-side installer for Hysteria2/TUIC)
-# Author: you + ChatGPT
-# Purpose: build a clean, game-focused UDP accelerator node (Hysteria2/TUIC) with ACME cert + strict UFW
-# OS: Ubuntu only
-# Note: This script installs to /etc/sbg and uses systemd service name "sbg"
-
 export LANG=en_US.UTF-8
 
 SBG_VERSION="v0.1.1-game-accel"
@@ -13,292 +7,289 @@ red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
 blue='\033[0;36m'
-bblue='\033[0;34m'
 plain='\033[0m'
 
-UPDATE_URL="https://raw.githubusercontent.com/ieduer/bdfz/main/sbg.sh"
-
-_red(){ echo -e "\033[31m\033[01m$1\033[0m"; }
-_green(){ echo -e "\033[32m\033[01m$1\033[0m"; }
-_yellow(){ echo -e "\033[33m\033[01m$1\033[0m"; }
-_blue(){ echo -e "\033[36m\033[01m$1\033[0m"; }
-_white(){ echo -e "\033[37m\033[01m$1\033[0m"; }
+_red(){ echo -e "${red}\033[01m$1${plain}"; }
+_green(){ echo -e "${green}\033[01m$1${plain}"; }
+_yellow(){ echo -e "${yellow}\033[01m$1${plain}"; }
+_blue(){ echo -e "${blue}\033[01m$1${plain}"; }
 readp(){ read -p "$(_yellow "$1")" "$2"; }
 
-# ---- constants ----
+# Update link
+UPDATE_URL="https://raw.githubusercontent.com/ieduer/bdfz/main/sbg.sh"
+
+# Paths
 SBG_DIR="/etc/sbg"
 SBG_BIN="${SBG_DIR}/sing-box"
 SBG_CONF="${SBG_DIR}/sbg.json"
 SBG_DOMAIN_LOG="${SBG_DIR}/domain.log"
+SBG_PUBLIC_INFO="${SBG_DIR}/public.info"
 SBG_CERT="${SBG_DIR}/cert.crt"
 SBG_KEY="${SBG_DIR}/private.key"
-SBG_SUBTXT="${SBG_DIR}/sub.txt"
-SBG_PUBLIC_INFO="${SBG_DIR}/public.info"
+SBG_SUB_TXT="${SBG_DIR}/sub.txt"
 
-# Internal call
-sbg(){
-  bash "$0"
-  exit 0
-}
-
-# ---- privilege ----
-if [[ $EUID -ne 0 ]]; then
-  _yellow "Please run as root."
-  exit 1
-fi
-
-# ---- OS check (Ubuntu only) ----
-if [[ -f /etc/issue ]] && grep -qi "ubuntu" /etc/issue; then
-  release="Ubuntu"
-elif [[ -f /proc/version ]] && grep -qi "ubuntu" /proc/version; then
-  release="Ubuntu"
-else
-  _red "This script only supports Ubuntu."
-  exit 1
-fi
-
-# ---- arch ----
-case "$(uname -m)" in
-  armv7l) cpu=armv7 ;;
-  aarch64) cpu=arm64 ;;
-  x86_64) cpu=amd64 ;;
-  *) _red "Unsupported arch: $(uname -m)" ; exit 1 ;;
-esac
-
+# Globals (runtime)
+domain_name=""
 hostname="$(hostname)"
+v4=""
+v6=""
+cpu=""
 
-# ---- helpers ----
-enable_bbr(){
-  if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf 2>/dev/null; then
-    _green "Enabling BBR..."
-    {
-      echo "net.core.default_qdisc = fq"
-      echo "net.ipv4.tcp_congestion_control = bbr"
-    } >> /etc/sysctl.conf
-    sysctl -p >/dev/null 2>&1 || true
-  fi
+# Ports (runtime)
+PORT_HY2=""
+ENABLE_TUIC="0"
+PORT_TUIC=""
+
+die(){ _red "$1"; exit 1; }
+
+need_root(){
+  [[ $EUID -ne 0 ]] && die "Please run as root."
 }
 
-install_depend(){
-  if [[ ! -f "${SBG_DIR}/.deps_ok" ]]; then
-    _green "Installing dependencies..."
-    apt update -y
-    apt install -y jq openssl iproute2 iputils-ping coreutils grep util-linux curl wget tar socat cron ufw ca-certificates
-    mkdir -p "${SBG_DIR}"
-    touch "${SBG_DIR}/.deps_ok"
+only_ubuntu(){
+  if [[ -f /etc/issue ]] && grep -qi ubuntu /etc/issue; then
+    return 0
+  elif [[ -f /proc/version ]] && grep -qi ubuntu /proc/version; then
+    return 0
   fi
+  die "This script supports Ubuntu only."
+}
+
+detect_arch(){
+  case "$(uname -m)" in
+    x86_64) cpu="amd64" ;;
+    aarch64) cpu="arm64" ;;
+    armv7l) cpu="armv7" ;;
+    *) die "Unsupported arch: $(uname -m)" ;;
+  esac
+}
+
+print_version(){
+  echo "sbg — Sing-box Game Accelerator (Hysteria2/TUIC)  |  ${SBG_VERSION}"
 }
 
 v4v6(){
-  v4="$(curl -s4m6 icanhazip.com -k | tr -d '\r\n ')" || true
-  v6="$(curl -s6m6 icanhazip.com -k | tr -d '\r\n ')" || true
+  v4="$(curl -s4m5 -k icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
+  v6="$(curl -s6m5 -k icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
 }
 
-rand_str(){
-  # 32 chars A-Za-z0-9
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32
-}
-
-is_udp_port_free(){
-  local p="$1"
-  # returns 0 if free
-  if ss -u -l -n -p 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qw "$p"; then
-    return 1
-  fi
-  return 0
-}
-
-pick_udp_port(){
-  # args: preferred_port
-  local preferred="$1"
-  if [[ -n "$preferred" ]] && is_udp_port_free "$preferred"; then
-    echo "$preferred"
-    return 0
-  fi
-  local p=""
+rand_port(){
+  # random high port not currently in use
   while true; do
+    local p
     p="$(shuf -i 10000-65535 -n 1)"
-    if is_udp_port_free "$p"; then
+    if ! ss -tunlp 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qx "$p"; then
       echo "$p"
-      return 0
+      return
     fi
   done
 }
 
-detect_ssh_port(){
-  local ssh_port=""
-  if command -v sshd >/dev/null 2>&1; then
-    ssh_port="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')"
-  fi
-  if [[ -z "$ssh_port" ]]; then
-    ssh_port="$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | tail -n 1 | awk '{print $2}')"
-  fi
-  [[ -z "$ssh_port" ]] && ssh_port="22"
-  echo "$ssh_port"
+rand_str(){
+  # safe random string for passwords
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
 }
 
-# ---- sing-box install ----
-inssb(){
+enable_bbr(){
+  if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+    _green "Enabling BBR..."
+    mkdir -p /etc/sysctl.d
+    cat > /etc/sysctl.d/99-sbg-bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+}
+
+apt_update_best_effort(){
+  # Mirror sync happens; don't hard-fail.
+  for i in 1 2 3; do
+    apt update -y && return 0
+    _yellow "apt update failed (attempt $i/3). Mirror may be syncing. Retrying..."
+    sleep 2
+  done
+  _yellow "apt update still failing. Continue with cached index (may still work)."
+  return 0
+}
+
+install_deps(){
+  mkdir -p "${SBG_DIR}"
+  _green "Installing dependencies..."
+  apt_update_best_effort
+  DEBIAN_FRONTEND=noninteractive apt install -y jq openssl iproute2 iputils-ping coreutils grep util-linux curl wget tar socat cron ufw ca-certificates python3 >/dev/null 2>&1 || \
+    die "Failed to install dependencies."
+}
+
+install_singbox_core(){
   _green "Installing sing-box core..."
   mkdir -p "${SBG_DIR}"
 
-  local sbcore=""
-  sbcore="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name' 2>/dev/null | sed 's/^v//' || true)"
-  if [[ -z "$sbcore" || "$sbcore" == "null" ]]; then
-    # fallback to a known stable version (no guessing future versions)
-    sbcore="1.12.4"
-    _yellow "GitHub API failed. Fallback to sing-box v${sbcore}."
-  fi
+  local ver name url
+  ver="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')"
+  [[ -z "$ver" || "$ver" == "null" ]] && die "Cannot fetch sing-box latest version from GitHub API."
 
-  local sbname="sing-box-${sbcore}-linux-${cpu}"
-  local sburl="https://github.com/SagerNet/sing-box/releases/download/v${sbcore}/${sbname}.tar.gz"
+  name="sing-box-${ver}-linux-${cpu}"
+  url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${name}.tar.gz"
 
-  _green "Downloading: v${sbcore} (${sbname})"
-  curl -fL -o "${SBG_DIR}/sing-box.tar.gz" -# --retry 2 "${sburl}" || {
-    _red "Failed to download sing-box from GitHub."
-    exit 1
-  }
+  curl -fL -o "${SBG_DIR}/sing-box.tar.gz" -# --retry 2 "$url" || die "Download sing-box failed."
+  tar xzf "${SBG_DIR}/sing-box.tar.gz" -C "${SBG_DIR}" >/dev/null 2>&1 || die "Extract sing-box failed."
+  [[ -x "${SBG_DIR}/${name}/sing-box" ]] || die "sing-box binary not found after extract."
 
-  tar xzf "${SBG_DIR}/sing-box.tar.gz" -C "${SBG_DIR}" 2>/dev/null || {
-    _red "Failed to extract sing-box tarball."
-    rm -f "${SBG_DIR}/sing-box.tar.gz"
-    exit 1
-  }
-
-  if [[ ! -x "${SBG_DIR}/${sbname}/sing-box" ]]; then
-    _red "sing-box binary not found after extracting."
-    exit 1
-  fi
-
-  mv "${SBG_DIR}/${sbname}/sing-box" "${SBG_BIN}"
-  rm -rf "${SBG_DIR}/${sbname}" "${SBG_DIR}/sing-box.tar.gz"
-  chown root:root "${SBG_BIN}"
+  mv "${SBG_DIR}/${name}/sing-box" "${SBG_BIN}"
+  rm -rf "${SBG_DIR:?}/${name}" "${SBG_DIR}/sing-box.tar.gz"
   chmod +x "${SBG_BIN}"
+  chown root:root "${SBG_BIN}"
 
-  _green "sing-box installed: $(${SBG_BIN} version 2>/dev/null | head -n 1)"
+  "${SBG_BIN}" version || true
 }
 
-# ---- ACME cert (acme.sh, Let's Encrypt) ----
+choose_ports(){
+  _green "UDP port selection (recommended for game accel):"
+  echo "1) Use 443/udp for Hysteria2 (best compatibility)"
+  echo "2) Random high UDP port"
+  readp "Choose [1/2] (default 1): " sel
+  sel="${sel:-1}"
+
+  if [[ "$sel" == "2" ]]; then
+    PORT_HY2="$(rand_port)"
+  else
+    PORT_HY2="443"
+  fi
+
+  _green "Enable TUIC as a second UDP option?"
+  echo "1) Yes"
+  echo "2) No (default)"
+  readp "Choose [1/2] (default 2): " tsel
+  tsel="${tsel:-2}"
+
+  if [[ "$tsel" == "1" ]]; then
+    ENABLE_TUIC="1"
+    if [[ "$PORT_HY2" == "443" ]]; then
+      PORT_TUIC="8443"
+    else
+      PORT_TUIC="$(rand_port)"
+    fi
+  else
+    ENABLE_TUIC="0"
+    PORT_TUIC=""
+  fi
+}
+
+acme_install_existing(){
+  local d="$1"
+  # ECC
+  /root/.acme.sh/acme.sh --installcert -d "$d" \
+    --fullchainpath "${SBG_CERT}" \
+    --keypath "${SBG_KEY}" \
+    --ecc >/dev/null 2>&1 && return 0
+  # RSA
+  /root/.acme.sh/acme.sh --installcert -d "$d" \
+    --fullchainpath "${SBG_CERT}" \
+    --keypath "${SBG_KEY}" \
+    >/dev/null 2>&1 && return 0
+  return 1
+}
+
 apply_acme(){
   v4v6
   _red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
   _green "ACME certificate required (Let's Encrypt)."
   _green "Your domain must resolve to this server IP:"
-  _green "IPv4: ${v4:-<none>}"
-  _green "IPv6: ${v6:-<none>}"
+  echo -e "IPv4: ${v4:-<none>}"
+  echo -e "IPv6: ${v6:-<none>}"
   readp "Enter your domain (e.g. example.com): " domain_name
-
-  if [[ -z "$domain_name" ]]; then
-    _red "Domain cannot be empty."
-    exit 1
-  fi
+  domain_name="$(echo "$domain_name" | tr -d ' \r\n')"
+  [[ -z "$domain_name" ]] && die "Domain cannot be empty."
 
   mkdir -p "${SBG_DIR}"
 
   _green "Installing/Upgrading acme.sh..."
   if [[ ! -x /root/.acme.sh/acme.sh ]]; then
-    curl https://get.acme.sh | sh
+    curl -fsSL https://get.acme.sh | sh || die "Install acme.sh failed."
   fi
 
   /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
   /root/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
 
-  acme_install_existing(){
-    local d="$1"
-    # ECC first
-    /root/.acme.sh/acme.sh --installcert -d "$d" \
-      --fullchainpath "${SBG_CERT}" \
-      --keypath "${SBG_KEY}" \
-      --ecc >/dev/null 2>&1 && return 0
-    # RSA
-    /root/.acme.sh/acme.sh --installcert -d "$d" \
-      --fullchainpath "${SBG_CERT}" \
-      --keypath "${SBG_KEY}" \
-      >/dev/null 2>&1 && return 0
-    return 1
-  }
-
-  # If already issued, just install.
+  # Try install existing first (no need 80)
   if acme_install_existing "$domain_name"; then
     _green "Existing cert found in acme.sh, installed to ${SBG_DIR}."
   else
-    # Standalone needs :80 free
+    # Need standalone on 80
     if ss -tulnp 2>/dev/null | awk '{print $5}' | grep -qE '(:|])80$'; then
-      _red "Port 80 is in use. Standalone ACME needs port 80 temporarily."
-      _red "Stop your web server (nginx/apache/caddy) or pre-issue cert in acme.sh first."
-      exit 1
+      die "Port 80 is in use. Stop your web server or ensure cert already exists in acme.sh."
     fi
 
-    # If UFW enabled, allow 80 temporarily.
     ufw allow 80/tcp >/dev/null 2>&1 || true
-
-    _green "Issuing cert via standalone (Let's Encrypt, ECC)..."
     /root/.acme.sh/acme.sh --register-account -m "admin@${domain_name}" --server letsencrypt >/dev/null 2>&1 || true
-    /root/.acme.sh/acme.sh --issue -d "$domain_name" --standalone -k ec-256 --server letsencrypt
-    issue_rc=$?
 
-    if [[ $issue_rc -ne 0 ]]; then
-      if acme_install_existing "$domain_name"; then
-        _yellow "acme.sh --issue returned non-zero (maybe skipping), but cert exists. Continue."
+    _green "Issuing cert (standalone, ec-256)..."
+    /root/.acme.sh/acme.sh --issue -d "$domain_name" --standalone -k ec-256 --server letsencrypt
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+      if ! acme_install_existing "$domain_name"; then
+        die "ACME issue failed. Check DNS A/AAAA, port 80 reachable, firewall/security-group."
       else
-        _red "ACME issue failed. Check DNS A record, port 80 reachability, firewall/security group."
-        exit 1
+        _yellow "acme.sh issue returned non-zero, but cert exists; continuing."
       fi
     else
-      if ! acme_install_existing "$domain_name"; then
-        _red "Issued but installcert failed."
-        exit 1
-      fi
+      acme_install_existing "$domain_name" || die "installcert failed after issue."
     fi
 
-    # Close port 80 back (best-effort).
+    # Optional: close 80 after issuance (keep strict)
     ufw delete allow 80/tcp >/dev/null 2>&1 || true
   fi
 
-  if [[ ! -s "${SBG_CERT}" || ! -s "${SBG_KEY}" ]]; then
-    _red "Cert install failed: missing ${SBG_CERT} or ${SBG_KEY}."
-    exit 1
-  fi
+  [[ -s "${SBG_CERT}" && -s "${SBG_KEY}" ]] || die "Cert/key missing under ${SBG_DIR}."
 
   /root/.acme.sh/acme.sh --install-cronjob >/dev/null 2>&1 || true
-  _green "acme.sh cron for renew installed/updated."
 
-  echo "$domain_name" > "${SBG_DOMAIN_LOG}"
+  echo "${domain_name}" > "${SBG_DOMAIN_LOG}"
+  chmod 600 "${SBG_DOMAIN_LOG}"
   _green "Domain saved: ${domain_name}"
 }
 
 ensure_domain_and_cert(){
   if [[ -s "${SBG_CERT}" && -s "${SBG_KEY}" && -s "${SBG_DOMAIN_LOG}" ]]; then
     domain_name="$(head -n1 "${SBG_DOMAIN_LOG}" | tr -d '\r\n ')"
-    _green "Found existing cert + domain: ${domain_name}. Skip ACME."
+    _green "Found existing cert and domain: ${domain_name}. Skipping ACME."
   else
     apply_acme
-    domain_name="$(head -n1 "${SBG_DOMAIN_LOG}" | tr -d '\r\n ')"
   fi
 }
 
-# ---- firewall ----
 setup_firewall(){
-  local ssh_port
-  ssh_port="$(detect_ssh_port)"
-
   _green "Configuring UFW (strict game-accelerator ports only)..."
+
+  local ssh_port
+  ssh_port="22"
+  if command -v sshd >/dev/null 2>&1; then
+    local p
+    p="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+    [[ -n "$p" ]] && ssh_port="$p"
+  fi
+
   echo "y" | ufw reset >/dev/null 2>&1 || true
-  ufw default deny incoming
-  ufw default allow outgoing
+  ufw default deny incoming >/dev/null 2>&1 || true
+  ufw default allow outgoing >/dev/null 2>&1 || true
 
-  ufw allow "${ssh_port}/tcp" comment "SSH" >/dev/null 2>&1 || true
-  ufw allow "${PORT_HY2}/udp" comment "Hysteria2-UDP" >/dev/null 2>&1 || true
+  ufw allow "${ssh_port}"/tcp comment "SSH" >/dev/null 2>&1 || true
+  ufw allow "${PORT_HY2}"/udp comment "HY2" >/dev/null 2>&1 || true
 
-  if [[ "${ENABLE_TUIC}" == "1" ]]; then
-    ufw allow "${PORT_TUIC}/udp" comment "TUIC-UDP" >/dev/null 2>&1 || true
+  if [[ "${ENABLE_TUIC}" == "1" && -n "${PORT_TUIC}" ]]; then
+    ufw allow "${PORT_TUIC}"/udp comment "TUIC" >/dev/null 2>&1 || true
   fi
 
   echo "y" | ufw enable >/dev/null 2>&1 || true
-  _green "UFW enabled. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp)$( [[ "${ENABLE_TUIC}" == "1" ]] && echo ", TUIC(${PORT_TUIC}/udp)" )."
+
+  if [[ "${ENABLE_TUIC}" == "1" ]]; then
+    _green "UFW enabled. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp), TUIC(${PORT_TUIC}/udp)."
+  else
+    _green "UFW enabled. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp)."
+  fi
 }
 
-# ---- config generation ----
 gen_server_config(){
   mkdir -p "${SBG_DIR}"
 
@@ -308,7 +299,6 @@ gen_server_config(){
   [[ -z "$tuic_uuid" ]] && tuic_uuid="$(rand_str)"
   tuic_pass="$(rand_str)"
 
-  # Pick IP strategy based on v4 availability
   v4v6
   local ipv
   if [[ -n "${v4}" ]]; then
@@ -317,7 +307,6 @@ gen_server_config(){
     ipv="prefer_ipv6"
   fi
 
-  # Save public info (credentials you will use on client)
   cat > "${SBG_PUBLIC_INFO}" <<EOF
 DOMAIN=${domain_name}
 PORT_HY2=${PORT_HY2}
@@ -329,12 +318,11 @@ TUIC_PASSWORD=${tuic_pass}
 EOF
   chmod 600 "${SBG_PUBLIC_INFO}"
 
-  # Build JSON config via python to avoid heredoc-templating pitfalls
   DOMAIN_NAME="${domain_name}" \
   PORT_HY2="${PORT_HY2}" \
   HY2_PASS="${hy2_pass}" \
   ENABLE_TUIC="${ENABLE_TUIC}" \
-  PORT_TUIC="${PORT_TUIC}" \
+  PORT_TUIC="${PORT_TUIC:-0}" \
   TUIC_UUID="${tuic_uuid}" \
   TUIC_PASS="${tuic_pass}" \
   SBG_CERT="${SBG_CERT}" \
@@ -343,16 +331,16 @@ EOF
   python3 - <<'PY'
 import json, os
 
-domain = os.environ.get("DOMAIN_NAME", "")
-port_hy2 = int(os.environ.get("PORT_HY2", "0") or 0)
-hy2_pass = os.environ.get("HY2_PASS", "")
-enable_tuic = os.environ.get("ENABLE_TUIC", "0") == "1"
-port_tuic = int(os.environ.get("PORT_TUIC", "0") or 0)
-tuic_uuid = os.environ.get("TUIC_UUID", "")
-tuic_pass = os.environ.get("TUIC_PASS", "")
-cert = os.environ.get("SBG_CERT", "/etc/sbg/cert.crt")
-key = os.environ.get("SBG_KEY", "/etc/sbg/private.key")
-ipv = os.environ.get("IPV_STRATEGY", "prefer_ipv4")
+domain = os.environ.get("DOMAIN_NAME","")
+port_hy2 = int(os.environ.get("PORT_HY2","0") or 0)
+hy2_pass = os.environ.get("HY2_PASS","")
+enable_tuic = os.environ.get("ENABLE_TUIC","0") == "1"
+port_tuic = int(os.environ.get("PORT_TUIC","0") or 0)
+tuic_uuid = os.environ.get("TUIC_UUID","")
+tuic_pass = os.environ.get("TUIC_PASS","")
+cert = os.environ.get("SBG_CERT","/etc/sbg/cert.crt")
+key  = os.environ.get("SBG_KEY","/etc/sbg/private.key")
+ipv  = os.environ.get("IPV_STRATEGY","prefer_ipv4")
 
 conf = {
   "log": {"disabled": False, "level": "info", "timestamp": True},
@@ -367,51 +355,48 @@ conf = {
         "enabled": True,
         "alpn": ["h3"],
         "certificate_path": cert,
-        "key_path": key,
+        "key_path": key
       },
       "masquerade": {
         "type": "proxy",
         "proxy": {
           "url": "https://www.cloudflare.com/",
-          "rewrite_host": True,
-        },
-      },
+          "rewrite_host": True
+        }
+      }
     }
   ],
   "outbounds": [
-    {"type": "direct", "tag": "direct", "domain_strategy": ipv},
-    {"type": "block", "tag": "block"},
-  ],
+    {"type":"direct","tag":"direct","domain_strategy": ipv},
+    {"type":"block","tag":"block"}
+  ]
 }
 
 if enable_tuic:
-  conf["inbounds"].append(
-    {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "::",
-      "listen_port": port_tuic,
-      "users": [{"uuid": tuic_uuid, "password": tuic_pass}],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": True,
-        "alpn": ["h3"],
-        "certificate_path": cert,
-        "key_path": key,
-      },
+  conf["inbounds"].append({
+    "type": "tuic",
+    "tag": "tuic-in",
+    "listen": "::",
+    "listen_port": port_tuic,
+    "users": [{"uuid": tuic_uuid, "password": tuic_pass}],
+    "congestion_control": "bbr",
+    "tls": {
+      "enabled": True,
+      "alpn": ["h3"],
+      "certificate_path": cert,
+      "key_path": key
     }
-  )
+  })
 
-path = "/etc/sbg/sbg.json"
-with open(path, "w", encoding="utf-8") as f:
-  json.dump(conf, f, indent=2)
+path="/etc/sbg/sbg.json"
+with open(path,"w",encoding="utf-8") as f:
+  json.dump(conf,f,indent=2)
 PY
 
   chmod 600 "${SBG_CONF}"
   _green "Server config generated: ${SBG_CONF}"
 }
 
-# ---- regenerate config from public.info ----
 regen_server_config_from_public_info(){
   if [[ ! -s "${SBG_PUBLIC_INFO}" || ! -s "${SBG_DOMAIN_LOG}" ]]; then
     _red "Missing ${SBG_PUBLIC_INFO} or ${SBG_DOMAIN_LOG}. Cannot regenerate config."
@@ -422,7 +407,6 @@ regen_server_config_from_public_info(){
   source "${SBG_PUBLIC_INFO}"
   domain_name="$(head -n1 "${SBG_DOMAIN_LOG}" | tr -d '\r\n ')"
 
-  # Pick IP strategy based on v4 availability
   v4v6
   local ipv
   if [[ -n "${v4}" ]]; then
@@ -431,7 +415,6 @@ regen_server_config_from_public_info(){
     ipv="prefer_ipv6"
   fi
 
-  # Rebuild config using stored credentials (no changes to passwords/UUID)
   DOMAIN_NAME="${DOMAIN}" \
   PORT_HY2="${PORT_HY2}" \
   HY2_PASS="${HY2_PASSWORD}" \
@@ -445,16 +428,15 @@ regen_server_config_from_public_info(){
   python3 - <<'PY'
 import json, os
 
-domain = os.environ.get("DOMAIN_NAME", "")
-port_hy2 = int(os.environ.get("PORT_HY2", "0") or 0)
-hy2_pass = os.environ.get("HY2_PASS", "")
-enable_tuic = os.environ.get("ENABLE_TUIC", "0") == "1"
-port_tuic = int(os.environ.get("PORT_TUIC", "0") or 0)
-tuic_uuid = os.environ.get("TUIC_UUID", "")
-tuic_pass = os.environ.get("TUIC_PASS", "")
-cert = os.environ.get("SBG_CERT", "/etc/sbg/cert.crt")
-key = os.environ.get("SBG_KEY", "/etc/sbg/private.key")
-ipv = os.environ.get("IPV_STRATEGY", "prefer_ipv4")
+port_hy2 = int(os.environ.get("PORT_HY2","0") or 0)
+hy2_pass = os.environ.get("HY2_PASS","")
+enable_tuic = os.environ.get("ENABLE_TUIC","0") == "1"
+port_tuic = int(os.environ.get("PORT_TUIC","0") or 0)
+tuic_uuid = os.environ.get("TUIC_UUID","")
+tuic_pass = os.environ.get("TUIC_PASS","")
+cert = os.environ.get("SBG_CERT","/etc/sbg/cert.crt")
+key  = os.environ.get("SBG_KEY","/etc/sbg/private.key")
+ipv  = os.environ.get("IPV_STRATEGY","prefer_ipv4")
 
 conf = {
   "log": {"disabled": False, "level": "info", "timestamp": True},
@@ -469,44 +451,42 @@ conf = {
         "enabled": True,
         "alpn": ["h3"],
         "certificate_path": cert,
-        "key_path": key,
+        "key_path": key
       },
       "masquerade": {
         "type": "proxy",
         "proxy": {
           "url": "https://www.cloudflare.com/",
-          "rewrite_host": True,
-        },
-      },
+          "rewrite_host": True
+        }
+      }
     }
   ],
   "outbounds": [
-    {"type": "direct", "tag": "direct", "domain_strategy": ipv},
-    {"type": "block", "tag": "block"},
-  ],
+    {"type":"direct","tag":"direct","domain_strategy": ipv},
+    {"type":"block","tag":"block"}
+  ]
 }
 
 if enable_tuic:
-  conf["inbounds"].append(
-    {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "::",
-      "listen_port": port_tuic,
-      "users": [{"uuid": tuic_uuid, "password": tuic_pass}],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": True,
-        "alpn": ["h3"],
-        "certificate_path": cert,
-        "key_path": key,
-      },
+  conf["inbounds"].append({
+    "type": "tuic",
+    "tag": "tuic-in",
+    "listen": "::",
+    "listen_port": port_tuic,
+    "users": [{"uuid": tuic_uuid, "password": tuic_pass}],
+    "congestion_control": "bbr",
+    "tls": {
+      "enabled": True,
+      "alpn": ["h3"],
+      "certificate_path": cert,
+      "key_path": key
     }
-  )
+  })
 
-path = "/etc/sbg/sbg.json"
-with open(path, "w", encoding="utf-8") as f:
-  json.dump(conf, f, indent=2)
+path="/etc/sbg/sbg.json"
+with open(path,"w",encoding="utf-8") as f:
+  json.dump(conf,f,indent=2)
 PY
 
   chmod 600 "${SBG_CONF}"
@@ -514,14 +494,10 @@ PY
   return 0
 }
 
-# ---- systemd service ----
-sbg_service_install(){
+write_service(){
   cat > /etc/systemd/system/sbg.service <<EOF
 [Unit]
-Description=sing-box game accelerator (Hysteria2/TUIC)
 After=network.target nss-lookup.target
-Wants=network-online.target
-After=network-online.target
 
 [Service]
 User=root
@@ -531,376 +507,238 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=${SBG_BIN} run -c ${SBG_CONF}
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
-RestartSec=2
+RestartSec=3
 LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable sbg >/dev/null 2>&1 || true
-  systemctl restart sbg
-  sleep 1
-  if systemctl is-active --quiet sbg; then
-    _green "Service started: sbg"
-  else
-    _red "Service failed to start. Check: systemctl status sbg -l && journalctl -u sbg -n 200 --no-pager"
-    exit 1
-  fi
-}
-
-view_log(){
-  if command -v journalctl >/dev/null 2>&1; then
-    _green "Last 120 lines of sbg logs:"
-    journalctl -u sbg --no-pager -n 120 2>/dev/null || _red "No logs found (service may not exist)."
-  else
-    _red "journalctl not available."
-  fi
 }
 
 restart_sbg(){
-  _green "Restarting sbg..."
-  systemctl restart sbg 2>/dev/null || { _red "Restart failed. Is sbg installed?"; return; }
+  systemctl restart sbg 2>/dev/null || return 1
   sleep 1
-  systemctl is-active --quiet sbg && _green "sbg restarted OK." || _red "sbg status abnormal."
+  if systemctl is-active --quiet sbg; then
+    _green "sbg is ACTIVE ✅"
+    return 0
+  fi
+  _red "sbg is NOT active ❌"
+  return 1
+}
+
+view_logs(){
+  journalctl -u sbg -n 200 --no-pager 2>/dev/null || _red "No journalctl output."
 }
 
 update_core(){
-  _green "Updating sing-box core..."
-  systemctl stop sbg 2>/dev/null || true
-  inssb
-  systemctl restart sbg 2>/dev/null || { _yellow "Core updated but restart failed. Check systemctl status sbg -l"; return; }
-  _green "Core updated & service restarted."
+  systemctl stop sbg >/dev/null 2>&1 || true
+  install_singbox_core
+  restart_sbg || true
 }
 
-# ---- self update ----
 lnsbg(){
   rm -f /usr/bin/sbg
-  curl -L -o /usr/bin/sbg -# --retry 2 --insecure "${UPDATE_URL}" || {
-    _red "Failed to download update script from: ${UPDATE_URL}"
-    exit 1
-  }
+  curl -fL -o /usr/bin/sbg -# --retry 2 --insecure "${UPDATE_URL}" || die "Download update script failed."
   chmod +x /usr/bin/sbg
+  _green "Updated /usr/bin/sbg"
 }
 
-upsbg(){
-  lnsbg
-  _green "Script updated. Run: sbg"
-  exit 0
-}
-
-# ---- share links + client config ----
-sbgshare(){
-  if [[ ! -s "${SBG_PUBLIC_INFO}" || ! -s "${SBG_DOMAIN_LOG}" ]]; then
-    _red "Missing ${SBG_PUBLIC_INFO} or ${SBG_DOMAIN_LOG}. Install first."
-    return
-  fi
+show_sub(){
+  [[ -s "${SBG_PUBLIC_INFO}" ]] || die "Missing ${SBG_PUBLIC_INFO}"
+  [[ -s "${SBG_DOMAIN_LOG}" ]] || die "Missing ${SBG_DOMAIN_LOG}"
 
   # shellcheck disable=SC1090
   source "${SBG_PUBLIC_INFO}"
-  domain="$(head -n1 "${SBG_DOMAIN_LOG}" | tr -d '\r\n ')"
 
   v4v6
-  host="${domain}"
-  if [[ -n "${v4}" ]]; then
-    host="${v4}"
-  fi
-
-  # Build URIs
-  hy_link="hysteria2://${HY2_PASSWORD}@${host}:${PORT_HY2}?security=tls&alpn=h3&sni=${domain}#HY2-GAME-${hostname}"
-  tu_link=""
-  if [[ "${ENABLE_TUIC}" == "1" ]]; then
-    tu_link="tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${host}:${PORT_TUIC}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${domain}&allow_insecure=0#TUIC-GAME-${hostname}"
-  fi
+  local host
+  host="${v4:-${DOMAIN}}"
 
   mkdir -p "${SBG_DIR}"
-  : > "${SBG_SUBTXT}"
-  echo "${hy_link}" >> "${SBG_SUBTXT}"
-  [[ -n "${tu_link}" ]] && echo "${tu_link}" >> "${SBG_SUBTXT}"
 
-  sub_base64="$(base64 -w 0 < "${SBG_SUBTXT}" 2>/dev/null || base64 < "${SBG_SUBTXT}" | tr -d '\n')"
+  # Hy2 link: hysteria2://<password>@<host>:<port>?security=tls&alpn=h3&sni=<domain>#HY2-<hostname>
+  local hy2_link tuic_link
+  hy2_link="hysteria2://${HY2_PASSWORD}@${host}:${PORT_HY2}?security=tls&alpn=h3&insecure=0&sni=${DOMAIN}#HY2-${hostname}"
+
+  echo "${hy2_link}" > "${SBG_SUB_TXT}"
+
+  if [[ "${ENABLE_TUIC}" == "1" && -n "${PORT_TUIC}" ]]; then
+    tuic_link="tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${host}:${PORT_TUIC}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&allow_insecure=0#TUIC-${hostname}"
+    echo "${tuic_link}" >> "${SBG_SUB_TXT}"
+  fi
+
+  local sub_b64
+  sub_b64="$(base64 -w 0 < "${SBG_SUB_TXT}")"
 
   echo
-  _white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-  echo -e "Domain: ${green}${domain}${plain}"
-  echo -e "Host (preferred): ${green}${host}${plain}"
+  _green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+  echo -e "Domain: ${DOMAIN}"
+  echo -e "HY2 UDP: ${PORT_HY2}"
+  if [[ "${ENABLE_TUIC}" == "1" ]]; then
+    echo -e "TUIC UDP: ${PORT_TUIC}"
+  fi
   echo
-  echo -e "Hysteria2 (UDP) Port: ${yellow}${PORT_HY2}${plain}"
-  [[ "${ENABLE_TUIC}" == "1" ]] && echo -e "TUIC (UDP) Port:      ${yellow}${PORT_TUIC}${plain}"
-  echo
-  _red "🚀 Base64 Subscription:"
-  echo -e "${yellow}${sub_base64}${plain}"
-  _white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+  _red "Base64 subscription:"
+  echo -e "${sub_b64}"
+  _green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 }
 
-client_conf(){
-  if [[ ! -s "${SBG_PUBLIC_INFO}" || ! -s "${SBG_DOMAIN_LOG}" ]]; then
-    _red "Missing ${SBG_PUBLIC_INFO} or ${SBG_DOMAIN_LOG}. Install first."
-    return
-  fi
-  if ! command -v jq >/dev/null 2>&1; then
-    _red "jq not found."
-    return
-  fi
+show_client_config(){
+  [[ -s "${SBG_PUBLIC_INFO}" ]] || die "Missing ${SBG_PUBLIC_INFO}"
+  [[ -s "${SBG_DOMAIN_LOG}" ]] || die "Missing ${SBG_DOMAIN_LOG}"
 
   # shellcheck disable=SC1090
   source "${SBG_PUBLIC_INFO}"
-  domain="$(head -n1 "${SBG_DOMAIN_LOG}" | tr -d '\r\n ')"
 
   v4v6
-  host="${domain}"
-  if [[ -n "${v4}" ]]; then
-    host="${v4}"
-  fi
+  local host
+  host="${v4:-${DOMAIN}}"
 
-  _green "Game-only sing-box client config (TUN)."
-  _yellow "Default behavior: ONLY route known game domains via proxy; everything else DIRECT."
-  _yellow "If a game uses pure IP/UDP with no domain, it may not match. In that case, switch to GLOBAL by setting route.final to \"proxy\"."
+  _green "Sing-box client config (TUN). Save as client.json and run as root on your client."
   echo
-
-  # NOTE:
-  # - Use MetaCubeX remote ruleset "category-games" for game domains.
-  # - Keep cn direct; games -> proxy; final -> direct.
-  # - DNS: game -> proxydns, cn -> localdns, final -> localdns.
   cat <<EOF
 {
-  "log": {
-    "disabled": false,
-    "level": "info",
-    "timestamp": true
-  },
-  "dns": {
-    "servers": [
-      {
-        "tag": "localdns",
-        "address": "223.5.5.5",
-        "detour": "direct"
-      },
-      {
-        "tag": "proxydns",
-        "address": "tls://1.1.1.1/dns-query",
-        "detour": "proxy"
-      }
-    ],
-    "rules": [
-      {
-        "rule_set": "geosite-cn",
-        "server": "localdns"
-      },
-      {
-        "rule_set": "geosite-category-games",
-        "server": "proxydns"
-      }
-    ],
-    "final": "localdns"
-  },
+  "log": { "disabled": false, "level": "info", "timestamp": true },
   "inbounds": [
     {
       "type": "tun",
       "tag": "tun-in",
-      "address": [
-        "172.19.0.1/30",
-        "fd00::1/126"
-      ],
+      "address": [ "172.19.0.1/30", "fd00::1/126" ],
       "auto_route": true,
       "strict_route": true,
       "sniff": true,
       "sniff_override_destination": true,
-      "mtu": 1500
+      "domain_strategy": "prefer_ipv4"
     }
   ],
   "outbounds": [
     {
+      "tag": "select",
+      "type": "selector",
+      "default": "hy2",
+      "outbounds": [
+        "hy2",
+        "tuic",
+        "direct"
+      ]
+    },
+    {
+      "tag": "hy2",
       "type": "hysteria2",
-      "tag": "proxy",
       "server": "${host}",
       "server_port": ${PORT_HY2},
       "password": "${HY2_PASSWORD}",
       "tls": {
         "enabled": true,
-        "server_name": "${domain}",
+        "server_name": "${DOMAIN}",
         "insecure": false,
-        "alpn": ["h3"]
+        "alpn": [ "h3" ]
       }
-    }$( [[ "${ENABLE_TUIC}" == "1" ]] && cat <<EOF_TUIC
-,
+    },
     {
+      "tag": "tuic",
       "type": "tuic",
-      "tag": "proxy-tuic",
       "server": "${host}",
-      "server_port": ${PORT_TUIC},
+      "server_port": ${PORT_TUIC:-0},
       "uuid": "${TUIC_UUID}",
       "password": "${TUIC_PASSWORD}",
       "congestion_control": "bbr",
       "udp_relay_mode": "native",
-      "udp_over_stream": false,
-      "heartbeat": "10s",
       "tls": {
         "enabled": true,
-        "server_name": "${domain}",
+        "server_name": "${DOMAIN}",
         "insecure": false,
-        "alpn": ["h3"]
+        "alpn": [ "h3" ]
       }
-    }
-EOF_TUIC
- )
-,
-    {
-      "type": "direct",
-      "tag": "direct"
     },
-    {
-      "type": "block",
-      "tag": "block"
-    },
-    {
-      "type": "dns",
-      "tag": "dns-out"
-    }
+    { "tag": "direct", "type": "direct" },
+    { "tag": "block", "type": "block" }
   ],
   "route": {
-    "rule_set": [
-      {
-        "tag": "geosite-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs",
-        "download_detour": "direct",
-        "update_interval": "1d"
-      },
-      {
-        "tag": "geoip-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "download_detour": "direct",
-        "update_interval": "1d"
-      },
-      {
-        "tag": "geosite-category-games",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-games.srs",
-        "download_detour": "direct",
-        "update_interval": "1d"
-      }
-    ],
     "auto_detect_interface": true,
-    "final": "direct",
+    "final": "select",
     "rules": [
-      { "protocol": "dns", "outbound": "dns-out" },
-      { "ip_is_private": true, "outbound": "direct" },
-
-      { "rule_set": "geoip-cn", "outbound": "direct" },
-      { "rule_set": "geosite-cn", "outbound": "direct" },
-
-      { "rule_set": "geosite-category-games", "outbound": "proxy" }
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "ip_is_private": true, "outbound": "direct" }
     ]
   }
 }
 EOF
   echo
-  _yellow "macOS run (example): sudo sing-box run -c ./game.json"
+  _yellow "Note: If you disabled TUIC on server, keep using 'hy2' outbound only."
 }
 
-# ---- uninstall ----
-unins(){
-  _yellow "Uninstalling sbg..."
-  systemctl stop sbg 2>/dev/null || true
-  systemctl disable sbg 2>/dev/null || true
+uninstall_all(){
+  systemctl stop sbg >/dev/null 2>&1 || true
+  systemctl disable sbg >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/sbg.service
   systemctl daemon-reload >/dev/null 2>&1 || true
 
   rm -rf "${SBG_DIR}"
   rm -f /usr/bin/sbg
 
-  _green "Uninstalled. (UFW rules not reset automatically; if needed: ufw status / ufw reset)"
+  _green "Uninstalled sbg."
 }
 
-# ---- install flow ----
-install_sbg(){
+install_all(){
   if [[ -f /etc/systemd/system/sbg.service ]]; then
-    _red "sbg is already installed. Please uninstall first."
-    exit 1
+    die "sbg already installed. Uninstall first."
   fi
 
-  install_depend
+  install_deps
   enable_bbr
-  inssb
-
-  _green "UDP port selection (recommended for game accel):"
-  _green "1) Use 443/udp for Hysteria2 (best compatibility)"
-  _green "2) Random high UDP port"
-  readp "Choose [1/2] (default 1): " port_choice
-  [[ -z "$port_choice" ]] && port_choice="1"
-
-  if [[ "$port_choice" == "1" ]]; then
-    PORT_HY2="$(pick_udp_port 443)"
-    if [[ "${PORT_HY2}" != "443" ]]; then
-      _yellow "UDP 443 is not free, picked: ${PORT_HY2}/udp"
-    fi
-  else
-    PORT_HY2="$(pick_udp_port "")"
-  fi
-
-  _green "Enable TUIC as a second UDP option?"
-  _green "1) Yes"
-  _green "2) No (default)"
-  readp "Choose [1/2] (default 2): " tuic_choice
-  [[ -z "$tuic_choice" ]] && tuic_choice="2"
-  if [[ "$tuic_choice" == "1" ]]; then
-    ENABLE_TUIC="1"
-    # Prefer 8443 if free; else random
-    PORT_TUIC="$(pick_udp_port 8443)"
-    if [[ "${PORT_TUIC}" != "8443" ]]; then
-      _yellow "UDP 8443 is not free, picked: ${PORT_TUIC}/udp"
-    fi
-  else
-    ENABLE_TUIC="0"
-    PORT_TUIC=""
-  fi
-
+  detect_arch
+  install_singbox_core
+  choose_ports
   ensure_domain_and_cert
   setup_firewall
-  gen_server_config || { _red "Failed to generate config."; exit 1; }
-  sbg_service_install
-  lnsbg
+  gen_server_config || die "Failed to generate config."
+  write_service
 
-  # Optional keepalive restart (lightweight)
-  (crontab -l 2>/dev/null | grep -v "systemctl restart sbg" ; echo "0 4 * * * systemctl restart sbg >/dev/null 2>&1") | crontab -
+  if ! restart_sbg; then
+    _red "Service failed to start. Check:"
+    echo "  systemctl status sbg -l --no-pager"
+    echo "  journalctl -u sbg -n 200 --no-pager"
+    return 1
+  fi
 
-  _green "Install complete!"
-  sbgshare
+  # daily restart as keepalive (optional)
+  (crontab -l 2>/dev/null; echo "0 4 * * * systemctl restart sbg >/dev/null 2>&1") | crontab -
+
+  _green "Install done."
+  show_sub
 }
 
-# ---- UI ----
-clear
-_white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-_white "sbg — Sing-box Game Accelerator (Hysteria2/TUIC)  |  ${SBG_VERSION}"
-_white "Shortcut command: sbg"
-_red   "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-_green " 1. Install (domain + ACME cert required)"
-_green " 2. Uninstall"
-_green " 3. Show subscription (Base64)"
-_green " 4. Update script"
-_green " 5. View logs"
-_green " 6. Restart service"
-_green " 7. Update sing-box core"
-_green " 8. Show game-only client config (TUN)"
-_green " 9. Regenerate server config (fix broken JSON)"
-_red   "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+menu(){
+  clear
+  echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+  print_version
+  echo "Shortcut command: sbg"
+  echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+  _green " 1. Install (domain + ACME cert required)"
+  _green " 2. Uninstall"
+  _green " 3. Show subscription (Base64)"
+  _green " 4. Update script"
+  _green " 5. View logs"
+  _green " 6. Restart service"
+  _green " 7. Update sing-box core"
+  _green " 8. Show game-only client config (TUN)"
+  _green " 9. Regenerate server config (fix broken JSON)"
+  echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+  readp "Select: " Input
 
-readp "Select: " Input
-case "$Input" in
-  1) install_sbg ;;
-  2) unins ;;
-  3) sbgshare ;;
-  4) upsbg ;;
-  5) view_log ;;
-  6) restart_sbg ;;
-  7) update_core ;;
-  8) client_conf ;;
-  9) regen_server_config_from_public_info && restart_sbg ;;
-  *) exit 0 ;;
-esac
+  case "$Input" in
+    1) install_all ;;
+    2) uninstall_all ;;
+    3) show_sub ;;
+    4) lnsbg ;;
+    5) view_logs ;;
+    6) restart_sbg || { _red "Restart failed."; } ;;
+    7) update_core ;;
+    8) show_client_config ;;
+    9) regen_server_config_from_public_info && restart_sbg ;;
+    *) exit 0 ;;
+  esac
+}
