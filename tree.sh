@@ -294,6 +294,8 @@ class PostsList(BaseModel):
     posts: List[PostOut]
 
 
+# --- Inject build id for HTML cache busting ---
+BUILD_ID = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 app = FastAPI(title="Treehole", version="0.1.0")
 
 
@@ -372,13 +374,13 @@ def send_telegram_notification(post: PostOut) -> None:
     except Exception:
         pass
 
-
-INDEX_HTML = """<!DOCTYPE html>
+INDEX_HTML = f"""<!DOCTYPE html>
 <html lang="zh-Hans">
 <head>
   <meta charset="UTF-8" />
   <title>匿名樹洞 · Treehole</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="treehole-build" content="{BUILD_ID}" />
   <style>
     :root {
       color-scheme: dark;
@@ -865,6 +867,7 @@ INDEX_HTML = """<!DOCTYPE html>
   </main>
 
   <script>
+    const TREEHOLE_BUILD_ID = "{BUILD_ID}";
     const statusEl = document.getElementById("status");
     const postsEl = document.getElementById("posts");
     const randomContentEl = document.getElementById("randomContent");
@@ -1124,11 +1127,17 @@ INDEX_HTML = """<!DOCTYPE html>
 </body>
 </html>
 """
-
-
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
-    return HTMLResponse(INDEX_HTML)
+    # Avoid stale cached HTML/JS causing timezone display bugs
+    return HTMLResponse(
+        INDEX_HTML,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.get("/api/health")
