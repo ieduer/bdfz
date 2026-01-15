@@ -247,7 +247,7 @@ class Post(Base):
     id = Column(Integer, primary_key=True, index=True)
     content = Column(String(2000), nullable=False)
     tag = Column(String(64), nullable=True, index=True)
-    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
     ip_hash = Column(String(64), nullable=False, index=True)
 
 
@@ -280,6 +280,11 @@ class PostOut(BaseModel):
 
     class Config:
         orm_mode = True
+        json_encoders = {
+            datetime: lambda v: (
+                v.replace(tzinfo=timezone.utc) if getattr(v, "tzinfo", None) is None else v.astimezone(timezone.utc)
+            ).isoformat()
+        }
 
 
 class PostsList(BaseModel):
