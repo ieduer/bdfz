@@ -374,13 +374,13 @@ def send_telegram_notification(post: PostOut) -> None:
     except Exception:
         pass
 
-INDEX_HTML = f"""<!DOCTYPE html>
+INDEX_HTML = """<!DOCTYPE html>
 <html lang="zh-Hans">
 <head>
   <meta charset="UTF-8" />
   <title>匿名樹洞 · Treehole</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="treehole-build" content="{BUILD_ID}" />
+  <meta name="treehole-build" content="__BUILD_ID__" />
   <style>
     :root {
       color-scheme: dark;
@@ -867,7 +867,7 @@ INDEX_HTML = f"""<!DOCTYPE html>
   </main>
 
   <script>
-    const TREEHOLE_BUILD_ID = "{BUILD_ID}";
+    const TREEHOLE_BUILD_ID = "__BUILD_ID__";
     const statusEl = document.getElementById("status");
     const postsEl = document.getElementById("posts");
     const randomContentEl = document.getElementById("randomContent");
@@ -1127,6 +1127,8 @@ INDEX_HTML = f"""<!DOCTYPE html>
 </body>
 </html>
 """
+# Replace build id placeholder (avoid f-string brace issues in CSS/JS)
+INDEX_HTML = INDEX_HTML.replace("__BUILD_ID__", BUILD_ID)
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     # Avoid stale cached HTML/JS causing timezone display bugs
