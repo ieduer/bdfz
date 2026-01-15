@@ -881,11 +881,32 @@ INDEX_HTML = """<!DOCTYPE html>
 
     function formatTime(iso) {
       try {
-        const d = new Date(iso);
+        // ✅ Robust timezone handling:
+        // - If backend accidentally returns a naive datetime (no Z / no offset), treat it as UTC.
+        // - If backend returns +00:00, normalize to Z for maximum browser compatibility.
+        let s = (iso || "").trim();
+        if (!s) return "";
+
+        // Normalize common UTC offset to Z
+        if (s.endsWith("+00:00")) s = s.replace("+00:00", "Z");
+
+        // If no explicit timezone info exists, assume UTC
+        // (e.g. "2026-01-15T12:34:56" or "2026-01-15 12:34:56")
+        const hasTZ = /[zZ]$/.test(s) || /[+-]\d{2}:?\d{2}$/.test(s);
+        if (!hasTZ) {
+          // Convert "YYYY-MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SSZ"
+          s = s.replace(" ", "T") + "Z";
+        }
+
+        const d = new Date(s);
         if (Number.isNaN(d.getTime())) return "";
+
         const now = new Date();
         const diff = Math.floor((now.getTime() - d.getTime()) / 1000);
+
+        // If client clock is behind or timezone mismatch, fallback to absolute time
         if (!Number.isFinite(diff) || diff < 0) return d.toLocaleString();
+
         if (diff < 60) return "剛剛";
         if (diff < 3600) return `${Math.floor(diff / 60)} 分鐘前`;
         if (diff < 86400) return `${Math.floor(diff / 3600)} 小時前`;
