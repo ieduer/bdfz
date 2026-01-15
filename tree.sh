@@ -21,7 +21,7 @@
 #
 
 set -Eeuo pipefail
-INSTALLER_VERSION="treehole-install-2025-12-13-v11-scroll-perf"
+INSTALLER_VERSION="treehole-install-2026-01-15-v12-fstringfix"
 
 # ==== 可按需修改的變量 ======================================
 
@@ -374,7 +374,7 @@ def send_telegram_notification(post: PostOut) -> None:
     except Exception:
         pass
 
-INDEX_HTML = """<!DOCTYPE html>
+INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="zh-Hans">
 <head>
   <meta charset="UTF-8" />
@@ -1221,6 +1221,11 @@ PYCODE
   chown "${APP_USER}:${APP_USER}" "${APP_DIR}/app.py"
 }
 
+sanity_check_app_py() {
+  log "語法檢查 app.py（避免 f-string / 字符串大括號導致服務炸裂）..."
+  "${PYTHON_BIN}" -m py_compile "${APP_DIR}/app.py"
+}
+
 setup_venv_and_deps() {
   log "建立 Python 虛擬環境並安裝依賴..."
   if [[ ! -d "${VENV_DIR}" ]]; then
@@ -1378,6 +1383,7 @@ main() {
   create_dirs
   write_env_if_missing
   write_app_code
+  sanity_check_app_py
   setup_venv_and_deps
   write_systemd_unit
 
