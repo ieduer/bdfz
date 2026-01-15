@@ -189,7 +189,7 @@ write_app_code() {
   cat >"${APP_DIR}/app.py" <<'PYCODE'
 import os
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -247,7 +247,7 @@ class Post(Base):
     id = Column(Integer, primary_key=True, index=True)
     content = Column(String(2000), nullable=False)
     tag = Column(String(64), nullable=True, index=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
     ip_hash = Column(String(64), nullable=False, index=True)
 
 
@@ -305,7 +305,7 @@ def hash_ip(ip: str) -> str:
 def enforce_rate_limit(db: Session, ip_hash: str) -> None:
     if POSTS_PER_MINUTE <= 0:
         return
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     window_start = now - timedelta(seconds=60)
     count = (
         db.query(func.count(Post.id))
@@ -1121,7 +1121,7 @@ def create_post(payload: PostCreate, request: Request, background_tasks: Backgro
 
         enforce_rate_limit(db, ip_hash)
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         post = Post(
             content=content,
             tag=tag,

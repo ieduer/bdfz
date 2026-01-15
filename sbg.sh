@@ -1,7 +1,7 @@
 #!/bin/bash
 export LANG=en_US.UTF-8
 
-SBG_VERSION="v0.1.1-game-accel"
+SBG_VERSION="v0.1.2-game-accel"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -260,7 +260,7 @@ ensure_domain_and_cert(){
 }
 
 setup_firewall(){
-  _green "Configuring UFW (strict game-accelerator ports only)..."
+  _green "Configuring UFW (safe mode: preserve existing services)..."
 
   local ssh_port
   ssh_port="22"
@@ -270,10 +270,56 @@ setup_firewall(){
     [[ -n "$p" ]] && ssh_port="$p"
   fi
 
-  echo "y" | ufw reset >/dev/null 2>&1 || true
-  ufw default deny incoming >/dev/null 2>&1 || true
-  ufw default allow outgoing >/dev/null 2>&1 || true
+  # Detect if this machine is also running a website on TCP 80/443.
+  local keep_web
+  keep_web="0"
+  if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE '(:|])80$'; then
+    keep_web="1"
+  fi
+  if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE '(:|])443$'; then
+    keep_web="1"
+  fi
 
+  # If UFW is inactive and we didn't detect listeners, still ask (default YES) to avoid breaking multi-purpose servers.
+  local ufw_active
+  ufw_active="0"
+  if ufw status 2>/dev/null | head -n1 | grep -qi "active"; then
+    ufw_active="1"
+  fi
+
+  if [[ "$keep_web" != "1" ]]; then
+    _yellow "This server may host websites (e.g., 750.bdfz.net)."
+    echo "Keep TCP 80/443 open?"
+    echo "1) Yes (default)"
+    echo "2) No (game-only strict)"
+    local wsel
+    readp "Choose [1/2] (default 1): " wsel
+    wsel="${wsel:-1}"
+    if [[ "$wsel" == "1" ]]; then
+      keep_web="1"
+    else
+      keep_web="0"
+    fi
+  fi
+
+  if [[ "$ufw_active" == "0" ]]; then
+    _yellow "UFW is currently inactive."
+    echo "1) Enable UFW now (recommended)"
+    echo "2) Skip firewall changes"
+    local fsel
+    readp "Choose [1/2] (default 1): " fsel
+    fsel="${fsel:-1}"
+    if [[ "$fsel" == "2" ]]; then
+      _yellow "Skipping firewall configuration (no UFW changes)."
+      return 0
+    fi
+
+    # When enabling from inactive, set sensible defaults.
+    ufw default deny incoming >/dev/null 2>&1 || true
+    ufw default allow outgoing >/dev/null 2>&1 || true
+  fi
+
+  # IMPORTANT: do NOT reset UFW rules here. Only add required allow rules.
   ufw allow "${ssh_port}"/tcp comment "SSH" >/dev/null 2>&1 || true
   ufw allow "${PORT_HY2}"/udp comment "HY2" >/dev/null 2>&1 || true
 
@@ -281,12 +327,30 @@ setup_firewall(){
     ufw allow "${PORT_TUIC}"/udp comment "TUIC" >/dev/null 2>&1 || true
   fi
 
-  echo "y" | ufw enable >/dev/null 2>&1 || true
+  # Keep web ports if requested/detected. Note: TCP 443 can coexist with UDP 443.
+  if [[ "$keep_web" == "1" ]]; then
+    ufw allow 80/tcp comment "HTTP" >/dev/null 2>&1 || true
+    ufw allow 443/tcp comment "HTTPS" >/dev/null 2>&1 || true
+  fi
+
+  if [[ "$ufw_active" == "0" ]]; then
+    echo "y" | ufw enable >/dev/null 2>&1 || true
+  else
+    ufw reload >/dev/null 2>&1 || true
+  fi
 
   if [[ "${ENABLE_TUIC}" == "1" ]]; then
-    _green "UFW enabled. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp), TUIC(${PORT_TUIC}/udp)."
+    if [[ "$keep_web" == "1" ]]; then
+      _green "UFW ready. Allowed: SSH(${ssh_port}/tcp), HTTP(80/tcp), HTTPS(443/tcp), HY2(${PORT_HY2}/udp), TUIC(${PORT_TUIC}/udp)."
+    else
+      _green "UFW ready. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp), TUIC(${PORT_TUIC}/udp)."
+    fi
   else
-    _green "UFW enabled. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp)."
+    if [[ "$keep_web" == "1" ]]; then
+      _green "UFW ready. Allowed: SSH(${ssh_port}/tcp), HTTP(80/tcp), HTTPS(443/tcp), HY2(${PORT_HY2}/udp)."
+    else
+      _green "UFW ready. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp)."
+    fi
   fi
 }
 
@@ -371,6 +435,13 @@ conf = {
     {"type":"block","tag":"block"}
   ]
 }
+
+# -------------------------
+# main
+# -------------------------
+need_root
+only_ubuntu
+menu
 
 if enable_tuic:
   conf["inbounds"].append({
