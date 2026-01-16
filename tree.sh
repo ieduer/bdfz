@@ -436,19 +436,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
       padding: 0 16px;
       display: grid;
       grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.3fr);
-      grid-template-areas: "feed compose";
+      grid-template-areas: "feed side";
       gap: 16px;
       align-items: start;
     }
     @media (max-width: 800px) {
       .page {
         grid-template-columns: minmax(0, 1fr);
-        grid-template-areas: "feed" "compose";
+        grid-template-areas: "feed" "side";
         gap: 12px;
       }
     }
     .feed-panel { grid-area: feed; }
-    .compose-panel { grid-area: compose; }
+    .side-column { grid-area: side; display: flex; flex-direction: column; gap: 16px; }
     .panel {
       background: linear-gradient(135deg, var(--bg-panel), #020617);
       border-radius: 16px;
@@ -818,86 +818,49 @@ INDEX_HTML = r"""<!DOCTYPE html>
         62%, 72% { opacity: 1; transform: scale(1) translateY(-2px); }
         78%, 100% { opacity: 0; transform: scale(0.96) translateY(0); }
     }
+
+    .clock-panel {
+      padding: 12px 14px;
+    }
+    .clock-inner {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+    }
+    #nowClock {
+      width: 170px;
+      height: 170px;
+      display: block;
+      image-rendering: crisp-edges;
+      filter: drop-shadow(0 10px 28px rgba(15, 23, 42, 0.75));
+    }
+    @media (max-width: 800px) {
+      .clock-inner {
+        justify-content: center;
+      }
+      #nowClock {
+        width: 160px;
+        height: 160px;
+      }
+    }
+
+    /* ✅ Mobile textarea scroll feels less “stuck” */
+    textarea {
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+      touch-action: pan-y;
+    }
+
+    /* ✅ Reduce heavy shadows on small screens */
+    @media (max-width: 600px) {
+      .panel {
+        box-shadow: 0 14px 36px rgba(15, 23, 42, 0.65), 0 0 0 1px rgba(15, 23, 42, 0.75);
+      }
+    }
   </style>
 </head>
 <body>
   <main class="page">
-    <section class="panel compose-panel">
-      <div class="panel-inner">
-        <div class="layout-title">
-          <div>
-            <h1>匿名樹洞</h1>
-            <div class="subtitle">說給樹聽就好，這裡不需要暱稱。</div>
-          </div>
-          <div class="pill">
-            <span class="pill-dot"></span>
-            <span>LIVE · 即時寫、即時看</span>
-          </div>
-        </div>
-        <form id="postForm">
-          <label for="content">對樹說點什麼</label>
-          <textarea id="content" name="content" maxlength="4000"
-            placeholder="這裡不記名、不追問，只代你保管片刻的情緒。"></textarea>
-
-          <div class="row">
-            <div class="tag-col">
-              <label for="tag">標籤（可選）</label>
-              <input id="tag" name="tag" type="text" placeholder="心情晴輕清青傾…" />
-            </div>
-            <div style="text-align: right; margin-top: 14px;">
-              <button type="submit" id="submitBtn">
-                <span>投進樹洞</span>
-              </button>
-            </div>
-          </div>
-        </form>
-
-        <div class="pixel-cat" aria-hidden="true">
-          <div class="pixel-cat-walk">
-            <div class="pixel-cat-art">
-              <svg viewBox="0 0 96 64" aria-hidden="true">
-                <g class="pixel-cat-meow">
-                  <rect x="8" y="6" width="48" height="18" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                  <rect x="22" y="24" width="8" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                  <text x="14" y="18" font-family="monospace" font-size="8" fill="#e5e7eb">MEOW!</text>
-                </g>
-
-                <rect x="30" y="18" width="32" height="26" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <rect x="32" y="20" width="28" height="22" fill="#020617" stroke="#1f2937" stroke-width="1" />
-
-                <rect x="30" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                <rect x="54" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
-
-                <rect class="pixel-cat-eye" x="36" y="26" width="4" height="5" fill="#a7f3d0" />
-                <rect class="pixel-cat-eye" x="52" y="26" width="4" height="5" fill="#a7f3d0" />
-
-                <rect x="44" y="31" width="4" height="2" fill="#22c55e" />
-
-                <rect x="38" y="31" width="3" height="2" fill="#10b981" />
-                <rect x="51" y="31" width="3" height="2" fill="#10b981" />
-
-                <rect x="43" y="34" width="2" height="1" fill="#22c55e" />
-                <rect x="47" y="34" width="2" height="1" fill="#22c55e" />
-
-                <rect x="42" y="36" width="8" height="2" fill="#020617" opacity="0.9" />
-              </svg>
-            </div>
-          </div>
-          <div class="small">樹洞守護貓在線值班。</div>
-        </div>
-
-        <div id="status" class="status"></div>
-        <div class="small" style="margin-top: 4px;">
-          系統會做簡單的頻率限制與內容長度限制。
-        </div>
-        <div class="footer-note">
-          <div class="footer-note-item">不記名 · 僅存 IP 雜湊</div>
-          <div class="footer-note-item">純文本 · 不支援圖片 / 附件</div>
-          <div class="footer-note-item">請避免輸入真實姓名、電話等敏感資訊</div>
-        </div>
-      </div>
-    </section>
-
     <section class="panel feed-panel">
       <div class="panel-inner">
         <div class="posts-header">
@@ -919,6 +882,80 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </section>
+
+    <div class="side-column">
+      <section class="panel compose-panel">
+        <div class="panel-inner">
+          <div class="layout-title">
+            <div>
+              <h1>匿名樹洞</h1>
+            </div>
+          </div>
+          <form id="postForm">
+            <textarea id="content" name="content" maxlength="4000"
+              placeholder="這裡不記名、不追問，只代你保管片刻的情緒。"></textarea>
+
+            <div class="row">
+              <div class="tag-col">
+                <label for="tag">標籤（可選）</label>
+                <input id="tag" name="tag" type="text" placeholder="心情晴輕清青傾…" />
+              </div>
+              <div style="text-align: right; margin-top: 14px;">
+                <button type="submit" id="submitBtn">
+                  <span>投進樹洞</span>
+                </button>
+              </div>
+            </div>
+          </form>
+
+          <div class="pixel-cat" aria-hidden="true">
+            <div class="pixel-cat-walk">
+              <div class="pixel-cat-art">
+                <svg viewBox="0 0 96 64" aria-hidden="true">
+                  <g class="pixel-cat-meow">
+                    <rect x="8" y="6" width="48" height="18" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                    <rect x="22" y="24" width="8" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                    <text x="14" y="18" font-family="monospace" font-size="8" fill="#e5e7eb">MEOW!</text>
+                  </g>
+
+                  <rect x="30" y="18" width="32" height="26" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                  <rect x="32" y="20" width="28" height="22" fill="#020617" stroke="#1f2937" stroke-width="1" />
+
+                  <rect x="30" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                  <rect x="54" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
+
+                  <rect class="pixel-cat-eye" x="36" y="26" width="4" height="5" fill="#a7f3d0" />
+                  <rect class="pixel-cat-eye" x="52" y="26" width="4" height="5" fill="#a7f3d0" />
+
+                  <rect x="44" y="31" width="4" height="2" fill="#22c55e" />
+
+                  <rect x="38" y="31" width="3" height="2" fill="#10b981" />
+                  <rect x="51" y="31" width="3" height="2" fill="#10b981" />
+
+                  <rect x="43" y="34" width="2" height="1" fill="#22c55e" />
+                  <rect x="47" y="34" width="2" height="1" fill="#22c55e" />
+
+                  <rect x="42" y="36" width="8" height="2" fill="#020617" opacity="0.9" />
+                </svg>
+              </div>
+            </div>
+          </div>
+
+          <div id="status" class="status"></div>
+          <div class="footer-note">
+            <div class="footer-note-item">不記名 · 僅存 IP 雜湊</div>
+            <div class="footer-note-item">純文本 · 不支援圖片 / 附件</div>
+            <div class="footer-note-item">請避免輸入真實姓名、電話等敏感資訊</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel clock-panel" aria-hidden="true">
+        <div class="panel-inner clock-inner">
+          <canvas id="nowClock" width="220" height="220"></canvas>
+        </div>
+      </section>
+    </div>
   </main>
 
   <script>
@@ -1135,6 +1172,113 @@ INDEX_HTML = r"""<!DOCTYPE html>
       updateCounter();
     }
     setupCounter();
+
+    // --- NOW clock (everything is NOW) ---
+    function setupNowClock() {
+      const c = document.getElementById('nowClock');
+      if (!c) return;
+      const ctx = c.getContext('2d');
+      if (!ctx) return;
+
+      function resizeCanvas() {
+        const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+        const cssSize = Math.min(190, Math.max(140, Math.floor((c.parentElement?.clientWidth || 220) * 0.72)));
+        c.style.width = cssSize + 'px';
+        c.style.height = cssSize + 'px';
+        c.width = cssSize * dpr;
+        c.height = cssSize * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      function draw(angleRad) {
+        const w = c.clientWidth;
+        const h = c.clientHeight;
+        const r = Math.min(w, h) / 2;
+        const cx = w / 2;
+        const cy = h / 2;
+
+        ctx.clearRect(0, 0, w, h);
+
+        // soft ring
+        ctx.beginPath();
+        ctx.arc(cx, cy, r - 6, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // ticks
+        for (let i = 0; i < 60; i++) {
+          const a = (i / 60) * Math.PI * 2;
+          const inner = r - (i % 5 === 0 ? 14 : 10);
+          const outer = r - 6;
+          ctx.beginPath();
+          ctx.moveTo(cx + Math.cos(a) * inner, cy + Math.sin(a) * inner);
+          ctx.lineTo(cx + Math.cos(a) * outer, cy + Math.sin(a) * outer);
+          ctx.strokeStyle = i % 5 === 0 ? 'rgba(148, 163, 184, 0.28)' : 'rgba(148, 163, 184, 0.16)';
+          ctx.lineWidth = i % 5 === 0 ? 2 : 1;
+          ctx.stroke();
+        }
+
+        // NOW words around the ring
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.fillStyle = 'rgba(229, 231, 235, 0.72)';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const words = 28;
+        for (let i = 0; i < words; i++) {
+          const a = (i / words) * Math.PI * 2 - Math.PI / 2;
+          ctx.save();
+          ctx.rotate(a);
+          ctx.translate(0, -(r - 28));
+          ctx.rotate(-a);
+          ctx.fillText('NOW', 0, 0);
+          ctx.restore();
+        }
+        ctx.restore();
+
+        // center NOW
+        ctx.font = '16px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.fillStyle = 'rgba(229, 231, 235, 0.85)';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('NOW', cx, cy + 4);
+
+        // hand (subtle motion, still "now")
+        const handLen = r - 36;
+        const hx = cx + Math.cos(angleRad - Math.PI / 2) * handLen;
+        const hy = cy + Math.sin(angleRad - Math.PI / 2) * handLen;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(hx, hy);
+        ctx.strokeStyle = 'rgba(34, 197, 94, 0.72)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(34, 197, 94, 0.9)';
+        ctx.fill();
+      }
+
+      let start = performance.now();
+      function loop(t) {
+        const elapsed = (t - start) / 1000;
+        const angle = (elapsed % 10) / 10 * Math.PI * 2; // slow rotate
+        draw(angle);
+        requestAnimationFrame(loop);
+      }
+
+      resizeCanvas();
+      window.addEventListener('resize', () => {
+        resizeCanvas();
+      }, { passive: true });
+
+      requestAnimationFrame(loop);
+    }
+
+    setupNowClock();
 
     formEl.addEventListener("submit", async (e) => {
       e.preventDefault();
