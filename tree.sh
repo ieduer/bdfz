@@ -21,7 +21,7 @@
 #
 
 set -Eeuo pipefail
-INSTALLER_VERSION="treehole-install-2026-01-15-v12-fstringfix"
+INSTALLER_VERSION="treehole-install-2026-01-16-v13-accentpicker"
 
 # ==== 可按需修改的變量 ======================================
 
@@ -390,8 +390,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
       --border: #1f2937;
       --text: #e5e7eb;
       --text-dim: #9ca3af;
-      --accent: #22c55e;
-      --accent-soft: rgba(34, 197, 94, 0.12);
+
+      --accent-rgb: 34, 197, 94;
+      --accent: rgb(var(--accent-rgb));
+      --accent-soft: rgba(var(--accent-rgb), 0.12);
+      --accent-shadow: rgba(var(--accent-rgb), 0.40);
+      --accent-ink: #022c22;
+      --accent1: #4ade80;
+      --accent2: #16a34a;
+      --accent3: #22c55e;
+
       --danger: #f97373;
     }
     html.theme-light {
@@ -402,8 +410,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
       --border: #e2e8f0;
       --text: #0f172a;
       --text-dim: #475569;
-      --accent: #16a34a;
-      --accent-soft: rgba(22, 163, 74, 0.12);
+
+      --accent-rgb: 22, 163, 74;
+      --accent: rgb(var(--accent-rgb));
+      --accent-soft: rgba(var(--accent-rgb), 0.12);
+      --accent-shadow: rgba(var(--accent-rgb), 0.35);
+      --accent-ink: #052e16;
+      --accent1: #86efac;
+      --accent2: #16a34a;
+      --accent3: #22c55e;
+
       --danger: #ef4444;
     }
     html.theme-light body {
@@ -415,6 +431,44 @@ INDEX_HTML = r"""<!DOCTYPE html>
       background: #ffffff;
       color: var(--text);
     }
+
+    /* Accent palettes (persisted by localStorage) */
+    html.accent-green {
+      --accent-rgb: 34, 197, 94;
+      --accent-ink: #022c22;
+      --accent1: #4ade80;
+      --accent2: #16a34a;
+      --accent3: #22c55e;
+    }
+    html.accent-blue {
+      --accent-rgb: 59, 130, 246;
+      --accent-ink: #0b1220;
+      --accent1: #93c5fd;
+      --accent2: #2563eb;
+      --accent3: #3b82f6;
+    }
+    html.accent-purple {
+      --accent-rgb: 168, 85, 247;
+      --accent-ink: #160a2b;
+      --accent1: #d8b4fe;
+      --accent2: #7c3aed;
+      --accent3: #a855f7;
+    }
+    html.accent-amber {
+      --accent-rgb: 245, 158, 11;
+      --accent-ink: #1f1300;
+      --accent1: #fde68a;
+      --accent2: #d97706;
+      --accent3: #f59e0b;
+    }
+    html.accent-rose {
+      --accent-rgb: 244, 63, 94;
+      --accent-ink: #24040d;
+      --accent1: #fda4af;
+      --accent2: #e11d48;
+      --accent3: #f43f5e;
+    }
+
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -517,7 +571,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     textarea:focus {
       border-color: var(--accent);
-      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.7);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.7);
     }
     input[type="text"] {
       width: 100%;
@@ -531,7 +585,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     input[type="text"]:focus {
       border-color: var(--accent);
-      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.7);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.7);
     }
     .row {
       display: flex;
@@ -573,9 +627,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       letter-spacing: 0.06em;
       text-transform: uppercase;
       cursor: pointer;
-      background: radial-gradient(circle at 0 0, #4ade80 0, #16a34a 50%, #22c55e 100%);
-      color: #022c22;
-      box-shadow: 0 10px 30px rgba(34, 197, 94, 0.4);
+      background: radial-gradient(circle at 0 0, var(--accent1) 0, var(--accent2) 50%, var(--accent3) 100%);
+      color: var(--accent-ink);
+      box-shadow: 0 10px 30px var(--accent-shadow);
       display: inline-flex;
       align-items: center;
       gap: 6px;
@@ -620,7 +674,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       height: 6px;
       border-radius: 999px;
       background: var(--accent);
-      box-shadow: 0 0 10px rgba(34, 197, 94, 0.9);
+      box-shadow: 0 0 10px rgba(var(--accent-rgb), 0.9);
     }
     .layout-title {
       display: flex;
@@ -629,6 +683,49 @@ INDEX_HTML = r"""<!DOCTYPE html>
       gap: 6px;
       margin-bottom: 8px;
     }
+
+    .accent-picker {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      background: rgba(15, 23, 42, 0.65);
+      box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.7);
+    }
+    html.theme-light .accent-picker {
+      background: rgba(248, 250, 252, 0.85);
+      border: 1px solid rgba(148, 163, 184, 0.35);
+    }
+    .accent-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      cursor: pointer;
+      padding: 0;
+      outline: none;
+      box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.6), 0 6px 16px rgba(15, 23, 42, 0.55);
+    }
+    .accent-dot:hover {
+      transform: translateY(-1px);
+    }
+    .accent-dot:active {
+      transform: translateY(0);
+    }
+    .accent-dot.is-active {
+      box-shadow:
+        0 0 0 2px rgba(var(--accent-rgb), 0.55),
+        0 0 18px rgba(var(--accent-rgb), 0.35);
+      border-color: rgba(255, 255, 255, 0.45);
+    }
+    .accent-dot.accent-green { background: #22c55e; }
+    .accent-dot.accent-blue { background: #3b82f6; }
+    .accent-dot.accent-purple { background: #a855f7; }
+    .accent-dot.accent-amber { background: #f59e0b; }
+    .accent-dot.accent-rose { background: #f43f5e; }
+
     .posts-header {
       display: flex;
       justify-content: space-between;
@@ -704,7 +801,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       gap: 4px;
       padding: 2px 7px;
       border-radius: 999px;
-      border: 1px solid rgba(34, 197, 94, 0.35);
+      border: 1px solid rgba(var(--accent-rgb), 0.35);
       background: var(--accent-soft);
       color: var(--accent);
       font-size: 0.72rem;
@@ -722,7 +819,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       padding: 8px 10px;
       border-radius: 10px;
       border: 1px dashed rgba(148, 163, 184, 0.5);
-      background: radial-gradient(circle at 0 0, rgba(34, 197, 94, 0.1), transparent 55%);
+      background: radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.10), transparent 55%);
       font-size: 0.85rem;
     }
     .random-box-title {
@@ -841,7 +938,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div class="posts-header">
           <div>
             <h2>最新樹洞</h2>
-            <small>按時間倒序顯示最近的樹洞。</small>
           </div>
           <div>
             <button type="button" class="muted-button" id="refreshBtn">刷新</button>
@@ -862,8 +958,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <section class="panel compose-panel">
         <div class="panel-inner">
           <div class="layout-title">
-            <div>
-              <h1>匿名樹洞</h1>
+            <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+              <h1 style="margin:0;">匿名樹洞</h1>
+              <div class="accent-picker" id="accentPicker" aria-label="色系選擇">
+                <button type="button" class="accent-dot accent-green" data-accent="green" aria-label="綠色"></button>
+                <button type="button" class="accent-dot accent-blue" data-accent="blue" aria-label="藍色"></button>
+                <button type="button" class="accent-dot accent-purple" data-accent="purple" aria-label="紫色"></button>
+                <button type="button" class="accent-dot accent-amber" data-accent="amber" aria-label="琥珀"></button>
+                <button type="button" class="accent-dot accent-rose" data-accent="rose" aria-label="玫瑰"></button>
+              </div>
             </div>
           </div>
           <form id="postForm">
@@ -902,13 +1005,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
                   <rect class="pixel-cat-eye" x="36" y="26" width="4" height="5" fill="#a7f3d0" />
                   <rect class="pixel-cat-eye" x="52" y="26" width="4" height="5" fill="#a7f3d0" />
 
-                  <rect x="44" y="31" width="4" height="2" fill="#22c55e" />
+                  <rect x="44" y="31" width="4" height="2" fill="var(--accent)" />
 
-                  <rect x="38" y="31" width="3" height="2" fill="#10b981" />
-                  <rect x="51" y="31" width="3" height="2" fill="#10b981" />
+                  <rect x="38" y="31" width="3" height="2" fill="rgba(var(--accent-rgb), 0.75)" />
+                  <rect x="51" y="31" width="3" height="2" fill="rgba(var(--accent-rgb), 0.75)" />
 
-                  <rect x="43" y="34" width="2" height="1" fill="#22c55e" />
-                  <rect x="47" y="34" width="2" height="1" fill="#22c55e" />
+                  <rect x="43" y="34" width="2" height="1" fill="var(--accent)" />
+                  <rect x="47" y="34" width="2" height="1" fill="var(--accent)" />
 
                   <rect x="42" y="36" width="8" height="2" fill="#020617" opacity="0.9" />
                 </svg>
@@ -942,6 +1045,48 @@ INDEX_HTML = r"""<!DOCTYPE html>
         // ignore
       }
     })();
+
+    // Accent theme picker (persist in localStorage)
+    const ACCENT_KEY = "treehole_accent";
+    const ACCENTS = ["green", "blue", "purple", "amber", "rose"];
+
+    function applyAccent(name) {
+      const n = (name || "green").toLowerCase();
+      const safe = ACCENTS.includes(n) ? n : "green";
+      const root = document.documentElement;
+      for (const a of ACCENTS) root.classList.remove(`accent-${a}`);
+      root.classList.add(`accent-${safe}`);
+      try { localStorage.setItem(ACCENT_KEY, safe); } catch (_) {}
+
+      const picker = document.getElementById("accentPicker");
+      if (picker) {
+        picker.querySelectorAll(".accent-dot").forEach((btn) => {
+          btn.classList.toggle("is-active", btn.dataset.accent === safe);
+        });
+      }
+    }
+
+    function initAccentPicker() {
+      const picker = document.getElementById("accentPicker");
+      if (!picker) return;
+      picker.addEventListener("click", (e) => {
+        const t = e.target;
+        if (!(t instanceof HTMLElement)) return;
+        const btn = t.closest(".accent-dot");
+        if (!btn) return;
+        const name = btn.getAttribute("data-accent") || "green";
+        applyAccent(name);
+      });
+
+      let saved = "green";
+      try {
+        saved = localStorage.getItem(ACCENT_KEY) || "green";
+      } catch (_) {}
+      applyAccent(saved);
+    }
+
+    initAccentPicker();
+
     const statusEl = document.getElementById("status");
     const postsEl = document.getElementById("posts");
     const randomContentEl = document.getElementById("randomContent");
