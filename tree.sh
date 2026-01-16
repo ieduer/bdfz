@@ -16,7 +16,7 @@
 #
 
 set -Eeuo pipefail
-INSTALLER_VERSION="treehole-install-2026-01-16-v15-neon-global-accent"
+INSTALLER_VERSION="treehole-install-2026-01-16-v16-neon-contrast-12-accents"
 
 # ==== 可按需修改的變量 ======================================
 
@@ -370,9 +370,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       --panel2:#111827;
       --panel3:#161e2e;
 
-      --text:#e5e7eb;
-      --text-dim:#9ca3af;
-      --text-faint:rgba(229,231,235,0.72);
+      /* ✅ 更清晰：對比度拉高，避免“字很淺但糊” */
+      --text:#f8fafc;
+      --text-dim:#cbd5e1;
+      --text-faint:rgba(248,250,252,0.76);
 
       --border:rgba(148,163,184,0.18);
       --border2:rgba(148,163,184,0.28);
@@ -420,9 +421,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       --panel2:#ffffff;
       --panel3:#f1f5f9;
 
-      --text:#0f172a;
-      --text-dim:#475569;
-      --text-faint:rgba(15,23,42,0.68);
+      /* ✅ 更清晰：亮色模式也把灰字拉亮一點 */
+      --text:#0b1220;
+      --text-dim:#334155;
+      --text-faint:rgba(15,23,42,0.72);
 
       --border:rgba(15,23,42,0.12);
       --border2:rgba(15,23,42,0.18);
@@ -450,12 +452,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
       --danger:#ef4444;
     }
 
-    /* Accent palettes */
-    html.accent-green{ --accent-rgb:34,197,94;  --accent-ink:#022c22; }
-    html.accent-blue{  --accent-rgb:59,130,246;  --accent-ink:#0b1220; }
-    html.accent-purple{--accent-rgb:168,85,247;  --accent-ink:#160a2b; }
-    html.accent-amber{ --accent-rgb:245,158,11;  --accent-ink:#1f1300; }
-    html.accent-rose{  --accent-rgb:244,63,94;   --accent-ink:#24040d; }
+    /* ✅ 12 Accent palettes：冷暖深淺到位 */
+    html.accent-green{  --accent-rgb:34,197,94;   --accent-ink:#022c22; }
+    html.accent-blue{   --accent-rgb:59,130,246;  --accent-ink:#0b1220; }
+    html.accent-cyan{   --accent-rgb:6,182,212;   --accent-ink:#00161a; }
+    html.accent-teal{   --accent-rgb:20,184,166;  --accent-ink:#001a16; }
+    html.accent-indigo{ --accent-rgb:99,102,241;  --accent-ink:#0b0f1f; }
+    html.accent-purple{ --accent-rgb:168,85,247;  --accent-ink:#160a2b; }
+    html.accent-rose{   --accent-rgb:244,63,94;   --accent-ink:#24040d; }
+    html.accent-red{    --accent-rgb:239,68,68;   --accent-ink:#1a0404; }
+    html.accent-amber{  --accent-rgb:245,158,11;  --accent-ink:#1f1300; }
+    html.accent-orange{ --accent-rgb:249,115,22;  --accent-ink:#1a0b00; }
+    html.accent-lime{   --accent-rgb:132,204,22;  --accent-ink:#0b1200; }
+    html.accent-slate{  --accent-rgb:148,163,184; --accent-ink:#020617; }
 
     *{ box-sizing:border-box; }
     ::selection{
@@ -490,7 +499,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       padding-bottom:24px;
       color:var(--text);
 
-      /* ✅ 更狠：全站霓虹背景 + 多層光暈 + 微弱暗噪點感（靠渐变模拟） */
+      /* ✅ 更狠：全站霓虹背景 + 多層光暈 */
       background:
         radial-gradient(1100px 700px at 12% 8%, var(--tint-1) 0, transparent 58%),
         radial-gradient(900px 650px at 86% 92%, var(--tint-2) 0, transparent 62%),
@@ -590,14 +599,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-size:1.08rem;
       font-weight:760;
       text-transform:uppercase;
-      color: color-mix(in srgb, var(--text) 70%, var(--accent) 30%);
-      text-shadow: 0 0 22px rgba(var(--accent-rgb),0.14);
+      color: color-mix(in srgb, var(--text) 74%, var(--accent) 26%);
+      /* ✅ 文字清晰：不加厚重阴影 */
+      text-shadow:none;
     }
     h2{
       font-size:0.88rem;
       font-weight:720;
       text-transform:uppercase;
-      color: color-mix(in srgb, var(--text-dim) 68%, var(--accent) 32%);
+      color: color-mix(in srgb, var(--text-dim) 74%, var(--accent) 26%);
+      text-shadow:none;
     }
 
     label{
@@ -605,8 +616,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-size:0.78rem;
       text-transform:uppercase;
       letter-spacing:0.09em;
-      color: color-mix(in srgb, var(--text-dim) 76%, var(--accent) 24%);
+      color: color-mix(in srgb, var(--text-dim) 84%, var(--accent) 16%);
       margin-bottom:6px;
+      text-shadow:none;
     }
 
     .row{ display:flex; gap:8px; align-items:center; margin-top:8px; }
@@ -627,15 +639,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
       padding:10px 11px;
       border-radius: var(--radius-sm);
 
-      /* ✅ 更狠：输入框发光 + 玻璃染色 */
+      /* ✅ 输入框发光 + 玻璃染色 */
       border:1px solid color-mix(in srgb, var(--border2) 54%, var(--tint-border-strong) 46%);
       background:
         radial-gradient(circle at 0 0, rgba(var(--accent-rgb),0.16) 0, transparent 58%),
         radial-gradient(circle at 100% 100%, rgba(var(--accent-rgb),0.10) 0, transparent 60%),
         linear-gradient(135deg, rgba(2,6,23,0.52), rgba(15,23,42,0.30));
       color:var(--text);
-      font-size:0.90rem;
-      line-height:1.5;
+      font-size:0.92rem;
+      line-height:1.55;
       outline:none;
 
       box-shadow:
@@ -659,8 +671,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
 
     textarea::placeholder{
-      color: color-mix(in srgb, var(--text-dim) 70%, var(--accent) 30%);
-      opacity:0.95;
+      color: color-mix(in srgb, var(--text-dim) 78%, var(--accent) 22%);
+      opacity:0.96;
     }
 
     textarea:focus{
@@ -696,8 +708,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
 
     input[type="text"]::placeholder{
-      color: color-mix(in srgb, var(--text-dim) 72%, var(--accent) 28%);
-      opacity:0.95;
+      color: color-mix(in srgb, var(--text-dim) 78%, var(--accent) 22%);
+      opacity:0.96;
     }
 
     input[type="text"]:focus{
@@ -721,7 +733,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
       align-items:center;
       gap:6px;
 
-      /* ✅ 更狠：按鈕霓虹爆閃 */
       background:
         radial-gradient(circle at 10% 20%, rgba(var(--accent-rgb),1.0) 0, rgba(var(--accent-rgb),0.75) 46%, rgba(var(--accent-rgb),0.92) 100%);
       box-shadow:
@@ -754,7 +765,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         radial-gradient(circle at 0 0, rgba(var(--accent-rgb),0.14) 0, transparent 62%),
         linear-gradient(135deg, rgba(2,6,23,0.40), rgba(15,23,42,0.20));
       border:1px solid color-mix(in srgb, var(--border2) 58%, var(--tint-border) 42%);
-      color: color-mix(in srgb, var(--text-dim) 70%, var(--accent) 30%);
+      color: color-mix(in srgb, var(--text-dim) 86%, var(--accent) 14%);
       box-shadow:
         inset 0 0 0 1px rgba(15,23,42,0.40),
         0 0 22px rgba(var(--accent-rgb),0.10);
@@ -772,9 +783,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       color:var(--text-dim);
       min-height:1.2em;
       white-space:pre-wrap;
+      text-shadow:none;
     }
-    .status-error{ color:var(--danger); text-shadow: 0 0 18px rgba(239,68,68,0.18); }
-    .status-ok{ color:var(--accent); text-shadow: 0 0 18px rgba(var(--accent-rgb),0.16); }
+    .status-error{ color:var(--danger); text-shadow:none; }
+    .status-ok{ color:var(--accent); text-shadow:none; }
 
     .layout-title{
       display:flex;
@@ -797,6 +809,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       box-shadow:
         inset 0 0 0 1px rgba(15,23,42,0.55),
         0 0 22px rgba(var(--accent-rgb),0.10);
+      flex-wrap:wrap;
+      max-width:100%;
     }
     html.theme-light .accent-picker{
       background:
@@ -831,15 +845,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .accent-dot.is-active{
       box-shadow:
-        0 0 0 2px rgba(var(--accent-rgb),0.70),
+        0 0 0 2px rgba(var(--accent-rgb),0.76),
         0 0 22px var(--glow-strong);
-      border-color: rgba(255,255,255,0.45);
+      border-color: rgba(255,255,255,0.55);
     }
+
     .accent-dot.accent-green{ background:#22c55e; }
     .accent-dot.accent-blue{ background:#3b82f6; }
+    .accent-dot.accent-cyan{ background:#06b6d4; }
+    .accent-dot.accent-teal{ background:#14b8a6; }
+    .accent-dot.accent-indigo{ background:#6366f1; }
     .accent-dot.accent-purple{ background:#a855f7; }
-    .accent-dot.accent-amber{ background:#f59e0b; }
     .accent-dot.accent-rose{ background:#f43f5e; }
+    .accent-dot.accent-red{ background:#ef4444; }
+    .accent-dot.accent-amber{ background:#f59e0b; }
+    .accent-dot.accent-orange{ background:#f97316; }
+    .accent-dot.accent-lime{ background:#84cc16; }
+    .accent-dot.accent-slate{ background:#94a3b8; }
 
     .posts-header{
       display:flex;
@@ -873,7 +895,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
       padding:9px 10px;
       position:relative;
 
-      /* ✅ 更狠：卡片霓虹层 */
       background:
         radial-gradient(circle at 0 0, rgba(var(--accent-rgb),0.18) 0, transparent 56%),
         radial-gradient(circle at 100% 100%, rgba(var(--accent-rgb),0.12) 0, transparent 58%),
@@ -903,24 +924,30 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-size:0.75rem;
       text-transform:uppercase;
       letter-spacing:0.10em;
-      color: color-mix(in srgb, var(--text-dim) 62%, var(--accent) 38%);
+      color: color-mix(in srgb, var(--text-dim) 76%, var(--accent) 24%);
       margin-bottom:4px;
-      text-shadow: 0 0 18px rgba(var(--accent-rgb),0.10);
+      text-shadow:none;
     }
     .post-card-content{
-      font-size:0.90rem;
+      font-size:0.92rem;
       white-space:pre-wrap;
       word-break:break-word;
       color:var(--text);
+      /* ✅ 关键：完全取消会糊字的阴影/混色 */
+      text-shadow:none;
+      font-weight:560;
+      letter-spacing:0.01em;
+      line-height:1.6;
     }
     .post-card-meta{
       margin-top:4px;
-      font-size:0.72rem;
+      font-size:0.74rem;
       color:var(--text-dim);
       display:flex;
       justify-content:flex-start;
       align-items:center;
       gap:8px;
+      text-shadow:none;
     }
 
     .random-box{
@@ -932,7 +959,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         radial-gradient(circle at 0 0, rgba(var(--accent-rgb),0.18), transparent 55%),
         radial-gradient(circle at 100% 100%, rgba(var(--accent-rgb),0.10), transparent 60%),
         linear-gradient(135deg, rgba(15,23,42,0.34), rgba(2,6,23,0.22));
-      font-size:0.85rem;
+      font-size:0.88rem;
       box-shadow: 0 0 26px rgba(var(--accent-rgb),0.10);
     }
     html.theme-light .random-box{
@@ -942,20 +969,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
       box-shadow: 0 0 18px rgba(var(--accent-rgb),0.08);
     }
     .random-box-title{
-      font-size:0.80rem;
+      font-size:0.82rem;
       text-transform:uppercase;
       letter-spacing:0.08em;
-      color: color-mix(in srgb, var(--text-dim) 64%, var(--accent) 36%);
+      color: color-mix(in srgb, var(--text-dim) 76%, var(--accent) 24%);
       margin-bottom:4px;
+      text-shadow:none;
     }
     .random-box-content{
       white-space:pre-wrap;
       word-break:break-word;
       color:var(--text);
+      text-shadow:none;
+      font-weight:560;
+      line-height:1.6;
     }
     .random-box-empty{ color:var(--text-dim); }
 
-    .small{ font-size:0.75rem; color:var(--text-dim); }
+    .small{ font-size:0.75rem; color:var(--text-dim); text-shadow:none; }
 
     .footer-note{
       margin-top:10px;
@@ -964,6 +995,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       gap:8px;
       font-size:0.75rem;
       color:var(--text-dim);
+      text-shadow:none;
     }
     .footer-note-item{
       padding:4px 8px;
@@ -972,8 +1004,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       background:
         radial-gradient(circle at 0 0, rgba(var(--accent-rgb),0.14) 0, transparent 62%),
         rgba(15,23,42,0.56);
-      color: color-mix(in srgb, var(--text-dim) 70%, var(--accent) 30%);
+      color: color-mix(in srgb, var(--text-dim) 84%, var(--accent) 16%);
       box-shadow: 0 0 18px rgba(var(--accent-rgb),0.08);
+      text-shadow:none;
     }
     html.theme-light .footer-note-item{
       background:
@@ -995,6 +1028,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       opacity:0.98;
       text-align:center;
       pointer-events:none;
+      text-shadow:none;
     }
     .pixel-cat-walk{ display:inline-block; animation:catWalk 9s ease-in-out infinite alternate; }
     .pixel-cat-art svg{
@@ -1060,9 +1094,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
               <div class="accent-picker" id="accentPicker" aria-label="色系選擇">
                 <button type="button" class="accent-dot accent-green" data-accent="green" aria-label="綠色"></button>
                 <button type="button" class="accent-dot accent-blue" data-accent="blue" aria-label="藍色"></button>
+                <button type="button" class="accent-dot accent-cyan" data-accent="cyan" aria-label="青色"></button>
+                <button type="button" class="accent-dot accent-teal" data-accent="teal" aria-label="青綠"></button>
+                <button type="button" class="accent-dot accent-indigo" data-accent="indigo" aria-label="靛色"></button>
                 <button type="button" class="accent-dot accent-purple" data-accent="purple" aria-label="紫色"></button>
-                <button type="button" class="accent-dot accent-amber" data-accent="amber" aria-label="琥珀"></button>
                 <button type="button" class="accent-dot accent-rose" data-accent="rose" aria-label="玫瑰"></button>
+                <button type="button" class="accent-dot accent-red" data-accent="red" aria-label="紅色"></button>
+                <button type="button" class="accent-dot accent-amber" data-accent="amber" aria-label="琥珀"></button>
+                <button type="button" class="accent-dot accent-orange" data-accent="orange" aria-label="橙色"></button>
+                <button type="button" class="accent-dot accent-lime" data-accent="lime" aria-label="萊姆"></button>
+                <button type="button" class="accent-dot accent-slate" data-accent="slate" aria-label="灰銀"></button>
               </div>
             </div>
           </div>
@@ -1139,7 +1180,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     })();
 
     const ACCENT_KEY = "treehole_accent";
-    const ACCENTS = ["green", "blue", "purple", "amber", "rose"];
+    const ACCENTS = ["green","blue","cyan","teal","indigo","purple","rose","red","amber","orange","lime","slate"];
 
     function applyAccent(name) {
       const n = (name || "green").toLowerCase();
