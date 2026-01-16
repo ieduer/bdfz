@@ -394,6 +394,27 @@ INDEX_HTML = r"""<!DOCTYPE html>
       --accent-soft: rgba(34, 197, 94, 0.12);
       --danger: #f97373;
     }
+    html.theme-light {
+      color-scheme: light;
+      --bg: #f8fafc;
+      --bg-panel: #ffffff;
+      --bg-panel-light: #f1f5f9;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --text-dim: #475569;
+      --accent: #16a34a;
+      --accent-soft: rgba(22, 163, 74, 0.12);
+      --danger: #ef4444;
+    }
+    html.theme-light body {
+      background: radial-gradient(circle at top, #eef2ff 0, #f8fafc 55%, #ffffff 100%);
+      color: var(--text);
+    }
+    html.theme-light textarea,
+    html.theme-light input[type="text"] {
+      background: #ffffff;
+      color: var(--text);
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -404,8 +425,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       color: var(--text);
       min-height: 100vh;
       display: flex;
-      align-items: stretch;
+      align-items: flex-start;
       justify-content: center;
+      padding-bottom: 24px;
     }
     .page {
       width: 100%;
@@ -413,14 +435,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
       margin: 24px auto;
       padding: 0 16px;
       display: grid;
-      grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+      grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.3fr);
+      grid-template-areas: "feed compose";
       gap: 16px;
+      align-items: start;
     }
     @media (max-width: 800px) {
       .page {
         grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "feed" "compose";
+        gap: 12px;
       }
     }
+    .feed-panel { grid-area: feed; }
+    .compose-panel { grid-area: compose; }
     .panel {
       background: linear-gradient(135deg, var(--bg-panel), #020617);
       border-radius: 16px;
@@ -518,6 +546,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
       max-width: 150px;
       flex: 0 0 150px;
     }
+    @media (max-width: 600px) {
+      textarea {
+        min-height: 120px;
+      }
+      .row {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+      }
+      .row > .tag-col {
+        max-width: none;
+        flex: 1 1 auto;
+      }
+      button {
+        width: 100%;
+        justify-content: center;
+      }
+    }
     button {
       border: none;
       border-radius: 999px;
@@ -600,7 +646,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       gap: 8px;
-      max-height: calc(100vh - 220px);
+      max-height: calc(100dvh - 220px);
       overflow-y: auto;
       -webkit-overflow-scrolling: touch;
       overscroll-behavior: contain;
@@ -608,6 +654,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
       margin-right: -4px;
       margin-top: 2px;
       contain: content;
+      scrollbar-gutter: stable;
+      touch-action: pan-y;
+    }
+    @media (max-width: 800px) {
+      .posts-list {
+        max-height: 58dvh;
+        padding-right: 2px;
+        margin-right: -2px;
+      }
     }
 
     .post-card {
@@ -639,7 +694,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-size: 0.72rem;
       color: var(--text-dim);
       display: flex;
-      justify-content: space-between;
+      justify-content: flex-start;
       align-items: center;
       gap: 8px;
     }
@@ -767,7 +822,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
   <main class="page">
-    <section class="panel">
+    <section class="panel compose-panel">
       <div class="panel-inner">
         <div class="layout-title">
           <div>
@@ -843,7 +898,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel feed-panel">
       <div class="panel-inner">
         <div class="posts-header">
           <div>
@@ -868,6 +923,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   <script>
     const TREEHOLE_BUILD_ID = "__BUILD_ID__";
+    // Auto theme: prefer OS dark-mode; otherwise use local time (07:00-19:00 = light)
+    (function autoTheme() {
+      try {
+        const preferDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        if (preferDark) return; // keep dark
+        const h = new Date().getHours();
+        const isLight = (h >= 7 && h < 19);
+        if (isLight) document.documentElement.classList.add('theme-light');
+      } catch (_) {
+        // ignore
+      }
+    })();
     const statusEl = document.getElementById("status");
     const postsEl = document.getElementById("posts");
     const randomContentEl = document.getElementById("randomContent");
@@ -959,17 +1026,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         left.className = "small";
         left.textContent = formatTime(p.created_at);
 
-        const right = document.createElement("span");
-        right.className = "chip";
-        const dot = document.createElement("span");
-        dot.className = "chip-dot";
-        const label = document.createElement("span");
-        label.textContent = "ANON";
-        right.appendChild(dot);
-        right.appendChild(label);
-
         meta.appendChild(left);
-        meta.appendChild(right);
         card.appendChild(meta);
 
         frag.appendChild(card);
