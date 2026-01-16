@@ -819,31 +819,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
         78%, 100% { opacity: 0; transform: scale(0.96) translateY(0); }
     }
 
-    .clock-panel {
-      padding: 12px 14px;
-    }
-    .clock-inner {
-      display: flex;
-      align-items: center;
-      justify-content: flex-end;
-    }
-    #nowClock {
-      width: 170px;
-      height: 170px;
-      display: block;
-      image-rendering: crisp-edges;
-      filter: drop-shadow(0 10px 28px rgba(15, 23, 42, 0.75));
-    }
-    @media (max-width: 800px) {
-      .clock-inner {
-        justify-content: center;
-      }
-      #nowClock {
-        width: 160px;
-        height: 160px;
-      }
-    }
-
     /* ✅ Mobile textarea scroll feels less “stuck” */
     textarea {
       -webkit-overflow-scrolling: touch;
@@ -950,11 +925,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
       </section>
 
-      <section class="panel clock-panel" aria-hidden="true">
-        <div class="panel-inner clock-inner">
-          <canvas id="nowClock" width="220" height="220"></canvas>
-        </div>
-      </section>
     </div>
   </main>
 
@@ -1173,112 +1143,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     setupCounter();
 
-    // --- NOW clock (everything is NOW) ---
-    function setupNowClock() {
-      const c = document.getElementById('nowClock');
-      if (!c) return;
-      const ctx = c.getContext('2d');
-      if (!ctx) return;
-
-      function resizeCanvas() {
-        const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
-        const cssSize = Math.min(190, Math.max(140, Math.floor((c.parentElement?.clientWidth || 220) * 0.72)));
-        c.style.width = cssSize + 'px';
-        c.style.height = cssSize + 'px';
-        c.width = cssSize * dpr;
-        c.height = cssSize * dpr;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      }
-
-      function draw(angleRad) {
-        const w = c.clientWidth;
-        const h = c.clientHeight;
-        const r = Math.min(w, h) / 2;
-        const cx = w / 2;
-        const cy = h / 2;
-
-        ctx.clearRect(0, 0, w, h);
-
-        // soft ring
-        ctx.beginPath();
-        ctx.arc(cx, cy, r - 6, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
-        ctx.lineWidth = 2;
-        ctx.stroke();
-
-        // ticks
-        for (let i = 0; i < 60; i++) {
-          const a = (i / 60) * Math.PI * 2;
-          const inner = r - (i % 5 === 0 ? 14 : 10);
-          const outer = r - 6;
-          ctx.beginPath();
-          ctx.moveTo(cx + Math.cos(a) * inner, cy + Math.sin(a) * inner);
-          ctx.lineTo(cx + Math.cos(a) * outer, cy + Math.sin(a) * outer);
-          ctx.strokeStyle = i % 5 === 0 ? 'rgba(148, 163, 184, 0.28)' : 'rgba(148, 163, 184, 0.16)';
-          ctx.lineWidth = i % 5 === 0 ? 2 : 1;
-          ctx.stroke();
-        }
-
-        // NOW words around the ring
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
-        ctx.fillStyle = 'rgba(229, 231, 235, 0.72)';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        const words = 28;
-        for (let i = 0; i < words; i++) {
-          const a = (i / words) * Math.PI * 2 - Math.PI / 2;
-          ctx.save();
-          ctx.rotate(a);
-          ctx.translate(0, -(r - 28));
-          ctx.rotate(-a);
-          ctx.fillText('NOW', 0, 0);
-          ctx.restore();
-        }
-        ctx.restore();
-
-        // center NOW
-        ctx.font = '16px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
-        ctx.fillStyle = 'rgba(229, 231, 235, 0.85)';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('NOW', cx, cy + 4);
-
-        // hand (subtle motion, still "now")
-        const handLen = r - 36;
-        const hx = cx + Math.cos(angleRad - Math.PI / 2) * handLen;
-        const hy = cy + Math.sin(angleRad - Math.PI / 2) * handLen;
-        ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.lineTo(hx, hy);
-        ctx.strokeStyle = 'rgba(34, 197, 94, 0.72)';
-        ctx.lineWidth = 2;
-        ctx.stroke();
-
-        ctx.beginPath();
-        ctx.arc(cx, cy, 4, 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(34, 197, 94, 0.9)';
-        ctx.fill();
-      }
-
-      let start = performance.now();
-      function loop(t) {
-        const elapsed = (t - start) / 1000;
-        const angle = (elapsed % 10) / 10 * Math.PI * 2; // slow rotate
-        draw(angle);
-        requestAnimationFrame(loop);
-      }
-
-      resizeCanvas();
-      window.addEventListener('resize', () => {
-        resizeCanvas();
-      }, { passive: true });
-
-      requestAnimationFrame(loop);
-    }
-
-    setupNowClock();
 
     formEl.addEventListener("submit", async (e) => {
       e.preventDefault();
