@@ -2,26 +2,21 @@
 #
 # treehole.sh - 一鍵部署「極簡匿名樹洞」(FastAPI + SQLite + Nginx)
 #
-# 功能概覽：
-#   - FastAPI 提供匿名發帖 / 隨機樹洞 / 最新樹洞 API + 簡單前端
-#   - SQLite 單檔資料庫，超輕量
-#   - 每 IP 每分鐘發帖次數限制，避免被灌爆
+# 特色：
+#   - FastAPI 提供匿名發帖 / 隨機樹洞 / 最新樹洞 API + 前端
+#   - SQLite 單檔資料庫
+#   - 每 IP 每分鐘發帖次數限制
 #   - 不需要登入、不記名，僅存 IP 雜湊（帶 salt）
-#   - systemd 常駐 + Nginx 反向代理 (HTTP 80 / 可升級到 HTTPS 443)
-#   - 內建 certbot + webroot 簽發 / 續期（若已有證書則不重複申請）
-#   - 可選 Telegram 通知（新貼文推送到指定 chat）
+#   - systemd 常駐 + Nginx 反向代理
+#   - 可選 certbot (webroot)
+#   - 可選 Telegram 通知
 #   - 最大限度匿名：
 #       * Nginx 對該站點關閉 access_log（不在 Nginx 日誌中記錄 IP）
 #       * Uvicorn 關閉 access log（不在 systemd/journal 中輸出客戶端 IP）
 #
-# 重新執行腳本：
-#   - 會覆蓋 app.py / systemd / nginx 配置
-#   - 會重啟 treehole.service，重載 Nginx
-#   - 不覆蓋已存在的 .env（配置請自行手動改）
-#
 
 set -Eeuo pipefail
-INSTALLER_VERSION="treehole-install-2026-01-16-v13-accentpicker"
+INSTALLER_VERSION="treehole-install-2026-01-16-v14-accent-global-tint"
 
 # ==== 可按需修改的變量 ======================================
 
@@ -87,7 +82,6 @@ install_packages() {
 stop_previous() {
   log "停止舊的 ${SERVICE_NAME} 服務與殘留 uvicorn 進程（如有）..."
   systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
-  # 僅殺死指定用戶的 uvicorn app:app，避免誤殺其它服務
   pkill -u "${APP_USER}" -f "uvicorn app:app" 2>/dev/null || true
 }
 
@@ -156,27 +150,13 @@ write_env_if_missing() {
   read -r -p "Telegram chat ID (可選，留空則不啟用通知): " tg_chat || true
   cat >"${env_file}" <<ENV
 # ===== treehole 環境配置 =====
-# 資料庫位置
 TREEHOLE_DB_PATH="${DATA_DIR}/treehole.db"
-
-# IP 雜湊用的 salt（建議改成更長更隨機的字符串）
 TREEHOLE_SECRET_SALT="${default_salt}"
-
-# 發帖字數限制
 TREEHOLE_MIN_POST_LENGTH=5
 TREEHOLE_MAX_POST_LENGTH=1000
-
-# 頻率限制：每 IP 每分鐘最多幾則貼文
 TREEHOLE_POSTS_PER_MINUTE=5
-
-# 最新列表默認顯示多少條
 TREEHOLE_RECENT_LIMIT=50
-
-# (可選) 你的域名（僅作記錄）
 TREEHOLE_DOMAIN="${DOMAIN}"
-
-# (可選) Telegram 通知配置：
-#  - 如果兩個都非空，則每條新樹洞會推送到該 chat
 TREEHOLE_TELEGRAM_BOT_TOKEN="${tg_token}"
 TREEHOLE_TELEGRAM_CHAT_ID="${tg_chat}"
 ENV
@@ -210,7 +190,6 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 try:
     from dotenv import load_dotenv
 except ImportError:
-    # 允許沒有 python-dotenv（但安裝腳本會裝）
     def load_dotenv(path: str) -> None:
         return
 
@@ -254,7 +233,6 @@ class Post(Base):
 def init_db() -> None:
     db_path_dir = Path(DB_PATH).parent
     db_path_dir.mkdir(parents=True, exist_ok=True)
-    # 開啟 WAL 模式，提高併發寫入能力
     with engine.connect() as connection:
         try:
             connection.execute(text("PRAGMA journal_mode=WAL;"))
@@ -294,7 +272,6 @@ class PostsList(BaseModel):
     posts: List[PostOut]
 
 
-# --- Inject build id for HTML cache busting ---
 BUILD_ID = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 app = FastAPI(title="Treehole", version="0.1.0")
 
@@ -374,6 +351,7 @@ def send_telegram_notification(post: PostOut) -> None:
     except Exception:
         pass
 
+
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="zh-Hans">
 <head>
@@ -384,105 +362,129 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <style>
     :root {
       color-scheme: dark;
+
+      /* Base palette */
       --bg: #050608;
-      --bg-panel: #111827;
-      --bg-panel-light: #161e2e;
-      --border: #1f2937;
+      --bg2: #020617;
+      --panel: #0b1020;
+      --panel2: #111827;
+      --panel3: #161e2e;
+
       --text: #e5e7eb;
       --text-dim: #9ca3af;
+      --text-faint: rgba(229,231,235,0.72);
 
+      --border: rgba(148, 163, 184, 0.18);
+      --border2: rgba(148, 163, 184, 0.28);
+
+      /* Accent core (changes by theme buttons) */
       --accent-rgb: 34, 197, 94;
       --accent: rgb(var(--accent-rgb));
-      --accent-soft: rgba(var(--accent-rgb), 0.12);
-      --accent-shadow: rgba(var(--accent-rgb), 0.40);
+      --accent-soft: rgba(var(--accent-rgb), 0.14);
+      --accent-soft2: rgba(var(--accent-rgb), 0.08);
+      --accent-shadow: rgba(var(--accent-rgb), 0.45);
       --accent-ink: #022c22;
-      --accent1: #4ade80;
-      --accent2: #16a34a;
-      --accent3: #22c55e;
+
+      /* Global tint that should “染整頁” */
+      --tint-1: rgba(var(--accent-rgb), 0.20);
+      --tint-2: rgba(var(--accent-rgb), 0.10);
+      --tint-3: rgba(var(--accent-rgb), 0.06);
+      --tint-border: rgba(var(--accent-rgb), 0.20);
+      --tint-border-strong: rgba(var(--accent-rgb), 0.32);
+
+      /* Accent grad endpoints */
+      --accent1: rgba(var(--accent-rgb), 0.95);
+      --accent2: rgba(var(--accent-rgb), 0.70);
+      --accent3: rgba(var(--accent-rgb), 0.85);
 
       --danger: #f97373;
     }
+
+    /* Light mode */
     html.theme-light {
       color-scheme: light;
+
       --bg: #f8fafc;
-      --bg-panel: #ffffff;
-      --bg-panel-light: #f1f5f9;
-      --border: #e2e8f0;
+      --bg2: #ffffff;
+      --panel: #ffffff;
+      --panel2: #ffffff;
+      --panel3: #f1f5f9;
+
       --text: #0f172a;
       --text-dim: #475569;
+      --text-faint: rgba(15,23,42,0.68);
+
+      --border: rgba(15, 23, 42, 0.12);
+      --border2: rgba(15, 23, 42, 0.18);
 
       --accent-rgb: 22, 163, 74;
       --accent: rgb(var(--accent-rgb));
-      --accent-soft: rgba(var(--accent-rgb), 0.12);
-      --accent-shadow: rgba(var(--accent-rgb), 0.35);
+      --accent-soft: rgba(var(--accent-rgb), 0.16);
+      --accent-soft2: rgba(var(--accent-rgb), 0.08);
+      --accent-shadow: rgba(var(--accent-rgb), 0.28);
       --accent-ink: #052e16;
-      --accent1: #86efac;
-      --accent2: #16a34a;
-      --accent3: #22c55e;
+
+      --tint-1: rgba(var(--accent-rgb), 0.12);
+      --tint-2: rgba(var(--accent-rgb), 0.08);
+      --tint-3: rgba(var(--accent-rgb), 0.05);
+      --tint-border: rgba(var(--accent-rgb), 0.18);
+      --tint-border-strong: rgba(var(--accent-rgb), 0.26);
 
       --danger: #ef4444;
-    }
-    html.theme-light body {
-      background: radial-gradient(circle at top, #eef2ff 0, #f8fafc 55%, #ffffff 100%);
-      color: var(--text);
-    }
-    html.theme-light textarea,
-    html.theme-light input[type="text"] {
-      background: #ffffff;
-      color: var(--text);
     }
 
     /* Accent palettes (persisted by localStorage) */
     html.accent-green {
       --accent-rgb: 34, 197, 94;
       --accent-ink: #022c22;
-      --accent1: #4ade80;
-      --accent2: #16a34a;
-      --accent3: #22c55e;
     }
     html.accent-blue {
       --accent-rgb: 59, 130, 246;
       --accent-ink: #0b1220;
-      --accent1: #93c5fd;
-      --accent2: #2563eb;
-      --accent3: #3b82f6;
     }
     html.accent-purple {
       --accent-rgb: 168, 85, 247;
       --accent-ink: #160a2b;
-      --accent1: #d8b4fe;
-      --accent2: #7c3aed;
-      --accent3: #a855f7;
     }
     html.accent-amber {
       --accent-rgb: 245, 158, 11;
       --accent-ink: #1f1300;
-      --accent1: #fde68a;
-      --accent2: #d97706;
-      --accent3: #f59e0b;
     }
     html.accent-rose {
       --accent-rgb: 244, 63, 94;
       --accent-ink: #24040d;
-      --accent1: #fda4af;
-      --accent2: #e11d48;
-      --accent3: #f43f5e;
     }
 
     * { box-sizing: border-box; }
+
     body {
       margin: 0;
       padding: 0;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
                    "Helvetica Neue", sans-serif;
-      background: radial-gradient(circle at top, #0f172a 0, #020617 55%, #000 100%);
-      color: var(--text);
       min-height: 100vh;
       display: flex;
       align-items: flex-start;
       justify-content: center;
       padding-bottom: 24px;
+
+      /* ✅ 整頁染色：背景直接吃 accent tint */
+      background:
+        radial-gradient(circle at 12% 8%, var(--tint-1) 0, transparent 55%),
+        radial-gradient(circle at 88% 92%, var(--tint-2) 0, transparent 58%),
+        radial-gradient(circle at 50% 0%, rgba(56,189,248,0.06) 0, transparent 60%),
+        linear-gradient(180deg, var(--bg2) 0, var(--bg) 55%, #000 100%);
+      color: var(--text);
     }
+
+    html.theme-light body {
+      background:
+        radial-gradient(circle at 10% 10%, var(--tint-1) 0, transparent 60%),
+        radial-gradient(circle at 90% 90%, var(--tint-2) 0, transparent 62%),
+        linear-gradient(180deg, var(--bg2) 0, var(--bg) 100%);
+      color: var(--text);
+    }
+
     .page {
       width: 100%;
       max-width: 1120px;
@@ -501,53 +503,70 @@ INDEX_HTML = r"""<!DOCTYPE html>
         gap: 12px;
       }
     }
+
     .feed-panel { grid-area: feed; }
     .side-column { grid-area: side; display: flex; flex-direction: column; gap: 16px; }
+
     .panel {
-      background: linear-gradient(135deg, var(--bg-panel), #020617);
+      background:
+        radial-gradient(circle at 0 0, var(--tint-3) 0, transparent 55%),
+        linear-gradient(135deg, var(--panel2), var(--panel));
       border-radius: 16px;
-      border: 1px solid var(--border);
-      padding: 16px 18px 18px;
+
+      /* ✅ 面板邊框與光暈也跟色系走 */
+      border: 1px solid color-mix(in srgb, var(--border) 65%, var(--tint-border) 35%);
       box-shadow:
-        0 24px 60px rgba(15, 23, 42, 0.75),
-        0 0 0 1px rgba(15, 23, 42, 0.8);
+        0 24px 60px rgba(15, 23, 42, 0.60),
+        0 0 0 1px rgba(15, 23, 42, 0.55),
+        0 0 34px rgba(var(--accent-rgb), 0.10);
       position: relative;
       overflow: hidden;
     }
+
     .panel::before {
       content: "";
       position: absolute;
-      inset: -120px;
+      inset: -140px;
+
+      /* ✅ 以前是固定青藍光，現在改成跟 accent 走 */
       background:
-        radial-gradient(circle at 0 0, rgba(45, 212, 191, 0.08), transparent 55%),
-        radial-gradient(circle at 100% 100%, rgba(56, 189, 248, 0.12), transparent 60%);
-      opacity: 0.7;
+        radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.12), transparent 56%),
+        radial-gradient(circle at 100% 100%, rgba(var(--accent-rgb), 0.10), transparent 60%),
+        radial-gradient(circle at 50% 30%, rgba(56, 189, 248, 0.06), transparent 55%);
+      opacity: 0.85;
       pointer-events: none;
     }
+
     .panel-inner {
       position: relative;
       z-index: 1;
     }
+
     h1, h2 {
       margin: 0 0 10px;
       letter-spacing: 0.03em;
     }
+
+    /* ✅ 標題也吃一點 accent */
     h1 {
       font-size: 1.1rem;
-      font-weight: 650;
+      font-weight: 700;
       text-transform: uppercase;
+      color: color-mix(in srgb, var(--text) 78%, var(--accent) 22%);
     }
     h2 {
       font-size: 0.9rem;
-      font-weight: 600;
+      font-weight: 650;
       text-transform: uppercase;
-      color: var(--text-dim);
+      color: color-mix(in srgb, var(--text-dim) 75%, var(--accent) 25%);
     }
+
     .subtitle {
       font-size: 0.85rem;
       color: var(--text-dim);
       margin-bottom: 10px;
     }
+
     label {
       display: block;
       font-size: 0.78rem;
@@ -556,95 +575,113 @@ INDEX_HTML = r"""<!DOCTYPE html>
       color: var(--text-dim);
       margin-bottom: 6px;
     }
+
     textarea {
       width: 100%;
       min-height: 140px;
       resize: vertical;
       padding: 10px 11px;
       border-radius: 10px;
-      border: 1px solid var(--border);
-      background: linear-gradient(135deg, #020617, #020617);
+
+      /* ✅ 輸入框跟色系一起染 */
+      border: 1px solid color-mix(in srgb, var(--border2) 70%, var(--tint-border) 30%);
+      background:
+        radial-gradient(circle at 0 0, var(--accent-soft2) 0, transparent 55%),
+        linear-gradient(135deg, var(--panel3), var(--panel));
       color: var(--text);
       font-size: 0.9rem;
       line-height: 1.5;
       outline: none;
     }
+
+    textarea::placeholder {
+      color: color-mix(in srgb, var(--text-dim) 80%, var(--accent) 20%);
+      opacity: 0.9;
+    }
+
     textarea:focus {
       border-color: var(--accent);
-      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.7);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.75);
     }
+
     input[type="text"] {
       width: 100%;
       padding: 7px 10px;
       border-radius: 999px;
-      border: 1px solid var(--border);
-      background: #020617;
+
+      border: 1px solid color-mix(in srgb, var(--border2) 70%, var(--tint-border) 30%);
+      background:
+        radial-gradient(circle at 0 0, var(--accent-soft2) 0, transparent 55%),
+        linear-gradient(135deg, var(--panel3), var(--panel));
       color: var(--text);
       font-size: 0.85rem;
       outline: none;
     }
+
+    input[type="text"]::placeholder {
+      color: color-mix(in srgb, var(--text-dim) 82%, var(--accent) 18%);
+      opacity: 0.9;
+    }
+
     input[type="text"]:focus {
       border-color: var(--accent);
       box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.7);
     }
+
     .row {
       display: flex;
       gap: 8px;
       align-items: center;
       margin-top: 8px;
     }
-    .row > * {
-      flex: 1;
-    }
-    .row > .tag-col {
-      max-width: 150px;
-      flex: 0 0 150px;
-    }
+    .row > * { flex: 1; }
+    .row > .tag-col { max-width: 150px; flex: 0 0 150px; }
+
     @media (max-width: 600px) {
-      textarea {
-        min-height: 120px;
-      }
-      .row {
-        flex-direction: column;
-        align-items: stretch;
-        gap: 10px;
-      }
-      .row > .tag-col {
-        max-width: none;
-        flex: 1 1 auto;
-      }
-      button {
-        width: 100%;
-        justify-content: center;
-      }
+      textarea { min-height: 120px; }
+      .row { flex-direction: column; align-items: stretch; gap: 10px; }
+      .row > .tag-col { max-width: none; flex: 1 1 auto; }
+      button { width: 100%; justify-content: center; }
     }
+
     button {
       border: none;
       border-radius: 999px;
       padding: 8px 16px;
       font-size: 0.85rem;
-      font-weight: 550;
+      font-weight: 650;
       letter-spacing: 0.06em;
       text-transform: uppercase;
       cursor: pointer;
-      background: radial-gradient(circle at 0 0, var(--accent1) 0, var(--accent2) 50%, var(--accent3) 100%);
+      background: radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.95) 0, rgba(var(--accent-rgb), 0.72) 52%, rgba(var(--accent-rgb), 0.88) 100%);
       color: var(--accent-ink);
       box-shadow: 0 10px 30px var(--accent-shadow);
       display: inline-flex;
       align-items: center;
       gap: 6px;
     }
+
     button:disabled {
       opacity: 0.65;
       cursor: default;
       box-shadow: none;
     }
+
     .muted-button {
-      background: transparent;
-      border: 1px solid var(--border);
-      color: var(--text-dim);
+      background:
+        radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.09) 0, transparent 60%),
+        linear-gradient(135deg, rgba(2,6,23,0.45), rgba(15,23,42,0.25));
+      border: 1px solid color-mix(in srgb, var(--border2) 70%, var(--tint-border) 30%);
+      color: color-mix(in srgb, var(--text-dim) 78%, var(--accent) 22%);
       box-shadow: none;
     }
+
+    html.theme-light .muted-button {
+      background:
+        radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.12) 0, transparent 60%),
+        linear-gradient(135deg, rgba(255,255,255,0.85), rgba(241,245,249,0.75));
+    }
+
     .status {
       margin-top: 8px;
       font-size: 0.78rem;
@@ -652,30 +689,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       min-height: 1.2em;
       white-space: pre-wrap;
     }
-    .status-error {
-      color: var(--danger);
-    }
-    .status-ok {
-      color: var(--accent);
-    }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 0.78rem;
-      padding: 3px 8px;
-      border-radius: 999px;
-      border: 1px solid rgba(148, 163, 184, 0.35);
-      background: rgba(15, 23, 42, 0.85);
-      color: var(--text-dim);
-    }
-    .pill-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 999px;
-      background: var(--accent);
-      box-shadow: 0 0 10px rgba(var(--accent-rgb), 0.9);
-    }
+    .status-error { color: var(--danger); }
+    .status-ok { color: var(--accent); }
+
     .layout-title {
       display: flex;
       justify-content: space-between;
@@ -690,14 +706,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
       gap: 8px;
       padding: 6px 10px;
       border-radius: 999px;
-      border: 1px solid rgba(148, 163, 184, 0.25);
-      background: rgba(15, 23, 42, 0.65);
-      box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.7);
+      border: 1px solid color-mix(in srgb, var(--border2) 70%, var(--tint-border) 30%);
+      background:
+        radial-gradient(circle at 0 0, var(--accent-soft2) 0, transparent 65%),
+        rgba(15, 23, 42, 0.55);
+      box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.55);
     }
+
     html.theme-light .accent-picker {
-      background: rgba(248, 250, 252, 0.85);
-      border: 1px solid rgba(148, 163, 184, 0.35);
+      background:
+        radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.10) 0, transparent 60%),
+        rgba(248, 250, 252, 0.90);
+      border: 1px solid color-mix(in srgb, var(--border2) 70%, var(--tint-border) 30%);
     }
+
     .accent-dot {
       width: 12px;
       height: 12px;
@@ -706,20 +728,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
       cursor: pointer;
       padding: 0;
       outline: none;
-      box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.6), 0 6px 16px rgba(15, 23, 42, 0.55);
+      box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.5), 0 6px 16px rgba(15, 23, 42, 0.45);
+      transition: transform 120ms ease, box-shadow 120ms ease;
     }
-    .accent-dot:hover {
-      transform: translateY(-1px);
-    }
-    .accent-dot:active {
-      transform: translateY(0);
-    }
+    .accent-dot:hover { transform: translateY(-1px); }
+    .accent-dot:active { transform: translateY(0); }
+
     .accent-dot.is-active {
       box-shadow:
         0 0 0 2px rgba(var(--accent-rgb), 0.55),
         0 0 18px rgba(var(--accent-rgb), 0.35);
       border-color: rgba(255, 255, 255, 0.45);
     }
+
     .accent-dot.accent-green { background: #22c55e; }
     .accent-dot.accent-blue { background: #3b82f6; }
     .accent-dot.accent-purple { background: #a855f7; }
@@ -738,7 +759,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
       color: var(--text-dim);
     }
 
-    /* ✅ 性能/體感：右欄列表高度跟視窗走，滾動更自然，不像被“限速” */
     .posts-list {
       display: flex;
       flex-direction: column;
@@ -765,27 +785,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .post-card {
       border-radius: 10px;
       padding: 9px 10px;
-      background: linear-gradient(135deg, var(--bg-panel-light), #020617);
-      border: 1px solid rgba(148, 163, 184, 0.25);
+
+      /* ✅ 卡片整體跟 accent tint */
+      background:
+        radial-gradient(circle at 0 0, var(--accent-soft2) 0, transparent 55%),
+        linear-gradient(135deg, var(--panel3), var(--panel));
+      border: 1px solid color-mix(in srgb, var(--border) 65%, var(--tint-border) 35%);
       position: relative;
 
-      /* ✅ 長列表更順：讓瀏覽器延後渲染不可見卡片 */
       content-visibility: auto;
       contain-intrinsic-size: 120px;
     }
+
     .post-card-tag {
       font-size: 0.75rem;
       text-transform: uppercase;
       letter-spacing: 0.09em;
-      color: var(--text-dim);
+      color: color-mix(in srgb, var(--text-dim) 72%, var(--accent) 28%);
       margin-bottom: 4px;
     }
+
     .post-card-content {
       font-size: 0.9rem;
       white-space: pre-wrap;
       word-break: break-word;
       color: var(--text);
     }
+
     .post-card-meta {
       margin-top: 4px;
       font-size: 0.72rem;
@@ -795,52 +821,45 @@ INDEX_HTML = r"""<!DOCTYPE html>
       align-items: center;
       gap: 8px;
     }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 2px 7px;
-      border-radius: 999px;
-      border: 1px solid rgba(var(--accent-rgb), 0.35);
-      background: var(--accent-soft);
-      color: var(--accent);
-      font-size: 0.72rem;
-      text-transform: uppercase;
-      letter-spacing: 0.07em;
-    }
-    .chip-dot {
-      width: 5px;
-      height: 5px;
-      border-radius: 999px;
-      background: var(--accent);
-    }
+
     .random-box {
       margin-top: 10px;
       padding: 8px 10px;
       border-radius: 10px;
-      border: 1px dashed rgba(148, 163, 184, 0.5);
-      background: radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.10), transparent 55%);
+      border: 1px dashed color-mix(in srgb, var(--border2) 62%, var(--tint-border-strong) 38%);
+      background:
+        radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.12), transparent 55%),
+        linear-gradient(135deg, rgba(15,23,42,0.35), rgba(2,6,23,0.25));
       font-size: 0.85rem;
     }
+
+    html.theme-light .random-box {
+      background:
+        radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.10), transparent 60%),
+        linear-gradient(135deg, rgba(255,255,255,0.90), rgba(241,245,249,0.75));
+    }
+
     .random-box-title {
       font-size: 0.8rem;
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      color: var(--text-dim);
+      color: color-mix(in srgb, var(--text-dim) 72%, var(--accent) 28%);
       margin-bottom: 4px;
     }
+
     .random-box-content {
       white-space: pre-wrap;
       word-break: break-word;
       color: var(--text);
     }
-    .random-box-empty {
-      color: var(--text-dim);
-    }
+
+    .random-box-empty { color: var(--text-dim); }
+
     .small {
       font-size: 0.75rem;
       color: var(--text-dim);
     }
+
     .footer-note {
       margin-top: 10px;
       display: flex;
@@ -849,84 +868,69 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-size: 0.75rem;
       color: var(--text-dim);
     }
+
     .footer-note-item {
       padding: 4px 8px;
       border-radius: 999px;
-      border: 1px dashed rgba(148, 163, 184, 0.35);
-      background: rgba(15, 23, 42, 0.8);
+      border: 1px dashed color-mix(in srgb, var(--border) 68%, var(--tint-border) 32%);
+      background:
+        radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.08) 0, transparent 60%),
+        rgba(15, 23, 42, 0.60);
+      color: color-mix(in srgb, var(--text-dim) 78%, var(--accent) 22%);
+    }
+
+    html.theme-light .footer-note-item {
+      background:
+        radial-gradient(circle at 0 0, rgba(var(--accent-rgb), 0.10) 0, transparent 60%),
+        rgba(255,255,255,0.85);
     }
 
     .pixel-cat {
-        margin-top: 22px;
-        width: 100%;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 8px;
-        font-size: 0.75rem;
-        color: var(--text-dim);
-        opacity: 0.98;
-        text-align: center;
-        pointer-events: none;
+      margin-top: 22px;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      opacity: 0.98;
+      text-align: center;
+      pointer-events: none;
     }
-    .pixel-cat-walk {
-        display: inline-block;
-        animation: catWalk 9s ease-in-out infinite alternate;
-    }
-    .pixel-cat-art {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-                     "Liberation Mono", "Courier New", monospace;
-        line-height: 1.1;
-        white-space: pre;
-    }
+    .pixel-cat-walk { display: inline-block; animation: catWalk 9s ease-in-out infinite alternate; }
     .pixel-cat-art svg {
-        width: 120px;
-        height: 96px;
-        image-rendering: pixelated;
-        filter: drop-shadow(0 6px 16px rgba(15, 23, 42, 0.95));
-        animation: catFloat 3.8s ease-in-out infinite;
+      width: 120px;
+      height: 96px;
+      image-rendering: pixelated;
+      filter: drop-shadow(0 6px 16px rgba(15, 23, 42, 0.85));
+      animation: catFloat 3.8s ease-in-out infinite;
     }
-    .pixel-cat-eye {
-        transform-origin: center center;
-        animation: catBlink 4.2s infinite;
-    }
-    .pixel-cat-meow {
-        opacity: 0;
-        transform-origin: left bottom;
-        animation: catMeow 11s ease-in-out infinite;
-    }
-    @keyframes catFloat {
-        0%, 100% { transform: translateY(0); }
-        50% { transform: translateY(-3px); }
-    }
-    @keyframes catBlink {
-        0%, 86%, 100% { transform: scaleY(1); }
-        88% { transform: scaleY(0.15); }
-        92% { transform: scaleY(1); }
-    }
-    @keyframes catWalk {
-        0% { transform: translateX(-14px); }
-        50% { transform: translateX(14px); }
-        100% { transform: translateX(-6px); }
-    }
+    .pixel-cat-eye { transform-origin: center center; animation: catBlink 4.2s infinite; }
+    .pixel-cat-meow { opacity: 0; transform-origin: left bottom; animation: catMeow 11s ease-in-out infinite; }
+
+    @keyframes catFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+    @keyframes catBlink { 0%, 86%, 100% { transform: scaleY(1); } 88% { transform: scaleY(0.15); } 92% { transform: scaleY(1); } }
+    @keyframes catWalk { 0% { transform: translateX(-14px); } 50% { transform: translateX(14px); } 100% { transform: translateX(-6px); } }
     @keyframes catMeow {
-        0%, 58% { opacity: 0; transform: scale(0.95) translateY(0); }
-        62%, 72% { opacity: 1; transform: scale(1) translateY(-2px); }
-        78%, 100% { opacity: 0; transform: scale(0.96) translateY(0); }
+      0%, 58% { opacity: 0; transform: scale(0.95) translateY(0); }
+      62%, 72% { opacity: 1; transform: scale(1) translateY(-2px); }
+      78%, 100% { opacity: 0; transform: scale(0.96) translateY(0); }
     }
 
-    /* ✅ Mobile textarea scroll feels less “stuck” */
     textarea {
       -webkit-overflow-scrolling: touch;
       overscroll-behavior: contain;
       touch-action: pan-y;
     }
 
-    /* ✅ Reduce heavy shadows on small screens */
     @media (max-width: 600px) {
       .panel {
-        box-shadow: 0 14px 36px rgba(15, 23, 42, 0.65), 0 0 0 1px rgba(15, 23, 42, 0.75);
+        box-shadow:
+          0 14px 36px rgba(15, 23, 42, 0.55),
+          0 0 0 1px rgba(15, 23, 42, 0.55),
+          0 0 28px rgba(var(--accent-rgb), 0.10);
       }
     }
   </style>
@@ -969,6 +973,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
               </div>
             </div>
           </div>
+
           <form id="postForm">
             <textarea id="content" name="content" maxlength="4000"
               placeholder="這裡不記名、不追問，只代你保管片刻的情緒。"></textarea>
@@ -991,29 +996,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
               <div class="pixel-cat-art">
                 <svg viewBox="0 0 96 64" aria-hidden="true">
                   <g class="pixel-cat-meow">
-                    <rect x="8" y="6" width="48" height="18" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                    <rect x="22" y="24" width="8" height="6" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                    <text x="14" y="18" font-family="monospace" font-size="8" fill="#e5e7eb">MEOW!</text>
+                    <rect x="8" y="6" width="48" height="18" fill="var(--panel)" stroke="var(--border2)" stroke-width="1" />
+                    <rect x="22" y="24" width="8" height="6" fill="var(--panel)" stroke="var(--border2)" stroke-width="1" />
+                    <text x="14" y="18" font-family="monospace" font-size="8" fill="var(--text)">MEOW!</text>
                   </g>
 
-                  <rect x="30" y="18" width="32" height="26" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                  <rect x="32" y="20" width="28" height="22" fill="#020617" stroke="#1f2937" stroke-width="1" />
+                  <rect x="30" y="18" width="32" height="26" fill="var(--panel)" stroke="var(--border2)" stroke-width="1" />
+                  <rect x="32" y="20" width="28" height="22" fill="var(--panel2)" stroke="var(--border)" stroke-width="1" />
 
-                  <rect x="30" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
-                  <rect x="54" y="14" width="8" height="8" fill="#020617" stroke="#4b5563" stroke-width="1" />
+                  <rect x="30" y="14" width="8" height="8" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
+                  <rect x="54" y="14" width="8" height="8" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
 
-                  <rect class="pixel-cat-eye" x="36" y="26" width="4" height="5" fill="#a7f3d0" />
-                  <rect class="pixel-cat-eye" x="52" y="26" width="4" height="5" fill="#a7f3d0" />
+                  <rect class="pixel-cat-eye" x="36" y="26" width="4" height="5" fill="rgba(var(--accent-rgb), 0.55)" />
+                  <rect class="pixel-cat-eye" x="52" y="26" width="4" height="5" fill="rgba(var(--accent-rgb), 0.55)" />
 
                   <rect x="44" y="31" width="4" height="2" fill="var(--accent)" />
-
                   <rect x="38" y="31" width="3" height="2" fill="rgba(var(--accent-rgb), 0.75)" />
                   <rect x="51" y="31" width="3" height="2" fill="rgba(var(--accent-rgb), 0.75)" />
 
                   <rect x="43" y="34" width="2" height="1" fill="var(--accent)" />
                   <rect x="47" y="34" width="2" height="1" fill="var(--accent)" />
-
-                  <rect x="42" y="36" width="8" height="2" fill="#020617" opacity="0.9" />
                 </svg>
               </div>
             </div>
@@ -1027,26 +1029,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
       </section>
-
     </div>
   </main>
 
   <script>
     const TREEHOLE_BUILD_ID = "__BUILD_ID__";
-    // Auto theme: prefer OS dark-mode; otherwise use local time (07:00-19:00 = light)
+
     (function autoTheme() {
       try {
         const preferDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-        if (preferDark) return; // keep dark
+        if (preferDark) return;
         const h = new Date().getHours();
         const isLight = (h >= 7 && h < 19);
         if (isLight) document.documentElement.classList.add('theme-light');
-      } catch (_) {
-        // ignore
-      }
+      } catch (_) {}
     })();
 
-    // Accent theme picker (persist in localStorage)
     const ACCENT_KEY = "treehole_accent";
     const ACCENTS = ["green", "blue", "purple", "amber", "rose"];
 
@@ -1103,32 +1101,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     function formatTime(iso) {
       try {
-        // ✅ Robust timezone handling:
-        // - If backend accidentally returns a naive datetime (no Z / no offset), treat it as UTC.
-        // - If backend returns +00:00, normalize to Z for maximum browser compatibility.
         let s = (iso || "").trim();
         if (!s) return "";
-
-        // Normalize common UTC offset to Z
         if (s.endsWith("+00:00")) s = s.replace("+00:00", "Z");
-
-        // If no explicit timezone info exists, assume UTC
-        // (e.g. "2026-01-15T12:34:56" or "2026-01-15 12:34:56")
         const hasTZ = /[zZ]$/.test(s) || /[+-]\d{2}:?\d{2}$/.test(s);
-        if (!hasTZ) {
-          // Convert "YYYY-MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SSZ"
-          s = s.replace(" ", "T") + "Z";
-        }
-
+        if (!hasTZ) s = s.replace(" ", "T") + "Z";
         const d = new Date(s);
         if (Number.isNaN(d.getTime())) return "";
-
         const now = new Date();
         const diff = Math.floor((now.getTime() - d.getTime()) / 1000);
-
-        // If client clock is behind or timezone mismatch, fallback to absolute time
         if (!Number.isFinite(diff) || diff < 0) return d.toLocaleString();
-
         if (diff < 60) return "剛剛";
         if (diff < 3600) return `${Math.floor(diff / 60)} 分鐘前`;
         if (diff < 86400) return `${Math.floor(diff / 3600)} 小時前`;
@@ -1198,18 +1180,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
         prevBtn.type = "button";
         prevBtn.className = "muted-button";
         prevBtn.disabled = offset <= 0;
-        prevBtn.onclick = async () => {
-          await loadRecent(offset - limit, limit);
-        };
+        prevBtn.onclick = async () => { await loadRecent(offset - limit, limit); };
 
         const nextBtn = document.createElement("button");
         nextBtn.textContent = "下一頁";
         nextBtn.type = "button";
         nextBtn.className = "muted-button";
         nextBtn.disabled = offset + limit >= total;
-        nextBtn.onclick = async () => {
-          await loadRecent(offset + limit, limit);
-        };
+        nextBtn.onclick = async () => { await loadRecent(offset + limit, limit); };
 
         const pageInfo = document.createElement("span");
         pageInfo.textContent = `第 ${Math.floor(offset/limit)+1} 頁 / 共 ${Math.ceil(total/limit)} 頁`;
@@ -1271,8 +1249,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       if (!counterEl) return;
       const val = contentInput.value || "";
       counterEl.textContent = `${val.length}/1000`;
-      if (val.length > 1000) counterEl.style.color = "var(--danger)";
-      else counterEl.style.color = "var(--text-dim)";
+      counterEl.style.color = (val.length > 1000) ? "var(--danger)" : "var(--text-dim)";
     }
 
     function setupCounter() {
@@ -1287,7 +1264,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
       updateCounter();
     }
     setupCounter();
-
 
     formEl.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -1337,11 +1313,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </body>
 </html>
 """
-# Replace build id placeholder (avoid f-string brace issues in CSS/JS)
 INDEX_HTML = INDEX_HTML.replace("__BUILD_ID__", BUILD_ID)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
-    # Avoid stale cached HTML/JS causing timezone display bugs
     return HTMLResponse(
         INDEX_HTML,
         headers={
