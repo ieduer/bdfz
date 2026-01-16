@@ -415,6 +415,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       background: #ffffff;
       color: var(--text);
     }
+
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -429,6 +430,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       justify-content: center;
       padding-bottom: 24px;
     }
+
     .page {
       width: 100%;
       max-width: 1120px;
@@ -447,8 +449,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         gap: 12px;
       }
     }
+
     .feed-panel { grid-area: feed; }
     .compose-panel { grid-area: compose; }
+
     .panel {
       background: linear-gradient(135deg, var(--bg-panel), #020617);
       border-radius: 16px;
@@ -474,12 +478,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
       position: relative;
       z-index: 1;
     }
+
     h1, h2 {
       margin: 0 0 10px;
       letter-spacing: 0.03em;
     }
     h1 {
-      font-size: 1.1rem;
+      font-size: 1.05rem;
       font-weight: 650;
       text-transform: uppercase;
     }
@@ -489,19 +494,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       text-transform: uppercase;
       color: var(--text-dim);
     }
-    .subtitle {
-      font-size: 0.85rem;
-      color: var(--text-dim);
-      margin-bottom: 10px;
-    }
-    label {
-      display: block;
-      font-size: 0.78rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--text-dim);
-      margin-bottom: 6px;
-    }
+
     textarea {
       width: 100%;
       min-height: 140px;
@@ -514,11 +507,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-size: 0.9rem;
       line-height: 1.5;
       outline: none;
+
+      /* ✅ mobile scroll smoothness */
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+      touch-action: pan-y;
     }
     textarea:focus {
       border-color: var(--accent);
       box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.7);
     }
+
     input[type="text"] {
       width: 100%;
       padding: 7px 10px;
@@ -533,11 +532,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border-color: var(--accent);
       box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.7);
     }
+
+    .counter-row {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 6px;
+      margin-bottom: 2px;
+    }
+    .counter {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      user-select: none;
+    }
+
     .row {
       display: flex;
       gap: 8px;
       align-items: center;
-      margin-top: 8px;
+      margin-top: 10px;
     }
     .row > * {
       flex: 1;
@@ -546,6 +558,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       max-width: 150px;
       flex: 0 0 150px;
     }
+
     @media (max-width: 600px) {
       textarea {
         min-height: 120px;
@@ -564,6 +577,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         justify-content: center;
       }
     }
+
     button {
       border: none;
       border-radius: 999px;
@@ -585,12 +599,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
       cursor: default;
       box-shadow: none;
     }
+
     .muted-button {
       background: transparent;
       border: 1px solid var(--border);
       color: var(--text-dim);
       box-shadow: none;
     }
+
     .status {
       margin-top: 8px;
       font-size: 0.78rem;
@@ -598,37 +614,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       min-height: 1.2em;
       white-space: pre-wrap;
     }
-    .status-error {
-      color: var(--danger);
-    }
-    .status-ok {
-      color: var(--accent);
-    }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 0.78rem;
-      padding: 3px 8px;
-      border-radius: 999px;
-      border: 1px solid rgba(148, 163, 184, 0.35);
-      background: rgba(15, 23, 42, 0.85);
-      color: var(--text-dim);
-    }
-    .pill-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 999px;
-      background: var(--accent);
-      box-shadow: 0 0 10px rgba(34, 197, 94, 0.9);
-    }
-    .layout-title {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 6px;
-      margin-bottom: 8px;
-    }
+    .status-error { color: var(--danger); }
+    .status-ok { color: var(--accent); }
+
     .posts-header {
       display: flex;
       justify-content: space-between;
@@ -641,7 +629,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       color: var(--text-dim);
     }
 
-    /* ✅ 性能/體感：右欄列表高度跟視窗走，滾動更自然，不像被“限速” */
+    /* ✅ Right column list scroll */
     .posts-list {
       display: flex;
       flex-direction: column;
@@ -671,8 +659,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
       background: linear-gradient(135deg, var(--bg-panel-light), #020617);
       border: 1px solid rgba(148, 163, 184, 0.25);
       position: relative;
-
-      /* ✅ 長列表更順：讓瀏覽器延後渲染不可見卡片 */
       content-visibility: auto;
       contain-intrinsic-size: 120px;
     }
@@ -698,25 +684,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       align-items: center;
       gap: 8px;
     }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 2px 7px;
-      border-radius: 999px;
-      border: 1px solid rgba(34, 197, 94, 0.35);
-      background: var(--accent-soft);
-      color: var(--accent);
-      font-size: 0.72rem;
-      text-transform: uppercase;
-      letter-spacing: 0.07em;
-    }
-    .chip-dot {
-      width: 5px;
-      height: 5px;
-      border-radius: 999px;
-      background: var(--accent);
-    }
+
     .random-box {
       margin-top: 10px;
       padding: 8px 10px;
@@ -737,13 +705,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
       word-break: break-word;
       color: var(--text);
     }
-    .random-box-empty {
-      color: var(--text-dim);
-    }
+    .random-box-empty { color: var(--text-dim); }
+
     .small {
       font-size: 0.75rem;
       color: var(--text-dim);
     }
+
     .footer-note {
       margin-top: 10px;
       display: flex;
@@ -759,8 +727,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       background: rgba(15, 23, 42, 0.8);
     }
 
+    /* ===== Pixel cat ===== */
     .pixel-cat {
-        margin-top: 22px;
+        margin-top: 20px;
         width: 100%;
         display: flex;
         flex-direction: column;
@@ -799,6 +768,112 @@ INDEX_HTML = r"""<!DOCTYPE html>
         transform-origin: left bottom;
         animation: catMeow 11s ease-in-out infinite;
     }
+
+    /* ===== NOW clock (bottom-right, no text) ===== */
+    .now-clock {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      width: 118px;
+      height: 118px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      background:
+        radial-gradient(circle at 30% 25%, rgba(34, 197, 94, 0.10), transparent 55%),
+        radial-gradient(circle at 70% 80%, rgba(56, 189, 248, 0.08), transparent 60%),
+        linear-gradient(135deg, rgba(17, 24, 39, 0.92), rgba(2, 6, 23, 0.92));
+      box-shadow:
+        0 18px 40px rgba(15, 23, 42, 0.75),
+        0 0 0 1px rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      display: grid;
+      place-items: center;
+      pointer-events: none;
+      user-select: none;
+      overflow: hidden;
+    }
+    .now-clock::before {
+      content: "";
+      position: absolute;
+      inset: 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      background:
+        repeating-conic-gradient(
+          from -90deg,
+          rgba(148,163,184,0.45) 0deg,
+          rgba(148,163,184,0.45) 1deg,
+          transparent 1deg,
+          transparent 6deg
+        );
+      mask: radial-gradient(circle, transparent 0 54%, #000 55%);
+      -webkit-mask: radial-gradient(circle, transparent 0 54%, #000 55%);
+      opacity: 0.55;
+    }
+    .now-clock-center {
+      position: relative;
+      z-index: 1;
+      width: 82px;
+      height: 82px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      background: rgba(2, 6, 23, 0.55);
+      display: grid;
+      place-items: center;
+    }
+    .now-clock-text {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                   "Liberation Mono", "Courier New", monospace;
+      font-size: 0.9rem;
+      letter-spacing: 0.18em;
+      text-indent: 0.18em;
+      color: rgba(229, 231, 235, 0.92);
+      text-transform: uppercase;
+    }
+    .now-hand {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform-origin: 50% 100%;
+      transform: translate(-50%, -100%) rotate(0deg);
+      width: 2px;
+      height: 44px;
+      border-radius: 999px;
+      background: rgba(229, 231, 235, 0.75);
+      box-shadow: 0 0 0 1px rgba(15,23,42,0.65);
+    }
+    .now-hand.second {
+      width: 2px;
+      height: 52px;
+      background: rgba(34, 197, 94, 0.95);
+      box-shadow: 0 0 14px rgba(34, 197, 94, 0.55);
+    }
+    .now-pin {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      transform: translate(-50%, -50%);
+      background: rgba(34, 197, 94, 0.85);
+      box-shadow: 0 0 0 2px rgba(2, 6, 23, 0.85);
+    }
+
+    @media (max-width: 800px) {
+      .now-clock {
+        width: 104px;
+        height: 104px;
+        right: 14px;
+        bottom: 14px;
+      }
+      .now-clock-center {
+        width: 74px;
+        height: 74px;
+      }
+    }
+
     @keyframes catFloat {
         0%, 100% { transform: translateY(0); }
         50% { transform: translateY(-3px); }
@@ -822,29 +897,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
   <main class="page">
+
     <section class="panel compose-panel">
       <div class="panel-inner">
-        <div class="layout-title">
-          <div>
-            <h1>匿名樹洞</h1>
-            <div class="subtitle">說給樹聽就好，這裡不需要暱稱。</div>
-          </div>
-          <div class="pill">
-            <span class="pill-dot"></span>
-            <span>LIVE · 即時寫、即時看</span>
-          </div>
-        </div>
+        <h1>匿名樹洞</h1>
+
         <form id="postForm">
-          <label for="content">對樹說點什麼</label>
-          <textarea id="content" name="content" maxlength="4000"
+          <textarea id="content" name="content" maxlength="1000"
             placeholder="這裡不記名、不追問，只代你保管片刻的情緒。"></textarea>
+
+          <div class="counter-row">
+            <span id="counter" class="counter">0/1000</span>
+          </div>
 
           <div class="row">
             <div class="tag-col">
-              <label for="tag">標籤（可選）</label>
-              <input id="tag" name="tag" type="text" placeholder="心情晴輕清青傾…" />
+              <input id="tag" name="tag" type="text" placeholder="標籤（可選）" />
             </div>
-            <div style="text-align: right; margin-top: 14px;">
+            <div style="text-align: right;">
               <button type="submit" id="submitBtn">
                 <span>投進樹洞</span>
               </button>
@@ -883,17 +953,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
               </svg>
             </div>
           </div>
-          <div class="small">樹洞守護貓在線值班。</div>
         </div>
 
         <div id="status" class="status"></div>
-        <div class="small" style="margin-top: 4px;">
-          系統會做簡單的頻率限制與內容長度限制。
-        </div>
+
         <div class="footer-note">
           <div class="footer-note-item">不記名 · 僅存 IP 雜湊</div>
           <div class="footer-note-item">純文本 · 不支援圖片 / 附件</div>
           <div class="footer-note-item">請避免輸入真實姓名、電話等敏感資訊</div>
+        </div>
+
+        <!-- NOW CLOCK (bottom-right, no text) -->
+        <div class="now-clock" id="nowClock" aria-hidden="true">
+          <div class="now-clock-center">
+            <div class="now-clock-text">NOW</div>
+          </div>
+          <div class="now-hand" id="nowHandMinute"></div>
+          <div class="now-hand second" id="nowHandSecond"></div>
+          <div class="now-pin"></div>
         </div>
       </div>
     </section>
@@ -919,22 +996,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </section>
+
   </main>
 
   <script>
     const TREEHOLE_BUILD_ID = "__BUILD_ID__";
+
     // Auto theme: prefer OS dark-mode; otherwise use local time (07:00-19:00 = light)
     (function autoTheme() {
       try {
         const preferDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-        if (preferDark) return; // keep dark
+        if (preferDark) return;
         const h = new Date().getHours();
         const isLight = (h >= 7 && h < 19);
         if (isLight) document.documentElement.classList.add('theme-light');
-      } catch (_) {
-        // ignore
-      }
+      } catch (_) {}
     })();
+
     const statusEl = document.getElementById("status");
     const postsEl = document.getElementById("posts");
     const randomContentEl = document.getElementById("randomContent");
@@ -951,30 +1029,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     function formatTime(iso) {
       try {
-        // ✅ Robust timezone handling:
-        // - If backend accidentally returns a naive datetime (no Z / no offset), treat it as UTC.
-        // - If backend returns +00:00, normalize to Z for maximum browser compatibility.
         let s = (iso || "").trim();
         if (!s) return "";
-
-        // Normalize common UTC offset to Z
         if (s.endsWith("+00:00")) s = s.replace("+00:00", "Z");
-
-        // If no explicit timezone info exists, assume UTC
-        // (e.g. "2026-01-15T12:34:56" or "2026-01-15 12:34:56")
         const hasTZ = /[zZ]$/.test(s) || /[+-]\d{2}:?\d{2}$/.test(s);
         if (!hasTZ) {
-          // Convert "YYYY-MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SSZ"
           s = s.replace(" ", "T") + "Z";
         }
-
         const d = new Date(s);
         if (Number.isNaN(d.getTime())) return "";
 
         const now = new Date();
         const diff = Math.floor((now.getTime() - d.getTime()) / 1000);
-
-        // If client clock is behind or timezone mismatch, fallback to absolute time
         if (!Number.isFinite(diff) || diff < 0) return d.toLocaleString();
 
         if (diff < 60) return "剛剛";
@@ -1112,29 +1178,37 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    // ===== counter (no float / no layout thrash) =====
     const contentInput = document.getElementById("content");
-    let counterEl;
+    const counterEl = document.getElementById("counter");
 
     function updateCounter() {
-      if (!counterEl) return;
       const val = contentInput.value || "";
       counterEl.textContent = `${val.length}/1000`;
       if (val.length > 1000) counterEl.style.color = "var(--danger)";
       else counterEl.style.color = "var(--text-dim)";
     }
+    contentInput.addEventListener("input", updateCounter);
+    updateCounter();
 
-    function setupCounter() {
-      counterEl = document.createElement("span");
-      counterEl.style.float = "right";
-      counterEl.style.fontSize = "0.78rem";
-      counterEl.style.marginTop = "-22px";
-      counterEl.style.marginBottom = "2px";
-      counterEl.style.color = "var(--text-dim)";
-      contentInput.parentNode.insertBefore(counterEl, contentInput.nextSibling);
-      contentInput.addEventListener("input", updateCounter);
-      updateCounter();
+    // ===== NOW clock (always now) =====
+    const handMinute = document.getElementById("nowHandMinute");
+    const handSecond = document.getElementById("nowHandSecond");
+
+    function tickNowClock() {
+      const d = new Date();
+      const ms = d.getMilliseconds();
+      const sec = d.getSeconds() + ms / 1000;
+      const min = d.getMinutes() + sec / 60;
+
+      const secDeg = sec * 6;
+      const minDeg = min * 6;
+
+      handSecond.style.transform = `translate(-50%, -100%) rotate(${secDeg}deg)`;
+      handMinute.style.transform = `translate(-50%, -100%) rotate(${minDeg}deg)`;
+      requestAnimationFrame(tickNowClock);
     }
-    setupCounter();
+    requestAnimationFrame(tickNowClock);
 
     formEl.addEventListener("submit", async (e) => {
       e.preventDefault();
