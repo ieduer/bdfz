@@ -21,7 +21,7 @@
 #
 
 set -Eeuo pipefail
-INSTALLER_VERSION="treehole-install-2026-01-15-v12-fstringfix"
+INSTALLER_VERSION="treehole-install-2026-01-15-v13-nowclock-flow-mobilefix"
 
 # ==== 可按需修改的變量 ======================================
 
@@ -512,6 +512,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       -webkit-overflow-scrolling: touch;
       overscroll-behavior: contain;
       touch-action: pan-y;
+      contain: content;
+      will-change: contents;
     }
     textarea:focus {
       border-color: var(--accent);
@@ -769,11 +771,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
         animation: catMeow 11s ease-in-out infinite;
     }
 
-    /* ===== NOW clock (bottom-right, no text) ===== */
+    /* ===== NOW clock (in-flow, right-bottom area, no extra text) ===== */
+    .compose-bottom {
+      margin-top: 14px;
+      display: flex;
+      justify-content: flex-end;
+      align-items: flex-end;
+      width: 100%;
+    }
+
     .now-clock {
-      position: absolute;
-      right: 16px;
-      bottom: 16px;
       width: 118px;
       height: 118px;
       border-radius: 999px;
@@ -792,6 +799,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       pointer-events: none;
       user-select: none;
       overflow: hidden;
+      flex: 0 0 auto;
+      position: relative;
     }
     .now-clock::before {
       content: "";
@@ -842,6 +851,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border-radius: 999px;
       background: rgba(229, 231, 235, 0.75);
       box-shadow: 0 0 0 1px rgba(15,23,42,0.65);
+      will-change: transform;
     }
     .now-hand.second {
       width: 2px;
@@ -862,11 +872,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
 
     @media (max-width: 800px) {
+      .compose-bottom {
+        margin-top: 12px;
+      }
       .now-clock {
         width: 104px;
         height: 104px;
-        right: 14px;
-        bottom: 14px;
       }
       .now-clock-center {
         width: 74px;
@@ -963,14 +974,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <div class="footer-note-item">請避免輸入真實姓名、電話等敏感資訊</div>
         </div>
 
-        <!-- NOW CLOCK (bottom-right, no text) -->
-        <div class="now-clock" id="nowClock" aria-hidden="true">
-          <div class="now-clock-center">
-            <div class="now-clock-text">NOW</div>
+        <div class="compose-bottom" aria-hidden="true">
+          <div class="now-clock" id="nowClock">
+            <div class="now-clock-center">
+              <div class="now-clock-text">NOW</div>
+            </div>
+            <div class="now-hand" id="nowHandMinute"></div>
+            <div class="now-hand second" id="nowHandSecond"></div>
+            <div class="now-pin"></div>
           </div>
-          <div class="now-hand" id="nowHandMinute"></div>
-          <div class="now-hand second" id="nowHandSecond"></div>
-          <div class="now-pin"></div>
         </div>
       </div>
     </section>
@@ -1191,11 +1203,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
     contentInput.addEventListener("input", updateCounter);
     updateCounter();
 
-    // ===== NOW clock (always now) =====
+    // ===== NOW clock (always now, but mobile-friendly) =====
     const handMinute = document.getElementById("nowHandMinute");
     const handSecond = document.getElementById("nowHandSecond");
 
-    function tickNowClock() {
+    function updateNowClockOnce() {
       const d = new Date();
       const ms = d.getMilliseconds();
       const sec = d.getSeconds() + ms / 1000;
@@ -1206,9 +1218,42 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
       handSecond.style.transform = `translate(-50%, -100%) rotate(${secDeg}deg)`;
       handMinute.style.transform = `translate(-50%, -100%) rotate(${minDeg}deg)`;
-      requestAnimationFrame(tickNowClock);
     }
-    requestAnimationFrame(tickNowClock);
+
+    let nowClockTimer = null;
+
+    function isMobileCoarsePointer() {
+      try {
+        return window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function startNowClock() {
+      if (nowClockTimer) return;
+      updateNowClockOnce();
+      // Mobile: slower tick to reduce main-thread pressure while scrolling/typing
+      const interval = isMobileCoarsePointer() ? 220 : 80;
+      nowClockTimer = setInterval(updateNowClockOnce, interval);
+    }
+
+    function stopNowClock() {
+      if (!nowClockTimer) return;
+      clearInterval(nowClockTimer);
+      nowClockTimer = null;
+    }
+
+    startNowClock();
+
+    // Pause clock updates while user is typing on mobile to avoid scroll/IME jank
+    contentInput.addEventListener('focus', () => {
+      if (isMobileCoarsePointer()) stopNowClock();
+    }, { passive: true });
+
+    contentInput.addEventListener('blur', () => {
+      startNowClock();
+    }, { passive: true });
 
     formEl.addEventListener("submit", async (e) => {
       e.preventDefault();
