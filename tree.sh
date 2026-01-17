@@ -421,10 +421,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       --panel2:#ffffff;
       --panel3:#f1f5f9;
 
-      /* ✅ 使用者要求：白天模式也維持白字（更狠、更霓虹） */
-      --text:#f8fafc;
-      --text-dim:#cbd5e1;
-      --text-faint:rgba(248,250,252,0.76);
+      /* ✅ 可讀性優先：亮色模式回到深色字，避免白底白字看不清 */
+      --text:#0b1220;
+      --text-dim:#334155;
+      --text-faint:rgba(15,23,42,0.72);
 
       --border:rgba(15,23,42,0.12);
       --border2:rgba(15,23,42,0.18);
@@ -918,6 +918,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
         0 14px 34px rgba(0,0,0,0.38),
         0 0 36px rgba(var(--accent-rgb),0.14),
         0 0 70px rgba(var(--accent-rgb),0.10);
+    }
+
+    html.theme-light .post-card{
+      background:
+        radial-gradient(circle at 0 0, rgba(var(--accent-rgb),0.12) 0, transparent 62%),
+        radial-gradient(circle at 100% 100%, rgba(var(--accent-rgb),0.08) 0, transparent 64%),
+        linear-gradient(135deg, rgba(255,255,255,0.96), rgba(241,245,249,0.82));
+      border:1px solid color-mix(in srgb, var(--border) 68%, var(--tint-border-strong) 32%);
+      box-shadow:
+        inset 0 0 0 1px rgba(15,23,42,0.06),
+        0 10px 28px rgba(15,23,42,0.10),
+        0 0 18px rgba(var(--accent-rgb),0.06);
+    }
+    html.theme-light .post-card:hover{
+      border-color: rgba(var(--accent-rgb),0.58);
+      box-shadow:
+        inset 0 0 0 1px rgba(var(--accent-rgb),0.10),
+        0 14px 34px rgba(15,23,42,0.14),
+        0 0 28px rgba(var(--accent-rgb),0.10),
+        0 0 60px rgba(var(--accent-rgb),0.08);
     }
 
     .post-card-tag{
