@@ -421,10 +421,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       --panel2:#ffffff;
       --panel3:#f1f5f9;
 
-      /* ✅ 更清晰：亮色模式也把灰字拉亮一點 */
-      --text:#0b1220;
-      --text-dim:#334155;
-      --text-faint:rgba(15,23,42,0.72);
+      /* ✅ 使用者要求：白天模式也維持白字（更狠、更霓虹） */
+      --text:#f8fafc;
+      --text-dim:#cbd5e1;
+      --text-faint:rgba(248,250,252,0.76);
 
       --border:rgba(15,23,42,0.12);
       --border2:rgba(15,23,42,0.18);
