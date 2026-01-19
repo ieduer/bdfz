@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # yue.k12media.cn 自動閱卷 demo — shell 版（加固版 / 可換題目）
 # 原始轉寫：2025-11-11
-# 本次加固：2026-01-19
+# 本次加固：2026-01-19（對齊 Python 加固版行為）
 # 依賴：bash, curl, jq, base64, mkdir, date, python3
 # 建議：macOS 用 brew 裝 jq:  brew install jq
 # ------------------------------------------------------------
@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="yue-auto-mark-2026-01-19-hardened"
+SCRIPT_VERSION="yue-auto-mark-2026-01-19-hardened-v2"
 echo "[info] script version: $SCRIPT_VERSION"
 
 ############################################
@@ -19,14 +19,14 @@ echo "[info] script version: $SCRIPT_VERSION"
 # 你可以：
 #   ./yue-auto-mark.sh \
 #      --paper-id 46736 --item-group-id 866723 \
-#      --model gemini-2.5-flash \
+#      --model gemini-3-flash-preview \
 #      --prompt-file ./prompt.txt \
 #      --export-dir exports --tag yue_marking_20260119
 #
 
 PAPER_ID=""
 ITEM_GROUP_ID=""
-GEMINI_MODEL="gemini-3-flash"
+GEMINI_MODEL="gemini-3-flash-preview"
 PROMPT_FILE=""
 EXPORT_DIR="exports"
 EXPORT_TAG=""
@@ -53,7 +53,7 @@ Usage:
 Options:
   --paper-id <id>        PaperID
   --item-group-id <id>   ItemGroupID
-  --model <name>         Gemini model (default: gemini-2.5-flash)
+  --model <name>         Gemini model (default: gemini-3-flash-preview)
   --prompt-file <path>   External prompt txt file (for next questions)
   --export-dir <dir>     Export directory (default: exports)
   --tag <tag>            Export tag prefix
@@ -111,7 +111,7 @@ TOKEN=""
 # Gemini keys：
 # 1) 優先讀 GEMINI_API_KEYS 環境變量（逗號分隔）
 # 2) 否則用下面陣列
-# 注意：環境變量名叫 GEMINI_API_KEYS（和腳本陣列同名）
+# 注意：環境變量名叫 GEMINI_API_KEYS
 GEMINI_API_KEYS_ARR=()
 if [[ -n "${GEMINI_API_KEYS:-}" ]]; then
   # shellcheck disable=SC2206
@@ -141,53 +141,57 @@ EXPORT_VALID_REPORTS="$EXPORT_DIR/${EXPORT_TAG}_valid_reports.txt"
 EXPORT_INVALID_REPORTS="$EXPORT_DIR/${EXPORT_TAG}_invalid_reports.txt"
 
 ############################################
-# 2. Prompt（默認：4 分題；下次換題請用 --prompt-file）
+# 2. Prompt（默認：本次 6 分題；下次換題請用 --prompt-file）
 ############################################
 
 read -r -d '' DEFAULT_PROMPT <<'EOF'
-你是一個語文閱卷老師，請你根據下面這套固定的參考答案與評分標準，對學生的作答進行打分，滿分 4 分。
-請你一定要先識別圖片中的學生答案，再按四條依次判分，每一條都寫一句判語，最後給一段總評。
+你是一個語文閱卷老師，請你根據下面這套固定的參考答案與評分標準，對學生的作答進行打分，滿分 6 分。
+請你一定要先識別圖片中的學生答案，再按六條依次判分，每一條都寫一句判語，最後給一段總評。
 
 【參考答案與評分標準（固定內容）】
 
-①塑造人物形象。吉米的父親看到蝙蝠就飛起刷子扔過去，說明父親身手矯健（1 分），最終吉米抓住蝙蝠，先關在籠子裡，但晚上的時候兩個人又把蝙蝠放生，刻畫出吉米的善良和對生命的尊重呵護。（1 分）
+（1）以秋瑾为代表的志士仁人（1 分）的救国救民之梦（1 分）；
+（2）以鲁迅为代表的思想家（1 分）揭露“国民性”，力求改造人的灵魂的“立人”之梦（1 分）；
+（3）以王羲之为代表的“群贤”（1 分），沉浸在青山绿水之中，“畅叙幽情”，追寻生命价值之梦（1 分）。
 
-②烘托離別情緒。（1 分）離別在即，廚房裡的任何一件事物都能讓吉米想起之前的事情，一個洗碗刷，背後有父子兩人抓蝙蝠、放飛蝙蝠的溫馨往事。（1 分）可以想像，其他的東西也同樣有不同的故事，小說雖然不一一提及，但通過這一細節，可以給讀者充分的想像空間，可以想像這個廚房承載著吉米多少的回憶。（1 分）
+【評分說明】
+1. 要提到“秋瑾”为代表的志士仁人，给 1 分。
+2. 要提到“救国救民之梦”，给 1 分。
+3. 要提到“鲁迅”为代表的思想家，给 1 分。
+4. 要提到“立人”之梦（改造人的灵魂/改造国民性/立人相关表述均可），给 1 分。
+5. 要提到“王羲之”为代表的“群贤”，给 1 分。
+6. 要提到“追寻生命价值之梦”（畅叙幽情、生命价值等相关表述均可），给 1 分。
 
-【打分要點（要嚴格照這個來）】
-1. 「父親形象」這一分（point_father）：
-   - 必須說到這個具體細節：「父親看到蝙蝠就用刷子扔過去」「父親迅速處理蝙蝠」這類，才能給 1 分。
-   - 只說「父親很好」「父親關心生活」「父親不拘小節」但沒扣到蝙蝠/刷子/抓蝙蝠這個細節，一律 0 分。
-2. 「吉米形象」這一分（point_jimmy）：
-   - 必須說到吉米（或寫成“我”的這個人物）善良 / 放生 / 尊重生命 / 把蝙蝠放回去 / 對生命有呵護，才能給 1 分。
-   - 只說「回憶」「我對家不捨」這種不行，0 分。
-   - 原文叫「吉米」，如果學生寫成「我」，你也要當成同一個人來判。
-3. 「烘托離別情緒」這一分（point_farewell）：
-   - 要把「離別在即」+「看到廚房裡的物件想起抓蝙蝠這件事」這兩部分說出來，才給 1 分。
-   - 只說「表現了離別的傷感」沒有扣到這個物件細節，0 分。
-4. 「細節作用」這一分（point_detail_function）：
-   - 說到「這個廚房承載很多回憶」「這個細節帶出沒寫完的往事」「給讀者想像空間」這一類，給 1 分。
-   - 沒說到上述作用，0 分。
-
-【你要輸出的 JSON 結構（必須照這個）】：
+【你要輸出的 JSON 結構】（只輸出 JSON，不能多文字）
 {
   "student_answer": "...你從圖片裡識別出的學生原文...",
-  "point_father": 0,
-  "comment_father": "",
-  "point_jimmy": 0,
-  "comment_jimmy": "",
-  "point_farewell": 0,
-  "comment_farewell": "",
-  "point_detail_function": 0,
-  "comment_detail_function": "",
-  "final_score": 0,
-  "overall_comment": ""
+
+  "point_qiujin": 0 或 1,
+  "comment_qiujin": "為什麼給/不給‘秋瑾为代表的志士仁人’這一分",
+
+  "point_guomin": 0 或 1,
+  "comment_guomin": "為什麼給/不給‘救国救民之梦’這一分",
+
+  "point_luxun": 0 或 1,
+  "comment_luxun": "為什麼給/不給‘鲁迅为代表的思想家’這一分",
+
+  "point_liren": 0 或 1,
+  "comment_liren": "為什麼給/不給‘立人之梦（改造人的灵魂/国民性）’這一分",
+
+  "point_qunxian": 0 或 1,
+  "comment_qunxian": "為什麼給/不給‘王羲之为代表的群贤’這一分",
+
+  "point_shengming": 0 或 1,
+  "comment_shengming": "為什麼給/不給‘追寻生命价值之梦’這一分",
+
+  "final_score": 0~6 的整數（必須等於所有 point_* 相加）, 
+  "overall_comment": "給學生的一段總體評語，說他扣在哪裡，下一步應該補哪裡"
 }
 
-請注意：
-- 一定要輸出合法 JSON，不能有 ```json 這種標記，不能有多餘文字。
-- 四個點的分數相加必須等於 final_score。
-- 如果圖片沒有字，就當作空白卷，四項都 0，final_score 也 0，overall_comment 寫「未作答」即可。
+要求：
+- 一定要輸出合法 JSON，不能有 ```json 這種包裝。
+- 所有 point_* 的分數相加必須等於 final_score。
+- 如果圖片沒有字，就所有 point_* 都 0，final_score 也 0，overall_comment 寫「未作答」。
 EOF
 
 GEMINI_SCORING_PROMPT="$DEFAULT_PROMPT"
@@ -846,5 +850,88 @@ main() {
 
     # record jsonl（每份一行）
     local record
-    record=$(
-     
+    record=$(jq -n \
+      --argjson task_id "$task_id" \
+      --argjson paper_id "$PAPER_ID" \
+      --argjson item_group_id "$ITEM_GROUP_ID" \
+      --arg image_path "$img_path" \
+      --argjson score "$score" \
+      --argjson full_score "$full_score" \
+      --arg platform_total "${PLATFORM_TOTAL:-}" \
+      --arg platform_done "${PLATFORM_DONE:-}" \
+      --arg platform_me_count "${PLATFORM_ME_COUNT:-}" \
+      --arg platform_me_avg "${PLATFORM_ME_AVG:-}" \
+      --arg gemini_model "$GEMINI_MODEL" \
+      --argjson gemini_result "$(printf "%s" "$gemini_json" | jq -c .)" \
+      --arg submit_resp_raw "$submit_resp" \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{
+        task_id: $task_id,
+        paper_id: $paper_id,
+        item_group_id: $item_group_id,
+        image_path: $image_path,
+        score: $score,
+        full_score: $full_score,
+        platform_total: ($platform_total | select(length>0)),
+        platform_done: ($platform_done | select(length>0)),
+        platform_me_count: ($platform_me_count | select(length>0)),
+        platform_me_avg: ($platform_me_avg | select(length>0)),
+        gemini_model: $gemini_model,
+        gemini_result: $gemini_result,
+        submit_resp_raw: $submit_resp_raw,
+        ts: $ts
+      }' 2>/dev/null || true)
+
+    if [[ -n "$record" ]]; then
+      append_jsonl "$EXPORT_JSONL" "$record"
+    fi
+
+    # report
+    local report
+    report=$(build_report_block "$task_id" "$img_path" "$score" "$full_score" "$gemini_json")
+    echo "$report"
+
+    # valid / invalid split
+    local reason
+    reason=$(echo "$gemini_json" | jq -r '._validate_reason // "ok"' 2>/dev/null || echo "ok")
+    if [[ "$reason" == "ok" ]]; then
+      append_text "$EXPORT_VALID_REPORTS" "$report"
+    else
+      append_text "$EXPORT_INVALID_REPORTS" "$report"
+    fi
+
+    log "[progress] fetched=$TOTAL_FETCHED success=$TOTAL_SCORED failed=$TOTAL_FAILED"
+
+    if [[ -n "$PLATFORM_TOTAL" ]]; then
+      local pct=""
+      if [[ -n "$PLATFORM_DONE" && "$PLATFORM_TOTAL" != "0" ]]; then
+        pct=$(python3 - <<PY
+try:
+  done = float("$PLATFORM_DONE")
+  total = float("$PLATFORM_TOTAL")
+  if total > 0:
+    print(round(done/total*100, 2))
+except Exception:
+  pass
+PY
+)
+      fi
+
+      local msg="平台進度: 已閱 ${PLATFORM_DONE:-?}/${PLATFORM_TOTAL}"
+      if [[ -n "$pct" ]]; then
+        msg+=" (${pct}%)"
+      fi
+      if [[ -n "$PLATFORM_ME_COUNT" ]]; then
+        msg+="，我自己：$PLATFORM_ME_COUNT 份"
+      fi
+      if [[ -n "$PLATFORM_ME_AVG" ]]; then
+        msg+="，均分 $PLATFORM_ME_AVG"
+      fi
+      log "$msg"
+    fi
+
+    sleep 0.5
+  done
+}
+
+main "$@"
