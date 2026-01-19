@@ -2,7 +2,8 @@
 # yue.k12media.cn 自動閱卷 demo — shell 版（加固版 / 可換題目）
 # 原始轉寫：2025-11-11
 # 本次加固：2026-01-19（對齊 Python 加固版行為）
-# 依賴：bash, curl, jq, base64, mkdir, date, python3
+# 本次更新：2026-01-19（加入 Explicit Context Caching，其他不動）
+# 依賴：bash, curl, jq, base64, mkdir, date, python3, shasum
 # 建議：macOS 用 brew 裝 jq:  brew install jq
 # ------------------------------------------------------------
 
@@ -131,6 +132,19 @@ GEMINI_KEY_INDEX=0
 KEY_COOLDOWN_SEC="${GEMINI_KEY_COOLDOWN_SEC:-120}"
 ALL_KEYS_BUSY_SLEEP="${GEMINI_ALL_KEYS_BUSY_SLEEP:-15}"
 
+# ✅ Explicit Context Caching（只新增这个能力，其余不动）
+# Enable/disable: GEMINI_CONTEXT_CACHING=1/0 (default: 1)
+# TTL seconds: GEMINI_CACHE_TTL=3600
+ENABLE_CONTEXT_CACHING="${GEMINI_CONTEXT_CACHING:-1}"
+GEMINI_CACHE_TTL="${GEMINI_CACHE_TTL:-3600}"
+# Refresh cache if it will expire within this many seconds
+GEMINI_CACHE_MARGIN="${GEMINI_CACHE_MARGIN:-60}"
+
+PROMPT_SHA256=""
+# Per-key cache tracking (bash 3.2 compatible)
+GEMINI_CACHE_NAME_ARR=()
+GEMINI_CACHE_EXPIRE_EPOCH=()
+
 # exports
 mkdir -p "$EXPORT_DIR"
 if [[ -z "$EXPORT_TAG" ]]; then
@@ -203,6 +217,10 @@ if [[ -n "$PROMPT_FILE" ]]; then
   GEMINI_SCORING_PROMPT="$(cat "$PROMPT_FILE")"
 fi
 
+# Build a stable hash for the current prompt (used for cache displayName)
+# macOS: shasum exists by default
+PROMPT_SHA256=$(printf "%s" "$GEMINI_SCORING_PROMPT" | shasum -a 256 | awk '{print $1}')
+
 ############################################
 # 3. 小工具
 ############################################
@@ -246,13 +264,42 @@ now_epoch() {
   date +%s
 }
 
+rfc3339_to_epoch() {
+  local ts="$1"
+  python3 - "$ts" <<'PY'
+import sys
+from datetime import datetime, timezone
+
+s = (sys.argv[1] or "").strip()
+if not s:
+    print(0)
+    sys.exit(0)
+
+try:
+    if s.endswith("Z"):
+        dt = datetime.fromisoformat(s[:-1] + "+00:00")
+    else:
+        dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    print(int(dt.timestamp()))
+except Exception:
+    print(0)
+PY
+}
+
 # ✅ 為兼容 macOS 內建 bash 3.2，不用 assoc array，用平行陣列
 KEYS_COOLDOWN_UNTIL=()
 
 init_cooldowns() {
   KEYS_COOLDOWN_UNTIL=()
+  GEMINI_CACHE_NAME_ARR=()
+  GEMINI_CACHE_EXPIRE_EPOCH=()
+
   for _ in "${GEMINI_API_KEYS_ARR[@]}"; do
     KEYS_COOLDOWN_UNTIL+=("0")
+    GEMINI_CACHE_NAME_ARR+=("")
+    GEMINI_CACHE_EXPIRE_EPOCH+=("0")
   done
 }
 
@@ -290,6 +337,82 @@ get_next_key_by_index() {
   echo "${GEMINI_API_KEYS_ARR[$idx]}"
   local total=${#GEMINI_API_KEYS_ARR[@]}
   GEMINI_KEY_INDEX=$(( (idx + 1) % total ))
+}
+
+# ✅ Explicit Context Cache create (per key)
+# Returns: "<cache_name>|<expire_epoch>"
+# On 429/503 it will print the http code to stderr and return empty cache.
+create_cached_content_for_key() {
+  local key="$1"
+
+  if [[ "$ENABLE_CONTEXT_CACHING" != "1" ]]; then
+    echo "|0"
+    return 0
+  fi
+
+  local short_hash="${PROMPT_SHA256:0:12}"
+  local display_name="yue-auto-mark-${GEMINI_MODEL}-${short_hash}"
+
+  local payload
+  payload=$(jq -n \
+    --arg model "models/${GEMINI_MODEL}" \
+    --arg ttl "${GEMINI_CACHE_TTL}s" \
+    --arg dn "$display_name" \
+    --arg sys "$GEMINI_SCORING_PROMPT" \
+    '{
+      model: $model,
+      displayName: $dn,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: "READY" }
+          ]
+        }
+      ],
+      systemInstruction: {
+        parts: [
+          { text: $sys }
+        ]
+      },
+      ttl: $ttl
+    }')
+
+  local resp_with_code
+  resp_with_code=$(curl -sS --connect-timeout "$GEMINI_TIMEOUT" --max-time "$GEMINI_TIMEOUT" \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    -w "\n__HTTP_CODE__:%{http_code}" \
+    "https://generativelanguage.googleapis.com/v1beta/cachedContents?key=$key" 2>&1) || true
+
+  local http_code
+  http_code=$(echo "$resp_with_code" | tail -n 1 | sed 's/__HTTP_CODE__://')
+  local resp
+  resp=$(echo "$resp_with_code" | sed '$d')
+
+  if [[ "$http_code" == "429" || "$http_code" == "503" ]]; then
+    echo "$http_code" >&2
+    echo "|0"
+    return 0
+  fi
+
+  local name
+  name=$(echo "$resp" | jq -r '.name // empty' 2>/dev/null || true)
+  local expire
+  expire=$(echo "$resp" | jq -r '.expireTime // empty' 2>/dev/null || true)
+
+  if [[ -z "$name" ]]; then
+    echo "|0"
+    return 0
+  fi
+
+  local exp_epoch
+  exp_epoch=$(rfc3339_to_epoch "$expire")
+  if [[ -z "$exp_epoch" || "$exp_epoch" == "0" ]]; then
+    exp_epoch=$(( $(now_epoch) + GEMINI_CACHE_TTL ))
+  fi
+
+  echo "$name|$exp_epoch"
 }
 
 ############################################
@@ -481,7 +604,7 @@ PY
 }
 
 ############################################
-# 7. Gemini OCR + 打分（加固：可換題 & key cooldown）
+# 7. Gemini OCR + 打分（加固：可換題 & key cooldown + Context Caching）
 ############################################
 
 # 將 Gemini 返回的 text 解析/校驗成可用 JSON：
@@ -580,19 +703,83 @@ gemini_call() {
 
     local url="https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent?key=$key"
 
+    # ✅ Explicit Context Caching:
+    # cache the long prompt once per key as systemInstruction in cachedContents
+    local cache_name=""
+    local cache_exp="0"
+
+    if [[ "$ENABLE_CONTEXT_CACHING" == "1" ]]; then
+      cache_name="${GEMINI_CACHE_NAME_ARR[$idx]}"
+      cache_exp="${GEMINI_CACHE_EXPIRE_EPOCH[$idx]}"
+      local now
+      now=$(now_epoch)
+
+      if [[ -z "$cache_name" || "$cache_exp" == "0" || $now -ge $((cache_exp - GEMINI_CACHE_MARGIN)) ]]; then
+        log "[cache] create/refresh (idx=$idx ttl=${GEMINI_CACHE_TTL}s model=$GEMINI_MODEL)"
+
+        local cache_http_file
+        cache_http_file="$(mktemp -t yue_cache_http.XXXXXX)"
+
+        local cache_pair
+        cache_pair=$(create_cached_content_for_key "$key" 2>"$cache_http_file" || true)
+
+        local cache_http=""
+        cache_http=$(cat "$cache_http_file" 2>/dev/null || true)
+        rm -f "$cache_http_file" || true
+        cache_http="$(echo "$cache_http" | tail -n 1 | tr -d '\n')"
+
+        if [[ "$cache_http" == "429" || "$cache_http" == "503" ]]; then
+          local until
+          until=$(( $(now_epoch) + KEY_COOLDOWN_SEC ))
+          set_key_cooldown "$idx" "$until"
+          log "[cache] http=$cache_http → cooldown key idx=$idx for ${KEY_COOLDOWN_SEC}s"
+        fi
+
+        cache_name="${cache_pair%%|*}"
+        cache_exp="${cache_pair##*|}"
+
+        if [[ -n "$cache_name" && "$cache_exp" != "0" ]]; then
+          GEMINI_CACHE_NAME_ARR[$idx]="$cache_name"
+          GEMINI_CACHE_EXPIRE_EPOCH[$idx]="$cache_exp"
+          log "[cache] ready name=$cache_name exp_epoch=$cache_exp"
+        else
+          cache_name=""
+          cache_exp="0"
+          log "[cache] unavailable, fallback to non-cached request"
+        fi
+      fi
+    fi
+
     local payload
-    payload=$(jq -n --arg prompt "$GEMINI_SCORING_PROMPT" --arg img "$image_b64" '
-      {
-        contents: [
-          {
-            parts: [
-              {text: $prompt},
-              {inline_data: {mime_type: "image/png", data: $img}}
-            ]
-          }
-        ]
-      }
-    ')
+    if [[ -n "$cache_name" ]]; then
+      payload=$(jq -n --arg img "$image_b64" --arg cc "$cache_name" '
+        {
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {text: "请严格按系统指令评分，只输出合法 JSON。"},
+                {inline_data: {mime_type: "image/png", data: $img}}
+              ]
+            }
+          ],
+          cachedContent: $cc
+        }
+      ')
+    else
+      payload=$(jq -n --arg prompt "$GEMINI_SCORING_PROMPT" --arg img "$image_b64" '
+        {
+          contents: [
+            {
+              parts: [
+                {text: $prompt},
+                {inline_data: {mime_type: "image/png", data: $img}}
+              ]
+            }
+          ]
+        }
+      ')
+    fi
 
     for ((attempt=1; attempt<=GEMINI_RETRY; attempt++)); do
       log "gemini key=$(mask_secret "$key") idx=$((idx+1))/${total_keys} attempt ${attempt}/${GEMINI_RETRY} model=$GEMINI_MODEL"
@@ -759,6 +946,7 @@ main() {
   require_cmd jq
   require_cmd python3
   require_cmd base64
+  require_cmd shasum
 
   if [[ -z "$USERNAME" || -z "$PASSWORD" || -z "$SITE_ID" ]]; then
     echo "[fatal] Missing USERNAME/PASSWORD/SITE_ID. Please export YUE_USERNAME / YUE_PASSWORD / YUE_SITE_ID." >&2
@@ -768,6 +956,7 @@ main() {
   log "[init] paper_id=$PAPER_ID item_group_id=$ITEM_GROUP_ID"
   log "[init] gemini_model=$GEMINI_MODEL export_tag=$EXPORT_TAG"
   log "[init] jsonl=$EXPORT_JSONL"
+  log "[init] context_caching=$ENABLE_CONTEXT_CACHING ttl=${GEMINI_CACHE_TTL}s"
 
   init_cooldowns
   login
