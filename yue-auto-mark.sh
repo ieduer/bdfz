@@ -1,15 +1,71 @@
 #!/usr/bin/env bash
-# yue.k12media.cn 自動閱卷 demo — shell 版
-# 轉寫日期：2025-11-11
-# 依賴：bash, curl, jq, base64, mkdir, date
+# yue.k12media.cn 自動閱卷 demo — shell 版（加固版 / 可換題目）
+# 原始轉寫：2025-11-11
+# 本次加固：2026-01-19
+# 依賴：bash, curl, jq, base64, mkdir, date, python3
 # 建議：macOS 用 brew 裝 jq:  brew install jq
 # ------------------------------------------------------------
 
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="yue-auto-mark-2025-11-11"
+SCRIPT_VERSION="yue-auto-mark-2026-01-19-hardened"
 echo "[info] script version: $SCRIPT_VERSION"
+
+############################################
+# 0. CLI 參數（可選）
+############################################
+#
+# 你可以：
+#   ./yue-auto-mark.sh \
+#      --paper-id 46736 --item-group-id 866723 \
+#      --model gemini-2.5-flash \
+#      --prompt-file ./prompt.txt \
+#      --export-dir exports --tag yue_marking_20260119
+#
+
+PAPER_ID=""
+ITEM_GROUP_ID=""
+GEMINI_MODEL="gemini-3-flash"
+PROMPT_FILE=""
+EXPORT_DIR="exports"
+EXPORT_TAG=""
+
+while (($#)); do
+  case "$1" in
+    --paper-id)
+      PAPER_ID="$2"; shift 2 ;;
+    --item-group-id)
+      ITEM_GROUP_ID="$2"; shift 2 ;;
+    --model)
+      GEMINI_MODEL="$2"; shift 2 ;;
+    --prompt-file)
+      PROMPT_FILE="$2"; shift 2 ;;
+    --export-dir)
+      EXPORT_DIR="$2"; shift 2 ;;
+    --tag)
+      EXPORT_TAG="$2"; shift 2 ;;
+    -h|--help)
+      cat <<'HELP'
+Usage:
+  ./yue-auto-mark.sh [options]
+
+Options:
+  --paper-id <id>        PaperID
+  --item-group-id <id>   ItemGroupID
+  --model <name>         Gemini model (default: gemini-2.5-flash)
+  --prompt-file <path>   External prompt txt file (for next questions)
+  --export-dir <dir>     Export directory (default: exports)
+  --tag <tag>            Export tag prefix
+HELP
+      exit 0
+      ;;
+    *)
+      echo "[fatal] unknown arg: $1" >&2
+      exit 1
+      ;;
+  esac
+done
 
 ############################################
 # 1. 基本配置
@@ -17,20 +73,27 @@ echo "[info] script version: $SCRIPT_VERSION"
 
 BASE="https://yue.k12media.cn/testmate/json"
 
-USERNAME=""
-PASSWORD=""
-SITE_ID=""    
+# ✅ 建議：用環境變量覆蓋（避免把帳密寫進腳本）
+USERNAME="${YUE_USERNAME:-}"  # export YUE_USERNAME='xxx'
+PASSWORD="${YUE_PASSWORD:-}"  # export YUE_PASSWORD='xxx'
+SITE_ID="${YUE_SITE_ID:-}"    # export YUE_SITE_ID='303'
 
-PAPER_ID=
-ITEM_GROUP_ID=
+# Paper / ItemGroup：可用 CLI 或環境變量覆蓋
+: "${PAPER_ID:=${YUE_PAPER_ID:-}}"
+: "${ITEM_GROUP_ID:=${YUE_ITEM_GROUP_ID:-}}"
+
+if [[ -z "$PAPER_ID" || -z "$ITEM_GROUP_ID" ]]; then
+  echo "[fatal] PAPER_ID / ITEM_GROUP_ID is required. Use --paper-id/--item-group-id or env YUE_PAPER_ID/YUE_ITEM_GROUP_ID" >&2
+  exit 1
+fi
 
 # timeout
-SITE_TIMEOUT=10
-GEMINI_TIMEOUT=25
-GEMINI_RETRY=3
+SITE_TIMEOUT="${YUE_SITE_TIMEOUT:-10}"
+GEMINI_TIMEOUT="${YUE_GEMINI_TIMEOUT:-25}"
+GEMINI_RETRY="${YUE_GEMINI_RETRY:-3}"
 
 # 沒任務時等幾秒
-IDLE_SLEEP=3
+IDLE_SLEEP="${YUE_IDLE_SLEEP:-3}"
 
 # 統計
 TOTAL_FETCHED=0     # 拿到的任務數（包含成功/失敗）
@@ -45,15 +108,43 @@ PLATFORM_ME_AVG=""       # ScoreStatistics[].ScoreSum / MarkingCount
 
 TOKEN=""
 
-# Gemini 部分（原封不動搬過來，少一個都不行）
-GEMINI_MODEL="gemini-2.5-flash"
-GEMINI_API_KEYS=(
-  ""
-)
-GEMINI_KEY_INDEX=0
+# Gemini keys：
+# 1) 優先讀 GEMINI_API_KEYS 環境變量（逗號分隔）
+# 2) 否則用下面陣列
+# 注意：環境變量名叫 GEMINI_API_KEYS（和腳本陣列同名）
+GEMINI_API_KEYS_ARR=()
+if [[ -n "${GEMINI_API_KEYS:-}" ]]; then
+  # shellcheck disable=SC2206
+  GEMINI_API_KEYS_ARR=( ${GEMINI_API_KEYS//,/ } )
+else
+  GEMINI_API_KEYS_ARR=(
+    ""
+  )
+fi
 
-# 給 Gemini 的 prompt，原樣搬
-read -r -d '' GEMINI_SCORING_PROMPT <<'EOF'
+if [[ ${#GEMINI_API_KEYS_ARR[@]} -eq 0 ]]; then
+  echo "[fatal] No Gemini API keys. Set env GEMINI_API_KEYS='k1,k2' or fill array." >&2
+  exit 1
+fi
+
+GEMINI_KEY_INDEX=0
+KEY_COOLDOWN_SEC="${GEMINI_KEY_COOLDOWN_SEC:-120}"
+ALL_KEYS_BUSY_SLEEP="${GEMINI_ALL_KEYS_BUSY_SLEEP:-15}"
+
+# exports
+mkdir -p "$EXPORT_DIR"
+if [[ -z "$EXPORT_TAG" ]]; then
+  EXPORT_TAG="yue_marking_$(date '+%Y%m%d_%H%M%S')"
+fi
+EXPORT_JSONL="$EXPORT_DIR/${EXPORT_TAG}_records.jsonl"
+EXPORT_VALID_REPORTS="$EXPORT_DIR/${EXPORT_TAG}_valid_reports.txt"
+EXPORT_INVALID_REPORTS="$EXPORT_DIR/${EXPORT_TAG}_invalid_reports.txt"
+
+############################################
+# 2. Prompt（默認：4 分題；下次換題請用 --prompt-file）
+############################################
+
+read -r -d '' DEFAULT_PROMPT <<'EOF'
 你是一個語文閱卷老師，請你根據下面這套固定的參考答案與評分標準，對學生的作答進行打分，滿分 4 分。
 請你一定要先識別圖片中的學生答案，再按四條依次判分，每一條都寫一句判語，最後給一段總評。
 
@@ -99,12 +190,20 @@ read -r -d '' GEMINI_SCORING_PROMPT <<'EOF'
 - 如果圖片沒有字，就當作空白卷，四項都 0，final_score 也 0，overall_comment 寫「未作答」即可。
 EOF
 
+GEMINI_SCORING_PROMPT="$DEFAULT_PROMPT"
+if [[ -n "$PROMPT_FILE" ]]; then
+  if [[ ! -f "$PROMPT_FILE" ]]; then
+    echo "[fatal] prompt file not found: $PROMPT_FILE" >&2
+    exit 1
+  fi
+  GEMINI_SCORING_PROMPT="$(cat "$PROMPT_FILE")"
+fi
+
 ############################################
-# 2. 小工具
+# 3. 小工具
 ############################################
 
 log() {
-  # 統一輸出
   echo "[$(date '+%H:%M:%S')] $*" >&1
 }
 
@@ -114,37 +213,89 @@ require_cmd() {
   }
 }
 
-# URL encode (純 bash 版)
 urlencode() {
-  local data
-  data=$(python3 - <<'PYCODE'
+  python3 - <<'PYCODE'
 import sys, urllib.parse
 print(urllib.parse.quote(sys.stdin.read().rstrip(), safe=''))
 PYCODE
-)
-  printf "%s" "$data"
 }
 
-get_next_gemini_key() {
-  local idx=$GEMINI_KEY_INDEX
-  local key="${GEMINI_API_KEYS[$idx]}"
-  # shellcheck disable=SC2004
-  GEMINI_KEY_INDEX=$(( (GEMINI_KEY_INDEX + 1) % ${#GEMINI_API_KEYS[@]} ))
-  printf "%s" "$key"
+mask_secret() {
+  local s="$1"
+  if [[ -z "$s" ]]; then
+    echo ""
+    return
+  fi
+  local n=${#s}
+  if (( n <= 12 )); then
+    echo "***"
+    return
+  fi
+  echo "${s:0:6}***${s:n-6:6}"
 }
 
 ensure_image_dir() {
   mkdir -p images
 }
 
+now_epoch() {
+  date +%s
+}
+
+# ✅ 為兼容 macOS 內建 bash 3.2，不用 assoc array，用平行陣列
+KEYS_COOLDOWN_UNTIL=()
+
+init_cooldowns() {
+  KEYS_COOLDOWN_UNTIL=()
+  for _ in "${GEMINI_API_KEYS_ARR[@]}"; do
+    KEYS_COOLDOWN_UNTIL+=("0")
+  done
+}
+
+set_key_cooldown() {
+  local idx="$1"
+  local until="$2"
+  KEYS_COOLDOWN_UNTIL[$idx]="$until"
+}
+
+get_key_cooldown() {
+  local idx="$1"
+  echo "${KEYS_COOLDOWN_UNTIL[$idx]}"
+}
+
+pick_usable_key_index() {
+  local now
+  now=$(now_epoch)
+
+  local total=${#GEMINI_API_KEYS_ARR[@]}
+  for ((i=0; i<total; i++)); do
+    local idx=$GEMINI_KEY_INDEX
+    local cd
+    cd=$(get_key_cooldown "$idx")
+    if (( now >= cd )); then
+      echo "$idx"
+      return 0
+    fi
+    GEMINI_KEY_INDEX=$(( (GEMINI_KEY_INDEX + 1) % total ))
+  done
+  echo "-1"
+}
+
+get_next_key_by_index() {
+  local idx="$1"
+  echo "${GEMINI_API_KEYS_ARR[$idx]}"
+  local total=${#GEMINI_API_KEYS_ARR[@]}
+  GEMINI_KEY_INDEX=$(( (idx + 1) % total ))
+}
+
 ############################################
-# 3. 登錄 & 通用請求
+# 4. 登錄 & 通用請求
 ############################################
 
 login() {
   local url="$BASE/Login.ashx"
   log "login → $url"
-  # 用 --data-urlencode 保證中文 OK
+
   local resp
   resp=$(curl -sS --connect-timeout "$SITE_TIMEOUT" --max-time "$SITE_TIMEOUT" \
     -d "clientType=html5" \
@@ -152,18 +303,18 @@ login() {
     --data-urlencode "username=$USERNAME" \
     --data-urlencode "password=$PASSWORD" \
     "$url")
+
   local ok
   ok=$(echo "$resp" | jq -r '.OperatorSuccess')
   if [[ "$ok" != "true" ]]; then
-    echo "[fatal] login failed: $resp"
+    echo "[fatal] login failed: $resp" >&2
     exit 1
   fi
   TOKEN=$(echo "$resp" | jq -r '.Token')
-  log "login ok, token=$TOKEN"
+  log "login ok, token=$(mask_secret "$TOKEN")"
 }
 
 api_post() {
-  # $1: path, $2...: extra data (key=value)
   local path="$1"; shift
   local url="$BASE/$path"
   local data=("token=$TOKEN")
@@ -171,7 +322,7 @@ api_post() {
     data+=("$1")
     shift
   done
-  # shellcheck disable=SC2068
+
   local resp
   resp=$(curl -sS --connect-timeout "$SITE_TIMEOUT" --max-time "$SITE_TIMEOUT" \
     -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
@@ -180,13 +331,11 @@ api_post() {
     -d "${data[@]}" \
     "$url" || true)
 
-  # 登錄失效的情況：Describe 裡有 “登录”
   local login_err
   login_err=$(echo "$resp" | jq -r 'select(.OperatorSuccess == false) | .Describe' 2>/dev/null || echo "")
   if [[ "$login_err" == *"登录"* ]]; then
     log "api_post: token invalid, re-login..."
     login
-    # 再打一次
     resp=$(curl -sS --connect-timeout "$SITE_TIMEOUT" --max-time "$SITE_TIMEOUT" \
       -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
       -H "Origin: https://yue.k12media.cn" \
@@ -199,17 +348,16 @@ api_post() {
 }
 
 ############################################
-# 4. 拿 paper_item_id & full_score
+# 5. 拿 paper_item_id & full_score
 ############################################
 
 get_marking_item_group_info() {
   local resp
   resp=$(api_post "GetMarkingItemGroupInfo.ashx")
-  # 尋找 PaperID == PAPER_ID 的那組
+
   local paper_item_id
   local full_score
 
-  # 用 jq 走一遍
   paper_item_id=$(echo "$resp" | jq --argjson pid "$PAPER_ID" --argjson gid "$ITEM_GROUP_ID" '
     .MarkingItemGroupInfos[]? | select(.PaperID == $pid)
     | .ItemGroups[]? | select(.ItemGroupID == $gid)
@@ -223,8 +371,8 @@ get_marking_item_group_info() {
   ' 2>/dev/null)
 
   if [[ -z "$paper_item_id" || "$paper_item_id" == "null" ]]; then
-    echo "[fatal] ItemGroup not found in GetMarkingItemGroupInfo.ashx"
-    echo "$resp"
+    echo "[fatal] ItemGroup not found in GetMarkingItemGroupInfo.ashx" >&2
+    echo "$resp" >&2
     exit 1
   fi
 
@@ -232,12 +380,13 @@ get_marking_item_group_info() {
 }
 
 ############################################
-# 5. 申請任務、取圖
+# 6. 申請任務、取圖
 ############################################
 
 apply_paper_marking_task() {
   local url="$BASE/ApplyPaperMarkingTask.ashx"
   log "apply task → $url"
+
   local resp
   resp=$(curl -sS --connect-timeout "$SITE_TIMEOUT" --max-time "$SITE_TIMEOUT" \
     -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
@@ -275,7 +424,6 @@ PY
   local task_id
   task_id=$(echo "$resp" | jq -r '.PaperMarkingTaskID // .Task.PaperMarkingTaskID // empty')
   if [[ -z "$task_id" || "$task_id" == "null" ]]; then
-    # 沒任務
     echo "NONE|$resp"
   else
     echo "$task_id|$resp"
@@ -283,53 +431,151 @@ PY
 }
 
 fetch_answer_image() {
-  # $1: apply_json
   local apply_json="$1"
-  local img_buf_id
+  local img_file="$2"
 
+  local img_buf_id
   img_buf_id=$(echo "$apply_json" | jq -r '.ImageBufferID // .ImageBufferId // .imageBufferID // .Task.ImageBufferID // .Task.ImageBufferId // .Task.imageBufferID // empty')
   if [[ -z "$img_buf_id" || "$img_buf_id" == "null" ]]; then
-    echo "[fatal] apply resp has no ImageBufferID"
-    echo "$apply_json"
+    echo "[fatal] apply resp has no ImageBufferID" >&2
+    echo "$apply_json" >&2
     return 1
   fi
 
-  local img_url="https://yue.k12media.cn/testmate/json/GetImageFromBuffer.ashx?token=$(python3 - <<PY
+  local token_enc
+  token_enc=$(python3 - <<PY
 import urllib.parse
 print(urllib.parse.quote("$TOKEN"))
 PY
-)&ImageBufferID=$(python3 - <<PY
+)
+
+  local buf_enc
+  buf_enc=$(python3 - <<PY
 import urllib.parse
 print(urllib.parse.quote("$img_buf_id"))
 PY
-)"
-  log "download image → $img_url"
-  local img_file="$2"
+)
+
+  # ✅ terminal 不打印帶 token 的完整 URL
+  log "download image → ImageBufferID=$img_buf_id"
+
+  local img_url="https://yue.k12media.cn/testmate/json/GetImageFromBuffer.ashx?token=${token_enc}&ImageBufferID=${buf_enc}"
+
   curl -sS --connect-timeout "$SITE_TIMEOUT" --max-time "$SITE_TIMEOUT" \
     -H "Referer: https://yue.k12media.cn/testmate/index.html" \
     -o "$img_file" \
     "$img_url"
+
+  local sz
+  sz=$(wc -c < "$img_file" | tr -d ' ')
+  if [[ -z "$sz" || "$sz" -lt 32 ]]; then
+    echo "[fatal] downloaded image too small/empty: $sz bytes" >&2
+    return 1
+  fi
+
   echo "$img_buf_id"
 }
 
 ############################################
-# 6. Gemini OCR + 打分
+# 7. Gemini OCR + 打分（加固：可換題 & key cooldown）
 ############################################
 
+# 將 Gemini 返回的 text 解析/校驗成可用 JSON：
+# - 去掉 ``` 包裹
+# - 抽取第一個 {...} JSON
+# - 正規化 point_* 為 0/1
+# - final_score = sum(point_*)
+normalize_gemini_text_to_json() {
+  python3 - <<'PY'
+import sys, json, re
+
+def parse_any_json(text: str):
+    t = (text or '').strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+
+    if t.startswith('```'):
+        nl = t.find('\n')
+        if nl != -1:
+            inner = t[nl+1:].strip()
+            if inner.endswith('```'):
+                inner = inner[:-3].strip()
+            try:
+                return json.loads(inner)
+            except Exception:
+                pass
+
+    m = re.search(r"\{.*\}", t, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+    return None
+
+raw = sys.stdin.read()
+obj = parse_any_json(raw)
+
+if not isinstance(obj, dict):
+    out = {
+        "student_answer": raw.strip(),
+        "final_score": 0,
+        "overall_comment": "模型輸出非標準 JSON，已降級為 0 分，請人工核查。",
+        "_validate_reason": "parse_failed"
+    }
+    print(json.dumps(out, ensure_ascii=False))
+    sys.exit(0)
+
+points_sum = 0
+for k in list(obj.keys()):
+    if isinstance(k, str) and k.startswith('point_'):
+        v = obj.get(k)
+        try:
+            iv = int(str(v).strip())
+            iv = 1 if iv != 0 else 0
+        except Exception:
+            iv = 0
+        obj[k] = iv
+        points_sum += iv
+
+obj.setdefault('student_answer', '')
+obj.setdefault('overall_comment', '本題已按 point_* 拆分評分，請對照批語修改。')
+
+obj['final_score'] = int(points_sum)
+
+if points_sum == 0 and not str(obj.get('student_answer', '')).strip():
+    obj['overall_comment'] = obj.get('overall_comment') or '未作答'
+
+obj['_validate_reason'] = 'ok'
+print(json.dumps(obj, ensure_ascii=False))
+PY
+}
+
 gemini_call() {
-  # $1: image_path
   local image_path="$1"
+
   local image_b64
   image_b64=$(base64 < "$image_path" | tr -d '\n')
 
+  local total_keys=${#GEMINI_API_KEYS_ARR[@]}
   local last_err=""
-  local total_keys=${#GEMINI_API_KEYS[@]}
 
-  for ((ki=0; ki<total_keys; ki++)); do
+  while true; do
+    local idx
+    idx=$(pick_usable_key_index)
+    if [[ "$idx" == "-1" ]]; then
+      log "[gemini] all keys in cooldown, sleep ${ALL_KEYS_BUSY_SLEEP}s ..."
+      sleep "$ALL_KEYS_BUSY_SLEEP"
+      continue
+    fi
+
     local key
-    key=$(get_next_gemini_key)
+    key=$(get_next_key_by_index "$idx")
+
     local url="https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent?key=$key"
-    # payload
+
     local payload
     payload=$(jq -n --arg prompt "$GEMINI_SCORING_PROMPT" --arg img "$image_b64" '
       {
@@ -343,57 +589,46 @@ gemini_call() {
         ]
       }
     ')
+
     for ((attempt=1; attempt<=GEMINI_RETRY; attempt++)); do
-      log "gemini key#$((ki+1))/$total_keys attempt $attempt/$GEMINI_RETRY ..."
-      local resp
-      resp=$(curl -sS --connect-timeout "$GEMINI_TIMEOUT" --max-time "$GEMINI_TIMEOUT" \
+      log "gemini key=$(mask_secret "$key") idx=$((idx+1))/${total_keys} attempt ${attempt}/${GEMINI_RETRY} model=$GEMINI_MODEL"
+
+      local resp_with_code
+      resp_with_code=$(curl -sS --connect-timeout "$GEMINI_TIMEOUT" --max-time "$GEMINI_TIMEOUT" \
         -H "Content-Type: application/json" \
         -d "$payload" \
+        -w "\n__HTTP_CODE__:%{http_code}" \
         "$url" 2>&1) || true
 
-      # 嘗試取 text
+      local http_code
+      http_code=$(echo "$resp_with_code" | tail -n 1 | sed 's/__HTTP_CODE__://')
+      local resp
+      resp=$(echo "$resp_with_code" | sed '$d')
+
+      if [[ "$http_code" == "429" || "$http_code" == "503" ]]; then
+        local until
+        until=$(( $(now_epoch) + KEY_COOLDOWN_SEC ))
+        set_key_cooldown "$idx" "$until"
+        log "[gemini] http=$http_code → cooldown key idx=$idx for ${KEY_COOLDOWN_SEC}s"
+        last_err="$resp"
+        break
+      fi
+
       local text
       text=$(echo "$resp" | jq -r '.candidates[0].content.parts[0].text // empty' 2>/dev/null || true)
-      if [[ -n "$text" ]]; then
-        # 嘗試把 text 當成 json
-        if echo "$text" | jq -e . >/dev/null 2>&1; then
-          # 校正 final_score
-          local pf pj pfare pdet
-          pf=$(echo "$text" | jq -r '.point_father // 0')
-          pj=$(echo "$text" | jq -r '.point_jimmy // 0')
-          pfare=$(echo "$text" | jq -r '.point_farewell // 0')
-          pdet=$(echo "$text" | jq -r '.point_detail_function // 0')
-          local fs=$((pf + pj + pfare + pdet))
-          # 合成一個帶 final_score 的 json
-          echo "$text" | jq --argjson fs "$fs" '.final_score = $fs'
-          return 0
-        else
-          # 不是 json，用 fallback
-          local guessed=0
-          # 粗暴抓 0~4 分
-          if [[ "$text" =~ ([0-4])[[:space:]]*分 ]]; then
-            guessed="${BASH_REMATCH[1]}"
-          fi
-          jq -n --arg sa "$text" --argjson sc "$guessed" '{
-            student_answer: $sa,
-            point_father: 0,
-            comment_father: "未能識別為父親抓蝙蝠的細節，按規則不得分。",
-            point_jimmy: 0,
-            comment_jimmy: "未能識別為吉米善良/放生/尊重生命，按規則不得分。",
-            point_farewell: 0,
-            comment_farewell: "未能把離別情緒與這個廚房細節關聯起來，按規則不得分。",
-            point_detail_function: 0,
-            comment_detail_function: "未具體說到“承載回憶/給想像空間”，按規則不得分。",
-            final_score: $sc,
-            overall_comment: "模型輸出非標準 JSON，已按文字估分。"
-          }'
-          return 0
-        fi
-      else
+      if [[ -z "$text" ]]; then
         last_err="$resp"
-        log "gemini error / empty resp, try next attempt/key..."
+        log "[gemini] empty text, retry ..."
+        sleep 1
+        continue
       fi
+
+      echo "$text" | normalize_gemini_text_to_json
+      return 0
     done
+
+    # next key
+    continue
   done
 
   echo "[fatal] gemini all keys failed: $last_err" >&2
@@ -401,11 +636,10 @@ gemini_call() {
 }
 
 ############################################
-# 7. 提交 & 取消
+# 8. 提交 & 取消
 ############################################
 
 submit_marking_result() {
-  # $1: task_id, $2: paper_item_id, $3: score
   local task_id="$1"
   local paper_item_id="$2"
   local score="$3"
@@ -436,6 +670,7 @@ submit_marking_result() {
 
   local url="$BASE/SubmitMarkingTaskResult.ashx"
   log "submit → $url (score=$score)"
+
   local resp
   resp=$(curl -sS --connect-timeout "$SITE_TIMEOUT" --max-time "$SITE_TIMEOUT" \
     -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
@@ -443,6 +678,7 @@ submit_marking_result() {
     -H "Referer: https://yue.k12media.cn/testmate/index.html" \
     --data "token=$TOKEN&taskResult=$encoded" \
     "$url")
+
   printf "%s" "$resp"
 }
 
@@ -456,7 +692,62 @@ cancel_task() {
 }
 
 ############################################
-# 8. 主流程
+# 9. 導出 / 報告
+############################################
+
+append_jsonl() {
+  local path="$1"
+  local json_line="$2"
+  printf "%s\n" "$json_line" >> "$path"
+}
+
+append_text() {
+  local path="$1"
+  local text="$2"
+  printf "%s\n" "$text" >> "$path"
+}
+
+build_report_block() {
+  local task_id="$1"
+  local img_path="$2"
+  local score="$3"
+  local full_score="$4"
+  local gemini_json="$5"
+
+  local sa
+  sa=$(echo "$gemini_json" | jq -r '.student_answer // ""')
+
+  local lines=()
+  lines+=("[report] ===== 一份批完 =====")
+  lines+=("任務ID: $task_id")
+  lines+=("圖片路徑: $img_path")
+  lines+=("得分(送回網站): $score/$full_score")
+  lines+=("學生答案OCR: $sa")
+
+  local pts
+  pts=$(echo "$gemini_json" | jq -r 'to_entries | map(select(.key|startswith("point_"))) | sort_by(.key) | .[] | .key')
+  if [[ -n "$pts" ]]; then
+    while read -r pk; do
+      [[ -z "$pk" ]] && continue
+      local ck
+      ck="comment_${pk#point_}"
+      local pv cv
+      pv=$(echo "$gemini_json" | jq -r --arg k "$pk" '.[$k] // 0')
+      cv=$(echo "$gemini_json" | jq -r --arg k "$ck" '.[$k] // ""')
+      lines+=("${pk}(${pv}): ${cv}")
+    done <<< "$pts"
+  fi
+
+  local oc
+  oc=$(echo "$gemini_json" | jq -r '.overall_comment // ""')
+  lines+=("總評: $oc")
+  lines+=("[report] =====================")
+
+  (IFS=$'\n'; echo "${lines[*]}")
+}
+
+############################################
+# 10. 主流程
 ############################################
 
 main() {
@@ -465,6 +756,16 @@ main() {
   require_cmd python3
   require_cmd base64
 
+  if [[ -z "$USERNAME" || -z "$PASSWORD" || -z "$SITE_ID" ]]; then
+    echo "[fatal] Missing USERNAME/PASSWORD/SITE_ID. Please export YUE_USERNAME / YUE_PASSWORD / YUE_SITE_ID." >&2
+    exit 1
+  fi
+
+  log "[init] paper_id=$PAPER_ID item_group_id=$ITEM_GROUP_ID"
+  log "[init] gemini_model=$GEMINI_MODEL export_tag=$EXPORT_TAG"
+  log "[init] jsonl=$EXPORT_JSONL"
+
+  init_cooldowns
   login
 
   local info
@@ -500,12 +801,21 @@ main() {
     fi
 
     TOTAL_FETCHED=$((TOTAL_FETCHED + 1))
+
     local img_path="images/${task_id}.png"
-    local img_buf_id
-    img_buf_id=$(fetch_answer_image "$apply_json" "$img_path")
+    local img_buf_id=""
+
+    if ! img_buf_id=$(fetch_answer_image "$apply_json" "$img_path"); then
+      log "[error] fetch image failed, cancel task $task_id"
+      cancel_task "$task_id" >/dev/null 2>&1 || true
+      TOTAL_FAILED=$((TOTAL_FAILED + 1))
+      log "[progress] fetched=$TOTAL_FETCHED success=$TOTAL_SCORED failed=$TOTAL_FAILED"
+      sleep "$IDLE_SLEEP"
+      continue
+    fi
+
     log "[image] saved to $img_path (ImageBufferID=$img_buf_id)"
 
-    # Gemini
     local gemini_json
     if ! gemini_json=$(gemini_call "$img_path"); then
       log "[error] gemini failed, cancel task $task_id"
@@ -515,58 +825,26 @@ main() {
       sleep "$IDLE_SLEEP"
       continue
     fi
-    log "[result] gemini parsed JSON:"
+
+    log "[result] gemini normalized JSON:"
     echo "$gemini_json" | jq .
 
-    # 拿分
     local score
     score=$(echo "$gemini_json" | jq -r '.final_score // 0')
+
+    if ! [[ "$score" =~ ^[0-9]+$ ]]; then
+      score=0
+    fi
     if (( score < 0 )); then score=0; fi
     if (( score > full_score )); then score="$full_score"; fi
 
-    # 提交
     local submit_resp
     submit_resp=$(submit_marking_result "$task_id" "$paper_item_id" "$score")
-    log "[submit] resp: $submit_resp"
     TOTAL_SCORED=$((TOTAL_SCORED + 1))
 
-    # 任務完成報告
-    log "[report] ===== 一份批完 ====="
-    log "任務ID: $task_id"
-    log "圖片路徑: $img_path"
-    log "得分(送回網站): $score/$full_score"
-    log "學生答案OCR: $(echo "$gemini_json" | jq -r '.student_answer')"
-    log "父親形象($(echo "$gemini_json" | jq -r '.point_father')): $(echo "$gemini_json" | jq -r '.comment_father')"
-    log "吉米形象($(echo "$gemini_json" | jq -r '.point_jimmy')): $(echo "$gemini_json" | jq -r '.comment_jimmy')"
-    log "離別情緒($(echo "$gemini_json" | jq -r '.point_farewell')): $(echo "$gemini_json" | jq -r '.comment_farewell')"
-    log "細節作用($(echo "$gemini_json" | jq -r '.point_detail_function')): $(echo "$gemini_json" | jq -r '.comment_detail_function')"
-    log "總評: $(echo "$gemini_json" | jq -r '.overall_comment')"
+    log "[submit] resp: $submit_resp"
 
-    if [[ -n "$PLATFORM_TOTAL" ]]; then
-      local msg="平台進度: 已閱 ${PLATFORM_DONE}/${PLATFORM_TOTAL}"
-      if [[ -n "$PLATFORM_DONE" && -n "$PLATFORM_TOTAL" && "$PLATFORM_TOTAL" != "0" ]]; then
-        local pct
-        pct=$(python3 - <<PY
-done = ${PLATFORM_DONE:-0}
-tot = ${PLATFORM_TOTAL:-1}
-print(round(done/tot*100, 2))
-PY
-)
-        msg+=" (${pct}%)"
-      fi
-      if [[ -n "$PLATFORM_ME_COUNT" ]]; then
-        msg+=", 我自己：$PLATFORM_ME_COUNT 份"
-      fi
-      if [[ -n "$PLATFORM_ME_AVG" ]]; then
-        msg+=", 均分 $PLATFORM_ME_AVG"
-      fi
-      log "$msg"
-    fi
-
-    log "當前進度: 已成功 $TOTAL_SCORED 份，失敗 $TOTAL_FAILED 份，總共申請 $TOTAL_FETCHED 份"
-    log "[report] ====================="
-
-  done
-}
-
-main "$@"
+    # record jsonl（每份一行）
+    local record
+    record=$(
+     
