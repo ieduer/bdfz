@@ -86,7 +86,7 @@ SHOW_STUDENT_FIND_PATH = "/tqms/report/ShowStudentImgsAction.a?findStudentImgs"
 IMG_SERVER_BASE = f"{BASE_URL_IMG}/tqms_image_server/"
 
 # --- Exam / school / state ---
-TEST_ID = 119274          # <input id="testId" value="119274">
+TEST_ID = 124364          # <input id="testId" value="119274">
 SCHOOL_ID = 3600          # <input id="schoolId" value="3600">
 TEST_STATE = 1            # <input id="testState" value="1">
 
@@ -119,14 +119,17 @@ class ClassConfig:
 CLASSES: List[ClassConfig] = [
     ClassConfig(class_id=91268,   is_teacher_class=False, label="格物3班"),
     ClassConfig(class_id=91272,   is_teacher_class=False, label="致知3班"),
-    ClassConfig(class_id=1883835, is_teacher_class=True,  label="格物3班班"),
-    ClassConfig(class_id=1883842, is_teacher_class=True,  label="致知3班班"),
+    ClassConfig(class_id=1883835, is_teacher_class=True,  label="格物3班"),
+    ClassConfig(class_id=1883842, is_teacher_class=True,  label="致知3班"),
 ]
 
 # --- Cookie: copy directly from test.k12media.cn (do NOT shorten) ---
-RAW_COOKIE = (
+# IMPORTANT: this must be a STRING like: "k1=v1; k2=v2; k3=v3"
+# Paste your real cookie from https://test.k12media.cn here.
+RAW_COOKIE = ""
 
-)
+if not isinstance(RAW_COOKIE, str):
+    raise TypeError("RAW_COOKIE must be a string like 'k1=v1; k2=v2'.")
 
 # --- User-Agent ---
 DEFAULT_USER_AGENT = (

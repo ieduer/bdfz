@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # yue.k12media.cn 自動閱卷 demo — shell 版（加固版 / 可換題目）
 # 原始轉寫：2025-11-11
-# 本次加固：2026-01-19（對齊 Python 加固版行為）
-# 本次更新：2026-01-19（加入 Explicit Context Caching，其他不動）
+# 加固對齊：2026-01-19（對齊 Python 加固版行為）
+# 本次更新：2026-01-19（加入 Explicit Context Caching）
+# 本次小升級：2026-01-19（v3：對齊 Python 版的更多「穩健性」細節，不破壞既有功能）
+# 本次優化：2026-01-19（v4：Apply/Submit 統一走 api_post 自動續登錄；空任務自動收斂退出可選；更多健壯性不改行為）
 # 依賴：bash, curl, jq, base64, mkdir, date, python3, shasum
 # 建議：macOS 用 brew 裝 jq:  brew install jq
 # ------------------------------------------------------------
@@ -10,7 +12,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="yue-auto-mark-2026-01-19-hardened-v2"
+SCRIPT_VERSION="yue-auto-mark-2026-01-19-hardened-v4"
 echo "[info] script version: $SCRIPT_VERSION"
 
 ############################################
@@ -32,6 +34,13 @@ PROMPT_FILE=""
 EXPORT_DIR="exports"
 EXPORT_TAG=""
 
+#
+# Optional exit controls
+# MAX_TASKS=0 => infinite
+MAX_TASKS="${YUE_MAX_TASKS:-0}"
+# If platform_done==platform_total and no task returned for N rounds, exit (0 disables)
+EXIT_WHEN_DONE_ROUNDS="${YUE_EXIT_WHEN_DONE_ROUNDS:-0}"
+
 while (($#)); do
   case "$1" in
     --paper-id)
@@ -46,6 +55,8 @@ while (($#)); do
       EXPORT_DIR="$2"; shift 2 ;;
     --tag)
       EXPORT_TAG="$2"; shift 2 ;;
+    --max-tasks)
+      MAX_TASKS="$2"; shift 2 ;;
     -h|--help)
       cat <<'HELP'
 Usage:
@@ -58,6 +69,22 @@ Options:
   --prompt-file <path>   External prompt txt file (for next questions)
   --export-dir <dir>     Export directory (default: exports)
   --tag <tag>            Export tag prefix
+  --max-tasks <N>        Process N tasks then exit (default: 0 infinite)
+
+Env:
+  # Dry-run: 不向網站提交分數，只跑到「模型打分 + 導出」
+  YUE_DRY_RUN=1
+
+  # Context caching
+  GEMINI_CONTEXT_CACHING=1/0
+  GEMINI_CACHE_TTL=3600
+  GEMINI_CACHE_MARGIN=60
+
+  # Auto-exit when platform done (optional)
+  YUE_EXIT_WHEN_DONE_ROUNDS=5
+
+  # Verbose（打印更多網路錯誤原文）
+  VERBOSE=1
 HELP
       exit 0
       ;;
@@ -95,6 +122,16 @@ GEMINI_RETRY="${YUE_GEMINI_RETRY:-3}"
 
 # 沒任務時等幾秒
 IDLE_SLEEP="${YUE_IDLE_SLEEP:-3}"
+
+# Dry-run（不提交）
+DRY_RUN="${YUE_DRY_RUN:-0}"
+
+# Verbose
+VERBOSE="${VERBOSE:-0}"
+
+#
+# Optional cleanup
+CLEAN_IMAGES="${YUE_CLEAN_IMAGES:-0}"
 
 # 統計
 TOTAL_FETCHED=0     # 拿到的任務數（包含成功/失敗）
@@ -288,6 +325,39 @@ except Exception:
 PY
 }
 
+detect_image_mime() {
+  local f="$1"
+  # Prefer file(1) if available
+  if command -v file >/dev/null 2>&1; then
+    local t
+    t=$(file -b --mime-type "$f" 2>/dev/null || true)
+    case "$t" in
+      image/png|image/jpeg|image/webp)
+        echo "$t"; return 0 ;;
+    esac
+  fi
+
+  # Fallback magic bytes
+  python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+try:
+    b = open(p, 'rb').read(16)
+except Exception:
+    print('image/png')
+    sys.exit(0)
+
+if b.startswith(b"\x89PNG\r\n\x1a\n"):
+    print('image/png')
+elif b.startswith(b"\xff\xd8\xff"):
+    print('image/jpeg')
+elif b.startswith(b"RIFF") and b[8:12] == b"WEBP":
+    print('image/webp')
+else:
+    print('image/png')
+PY
+}
+
 # ✅ 為兼容 macOS 內建 bash 3.2，不用 assoc array，用平行陣列
 KEYS_COOLDOWN_UNTIL=()
 
@@ -392,6 +462,15 @@ create_cached_content_for_key() {
 
   if [[ "$http_code" == "429" || "$http_code" == "503" ]]; then
     echo "$http_code" >&2
+    echo "|0"
+    return 0
+  fi
+
+  # 某些情況下可能是 409/400 等，直接降級不使用 cache
+  if [[ "$http_code" != "200" ]]; then
+    if [[ "$VERBOSE" == "1" ]]; then
+      log "[cache] create failed http=$http_code resp=$(echo "$resp" | tr '\n' ' ' | head -c 240)"
+    fi
     echo "|0"
     return 0
   fi
@@ -511,18 +590,13 @@ get_marking_item_group_info() {
 ############################################
 
 apply_paper_marking_task() {
-  local url="$BASE/ApplyPaperMarkingTask.ashx"
-  log "apply task → $url"
+  log "apply task → ApplyPaperMarkingTask.ashx"
 
+  # v4: 走 api_post，保證 token 失效時會自動 re-login
   local resp
-  resp=$(curl -sS --connect-timeout "$SITE_TIMEOUT" --max-time "$SITE_TIMEOUT" \
-    -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
-    -H "Origin: https://yue.k12media.cn" \
-    -H "Referer: https://yue.k12media.cn/testmate/index.html" \
-    -d "token=$TOKEN" \
-    -d "paperID=$PAPER_ID" \
-    -d "itemGroupID=$ITEM_GROUP_ID" \
-    "$url")
+  resp=$(api_post "ApplyPaperMarkingTask.ashx" \
+    "paperID=$PAPER_ID" \
+    "itemGroupID=$ITEM_GROUP_ID")
 
   # 更新平台進度
   local task_block
@@ -612,9 +686,19 @@ PY
 # - 抽取第一個 {...} JSON
 # - 正規化 point_* 為 0/1
 # - final_score = sum(point_*)
+# - 盡量補齊 comment_* 字段（與 Python 版行為更一致）
 normalize_gemini_text_to_json() {
   python3 - <<'PY'
 import sys, json, re
+
+EXPECTED_POINTS = [
+    "point_qiujin",
+    "point_guomin",
+    "point_luxun",
+    "point_liren",
+    "point_qunxian",
+    "point_shengming",
+]
 
 def parse_any_json(text: str):
     t = (text or '').strip()
@@ -655,17 +739,23 @@ if not isinstance(obj, dict):
     print(json.dumps(out, ensure_ascii=False))
     sys.exit(0)
 
+# Normalize points
 points_sum = 0
-for k in list(obj.keys()):
-    if isinstance(k, str) and k.startswith('point_'):
-        v = obj.get(k)
-        try:
-            iv = int(str(v).strip())
-            iv = 1 if iv != 0 else 0
-        except Exception:
-            iv = 0
-        obj[k] = iv
-        points_sum += iv
+for k in EXPECTED_POINTS:
+    v = obj.get(k, 0)
+    try:
+        iv = int(str(v).strip())
+        iv = 1 if iv != 0 else 0
+    except Exception:
+        iv = 0
+    obj[k] = iv
+    points_sum += iv
+
+# Ensure comments exist
+for k in EXPECTED_POINTS:
+    ck = "comment_" + k[len("point_"):]
+    if ck not in obj or obj.get(ck) is None:
+        obj[ck] = ""
 
 obj.setdefault('student_answer', '')
 obj.setdefault('overall_comment', '本題已按 point_* 拆分評分，請對照批語修改。')
@@ -682,6 +772,9 @@ PY
 
 gemini_call() {
   local image_path="$1"
+
+  local mime
+  mime=$(detect_image_mime "$image_path")
 
   local image_b64
   image_b64=$(base64 < "$image_path" | tr -d '\n')
@@ -752,14 +845,14 @@ gemini_call() {
 
     local payload
     if [[ -n "$cache_name" ]]; then
-      payload=$(jq -n --arg img "$image_b64" --arg cc "$cache_name" '
+      payload=$(jq -n --arg img "$image_b64" --arg cc "$cache_name" --arg mime "$mime" '
         {
           contents: [
             {
               role: "user",
               parts: [
                 {text: "请严格按系统指令评分，只输出合法 JSON。"},
-                {inline_data: {mime_type: "image/png", data: $img}}
+                {inline_data: {mime_type: $mime, data: $img}}
               ]
             }
           ],
@@ -767,13 +860,13 @@ gemini_call() {
         }
       ')
     else
-      payload=$(jq -n --arg prompt "$GEMINI_SCORING_PROMPT" --arg img "$image_b64" '
+      payload=$(jq -n --arg prompt "$GEMINI_SCORING_PROMPT" --arg img "$image_b64" --arg mime "$mime" '
         {
           contents: [
             {
               parts: [
                 {text: $prompt},
-                {inline_data: {mime_type: "image/png", data: $img}}
+                {inline_data: {mime_type: $mime, data: $img}}
               ]
             }
           ]
@@ -782,7 +875,7 @@ gemini_call() {
     fi
 
     for ((attempt=1; attempt<=GEMINI_RETRY; attempt++)); do
-      log "gemini key=$(mask_secret "$key") idx=$((idx+1))/${total_keys} attempt ${attempt}/${GEMINI_RETRY} model=$GEMINI_MODEL"
+      log "gemini key=$(mask_secret "$key") idx=$((idx+1))/${total_keys} attempt ${attempt}/${GEMINI_RETRY} model=$GEMINI_MODEL mime=$mime"
 
       local resp_with_code
       resp_with_code=$(curl -sS --connect-timeout "$GEMINI_TIMEOUT" --max-time "$GEMINI_TIMEOUT" \
@@ -803,6 +896,16 @@ gemini_call() {
         log "[gemini] http=$http_code → cooldown key idx=$idx for ${KEY_COOLDOWN_SEC}s"
         last_err="$resp"
         break
+      fi
+
+      if [[ "$http_code" != "200" ]]; then
+        last_err="$resp"
+        log "[gemini] http=$http_code non-200, retry ..."
+        if [[ "$VERBOSE" == "1" ]]; then
+          log "[gemini] resp=$(echo "$resp" | tr '\n' ' ' | head -c 260)"
+        fi
+        sleep 1
+        continue
       fi
 
       local text
@@ -859,17 +962,11 @@ submit_marking_result() {
   local encoded
   encoded=$(printf "%s" "$task_result_obj" | urlencode)
 
-  local url="$BASE/SubmitMarkingTaskResult.ashx"
-  log "submit → $url (score=$score)"
+  log "submit → SubmitMarkingTaskResult.ashx (score=$score)"
 
+  # v4: 走 api_post，保證 token 失效時會自動 re-login
   local resp
-  resp=$(curl -sS --connect-timeout "$SITE_TIMEOUT" --max-time "$SITE_TIMEOUT" \
-    -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
-    -H "Origin: https://yue.k12media.cn" \
-    -H "Referer: https://yue.k12media.cn/testmate/index.html" \
-    --data "token=$TOKEN&taskResult=$encoded" \
-    "$url")
-
+  resp=$(api_post "SubmitMarkingTaskResult.ashx" "taskResult=$encoded")
   printf "%s" "$resp"
 }
 
@@ -957,6 +1054,8 @@ main() {
   log "[init] gemini_model=$GEMINI_MODEL export_tag=$EXPORT_TAG"
   log "[init] jsonl=$EXPORT_JSONL"
   log "[init] context_caching=$ENABLE_CONTEXT_CACHING ttl=${GEMINI_CACHE_TTL}s"
+  log "[init] prompt_sha256=${PROMPT_SHA256:0:12}"
+  log "[init] dry_run=$DRY_RUN max_tasks=$MAX_TASKS clean_images=$CLEAN_IMAGES"
 
   init_cooldowns
   login
@@ -969,13 +1068,22 @@ main() {
 
   ensure_image_dir
 
+  local no_task_rounds=0
+
   while true; do
+    if [[ "$MAX_TASKS" =~ ^[0-9]+$ ]] && (( MAX_TASKS > 0 )) && (( TOTAL_SCORED >= MAX_TASKS )); then
+      log "[exit] reached max tasks: $MAX_TASKS"
+      exit 0
+    fi
+
     local applied
     applied=$(apply_paper_marking_task)
     local task_id="${applied%%|*}"
     local apply_json="${applied#*|}"
 
     if [[ "$task_id" == "NONE" ]]; then
+      no_task_rounds=$((no_task_rounds + 1))
+
       if [[ -n "$PLATFORM_TOTAL" ]]; then
         local msg="[loop] no task, sleep ${IDLE_SLEEP}s ... (platform ${PLATFORM_DONE}/${PLATFORM_TOTAL}"
         if [[ -n "$PLATFORM_ME_COUNT" ]]; then
@@ -986,13 +1094,25 @@ main() {
         fi
         msg+=")"
         log "$msg"
+
+        # Optional exit when finished
+        if [[ "$EXIT_WHEN_DONE_ROUNDS" =~ ^[0-9]+$ ]] && (( EXIT_WHEN_DONE_ROUNDS > 0 )); then
+          if [[ "$PLATFORM_DONE" =~ ^[0-9]+$ && "$PLATFORM_TOTAL" =~ ^[0-9]+$ ]] && (( PLATFORM_TOTAL > 0 )) && (( PLATFORM_DONE >= PLATFORM_TOTAL )); then
+            if (( no_task_rounds >= EXIT_WHEN_DONE_ROUNDS )); then
+              log "[exit] platform done (${PLATFORM_DONE}/${PLATFORM_TOTAL}) and no task for ${no_task_rounds} rounds"
+              exit 0
+            fi
+          fi
+        fi
       else
         log "[loop] no task, sleep ${IDLE_SLEEP}s ... (done=$TOTAL_SCORED, failed=$TOTAL_FAILED)"
       fi
+
       sleep "$IDLE_SLEEP"
       continue
     fi
 
+    no_task_rounds=0
     TOTAL_FETCHED=$((TOTAL_FETCHED + 1))
 
     local img_path="images/${task_id}.png"
@@ -1031,11 +1151,17 @@ main() {
     if (( score < 0 )); then score=0; fi
     if (( score > full_score )); then score="$full_score"; fi
 
-    local submit_resp
-    submit_resp=$(submit_marking_result "$task_id" "$paper_item_id" "$score")
-    TOTAL_SCORED=$((TOTAL_SCORED + 1))
+    local submit_resp=""
 
-    log "[submit] resp: $submit_resp"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      submit_resp='{"OperatorSuccess":true,"Describe":"DRY_RUN=1, not submitted"}'
+      log "[submit] DRY_RUN=1 → skip submit (score=$score)"
+    else
+      submit_resp=$(submit_marking_result "$task_id" "$paper_item_id" "$score")
+      log "[submit] resp: $submit_resp"
+    fi
+
+    TOTAL_SCORED=$((TOTAL_SCORED + 1))
 
     # record jsonl（每份一行）
     local record
@@ -1117,6 +1243,11 @@ PY
         msg+="，均分 $PLATFORM_ME_AVG"
       fi
       log "$msg"
+    fi
+
+    # Optional image cleanup
+    if [[ "$CLEAN_IMAGES" == "1" ]]; then
+      rm -f "$img_path" >/dev/null 2>&1 || true
     fi
 
     sleep 0.5
