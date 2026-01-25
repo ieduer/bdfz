@@ -1135,48 +1135,45 @@ EOF
     yellow "📌 將以上 JSON 保存為 client.json，以 root 運行 tun 模式即可"
 }
 
-# ==================== 1.10.x / 1.11.x 舊版客戶端配置 ====================
+# ==================== iOS SFI 1.11.4 客戶端配置 ====================
 show_client_conf_legacy(){
     local host="$1" domain="$2" uuid="$3" port_vl="$4" port_vm="$5" port_hy="$6" port_tu="$7" pk="$8" sid="$9" reality_sni_client="${10}" vm_path="${11}"
     
     green "╔══════════════════════════════════════════════════════════════╗"
-    green "║  Sing-box 1.10.x / 1.11.x 舊版 客戶端配置 (tun 全局模式)     ║"
-    green "║  📦 使用傳統 Inbound Fields (舊語法)                         ║"
+    green "║  Sing-box iOS SFI 1.11.4 客戶端配置 (tun 全局模式)           ║"
+    green "║  � 適用於 iOS Sing-box (SFI) 1.11.x 版本                    ║"
     green "╚══════════════════════════════════════════════════════════════╝"
     echo
     cat <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
   "experimental": {
-    "clash_api": { "external_controller": "127.0.0.1:9090", "external_ui": "ui", "secret": "" },
     "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true }
   },
   "dns": {
     "servers": [
-      { "tag": "proxydns", "address": "tls://8.8.8.8", "detour": "select" },
+      { "tag": "proxydns", "address": "https://8.8.8.8/dns-query", "detour": "select" },
       { "tag": "localdns", "address": "https://223.5.5.5/dns-query", "detour": "direct" },
       { "tag": "dns_fakeip", "address": "fakeip" }
     ],
     "rules": [
-      { "outbound": "any", "server": "localdns", "disable_cache": true },
       { "clash_mode": "Global", "server": "proxydns" },
       { "clash_mode": "Direct", "server": "localdns" },
-      { "geosite": "cn", "server": "localdns" },
-      { "geosite": "geolocation-!cn", "server": "proxydns" },
-      { "geosite": "geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" }
+      { "rule_set": "geosite-cn", "server": "localdns" },
+      { "rule_set": "geosite-geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" },
+      { "rule_set": "geosite-geolocation-!cn", "server": "proxydns" }
     ],
     "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" },
     "independent_cache": true,
-    "strategy": "prefer_ipv4",
     "final": "proxydns"
   },
   "inbounds": [
     {
       "type": "tun", "tag": "tun-in",
-      "inet4_address": "172.19.0.1/30",
-      "inet6_address": "fd00::1/126",
+      "address": ["172.19.0.1/30", "fd00::1/126"],
       "auto_route": true, "strict_route": true,
-      "sniff": true, "sniff_override_destination": true
+      "sniff": true, "sniff_override_destination": true,
+      "domain_strategy": "prefer_ipv4"
     }
   ],
   "outbounds": [
@@ -1192,9 +1189,12 @@ show_client_conf_legacy(){
     },
     {
       "type": "vmess", "tag": "vmess-sb", "server": "$host", "server_port": $port_vm,
-      "uuid": "$uuid", "security": "auto",
-      "tls": { "enabled": true, "server_name": "$domain", "insecure": false },
-      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": "$domain" } }
+      "uuid": "$uuid", "security": "auto", "packet_encoding": "packetaddr",
+      "tls": {
+        "enabled": true, "server_name": "$domain", "insecure": false,
+        "utls": { "enabled": true, "fingerprint": "firefox" }
+      },
+      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": ["$domain"] } }
     },
     {
       "type": "hysteria2", "tag": "hy2-sb", "server": "$host", "server_port": $port_hy,
@@ -1204,37 +1204,41 @@ show_client_conf_legacy(){
     {
       "type": "tuic", "tag": "tuic5-sb", "server": "$host", "server_port": $port_tu,
       "uuid": "$uuid", "password": "$uuid", "congestion_control": "bbr", "udp_relay_mode": "native",
+      "udp_over_stream": false, "zero_rtt_handshake": false, "heartbeat": "10s",
       "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "alpn": ["h3"] }
     },
     { "tag": "direct", "type": "direct" },
-    { "tag": "block", "type": "block" },
-    { "tag": "dns", "type": "dns" },
     {
       "tag": "auto", "type": "urltest",
       "outbounds": ["vless-sb", "vmess-sb", "hy2-sb", "tuic5-sb"],
-      "url": "https://www.gstatic.com/generate_204", "interval": "1m", "tolerance": 50
+      "url": "https://www.gstatic.com/generate_204", "interval": "1m", "tolerance": 50,
+      "interrupt_exist_connections": false
     }
   ],
   "route": {
-    "geoip": { "download_url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.db", "download_detour": "select" },
-    "geosite": { "download_url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.db", "download_detour": "select" },
+    "rule_set": [
+      { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geoip-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs", "download_detour": "select", "update_interval": "1d" }
+    ],
     "auto_detect_interface": true,
     "final": "select",
     "rules": [
-      { "protocol": "dns", "outbound": "dns" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "inbound": "tun-in", "action": "sniff" },
       { "ip_is_private": true, "outbound": "direct" },
       { "clash_mode": "Direct", "outbound": "direct" },
       { "clash_mode": "Global", "outbound": "select" },
-      { "geoip": "cn", "outbound": "direct" },
-      { "geosite": "cn", "outbound": "direct" },
-      { "geosite": "geolocation-!cn", "outbound": "select" }
+      { "rule_set": "geoip-cn", "outbound": "direct" },
+      { "rule_set": "geosite-cn", "outbound": "direct" },
+      { "rule_set": "geosite-geolocation-!cn", "outbound": "select" }
     ]
   }
 }
 EOF
     echo
-    yellow "📌 適用於: Sing-box 1.10.x, 1.11.x (Android SFA, iOS SFI 舊版本)"
-    yellow "📌 將以上 JSON 保存為 client.json，以 root 運行 tun 模式即可"
+    yellow "📌 適用於: iOS Sing-box (SFI) 1.11.x 版本"
+    yellow "📌 將以上 JSON 保存為配置文件，導入到 SFI 即可使用"
 }
 
 # 卸载
