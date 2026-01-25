@@ -34,6 +34,27 @@ else
     red "脚本仅支持 Ubuntu 系统。" && exit
 fi
 
+# 检查 systemd 是否存在
+if ! command -v systemctl >/dev/null 2>&1; then
+    red "错误：当前系统未检测到 systemd。"
+    red "本脚本严重依赖 systemd 管理服务，无法繼續。"
+    exit 1
+fi
+
+# 安全的 UFW 放行函數 (處理 comment 兼容性)
+ufw_allow(){
+    local port="$1" proto="$2" comment="$3"
+    if [[ -z "$comment" ]]; then
+        ufw allow "${port}/${proto}" >/dev/null 2>&1
+    else
+        # 嘗試帶 comment 添加
+        if ! ufw allow "${port}/${proto}" comment "${comment}" >/dev/null 2>&1; then
+             # fallback: 不帶 comment
+             ufw allow "${port}/${proto}" >/dev/null 2>&1
+        fi
+    fi
+}
+
 export sbfiles="/etc/s-box/sb.json"
 case $(uname -m) in
     armv7l) cpu=armv7;;
@@ -43,14 +64,26 @@ case $(uname -m) in
 esac
 
 hostname=$(hostname)
-reality_sni="www.apple.com"  # VLESS-Reality 默认伪装域名，可按需修改
+# VLESS-Reality 伪装域名，可通过环境变量 REALITY_SNI 覆盖
+reality_sni="${REALITY_SNI:-www.apple.com}"
 
 # 1. 自动开启 BBR (无需交互)
 enable_bbr(){
-    if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
-        green "正在自动开启 BBR 加速..."
+    local needs_update=false
+    
+    # 检查是否已配置 fq 和 bbr
+    if ! grep -q "net.core.default_qdisc = fq" /etc/sysctl.conf; then
         echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+        needs_update=true
+    fi
+    
+    if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
         echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+        needs_update=true
+    fi
+    
+    if [[ "$needs_update" == "true" ]]; then
+        green "正在自动开启 BBR 加速..."
         sysctl -p >/dev/null 2>&1
     fi
 }
@@ -84,10 +117,26 @@ EOF
     fi
 }
 
-# 获取 IP
+# 获取 IP (带缓存，避免重复请求)
+_v4_cache=""
+_v6_cache=""
 v4v6(){
-    v4=$(curl -s4m5 icanhazip.com -k)
-    v6=$(curl -s6m5 icanhazip.com -k)
+    # 如果已缓存且非强制刷新，直接使用
+    if [[ -z "$_v4_cache" ]]; then
+        _v4_cache=$(curl -s4m5 icanhazip.com -k 2>/dev/null || echo "")
+    fi
+    if [[ -z "$_v6_cache" ]]; then
+        _v6_cache=$(curl -s6m5 icanhazip.com -k 2>/dev/null || echo "")
+    fi
+    v4="$_v4_cache"
+    v6="$_v6_cache"
+}
+
+# 强制刷新 IP 缓存
+v4v6_refresh(){
+    _v4_cache=""
+    _v6_cache=""
+    v4v6
 }
 
 # 安装 Sing-box 核心
@@ -95,11 +144,25 @@ inssb(){
     green "下载并安装 Sing-box 内核..."
     mkdir -p /etc/s-box
 
-    # 从 GitHub 官方 API 获取最新版本号 (tag_name 形如 v1.13.0)
-    sbcore=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')
-    if [[ -z "$sbcore" ]]; then
-        red "无法从 GitHub API 获取 sing-box 最新版本号，请检查网络或稍后重试。"
-        exit 1
+    # 支持环境变量指定版本，否则从 GitHub API 获取最新版本
+    if [[ -n "${SB_VERSION:-}" ]]; then
+        sbcore="$SB_VERSION"
+        green "使用指定版本: $sbcore"
+    else
+        # 从 GitHub 官方 API 获取最新版本号 (tag_name 形如 v1.13.0)
+        sbcore=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
+        
+        # API fallback: 如果 API 失败（rate limit 等），尝试从 releases 页面抓取
+        if [[ -z "$sbcore" ]]; then
+            yellow "GitHub API 获取失败，尝试 fallback..."
+            sbcore=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null | grep -oP 'releases/tag/v\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        fi
+        
+        if [[ -z "$sbcore" ]]; then
+            red "无法获取 sing-box 最新版本号。"
+            red "可尝试：export SB_VERSION=1.11.0 后重新运行脚本指定版本。"
+            exit 1
+        fi
     fi
 
     sbname="sing-box-$sbcore-linux-$cpu"
@@ -111,7 +174,17 @@ inssb(){
         exit 1
     }
 
-    # 解压并校验
+    # ========== 供应链安全校验 ==========
+    # 1. 检查文件类型是否为 gzip
+    local file_type=$(file -b /etc/s-box/sing-box.tar.gz 2>/dev/null)
+    if ! echo "$file_type" | grep -qi "gzip\|tar"; then
+        red "下载的文件不是有效的 tar.gz 格式（可能被劫持或返回了 HTML 错误页）"
+        red "文件类型: $file_type"
+        rm -f /etc/s-box/sing-box.tar.gz
+        exit 1
+    fi
+
+    # 2. 解压并校验
     tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box 2>/dev/null || {
         red "解压 sing-box.tar.gz 失败，文件可能损坏。"
         rm -f /etc/s-box/sing-box.tar.gz
@@ -127,7 +200,15 @@ inssb(){
     rm -rf "/etc/s-box/${sbname}" /etc/s-box/sing-box.tar.gz
     chown root:root /etc/s-box/sing-box
     chmod +x /etc/s-box/sing-box
-    green "Sing-box 内核安装完成。"
+    
+    # 3. Sanity check: 验证二进制是否可执行并返回版本
+    local installed_ver=$(/etc/s-box/sing-box version 2>/dev/null | head -1 | awk '{print $NF}')
+    if [[ -z "$installed_ver" ]]; then
+        red "sing-box 二进制无法执行，可能已损坏或不匹配当前架构。"
+        rm -f /etc/s-box/sing-box
+        exit 1
+    fi
+    green "Sing-box 内核安装完成，版本: $installed_ver"
 }
 
 # 随机端口生成
@@ -165,10 +246,25 @@ apply_acme(){
 
     mkdir -p /etc/s-box
 
-    # 安装/更新 acme.sh
+    # 安装/更新 acme.sh（带安全验证）
     green "安装/更新 acme.sh..."
     if [[ ! -x /root/.acme.sh/acme.sh ]]; then
-        curl https://get.acme.sh | sh
+        # 下載到臨時文件，驗證後再執行
+        curl -fsSL -o /tmp/acme_install.sh https://get.acme.sh || {
+            red "下載 acme.sh 安裝腳本失敗"
+            exit 1
+        }
+        
+        # 驗證是 shell 腳本而非 HTML
+        local acme_type=$(file -b /tmp/acme_install.sh 2>/dev/null)
+        if ! echo "$acme_type" | grep -qi "shell\|script\|text\|ASCII"; then
+            red "acme.sh 安裝腳本下載異常（非腳本文件）"
+            rm -f /tmp/acme_install.sh
+            exit 1
+        fi
+        
+        sh /tmp/acme_install.sh
+        rm -f /tmp/acme_install.sh
     fi
 
     # 优先选择 Let's Encrypt 作为默认 CA，避免 ZeroSSL 需要 EAB 的问题
@@ -199,33 +295,55 @@ apply_acme(){
     if acme_install_existing "$domain_name"; then
         green "检测到 acme.sh 已存在证书，已直接安装到 /etc/s-box（无需重新签发）。"
     else
-        # 2) 若不存在，则需要 Standalone 验证：此时才检查 80 端口占用。
-        if ss -tulnp 2>/dev/null | awk '{print $5}' | grep -qE '(:|])80$'; then
-            red "检测到 80 端口已被其他进程占用，Standalone 申请证书需要临时占用 80。"
-            red "请先停止现有 Web 服务 (如 nginx/apache/caddy) 后再运行本脚本，或确保该域名证书已在 acme.sh 中存在。"
-            exit 1
+        # 2) 若不存在，则需要申请证书
+        local acme_mode="standalone"
+        
+        # 檢查 80 端口占用情況
+        local port80_pid=$(ss -tulnp 2>/dev/null | grep -E '(:|])80[[:space:]]' | awk '{print $NF}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1)
+        
+        if [[ -n "$port80_pid" ]]; then
+            local p_name=$(ps -p "$port80_pid" -o comm= 2>/dev/null)
+            yellow "檢測到 80 端口已被進程 [${p_name:-未知}] (PID: $port80_pid) 占用。"
+            
+            if [[ "$p_name" == "nginx" ]]; then
+                yellow "識別到 Nginx 正在運行。"
+                readp "   是否嘗試使用 --nginx 模式申請證書？(無需停止服務) [Y/n]: " nginx_choice
+                if [[ "${nginx_choice:-y}" =~ ^[Yy]$ ]]; then
+                    acme_mode="nginx"
+                else
+                    red "Standalone 模式需要 80 端口空閒。請手動停止 Nginx 後重試。"
+                    exit 1
+                fi
+            else
+                red "Standalone 模式需要占用 80 端口。請先停止該服務 (service $p_name stop)。"
+                exit 1
+            fi
         fi
 
-        # 临时开放 80 端口用于 ACME 验证（若启用了 UFW）
-        ufw allow 80/tcp >/dev/null 2>&1 || true
-
-        green "正在申请证书 (Stand-alone 模式，CA: Let's Encrypt)..."
+        green "正在申请证书 (模式: $acme_mode, CA: Let's Encrypt)..."
         /root/.acme.sh/acme.sh --register-account -m "admin@$domain_name" --server letsencrypt >/dev/null 2>&1 || true
 
-        # 使用 ECC 证书（ec-256）。注意：acme.sh 可能在“Domains not changed / Skipping”时返回非 0。
-        /root/.acme.sh/acme.sh --issue -d "$domain_name" --standalone -k ec-256 --server letsencrypt
-        issue_rc=$?
+        local issue_cmd="/root/.acme.sh/acme.sh --issue -d $domain_name -k ec-256 --server letsencrypt"
+        
+        if [[ "$acme_mode" == "standalone" ]]; then
+            # 临时开放 80 端口用于 ACME 验证（若启用了 UFW）
+            ufw allow 80/tcp >/dev/null 2>&1 || true
+            $issue_cmd --standalone
+            local issue_rc=$?
+        elif [[ "$acme_mode" == "nginx" ]]; then
+            $issue_cmd --nginx
+            local issue_rc=$?
+        fi
 
         if [[ $issue_rc -ne 0 ]]; then
-            # 这里不立刻判失败：只要证书确实存在，就继续安装。
             if acme_install_existing "$domain_name"; then
-                yellow "acme.sh --issue 返回非 0（可能是 Skipping/未到续期时间），但证书已存在，继续安装。"
+                yellow "acme.sh --issue 返回非 0，但证书已存在，继续安装。"
             else
-                red "证书申请失败！请检查域名解析是否正确、80 端口是否可被外网访问、以及防火墙/云厂商安全组。"
+                red "证书申请失败！请检查域名解析、80 端口开放情况及防火墙。"
+                [[ "$acme_mode" == "nginx" ]] && red "Nginx 模式失敗：請確認 Nginx 配置正確且監聽 80 端口。"
                 exit 1
             fi
         else
-            # issue 成功后再安装到 /etc/s-box
             if ! acme_install_existing "$domain_name"; then
                 red "证书安装失败！(acme.sh 已签发但 installcert 失败)" && exit 1
             fi
@@ -236,6 +354,32 @@ apply_acme(){
     if [[ ! -s /etc/s-box/cert.crt || ! -s /etc/s-box/private.key ]]; then
         red "证书安装失败！未找到 /etc/s-box/cert.crt 或 /etc/s-box/private.key" && exit 1
     fi
+    
+    # 收紧私钥权限
+    chmod 600 /etc/s-box/private.key
+    
+    # 輸出證書類型與校驗域名
+    local cert_type="Unknown"
+    local cert_expiry=""
+    if command -v openssl >/dev/null 2>&1; then
+        local key_algo=$(openssl x509 -in /etc/s-box/cert.crt -noout -text 2>/dev/null | grep -i "Public Key Algorithm" | head -1)
+        if echo "$key_algo" | grep -qi "ec\|ecdsa"; then
+            cert_type="ECC (ECDSA)"
+        elif echo "$key_algo" | grep -qi "rsa"; then
+            cert_type="RSA"
+        fi
+        cert_expiry=$(openssl x509 -in /etc/s-box/cert.crt -noout -enddate 2>/dev/null | cut -d= -f2)
+        
+        # 校验 SAN 是否包含域名
+        if ! openssl x509 -in /etc/s-box/cert.crt -noout -text | grep -A1 "Subject Alternative Name" | grep -q "$domain_name"; then
+            red "⚠️ 严重警告：证书 Subject Alternative Name (SAN) 不包含域名 $domain_name"
+            red "这可能导致客户端 TLS 握手失败（域名不匹配）。请检查证书源。"
+        else
+            green "✅ 证书域名匹配校验通过 ($domain_name)"
+        fi
+    fi
+    green "證書類型: ${yellow}${cert_type}${plain}"
+    [[ -n "$cert_expiry" ]] && green "證書到期: ${yellow}${cert_expiry}${plain}"
 
     # 确保已安装自动续期计划任务
     /root/.acme.sh/acme.sh --install-cronjob >/dev/null 2>&1 || true
@@ -254,38 +398,156 @@ ensure_domain_and_cert(){
     fi
 }
 
-# 3. 配置防火墙 (只开必要端口)
+# 3. 配置防火墙 (安全模式：只添加必要端口)
 setup_firewall(){
-    green "正在配置防火墙 (UFW)..."
+    green "正在配置防火墙 (UFW - 安全模式)..."
     
-    # 尝试检测 SSH 端口 (优先从 sshd -T 获取，兼容 /etc/ssh/sshd_config.d/)
-    if command -v sshd >/dev/null 2>&1; then
+    # ========== 端口保留功能（預設關閉，避免意外暴露內部服務）==========
+    # 可通過 PRESERVE_EXISTING_PORTS=1 環境變量啟用
+    local preserve_tcp_ports=()
+    local preserve_udp_ports=()
+    
+    if [[ "${PRESERVE_EXISTING_PORTS:-0}" == "1" ]]; then
+        yellow "⚠️  PRESERVE_EXISTING_PORTS=1 已啟用，將保留現有監聽端口"
+        yellow "⚠️  警告：這可能會暴露內部服務（如 Redis/MongoDB），請確認風險！"
+        
+        local existing_tcp_ports=$(ss -tlnp 2>/dev/null | awk 'NR>1 {print $4}' | grep -oE '[0-9]+$' | sort -u)
+        local existing_udp_ports=$(ss -ulnp 2>/dev/null | awk 'NR>1 {print $4}' | grep -oE '[0-9]+$' | sort -u)
+        
+        for port in $existing_tcp_ports; do
+            # 排除本腳本即將使用的端口
+            if [[ "$port" != "$port_vl_re" && "$port" != "$port_vm_ws" ]]; then
+                preserve_tcp_ports+=("$port")
+            fi
+        done
+        
+        for port in $existing_udp_ports; do
+            if [[ "$port" != "$port_hy2" && "$port" != "$port_tu" ]]; then
+                preserve_udp_ports+=("$port")
+            fi
+        done
+        
+        # 顯示檢測到的端口
+        if [[ ${#preserve_tcp_ports[@]} -gt 0 || ${#preserve_udp_ports[@]} -gt 0 ]]; then
+            yellow "檢測到以下正在使用的端口，將予以保留："
+            [[ ${#preserve_tcp_ports[@]} -gt 0 ]] && echo -e "  TCP: ${preserve_tcp_ports[*]}"
+            [[ ${#preserve_udp_ports[@]} -gt 0 ]] && echo -e "  UDP: ${preserve_udp_ports[*]}"
+        fi
+    fi
+    
+    # ========== 第二步：檢測 SSH 端口（使用最可靠的方法）==========
+    local ssh_port=""
+    
+    # 方法 0（最穩）：從當前 SSH 會話反推端口
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        ssh_port=$(echo "$SSH_CONNECTION" | awk '{print $4}' 2>/dev/null)
+        if [[ -n "$ssh_port" ]]; then
+            green "從當前 SSH 會話檢測到端口: $ssh_port"
+        fi
+    fi
+    
+    # 方法 1：從 ss 獲取 sshd 實際監聽端口
+    if [[ -z "$ssh_port" ]]; then
+        ssh_port=$(ss -tlnp 2>/dev/null | grep -E 'sshd|"ssh"' | awk '{print $4}' | grep -oE '[0-9]+$' | head -1)
+    fi
+    
+    # 方法 2：sshd -T（可能受 Include 影響）
+    if [[ -z "$ssh_port" ]] && command -v sshd >/dev/null 2>&1; then
         ssh_port=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')
     fi
+    
+    # 方法 3：從配置文件讀取
     if [[ -z "$ssh_port" ]]; then
         ssh_port=$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | tail -n 1 | awk '{print $2}')
     fi
+    
+    # 預設值
     if [[ -z "$ssh_port" ]]; then
         ssh_port=22
+        yellow "無法自動檢測 SSH 端口，使用預設值 22"
     fi
     
-    # 重置 ufw
-    echo "y" | ufw reset >/dev/null 2>&1
-    ufw default deny incoming
-    ufw default allow outgoing
+    # 顯示檢測結果供用戶確認
+    green "將放行 SSH 端口: $ssh_port"
     
-    # 放行必要端口
-    ufw allow "$ssh_port"/tcp comment "SSH"
-    ufw allow 80/tcp comment "ACME"
-    ufw allow 443/tcp comment "HTTPS"
-    ufw allow "$port_vl_re"/tcp comment "Vless"
-    ufw allow "$port_vm_ws"/tcp comment "Vmess"
-    ufw allow "$port_hy2"/udp comment "Hysteria2"
-    ufw allow "$port_tu"/udp comment "Tuic5"
+    # ========== 第三步：檢查 UFW 狀態並決定策略 ==========
+    local ufw_status=$(ufw status 2>/dev/null | head -1)
     
-    # 启用 ufw
-    echo "y" | ufw enable
-    green "防火墙已开启，仅放行 SSH($ssh_port) 和代理端口。"
+    if echo "$ufw_status" | grep -qi "inactive"; then
+        # UFW 未啟用，首次設置
+        green "UFW 未啟用，進行首次安全配置..."
+        ufw default deny incoming >/dev/null 2>&1
+        ufw default allow outgoing >/dev/null 2>&1
+    else
+        # UFW 已啟用，增量添加規則
+        green "UFW 已啟用，採用增量模式（保留現有規則）..."
+    fi
+    
+    # ========== 第四步：添加必要端口（不會重複添加） ==========
+    # SSH 端口（最重要，首先確保）
+    ufw_allow "$ssh_port" tcp "SSH"
+    
+    # 保留現有 TCP 端口
+    for port in "${preserve_tcp_ports[@]}"; do
+        [[ -n "$port" ]] && ufw_allow "$port" tcp "Preserved"
+    done
+    
+    # 保留現有 UDP 端口
+    for port in "${preserve_udp_ports[@]}"; do
+        [[ -n "$port" ]] && ufw_allow "$port" udp "Preserved"
+    done
+    
+    # Sing-box 代理端口
+    ufw_allow 80 tcp "ACME"
+    ufw_allow 443 tcp "HTTPS"
+    ufw_allow "$port_vl_re" tcp "VLESS-Reality"
+    ufw_allow "$port_vm_ws" tcp "VMess-WS"
+    ufw_allow "$port_hy2" udp "Hysteria2"
+    ufw_allow "$port_tu" udp "TUIC5"
+    
+    # ========== 第五步：詢問是否啟用 UFW ==========
+    local ufw_was_inactive=false
+    if echo "$ufw_status" | grep -qi "inactive"; then
+        ufw_was_inactive=true
+    fi
+    
+    # 記錄本腳本添加的端口，供卸載時清理
+    cat > /etc/s-box/firewall_ports.log <<EOF
+# 本腳本添加的防火牆端口（卸載時自動清理）
+SSH_PORT=$ssh_port
+VLESS_PORT=$port_vl_re
+VMESS_PORT=$port_vm_ws
+HY2_PORT=$port_hy2
+TUIC_PORT=$port_tu
+EOF
+    
+    if [[ "$ufw_was_inactive" == "true" ]]; then
+        yellow "╔═══════════════════════════════════════════════════════════════════╗"
+        yellow "║  ⚠️  UFW 防火牆目前未啟用                                         ║"
+        yellow "║  啟用後將會阻止所有未明確放行的入站連接                           ║"
+        yellow "║  請確認雲廠商安全組已放行相應端口！                               ║"
+        yellow "╚═══════════════════════════════════════════════════════════════════╝"
+        echo
+        readp "   是否啟用 UFW 防火牆？[y/N]: " enable_ufw_choice
+        if [[ "$enable_ufw_choice" =~ ^[Yy]$ ]]; then
+            echo "y" | ufw enable >/dev/null 2>&1
+            green "UFW 已啟用。"
+        else
+            yellow "已跳過 UFW 啟用。端口規則已添加，UFW 啟用後將生效。"
+            yellow "手動啟用: ufw enable"
+        fi
+    else
+        green "UFW 已是啟用狀態，規則已添加。"
+    fi
+    
+    green "防火墙配置完成！"
+    echo -e "  SSH端口: ${yellow}$ssh_port${plain}"
+    echo -e "  VLESS-Reality: ${yellow}$port_vl_re/tcp${plain}"
+    echo -e "  VMess-WS: ${yellow}$port_vm_ws/tcp${plain}"
+    echo -e "  Hysteria2: ${yellow}$port_hy2/udp${plain}"
+    echo -e "  TUIC5: ${yellow}$port_tu/udp${plain}"
+    [[ ${#preserve_tcp_ports[@]} -gt 0 ]] && echo -e "  保留的TCP端口: ${yellow}${preserve_tcp_ports[*]}${plain}"
+    [[ ${#preserve_udp_ports[@]} -gt 0 ]] && echo -e "  保留的UDP端口: ${yellow}${preserve_udp_ports[*]}${plain}"
 }
 
 # 生成配置
@@ -297,9 +559,25 @@ gen_config(){
     short_id=$(/etc/s-box/sing-box generate rand --hex 4)
     echo "$public_key_reality" > /etc/s-box/public.key
 
-    # 下载 geo 库
-    wget -q -O /root/geoip.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.db
-    wget -q -O /root/geosite.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.db
+    # GeoIP/GeoSite 資料庫下載（預設關閉，因為服務端配置未啟用分流）
+    # 可通過 DOWNLOAD_GEO_DB=1 環境變量啟用
+    if [[ "${DOWNLOAD_GEO_DB:-0}" == "1" ]]; then
+        green "下载 GeoIP/GeoSite 数据库..."
+        local geo_primary="https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest"
+        local geo_fallback="https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release"
+        
+        # GeoIP
+        wget -q -O /root/geoip.db "${geo_primary}/geoip.db" 2>/dev/null
+        if [[ ! -s /root/geoip.db ]]; then
+            wget -q -O /root/geoip.db "${geo_fallback}/geoip.db" 2>/dev/null
+        fi
+        
+        # GeoSite
+        wget -q -O /root/geosite.db "${geo_primary}/geosite.db" 2>/dev/null
+        if [[ ! -s /root/geosite.db ]]; then
+            wget -q -O /root/geosite.db "${geo_fallback}/geosite.db" 2>/dev/null
+        fi
+    fi
 
     # IP 策略
     v4v6
@@ -383,8 +661,7 @@ cat > /etc/s-box/sb.json <<EOF
     }
   ],
   "outbounds": [
-    { "type": "direct", "tag": "direct", "domain_strategy": "${ipv}" },
-    { "type": "block", "tag": "block" }
+    { "type": "direct", "tag": "direct", "domain_strategy": "${ipv}" }
   ]
 }
 EOF
@@ -400,6 +677,7 @@ User=root
 WorkingDirectory=/root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStartPre=/etc/s-box/sing-box check -c /etc/s-box/sb.json
 ExecStart=/etc/s-box/sing-box run -c /etc/s-box/sb.json
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
@@ -414,6 +692,47 @@ EOF
     systemctl restart sing-box
 }
 
+
+# 安裝後自檢
+post_install_check(){
+    green "正在進行安裝後自檢..."
+    if systemctl is-active --quiet sing-box; then
+        green "✅ sing-box 服務已運行"
+    else
+        red "❌ sing-box 服務未運行"
+        systemctl status sing-box --no-pager -n 10
+    fi
+
+    # 端口監聽檢查
+    green "檢查端口監聽狀態..."
+    local ports=("$port_vl_re/tcp" "$port_vm_ws/tcp" "$port_hy2/udp" "$port_tu/udp")
+    for p in "${ports[@]}"; do
+        local port="${p%/*}"
+        local proto="${p#*/}"
+        if [[ "$proto" == "tcp" ]]; then
+            if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+                green "✅ TCP $port 正在監聽"
+            else
+                yellow "⚠️ TCP $port 未監聽 (可能是服務啟動延遲或配置錯誤)"
+            fi
+        else
+            if ss -ulnp 2>/dev/null | grep -q ":${port} "; then
+                green "✅ UDP $port 正在監聽"
+            else
+                yellow "⚠️ UDP $port 未監聽 (可能是 UDP 綁定失敗)"
+            fi
+        fi
+    done
+
+    # 配置檢查
+    green "驗證配置文件語法..."
+    if /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then
+        green "✅ 配置文件校驗通過"
+    else
+        red "❌ 配置文件校驗失敗"
+        /etc/s-box/sing-box check -c /etc/s-box/sb.json
+    fi
+}
 view_log(){
     if command -v journalctl >/dev/null 2>&1; then
         green "最近 100 行 sing-box 运行日志："
@@ -451,8 +770,39 @@ update_core(){
 # 4. 更新与快捷方式
 lnsb(){
     rm -rf /usr/bin/sb
-    curl -L -o /usr/bin/sb -# --retry 2 --insecure "${UPDATE_URL}"
+    
+    # 下载更新（不使用 --insecure，程序文件必须 TLS 验证）
+    curl -fsSL -o /tmp/sb_update.sh --retry 2 "${UPDATE_URL}" || {
+        red "下载更新失败，请检查网络或 GitHub 访问。"
+        return 1
+    }
+    
+    # 验证下载的是脚本而不是 HTML 错误页
+    local file_type=$(file -b /tmp/sb_update.sh 2>/dev/null)
+    if ! echo "$file_type" | grep -qi "shell\|script\|text\|ASCII"; then
+        red "下载的文件不是有效的 shell 脚本（可能被劫持或返回了 HTML）"
+        red "文件类型: $file_type"
+        rm -f /tmp/sb_update.sh
+        return 1
+    fi
+    
+    # 基本语法检查
+    if ! bash -n /tmp/sb_update.sh 2>/dev/null; then
+        red "下载的脚本语法错误，拒绝更新。"
+        rm -f /tmp/sb_update.sh
+        return 1
+    fi
+    
+    # 內容完整性校驗（防止被中間人篡改內容但保留腳本格式）
+    if ! grep -q "Sing-Box 四協議一鍵安裝腳本" /tmp/sb_update.sh; then
+        red "更新脚本校验失败：未檢測到預期標識，可能被篡改或下載不完整。"
+        rm -f /tmp/sb_update.sh
+        return 1
+    fi
+    
+    mv /tmp/sb_update.sh /usr/bin/sb
     chmod +x /usr/bin/sb
+    green "脚本更新成功。"
 }
 
 # 安装流程
@@ -471,11 +821,25 @@ install_singbox(){
     gen_config
     sbservice
     
-    # 注册 cron 保活
-    (crontab -l 2>/dev/null; echo "0 1 * * * systemctl restart sing-box") | crontab -
+    # 不再自动注册每日重启 cron (会导致用户断流)
+    # 如需自动重启，可手动添加: (crontab -l; echo "0 4 * * * systemctl restart sing-box") | crontab -
     
     lnsb
     green "安装完成！"
+    
+    # 進行安裝後自檢
+    post_install_check
+    
+    # 3. 如果使用了 Nginx 模式，或者檢測到 Nginx 運行，提示重載
+    if pgrep -x "nginx" >/dev/null; then
+        yellow "檢測到 Nginx 正在運行。"
+        readp "   是否重載 Nginx 以應用新證書？[Y/n]: " nginx_reload
+        if [[ "${nginx_reload:-y}" =~ ^[Yy]$ ]]; then
+            systemctl reload nginx 2>/dev/null || service nginx reload 2>/dev/null
+            green "Nginx 已重載。"
+        fi
+    fi
+
     sbshare
 }
 
@@ -484,20 +848,23 @@ sbshare(){
     # 确保每次调用都重新拿到当前 IP
     v4v6
 
-    domain=$(cat /etc/s-box/domain.log 2>/dev/null)
-    uuid=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].users[0].uuid')
+    domain=$(cat /etc/s-box/domain.log 2>/dev/null | head -n1 | tr -d '\r\n ')
+    
+    # 直接使用 jq 读取配置，无需 sed 处理（sb.json 不含行注释）
+    uuid=$(jq -r '.inbounds[0].users[0].uuid' /etc/s-box/sb.json 2>/dev/null)
     
     # 端口读取
-    port_vl=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].listen_port')
-    port_vm=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')
-    port_hy=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[2].listen_port')
-    port_tu=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[3].listen_port')
+    port_vl=$(jq -r '.inbounds[0].listen_port' /etc/s-box/sb.json 2>/dev/null)
+    port_vm=$(jq -r '.inbounds[1].listen_port' /etc/s-box/sb.json 2>/dev/null)
+    port_hy=$(jq -r '.inbounds[2].listen_port' /etc/s-box/sb.json 2>/dev/null)
+    port_tu=$(jq -r '.inbounds[3].listen_port' /etc/s-box/sb.json 2>/dev/null)
     
-    pk=$(cat /etc/s-box/public.key)
-    sid=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].tls.reality.short_id[0]')
-    vm_path=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')
-    # 从 sb.json 中读取 Reality 伪装域名，用于生成 VLESS 链接的 sni 参数
-    reality_sni_share=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].tls.reality.handshake.server // .inbounds[0].tls.server_name // empty')
+    pk=$(cat /etc/s-box/public.key 2>/dev/null)
+    sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/s-box/sb.json 2>/dev/null)
+    # 从服务端配置读取 VMess WS 路径，确保客户端一致
+    vm_path=$(jq -r '.inbounds[1].transport.path' /etc/s-box/sb.json 2>/dev/null)
+    # 从 sb.json 中读取 Reality 伪装域名
+    reality_sni_share=$(jq -r '.inbounds[0].tls.reality.handshake.server // .inbounds[0].tls.server_name // empty' /etc/s-box/sb.json 2>/dev/null)
     if [[ -z "$reality_sni_share" ]]; then
         reality_sni_share="$reality_sni"
     fi
@@ -510,7 +877,24 @@ sbshare(){
 
     # 生成链接
     vl_link="vless://$uuid@$host:$port_vl?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reality_sni_share&fp=chrome&pbk=$pk&sid=$sid&type=tcp&headerType=none#VL-$hostname"
-    vm_link="vmess://$(echo -n "{\"add\":\"$host\",\"aid\":\"0\",\"host\":\"$domain\",\"id\":\"$uuid\",\"net\":\"ws\",\"path\":\"$vm_path\",\"port\":\"$port_vm\",\"ps\":\"VM-$hostname\",\"tls\":\"tls\",\"sni\":\"$domain\",\"type\":\"none\",\"v\":\"2\"}" | base64 -w 0)"
+    
+    # 使用 jq 安全構建 VMess JSON
+    vm_json=$(jq -n \
+        --arg add "$host" \
+        --arg aid "0" \
+        --arg host "$domain" \
+        --arg id "$uuid" \
+        --arg net "ws" \
+        --arg path "$vm_path" \
+        --arg port "$port_vm" \
+        --arg ps "VM-$hostname" \
+        --arg tls "tls" \
+        --arg sni "$domain" \
+        --arg type "none" \
+        --arg v "2" \
+        '{add:$add, aid:$aid, host:$host, id:$id, net:$net, path:$path, port:$port, ps:$ps, tls:$tls, sni:$sni, type:$type, v:$v}')
+    vm_link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
+    
     hy_link="hysteria2://$uuid@$host:$port_hy?security=tls&alpn=h3&insecure=0&sni=$domain#HY2-$hostname"
     tu_link="tuic://$uuid:$uuid@$host:$port_tu?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$domain&allow_insecure=0#TU5-$hostname"
     
@@ -552,308 +936,298 @@ client_conf(){
         return
     fi
 
-    uuid=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].users[0].uuid')
-    port_vl=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].listen_port')
-    port_vm=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')
-    port_hy=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[2].listen_port')
-    port_tu=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[3].listen_port')
+    # 直接使用 jq 读取配置（sb.json 不含行注释，无需 sed 处理）
+    uuid=$(jq -r '.inbounds[0].users[0].uuid' /etc/s-box/sb.json 2>/dev/null)
+    port_vl=$(jq -r '.inbounds[0].listen_port' /etc/s-box/sb.json 2>/dev/null)
+    port_vm=$(jq -r '.inbounds[1].listen_port' /etc/s-box/sb.json 2>/dev/null)
+    port_hy=$(jq -r '.inbounds[2].listen_port' /etc/s-box/sb.json 2>/dev/null)
+    port_tu=$(jq -r '.inbounds[3].listen_port' /etc/s-box/sb.json 2>/dev/null)
     pk=$(cat /etc/s-box/public.key 2>/dev/null)
-    sid=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].tls.reality.short_id[0]')
+    sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/s-box/sb.json 2>/dev/null)
+    # 从服务端读取 VMess WS 路径，确保客户端配置一致
+    vm_path=$(jq -r '.inbounds[1].transport.path' /etc/s-box/sb.json 2>/dev/null)
 
-    # 优先从 sb.json 中读取 Reality 的伪装域名 (handshake.server 或 tls.server_name)
-    reality_sni_client=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].tls.reality.handshake.server // .inbounds[0].tls.server_name // empty')
+    reality_sni_client=$(jq -r '.inbounds[0].tls.reality.handshake.server // .inbounds[0].tls.server_name // empty' /etc/s-box/sb.json 2>/dev/null)
     if [[ -z "$reality_sni_client" ]]; then
         reality_sni_client="$reality_sni"
     fi
 
-    if [[ -z "$uuid" || -z "$port_vl" || -z "$port_vm" || -z "$port_hy" || -z "$port_tu" || -z "$pk" || -z "$sid" ]]; then
+    if [[ -z "$uuid" || -z "$port_vl" || -z "$port_vm" || -z "$port_hy" || -z "$port_tu" || -z "$pk" || -z "$sid" || -z "$vm_path" ]]; then
         red "从服务端配置中提取必要参数失败，请检查 /etc/s-box/sb.json。"
         return
     fi
 
-    # 获取当前服务器公网 IP，用于客户端直接连 IP；获取失败时退回域名
     v4v6
     host="$domain"
     if [[ -n "$v4" ]]; then
         host="$v4"
     fi
 
-    green "以下为基于当前服务端自动生成的 Sing-box 客户端配置 (tun 全局模式，最新版模板)："
+    # 顯示版本選擇菜單
+    echo
+    green "╔══════════════════════════════════════════════════════════════╗"
+    green "║          請選擇客戶端配置版本                                 ║"
+    green "╠══════════════════════════════════════════════════════════════╣"
+    yellow "║  [1] 🆕 1.12+ / 最新版 (推薦 - 使用 Rule Actions)            ║"
+    yellow "║  [2] 📦 1.10.x / 1.11.x 舊版 (傳統 Inbound Fields)           ║"
+    yellow "║  [0] ↩️  返回主菜單                                          ║"
+    green "╚══════════════════════════════════════════════════════════════╝"
+    echo
+    readp "   選擇版本 [0-2]: " ver_choice
+    
+    case "$ver_choice" in
+        1) show_client_conf_latest "$host" "$domain" "$uuid" "$port_vl" "$port_vm" "$port_hy" "$port_tu" "$pk" "$sid" "$reality_sni_client" "$vm_path";;
+        2) show_client_conf_legacy "$host" "$domain" "$uuid" "$port_vl" "$port_vm" "$port_hy" "$port_tu" "$pk" "$sid" "$reality_sni_client" "$vm_path";;
+        0|*) return;;
+    esac
+}
+
+# ==================== 1.12+ 最新版客戶端配置 ====================
+show_client_conf_latest(){
+    local host="$1" domain="$2" uuid="$3" port_vl="$4" port_vm="$5" port_hy="$6" port_tu="$7" pk="$8" sid="$9" reality_sni_client="${10}" vm_path="${11}"
+    
+    green "╔══════════════════════════════════════════════════════════════╗"
+    green "║  Sing-box 1.12+ / 最新版 客戶端配置 (tun 全局模式)           ║"
+    green "║  ✅ 使用 Rule Actions (新語法)                               ║"
+    green "╚══════════════════════════════════════════════════════════════╝"
     echo
     cat <<EOF
 {
-  "log": {
-    "disabled": false,
-    "level": "info",
-    "timestamp": true
-  },
+  "log": { "disabled": false, "level": "info", "timestamp": true },
   "experimental": {
-    "cache_file": {
-      "enabled": true,
-      "path": "cache.db",
-      "store_fakeip": true
+    "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "external_ui": "ui",
+      "secret": "",
+      "default_mode": "rule"
     }
   },
   "dns": {
     "servers": [
-      {
-        "tag": "proxydns",
-        "address": "tls://8.8.8.8/dns-query",
-        "detour": "select"
-      },
-      {
-        "tag": "localdns",
-        "address": "h3://223.5.5.5/dns-query",
-        "detour": "direct"
-      },
-      {
-        "tag": "dns_fakeip",
-        "address": "fakeip"
-      }
+      { "tag": "proxydns", "address": "tls://8.8.8.8", "detour": "select" },
+      { "tag": "localdns", "address": "https://223.5.5.5/dns-query", "detour": "direct" },
+      { "tag": "dns_fakeip", "address": "fakeip" }
     ],
     "rules": [
-      {
-        "clash_mode": "Global",
-        "server": "proxydns"
-      },
-      {
-        "clash_mode": "Direct",
-        "server": "localdns"
-      },
-      {
-        "rule_set": "geosite-cn",
-        "server": "localdns"
-      },
-      {
-        "rule_set": "geosite-geolocation-!cn",
-        "server": "proxydns"
-      },
-      {
-        "rule_set": "geosite-geolocation-!cn",
-        "query_type": [
-          "A",
-          "AAAA"
-        ],
-        "server": "dns_fakeip"
-      }
+      { "clash_mode": "Global", "server": "proxydns" },
+      { "clash_mode": "Direct", "server": "localdns" },
+      { "rule_set": "geosite-cn", "server": "localdns" },
+      { "rule_set": "geosite-geolocation-!cn", "server": "proxydns" },
+      { "rule_set": "geosite-geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" }
     ],
-    "fakeip": {
-      "enabled": true,
-      "inet4_range": "198.18.0.0/15",
-      "inet6_range": "fc00::/18"
-    },
-    "independent_cache": true,
+    "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" },
+    "independent_cache": false,
     "final": "proxydns"
   },
   "inbounds": [
     {
-      "type": "tun",
-      "tag": "tun-in",
-      "address": [
-        "172.19.0.1/30",
-        "fd00::1/126"
-      ],
-      "auto_route": true,
-      "strict_route": true,
-      "sniff": true,
-      "sniff_override_destination": true,
-      "domain_strategy": "prefer_ipv4"
+      "type": "tun", "tag": "tun-in",
+      "address": ["172.19.0.1/30", "fd00::1/126"],
+      "auto_route": true, "strict_route": true
     }
   ],
   "outbounds": [
+    { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "vless-sb", "vmess-sb", "hy2-sb", "tuic5-sb"] },
     {
-      "tag": "select",
-      "type": "selector",
-      "default": "auto",
-      "outbounds": [
-        "auto",
-        "vless-sb",
-        "vmess-sb",
-        "hy2-sb",
-        "tuic5-sb"
-      ]
-    },
-    {
-      "type": "vless",
-      "tag": "vless-sb",
-      "server": "$host",
-      "server_port": $port_vl,
-      "uuid": "$uuid",
-      "flow": "xtls-rprx-vision",
+      "type": "vless", "tag": "vless-sb", "server": "$host", "server_port": $port_vl,
+      "uuid": "$uuid", "flow": "xtls-rprx-vision",
       "tls": {
-        "enabled": true,
-        "server_name": "$reality_sni_client",
-        "utls": {
-          "enabled": true,
-          "fingerprint": "firefox"
-        },
-        "reality": {
-          "enabled": true,
-          "public_key": "$pk",
-          "short_id": "$sid"
-        }
+        "enabled": true, "server_name": "$reality_sni_client",
+        "utls": { "enabled": true, "fingerprint": "firefox" },
+        "reality": { "enabled": true, "public_key": "$pk", "short_id": "$sid" }
       }
     },
     {
-      "type": "vmess",
-      "tag": "vmess-sb",
-      "server": "$host",
-      "server_port": $port_vm,
-      "uuid": "$uuid",
-      "security": "auto",
-      "packet_encoding": "packetaddr",
-      "tls": {
-        "enabled": true,
-        "server_name": "$domain",
-        "insecure": false,
-        "utls": {
-          "enabled": true,
-          "fingerprint": "firefox"
-        }
-      },
-      "transport": {
-        "type": "ws",
-        "path": "/$uuid-vm",
-        "headers": {
-          "Host": [
-            "$domain"
-          ]
-        }
-      }
+      "type": "vmess", "tag": "vmess-sb", "server": "$host", "server_port": $port_vm,
+      "uuid": "$uuid", "security": "auto", "packet_encoding": "packetaddr",
+      "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "utls": { "enabled": true, "fingerprint": "firefox" } },
+      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": ["$domain"] } }
     },
     {
-      "type": "hysteria2",
-      "tag": "hy2-sb",
-      "server": "$host",
-      "server_port": $port_hy,
+      "type": "hysteria2", "tag": "hy2-sb", "server": "$host", "server_port": $port_hy,
       "password": "$uuid",
-      "tls": {
-        "enabled": true,
-        "server_name": "$domain",
-        "insecure": false,
-        "alpn": [
-          "h3"
-        ]
-      }
+      "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "alpn": ["h3"] }
     },
     {
-      "type": "tuic",
-      "tag": "tuic5-sb",
-      "server": "$host",
-      "server_port": $port_tu,
-      "uuid": "$uuid",
-      "password": "$uuid",
-      "congestion_control": "bbr",
-      "udp_relay_mode": "native",
-      "udp_over_stream": false,
-      "zero_rtt_handshake": false,
-      "heartbeat": "10s",
-      "tls": {
-        "enabled": true,
-        "server_name": "$domain",
-        "insecure": false,
-        "alpn": [
-          "h3"
-        ]
-      }
+      "type": "tuic", "tag": "tuic5-sb", "server": "$host", "server_port": $port_tu,
+      "uuid": "$uuid", "password": "$uuid", "congestion_control": "bbr", "udp_relay_mode": "native",
+      "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "alpn": ["h3"] }
     },
+    { "tag": "direct", "type": "direct" },
     {
-      "tag": "direct",
-      "type": "direct"
-    },
-    {
-      "tag": "auto",
-      "type": "urltest",
-      "outbounds": [
-        "vless-sb",
-        "vmess-sb",
-        "hy2-sb",
-        "tuic5-sb"
-      ],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "1m",
-      "tolerance": 50,
-      "interrupt_exist_connections": false
+      "tag": "auto", "type": "urltest",
+      "outbounds": ["vless-sb", "vmess-sb", "hy2-sb", "tuic5-sb"],
+      "url": "https://www.gstatic.com/generate_204", "interval": "1m", "tolerance": 50
     }
   ],
   "route": {
     "rule_set": [
-      {
-        "tag": "geosite-geolocation-!cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-        "download_detour": "select",
-        "update_interval": "1d"
-      },
-      {
-        "tag": "geosite-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs",
-        "download_detour": "select",
-        "update_interval": "1d"
-      },
-      {
-        "tag": "geoip-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "download_detour": "select",
-        "update_interval": "1d"
-      }
+      { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geoip-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs", "download_detour": "select", "update_interval": "1d" }
     ],
     "auto_detect_interface": true,
     "final": "select",
     "rules": [
-      {
-        "inbound": "tun-in",
-        "action": "sniff"
-      },
-      {
-        "protocol": "dns",
-        "action": "hijack-dns"
-      },
-      {
-        "ip_is_private": true,
-        "outbound": "direct"
-      },
-      {
-        "clash_mode": "Direct",
-        "outbound": "direct"
-      },
-      {
-        "clash_mode": "Global",
-        "outbound": "select"
-      },
-      {
-        "rule_set": "geoip-cn",
-        "outbound": "direct"
-      },
-      {
-        "rule_set": "geosite-cn",
-        "outbound": "direct"
-      },
-      {
-        "rule_set": "geosite-geolocation-!cn",
-        "outbound": "select"
-      }
+      { "inbound": "tun-in", "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "ip_is_private": true, "outbound": "direct" },
+      { "clash_mode": "Direct", "outbound": "direct" },
+      { "clash_mode": "Global", "outbound": "select" },
+      { "rule_set": "geoip-cn", "outbound": "direct" },
+      { "rule_set": "geosite-cn", "outbound": "direct" },
+      { "rule_set": "geosite-geolocation-!cn", "outbound": "select" }
     ]
   }
 }
 EOF
     echo
-    yellow "将以上 JSON 保存为本地 sing-box 客户端配置文件 (例如 client.json)，并以 root 运行 tun 模式即可。"
+    yellow "📌 適用於: Sing-box 1.12.0+, 1.13.x, 最新版本"
+    yellow "📌 將以上 JSON 保存為 client.json，以 root 運行 tun 模式即可"
+}
+
+# ==================== 1.10.x / 1.11.x 舊版客戶端配置 ====================
+show_client_conf_legacy(){
+    local host="$1" domain="$2" uuid="$3" port_vl="$4" port_vm="$5" port_hy="$6" port_tu="$7" pk="$8" sid="$9" reality_sni_client="${10}" vm_path="${11}"
+    
+    green "╔══════════════════════════════════════════════════════════════╗"
+    green "║  Sing-box 1.10.x / 1.11.x 舊版 客戶端配置 (tun 全局模式)     ║"
+    green "║  📦 使用傳統 Inbound Fields (舊語法)                         ║"
+    green "╚══════════════════════════════════════════════════════════════╝"
+    echo
+    cat <<EOF
+{
+  "log": { "disabled": false, "level": "info", "timestamp": true },
+  "experimental": {
+    "clash_api": { "external_controller": "127.0.0.1:9090", "external_ui": "ui", "secret": "" },
+    "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true }
+  },
+  "dns": {
+    "servers": [
+      { "tag": "proxydns", "address": "tls://8.8.8.8", "detour": "select" },
+      { "tag": "localdns", "address": "https://223.5.5.5/dns-query", "detour": "direct" },
+      { "tag": "dns_fakeip", "address": "fakeip" }
+    ],
+    "rules": [
+      { "outbound": "any", "server": "localdns", "disable_cache": true },
+      { "clash_mode": "Global", "server": "proxydns" },
+      { "clash_mode": "Direct", "server": "localdns" },
+      { "geosite": "cn", "server": "localdns" },
+      { "geosite": "geolocation-!cn", "server": "proxydns" },
+      { "geosite": "geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" }
+    ],
+    "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" },
+    "independent_cache": true,
+    "strategy": "prefer_ipv4",
+    "final": "proxydns"
+  },
+  "inbounds": [
+    {
+      "type": "tun", "tag": "tun-in",
+      "inet4_address": "172.19.0.1/30",
+      "inet6_address": "fd00::1/126",
+      "auto_route": true, "strict_route": true,
+      "sniff": true, "sniff_override_destination": true
+    }
+  ],
+  "outbounds": [
+    { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "vless-sb", "vmess-sb", "hy2-sb", "tuic5-sb"] },
+    {
+      "type": "vless", "tag": "vless-sb", "server": "$host", "server_port": $port_vl,
+      "uuid": "$uuid", "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true, "server_name": "$reality_sni_client",
+        "utls": { "enabled": true, "fingerprint": "firefox" },
+        "reality": { "enabled": true, "public_key": "$pk", "short_id": "$sid" }
+      }
+    },
+    {
+      "type": "vmess", "tag": "vmess-sb", "server": "$host", "server_port": $port_vm,
+      "uuid": "$uuid", "security": "auto",
+      "tls": { "enabled": true, "server_name": "$domain", "insecure": false },
+      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": "$domain" } }
+    },
+    {
+      "type": "hysteria2", "tag": "hy2-sb", "server": "$host", "server_port": $port_hy,
+      "password": "$uuid",
+      "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "alpn": ["h3"] }
+    },
+    {
+      "type": "tuic", "tag": "tuic5-sb", "server": "$host", "server_port": $port_tu,
+      "uuid": "$uuid", "password": "$uuid", "congestion_control": "bbr", "udp_relay_mode": "native",
+      "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "alpn": ["h3"] }
+    },
+    { "tag": "direct", "type": "direct" },
+    { "tag": "block", "type": "block" },
+    { "tag": "dns", "type": "dns" },
+    {
+      "tag": "auto", "type": "urltest",
+      "outbounds": ["vless-sb", "vmess-sb", "hy2-sb", "tuic5-sb"],
+      "url": "https://www.gstatic.com/generate_204", "interval": "1m", "tolerance": 50
+    }
+  ],
+  "route": {
+    "geoip": { "download_url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.db", "download_detour": "select" },
+    "geosite": { "download_url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.db", "download_detour": "select" },
+    "auto_detect_interface": true,
+    "final": "select",
+    "rules": [
+      { "protocol": "dns", "outbound": "dns" },
+      { "ip_is_private": true, "outbound": "direct" },
+      { "clash_mode": "Direct", "outbound": "direct" },
+      { "clash_mode": "Global", "outbound": "select" },
+      { "geoip": "cn", "outbound": "direct" },
+      { "geosite": "cn", "outbound": "direct" },
+      { "geosite": "geolocation-!cn", "outbound": "select" }
+    ]
+  }
+}
+EOF
+    echo
+    yellow "📌 適用於: Sing-box 1.10.x, 1.11.x (Android SFA, iOS SFI 舊版本)"
+    yellow "📌 將以上 JSON 保存為 client.json，以 root 運行 tun 模式即可"
 }
 
 # 卸载
 unins(){
-    systemctl stop sing-box
-    systemctl disable sing-box
+    systemctl stop sing-box 2>/dev/null
+    systemctl disable sing-box 2>/dev/null
+    
+    # 清理防火牆規則（安全解析端口日誌，不使用 source）
+    if [[ -f /etc/s-box/firewall_ports.log ]]; then
+        green "正在清理防火牆規則..."
+        
+        # 安全解析：只讀取特定格式的行，避免執行任意代碼
+        local VLESS_PORT=$(grep '^VLESS_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
+        local VMESS_PORT=$(grep '^VMESS_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
+        local HY2_PORT=$(grep '^HY2_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
+        local TUIC_PORT=$(grep '^TUIC_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
+        
+        # 刪除本腳本添加的端口規則
+        [[ -n "$VLESS_PORT" ]] && ufw delete allow "$VLESS_PORT"/tcp >/dev/null 2>&1
+        [[ -n "$VMESS_PORT" ]] && ufw delete allow "$VMESS_PORT"/tcp >/dev/null 2>&1
+        [[ -n "$HY2_PORT" ]] && ufw delete allow "$HY2_PORT"/udp >/dev/null 2>&1
+        [[ -n "$TUIC_PORT" ]] && ufw delete allow "$TUIC_PORT"/udp >/dev/null 2>&1
+        
+        # 80/443 可能被其他服務使用，詢問是否刪除
+        yellow "端口 80/443 可能被其他服務使用，是否刪除這些規則？"
+        readp "   刪除 80/443 規則？[y/N]: " del_common_ports
+        if [[ "$del_common_ports" =~ ^[Yy]$ ]]; then
+            ufw delete allow 80/tcp >/dev/null 2>&1
+            ufw delete allow 443/tcp >/dev/null 2>&1
+            green "已刪除 80/443 端口規則。"
+        fi
+        
+        green "防火牆規則已清理。"
+    else
+        yellow "未找到防火牆端口記錄，可能需要手動清理 UFW 規則。"
+        yellow "使用 'ufw status numbered' 查看並 'ufw delete <number>' 刪除。"
+    fi
+    
     rm -rf /etc/s-box /usr/bin/sb /etc/systemd/system/sing-box.service /root/geoip.db /root/geosite.db
-    # 恢复防火墙 (可选，这里仅删除规则可能比较复杂，建议直接重置或提示用户)
-    echo "y" | ufw delete allow 80/tcp >/dev/null 2>&1
-    green "卸载完成 (BBR 设置保留，防火墙规则请按需手动清理)。"
+    systemctl daemon-reload 2>/dev/null
+    green "卸载完成 (BBR 设置保留)。"
 }
 
 # 更新脚本
@@ -862,31 +1236,117 @@ upsbyg(){
     green "脚本已更新，请重新运行 sb" && exit
 }
 
-# 菜单
-clear
-white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" 
-white "Sing-box 四协议脚本 (强制域名证书 + 自动BBR + 严格防火墙版)"
-white "脚本快捷方式：sb"
-red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-green " 1. 安装 (需要准备好域名)" 
-green " 2. 卸载"
-green " 3. 查看节点订阅"
-green " 4. 更新脚本"
-green " 5. 查看运行日志"
-green " 6. 重启 Sing-box 服务"
-green " 7. 单独更新 Sing-box 内核"
-green " 8. 显示客户端配置示例"
-red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+# ==================== 漸層動畫 Banner ====================
+show_banner(){
+    # 漸層顏色定義 (由亮到暗)
+    local C1="\033[1;96m"   # 亮青色
+    local C2="\033[1;36m"   # 青色
+    local C3="\033[0;36m"   # 暗青色
+    local C4="\033[1;34m"   # 亮藍色
+    local C5="\033[0;34m"   # 藍色
+    local C6="\033[1;30m"   # 暗灰色 (陰影)
+    local G="\033[1;33m"    # 金色強調
+    local R="\033[0m"
+    
+    clear
+    
+    # BDFZ ASCII Art - 動畫效果: 逐行淡入顯示
+    local lines=(
+        "${C1}   ╔════════════════════════════════════════════════════════════════════╗${R}"
+        "${C1}   ║${R}  ${C1}██████╗ ${C2}██████╗ ${C3}███████╗${C4}███████╗${R}                                ${C1}║${R}"
+        "${C2}   ║${R}  ${C1}██╔══██╗${C2}██╔══██╗${C3}██╔════╝${C4}╚══███╔╝${R}                                ${C2}║${R}"
+        "${C2}   ║${R}  ${C2}██████╔╝${C3}██║  ██║${C3}█████╗  ${C5}  ███╔╝${R}                                 ${C2}║${R}"
+        "${C3}   ║${R}  ${C2}██╔══██╗${C3}██║  ██║${C4}██╔══╝  ${C5} ███╔╝${R}                                  ${C3}║${R}"
+        "${C4}   ║${R}  ${C3}██████╔╝${C4}██████╔╝${C4}██║     ${C6}███████╗${R}                                ${C4}║${R}"
+        "${C5}   ║${R}  ${C4}╚═════╝ ${C5}╚═════╝ ${C5}╚═╝     ${C6}╚══════╝${R}                                ${C5}║${R}"
+        "${C5}   ╠════════════════════════════════════════════════════════════════════╣${R}"
+        "${C4}   ║${R}           ${G}🚀 Sing-Box 四協議一鍵安裝腳本 v2.0 🚀${R}                  ${C4}║${R}"
+        "${C5}   ║${R}      ${C5}VLESS-Reality │ VMess-WS │ Hysteria2 │ TUIC V5${R}             ${C5}║${R}"
+        "${C6}   ╚════════════════════════════════════════════════════════════════════╝${R}"
+    )
 
-readp "请选择: " Input
+    # 逐行動畫顯示
+    for line in "${lines[@]}"; do
+        echo -e "$line"
+        sleep 0.04  # 40ms 延遲呈現淡入效果
+    done
+    echo
+}
+
+# ==================== 系統狀態顯示 ====================
+show_status(){
+    local C="\033[0;36m"   # 青色
+    local G="\033[0;32m"   # 綠色
+    local Y="\033[0;33m"   # 黃色
+    local R="\033[0m"
+    
+    # 檢查 sing-box 狀態
+    local sb_status
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        sb_status="${G}● 運行中${R}"
+    elif [[ -f /etc/systemd/system/sing-box.service ]]; then
+        sb_status="${Y}○ 已停止${R}"
+    else
+        sb_status="${Y}◌ 未安裝${R}"
+    fi
+    
+    # 獲取版本 (如果已安裝)
+    local sb_ver=""
+    if [[ -x /etc/s-box/sing-box ]]; then
+        sb_ver=$(/etc/s-box/sing-box version 2>/dev/null | head -n1 | awk '{print $NF}')
+        [[ -n "$sb_ver" ]] && sb_ver=" v${sb_ver}"
+    fi
+    
+    echo -e "   ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}"
+    echo -e "   ${C}狀態:${R} $sb_status${sb_ver}    ${C}快捷命令:${R} sb    ${C}系統:${R} $(uname -s) $(uname -m)"
+    echo -e "   ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}"
+}
+
+# ==================== 菜單 ====================
+show_menu(){
+    local G="\033[0;32m"   # 綠色
+    local Y="\033[0;33m"   # 黃色
+    local C="\033[0;36m"   # 青色
+    local W="\033[1;37m"   # 白色粗體
+    local R="\033[0m"
+    
+    echo
+    echo -e "   ${W}◆ 安裝與管理${R}"
+    echo -e "   ${G}  [1]${R} 🛠️  安裝 Sing-box (需準備域名)"
+    echo -e "   ${G}  [2]${R} 🗑️  卸載 Sing-box"
+    echo -e "   ${G}  [7]${R} ⬆️  單獨更新 Sing-box 內核"
+    echo
+    echo -e "   ${W}◆ 節點與配置${R}"
+    echo -e "   ${C}  [3]${R} 📋 查看節點訂閱鏈接"
+    echo -e "   ${C}  [8]${R} 📱 顯示客戶端配置示例"
+    echo
+    echo -e "   ${W}◆ 運維操作${R}"
+    echo -e "   ${Y}  [5]${R} 📜 查看運行日誌"
+    echo -e "   ${Y}  [6]${R} 🔄 重啟 Sing-box 服務"
+    echo -e "   ${Y}  [4]${R} 📥 更新此腳本"
+    echo
+    echo -e "   ${W}◆ 退出${R}"
+    echo -e "   ${R}  [0]${R} ❌ 退出腳本"
+    echo
+}
+
+# 主程序入口
+show_banner
+show_status
+show_menu
+
+readp "   請選擇操作 [0-8]: " Input
+echo
+
 case "$Input" in  
- 1 ) install_singbox;;
- 2 ) unins;;
- 3 ) sbshare;;
- 5 ) view_log;;
- 6 ) restart_singbox;;
- 4 ) upsbyg;;
- 7 ) update_core;;
- 8 ) client_conf;;
- * ) exit 
+    1 ) install_singbox;;
+    2 ) unins;;
+    3 ) sbshare;;
+    4 ) upsbyg;;
+    5 ) view_log;;
+    6 ) restart_singbox;;
+    7 ) update_core;;
+    8 ) client_conf;;
+    0 ) green "再見！" && exit 0;;
+    * ) yellow "無效選項，請重新運行腳本。" && exit 1
 esac
