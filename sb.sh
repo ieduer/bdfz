@@ -1194,7 +1194,7 @@ show_client_conf_legacy(){
         "enabled": true, "server_name": "$domain", "insecure": false,
         "utls": { "enabled": true, "fingerprint": "firefox" }
       },
-      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": ["$domain"] } }
+      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": "$domain" } }
     },
     {
       "type": "hysteria2", "tag": "hy2-sb", "server": "$host", "server_port": $port_hy,
