@@ -297,6 +297,7 @@ apply_acme(){
     else
         # 2) 若不存在，则需要申请证书
         local acme_mode="standalone"
+        local nginx_webroot=""
         
         # 檢查 80 端口占用情況
         local port80_pid=$(ss -tulnp 2>/dev/null | grep -E '(:|])80[[:space:]]' | awk '{print $NF}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1)
@@ -307,13 +308,43 @@ apply_acme(){
             
             if [[ "$p_name" == "nginx" ]]; then
                 yellow "識別到 Nginx 正在運行。"
-                readp "   是否嘗試使用 --nginx 模式申請證書？(無需停止服務) [Y/n]: " nginx_choice
-                if [[ "${nginx_choice:-y}" =~ ^[Yy]$ ]]; then
-                    acme_mode="nginx"
-                else
-                    red "Standalone 模式需要 80 端口空閒。請手動停止 Nginx 後重試。"
-                    exit 1
-                fi
+                echo
+                yellow "請選擇證書申請方式："
+                yellow "  [1] Webroot 模式 (推薦 - 使用現有 Nginx 的 webroot 目錄)"
+                yellow "  [2] Nginx 模式 (需要域名已在 Nginx 配置中存在)"
+                yellow "  [3] 臨時停止 Nginx，使用 Standalone 模式"
+                readp "   請選擇 [1/2/3]: " nginx_choice
+                
+                case "${nginx_choice:-1}" in
+                    1)
+                        acme_mode="webroot"
+                        # 嘗試檢測常見 webroot 路徑
+                        if [[ -d /var/www/html ]]; then
+                            nginx_webroot="/var/www/html"
+                        elif [[ -d /usr/share/nginx/html ]]; then
+                            nginx_webroot="/usr/share/nginx/html"
+                        else
+                            readp "   請輸入 Nginx webroot 路徑 (默認 /var/www/html): " custom_webroot
+                            nginx_webroot="${custom_webroot:-/var/www/html}"
+                            mkdir -p "$nginx_webroot"
+                        fi
+                        green "使用 Webroot 模式，路徑: $nginx_webroot"
+                        ;;
+                    2)
+                        acme_mode="nginx"
+                        yellow "注意：Nginx 模式需要該域名已在 Nginx 配置中存在 server block。"
+                        ;;
+                    3)
+                        acme_mode="standalone"
+                        yellow "臨時停止 Nginx..."
+                        systemctl stop nginx 2>/dev/null || service nginx stop 2>/dev/null
+                        ;;
+                    *)
+                        acme_mode="webroot"
+                        nginx_webroot="/var/www/html"
+                        mkdir -p "$nginx_webroot"
+                        ;;
+                esac
             else
                 red "Standalone 模式需要占用 80 端口。請先停止該服務 (service $p_name stop)。"
                 exit 1
@@ -323,29 +354,46 @@ apply_acme(){
         green "正在申请证书 (模式: $acme_mode, CA: Let's Encrypt)..."
         /root/.acme.sh/acme.sh --register-account -m "admin@$domain_name" --server letsencrypt >/dev/null 2>&1 || true
 
-        local issue_cmd="/root/.acme.sh/acme.sh --issue -d $domain_name -k ec-256 --server letsencrypt"
+        local issue_rc=0
         
         if [[ "$acme_mode" == "standalone" ]]; then
-            # 临时开放 80 端口用于 ACME 验证（若启用了 UFW）
             ufw allow 80/tcp >/dev/null 2>&1 || true
-            $issue_cmd --standalone
-            local issue_rc=$?
+            /root/.acme.sh/acme.sh --issue -d "$domain_name" -k ec-256 --server letsencrypt --standalone
+            issue_rc=$?
+            # 如果之前停止了 Nginx，重啟它
+            if [[ -n "$port80_pid" ]]; then
+                systemctl start nginx 2>/dev/null || service nginx start 2>/dev/null
+                green "Nginx 已重新啟動。"
+            fi
         elif [[ "$acme_mode" == "nginx" ]]; then
-            $issue_cmd --nginx
-            local issue_rc=$?
+            /root/.acme.sh/acme.sh --issue -d "$domain_name" -k ec-256 --server letsencrypt --nginx
+            issue_rc=$?
+            # 如果 nginx 模式失敗，嘗試 webroot 作為 fallback
+            if [[ $issue_rc -ne 0 ]]; then
+                yellow "Nginx 模式失敗（域名可能未在 Nginx 配置中），嘗試 Webroot 模式..."
+                nginx_webroot="/var/www/html"
+                mkdir -p "$nginx_webroot"
+                /root/.acme.sh/acme.sh --issue -d "$domain_name" -k ec-256 --server letsencrypt -w "$nginx_webroot"
+                issue_rc=$?
+            fi
+        elif [[ "$acme_mode" == "webroot" ]]; then
+            /root/.acme.sh/acme.sh --issue -d "$domain_name" -k ec-256 --server letsencrypt -w "$nginx_webroot"
+            issue_rc=$?
         fi
 
         if [[ $issue_rc -ne 0 ]]; then
             if acme_install_existing "$domain_name"; then
                 yellow "acme.sh --issue 返回非 0，但证书已存在，继续安装。"
             else
-                red "证书申请失败！请检查域名解析、80 端口开放情况及防火墙。"
-                [[ "$acme_mode" == "nginx" ]] && red "Nginx 模式失敗：請確認 Nginx 配置正確且監聽 80 端口。"
+                red "证书申请失败！请检查："
+                red "  1. 域名 $domain_name 是否已解析到本機 IP"
+                red "  2. 防火牆/安全組是否放行 80 端口"
+                red "  3. Nginx 配置是否正確指向 webroot 目錄"
                 exit 1
             fi
         else
             if ! acme_install_existing "$domain_name"; then
-                red "证书安装失败！(acme.sh 已签发但 installcert 失败)" && exit 1
+                red "证书安装失败！" && exit 1
             fi
         fi
     fi
