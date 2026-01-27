@@ -119,7 +119,45 @@ USAGE
     read -r -p "輸入學科: " ans
     [ -n "$ans" ] && SUBJECTS="$ans"
 
+    # 詢問是否強制覆蓋
+    printf "\n[3] 是否強制重新下載（覆蓋已有文件）？\n"
+    read -r -p "輸入 y 強制覆蓋，留空跳過: " ans
+    if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+      FORCE_OVERWRITE="1"
+    fi
+
     # 直接開始——不再詢問：僅重試/限制/重試輪數/輸出目錄/確認
+  fi
+
+  # 若使用強制模式，詢問是否清除舊 PDF（僅在交互模式下）
+  if [ "$FORCE_OVERWRITE" = "1" ] && [ -t 0 ] && [ "$AUTO_RUN" != "1" ]; then
+    # 檢查輸出目錄是否存在 PDF 文件
+    if [ -z "$OUT_DIR" ]; then
+      if [ -d /srv/smartedu_textbooks ]; then
+        _CHECK_DIR="/srv/smartedu_textbooks"
+      else
+        _CHECK_DIR="./smartedu_textbooks"
+      fi
+    else
+      _CHECK_DIR="$OUT_DIR"
+    fi
+    
+    if [ -d "$_CHECK_DIR" ]; then
+      _PDF_COUNT=$(find "$_CHECK_DIR" -name "*.pdf" -type f 2>/dev/null | wc -l | tr -d ' ')
+      if [ "$_PDF_COUNT" -gt 0 ]; then
+        printf "\n⚠️  發現 %s 個現有 PDF 文件在 %s\n" "$_PDF_COUNT" "$_CHECK_DIR"
+        printf "    強制模式會重新下載所有文件，但不會自動刪除舊文件。\n"
+        read -r -p "是否在開始前清除所有舊 PDF？(y/N): " ans
+        if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+          printf "[*] 正在清除舊 PDF 文件..."
+          find "$_CHECK_DIR" -name "*.pdf" -type f -delete 2>/dev/null
+          find "$_CHECK_DIR" -name "*.part" -type f -delete 2>/dev/null
+          printf " 完成\n"
+        else
+          printf "[i] 保留舊文件，新下載將覆蓋同名文件\n"
+        fi
+      fi
+    fi
   fi
 
   # 交互輸入後再做一次數值校驗
@@ -1401,7 +1439,7 @@ f""".chip--{cls}{{background:linear-gradient(135deg,{th['chip']}dd,{th['chip']}8
         if (!subj) return;
         activeSubj = subj;
         
-        const id = 'subj-' + subj.replace(/\\s+/g, '-');
+        const id = 'subj-' + subj.replace(/\s+/g, '-');
         const targetSec = document.getElementById(id);
         
         sections.forEach(s => s.style.display = 'none');
