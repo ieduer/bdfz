@@ -43,6 +43,7 @@ else
   LIMIT=""
   POST_RETRY=2
   AUTO_RUN="0"
+  FORCE_OVERWRITE="0"
 
   usage() {
     cat >&2 <<'USAGE'
@@ -60,6 +61,7 @@ else
   -d N             下載並發，預設 5
   -n N             只處理前 N 本（調試用）
   -T N             整輪結束後自動重試 N 輪（預設 2；0=關閉）
+  -f               強制覆蓋：忽略已存在文件，重新下載（確保版本更新）
   -y               非互動直跑（跳過交互選擇，使用當前參數）
   -h               顯示此幫助
 
@@ -70,7 +72,7 @@ else
 USAGE
   }
 
-  while getopts ":p:s:m:i:o:w:Rc:d:n:T:hy" opt; do
+  while getopts ":p:s:m:i:o:w:Rc:d:n:T:fhy" opt; do
     case "$opt" in
       p) PHASE="$OPTARG" ;;
       s) SUBJECTS="$OPTARG" ;;
@@ -83,6 +85,7 @@ USAGE
       d) DCON="$OPTARG" ;;
       n) LIMIT="$OPTARG" ;;
       T) POST_RETRY="$OPTARG" ;;
+      f) FORCE_OVERWRITE="1" ;;
       y) AUTO_RUN="1" ;;
       h) usage; exit 0 ;;
       :) echo "錯誤：選項 -$OPTARG 需要一個參數。" >&2; usage; exit 2 ;;
@@ -298,7 +301,22 @@ PY
   export SMARTEDU_LIMIT="$LIMIT"
   export SMARTEDU_POST_RETRY="$POST_RETRY"
   export SMARTEDU_WEB_DIR="$WEB_DIR"
+  export SMARTEDU_FORCE="$FORCE_OVERWRITE"
   export PYTHON_EXEC=1
+
+  # --- 清理孤立的 .part 文件（超過 24 小時） ---
+  cleanup_stale_parts() {
+    local dir="$1"
+    if [ ! -d "$dir" ]; then return; fi
+    local count=0
+    while IFS= read -r -d '' f; do
+      rm -f "$f" && count=$((count + 1))
+    done < <(find "$dir" -name "*.part" -type f -mmin +1440 -print0 2>/dev/null)
+    if [ "$count" -gt 0 ]; then
+      echo "[i] 已清理 $count 個孤立的 .part 文件"
+    fi
+  }
+  cleanup_stale_parts "$OUT_DIR"
 
   # --- 配置 Nginx PDF 訪問專用日誌（若系統有 nginx） ---
   setup_nginx_pdf_logging() {
@@ -357,7 +375,7 @@ from tqdm import tqdm
 # ---------------- 基本配置 / 常量 ----------------
 Settings = namedtuple("Settings", [
     "PHASE","SUBJECTS","MATCH","IDS","OUT_DIR","WEB_DIR","ONLY_FAILED",
-    "HCON","DCON","LIMIT","POST_RETRY"
+    "HCON","DCON","LIMIT","POST_RETRY","FORCE"
 ])
 
 PHASE_TAGS = {
@@ -464,6 +482,7 @@ def load_settings_from_env() -> Settings:
     except ValueError: pr = 2
     web_env = os.getenv("SMARTEDU_WEB_DIR","").strip()
     web_dir = Path(os.path.expanduser(web_env)) if web_env else out_dir
+    force = os.getenv("SMARTEDU_FORCE", "0") == "1"
     return Settings(
         PHASE=os.getenv("SMARTEDU_PHASE","高中"),
         SUBJECTS=[s.strip().replace(" ","") for s in os.getenv("SMARTEDU_SUBJ","语文,数学,英语,思想政治,历史,地理,物理,化学,生物").split(",") if s.strip()],
@@ -476,12 +495,13 @@ def load_settings_from_env() -> Settings:
         DCON=int(os.getenv("SMARTEDU_DCON","5")),
         LIMIT=int(v) if (v:=os.getenv("SMARTEDU_LIMIT","").strip()).isdigit() else None,
         POST_RETRY=pr,
+        FORCE=force,
     )
 
 def build_referer(book_id: str) -> str:
-    return ("https://basic.smartedu.cn/tchMaterial/detail"
-            f"?contentType=assets_document&amp;contentId={book_id}"
-            "&amp;catalogType=tchMaterial&amp;subCatalog=tchMaterial")
+    return (f"https://basic.smartedu.cn/tchMaterial/detail"
+            f"?contentType=assets_document&contentId={book_id}"
+            f"&catalogType=tchMaterial&subCatalog=tchMaterial")
 
 # ---------------- 遠端資源抓取 ----------------
 async def get_json(session: aiohttp.ClientSession, url: str) -> Optional[Dict | List]:
@@ -647,47 +667,99 @@ def mirror_to_web_dir(out_dir: Path, web_dir: Path, combined: Dict[str,Any]) -> 
         except Exception as e:
             LOGGER.warning("鏡像到網頁目錄失敗: %s -> %s (%s)", src, dst, e)
 
-async def download_pdf(session: aiohttp.ClientSession, url: str, dest: Path, referer: str) -> bool:
-    if have_pdf_head(dest):
-        LOGGER.info("已存在有效 PDF，跳過: %s", dest.name); return True
+async def download_pdf(session: aiohttp.ClientSession, url: str, dest: Path, referer: str, force: bool = False) -> bool:
+    """Download PDF with exponential backoff retry and optional force overwrite."""
+    # Skip if already exists and not forcing
+    if not force and have_pdf_head(dest):
+        LOGGER.info("已存在有效 PDF，跳過: %s", dest.name)
+        return True
+    
+    # Force mode: remove existing file to ensure fresh download
+    if force and dest.exists():
+        try:
+            dest.unlink()
+            LOGGER.info("強制模式：刪除舊版本 %s", dest.name)
+        except Exception as e:
+            LOGGER.warning("刪除舊文件失敗: %s (%s)", dest.name, e)
+    
     tmp = dest.with_suffix(".part")
     start = tmp.stat().st_size if tmp.exists() else 0
     headers = {**BASE_HEADERS, "Referer": referer}
-    if start>0: headers["Range"]=f"bytes={start}-"
-    for attempt in range(3):
+    if start > 0 and not force:
+        headers["Range"] = f"bytes={start}-"
+    elif force and tmp.exists():
+        # Force mode: start fresh
+        tmp.unlink()
+        start = 0
+    
+    max_retries = 4
+    for attempt in range(max_retries):
+        # Exponential backoff: 1s, 2s, 4s, 8s
+        backoff = 2 ** attempt
         try:
             async with session.get(url, headers=headers, timeout=180) as r:
-                if r.status not in (200,206):
-                    LOGGER.debug("下載 HTTP %s: %s", r.status, url); await asyncio.sleep(2*(attempt+1)); continue
+                if r.status not in (200, 206):
+                    LOGGER.debug("下載 HTTP %s: %s", r.status, url)
+                    await asyncio.sleep(backoff)
+                    continue
+                
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                mode = "ab" if (start>0 and r.status==206) else "wb"
+                mode = "ab" if (start > 0 and r.status == 206) else "wb"
+                total_size = int(r.headers.get("Content-Length", 0)) + start
+                downloaded = start
+                
                 async with aiofiles.open(tmp, mode) as f:
-                    async for chunk in r.content.iter_chunked(1<<14):
+                    async for chunk in r.content.iter_chunked(1 << 14):
                         await f.write(chunk)
+                        downloaded += len(chunk)
+                
+                # Validate minimum file size (at least 100KB for a real PDF)
+                if tmp.stat().st_size < 100 * 1024:
+                    LOGGER.warning("下載文件過小，可能損壞: %s (%d bytes)", dest.name, tmp.stat().st_size)
+                    await asyncio.sleep(backoff)
+                    continue
+                
                 tmp.replace(dest)
-                return have_pdf_head(dest)
+                if have_pdf_head(dest):
+                    LOGGER.info("✅ 下載完成: %s (%.1f MB)", dest.name, dest.stat().st_size / 1024 / 1024)
+                    return True
+                else:
+                    LOGGER.warning("下載完成但非有效 PDF: %s", dest.name)
+                    return False
+                    
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            LOGGER.debug("下載異常 (%d/3) %s", attempt+1, e); await asyncio.sleep(2.5*(attempt+1))
-    LOGGER.warning("下載失敗: %s", url)
+            LOGGER.debug("下載異常 (%d/%d) %s - 等待 %ds", attempt + 1, max_retries, e, backoff)
+            await asyncio.sleep(backoff)
+        except Exception as e:
+            LOGGER.warning("下載未預期錯誤: %s (%s)", url, e)
+            await asyncio.sleep(backoff)
+    
+    LOGGER.warning("下載失敗（已重試 %d 次）: %s", max_retries, url)
     return False
 
-# ---------------- HTML 生成（最終版樣式，無 Template 佔位風險） ----------------
+# ---------------- HTML 生成（完全重寫版：現代化 Premium UI） ----------------
 def render_html(out_dir: Path, items: List[Dict[str,Any]]):
+    """Generate modern premium HTML interface with glassmorphism, animations, and statistics."""
+    import datetime
+    
     # —— 合併 & 真正去重（同學科 + 規範書名，保留更大者） ——
     collected={}
+    total_size = 0
     for it in items:
         subj = it.get("subject") or "綜合"
         title= canon_title(it.get("title") or Path(it.get("path","")).stem)
         path = Path(it.get("path",""))
         if not (out_dir/path).exists(): 
-            # 兼容存儲為絕對路徑
             if path.exists(): pass
             else: continue
         size = (out_dir/path).stat().st_size if (out_dir/path).exists() else path.stat().st_size
         key  = logic_key(subj, title)
         old  = collected.get(key)
         if (not old) or (size > old["_size"]) or (size==old["_size"] and len(str(path))<len(old["_rel"])):
+            if old:
+                total_size -= old["_size"]
             collected[key]={"_rel":str(path), "_size":size, "_disp":title, "subject":subj, "_fname":Path(path).name}
+            total_size += size
 
     # —— 分組與排序 ——
     by={}
@@ -697,12 +769,17 @@ def render_html(out_dir: Path, items: List[Dict[str,Any]]):
     for s in subjects:
         by[s].sort(key=lambda v: v["_disp"])
 
+    total_books = len(collected)
+    total_size_gb = total_size / 1024 / 1024 / 1024
+    update_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
     # —— chips —— 
     def anchor(s:str): return f"subj-{s.replace(' ','-')}"
-    chips = ['<a class="chip chip--all" data-all="1" href="#">全部</a>']
+    chips = [f'<a class="chip chip--all active" data-all="1" href="#">全部 <span class="chip-count">{total_books}</span></a>']
     for s in ORDER_SUBJ:
         if s in by:
-            chips.append(f'<a class="chip chip--{CLS.get(s,"generic")}" href="#{esc(anchor(s))}" data-subj="{esc(s)}">{esc(s)}</a>')
+            count = len(by[s])
+            chips.append(f'<a class="chip chip--{CLS.get(s,"generic")}" href="#{esc(anchor(s))}" data-subj="{esc(s)}">{esc(s)} <span class="chip-count">{count}</span></a>')
     chips_html="".join(chips)
 
     # —— 科目 CSS —— 
@@ -710,9 +787,12 @@ def render_html(out_dir: Path, items: List[Dict[str,Any]]):
     for subj,cls in CLS.items():
         th = THEME[cls]
         subject_css.append(
-f""".chip--{cls}{{background:{th['chip']};border-color:#1e2833;color:#fff;}}
+f""".chip--{cls}{{background:linear-gradient(135deg,{th['chip']}dd,{th['chip']}88);border-color:{th['chip']}55;}}
+.chip--{cls}:hover,.chip--{cls}.active{{background:linear-gradient(135deg,{th['chip']},{th['chip']}cc);box-shadow:0 4px 20px {th['chip']}40;}}
+.section--{cls} .card:hover{{border-color:{th['border']};box-shadow:0 8px 32px {th['chip']}30;}}
 .section--{cls} .name{{color:{th['name']};}}
-.section--{cls} > h2{{color:{th['title']};}}
+.section--{cls} > h2{{color:{th['title']};text-shadow:0 2px 12px {th['title']}40;}}
+.section--{cls} .thumb{{background:{th['grad']};border-color:{th['border']}88;}}
 """)
     subject_css="".join(subject_css)
 
@@ -725,138 +805,665 @@ f""".chip--{cls}{{background:{th['chip']};border-color:#1e2833;color:#fff;}}
         for v in by[s]:
             rel = v["_rel"].replace(os.sep,"/")
             href = quote(rel, safe="/")
-            size_mb = f"{(v['_size']/1024/1024):.1f}MB"
+            size_mb = f"{(v['_size']/1024/1024):.1f} MB"
             cards.append(
-                f'<li class="card" data-title="{esc(v["_disp"])}">'
-                f'  <a class="card-link" href="{href}" target="_blank" download title="{esc(v["_fname"])}">'
-                f'    <div class="thumb" aria-hidden="true" style="background:{th["grad"]};border-color:{th["border"]}"><span>📄</span></div>'
+                f'<li class="card" data-title="{esc(v["_disp"])}" data-size="{v["_size"]}">'
+                f'  <a class="card-link" href="{href}" target="_blank" download title="下載 {esc(v["_fname"])}">'
+                f'    <div class="thumb" aria-hidden="true"><span class="pdf-icon">📕</span></div>'
                 f'    <div class="meta">'
                 f'      <div class="name">{esc(v["_disp"])}</div>'
-                f'      <div class="filesize">{esc(size_mb)}</div>'
-                f'      <div class="subj subj--{cls}">{esc(s)}</div>'
+                f'      <div class="info-row"><span class="filesize">📦 {esc(size_mb)}</span></div>'
                 f'    </div>'
+                f'    <div class="download-icon">⬇️</div>'
                 f'  </a>'
                 f'</li>'
             )
+        subj_size = sum(v["_size"] for v in by[s])
+        subj_size_str = f"{subj_size/1024/1024:.1f} MB" if subj_size < 1024*1024*1024 else f"{subj_size/1024/1024/1024:.2f} GB"
         sections.append(
-            f'<section id="{esc(anchor(s))}" class="section section--{cls}" style="background:{THEME[cls]["tint"]}33">'
-            f'  <h2>{esc(s)}</h2>'
+            f'<section id="{esc(anchor(s))}" class="section section--{cls}">'
+            f'  <h2><span class="section-icon">📚</span> {esc(s)} <span class="section-stats">({len(by[s])} 本 · {subj_size_str})</span></h2>'
             f'  <ul class="grid">{"".join(cards)}</ul>'
             f'</section>'
         )
 
-    HTML_TMPL = """<!doctype html>
+    HTML_TMPL = '''<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BDFZ- Suen 教材庫</title>
+<title>BDFZ-Suen 教材庫</title>
+<meta name="description" content="智慧教育平台教材 PDF 下載站，收錄高中各學科電子教材">
 <link rel="icon" href="https://img.bdfz.net/20250503004.webp" type="image/jpeg">
-<link rel="icon" href="/favicon.ico" sizes="any">
-<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
-<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
-<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#0b0d10; --fg:#e6edf3; --muted:#9aa4ad; --line:#161f29; --card:#0f141a; --accent:#6ab7ff; }
-  * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Noto Sans CJK SC','Hiragino Sans GB','Microsoft YaHei',sans-serif; background:var(--bg); color:var(--fg); }
-  header { position:sticky; top:0; z-index:10; padding:10px 12px 10px; border-bottom:1px solid #11161c; background:rgba(11,13,16,.92); backdrop-filter: blur(8px); }
-  .container { max-width: 1280px; margin: 0 auto; }
-  .center { display:flex; justify-content:center; align-items:center; flex-wrap:wrap; gap:8px; }
-  .chips { padding:4px 0 6px; }
-  .chip { display:inline-block; padding:6px 12px; border-radius:999px; white-space:nowrap; color:#fff; text-decoration:none; border:1px solid #1e2833; }
-  .chip--all { background:#374151; }
-  .toolbar { margin-top:6px; gap:8px; }
-  .btn, .link { color:#cbd5e1; text-decoration:none; background:#0f141a; border:1px solid #17212b; border-radius:8px; padding:6px 10px; }
-  .btn:hover, .link:hover { border-color:#2a3644; color:var(--accent); cursor:pointer;}
-  input[type="search"] { background:#0f141a; color:#e6edf3; border:1px solid #17212b; border-radius:8px; padding:6px 10px; min-width:200px; outline:none; }
-  main { padding:18px 12px; }
-  .page { max-width:1280px; margin:0 auto; }
-  section { margin:18px 0 28px; border-radius:14px; padding:8px 10px 12px; }
-  section>h2 { font-size:16px; margin:6px 0 12px; text-align:center; scroll-margin-top: 120px; color:#dbe7f3; }
-  .grid { list-style:none; padding:0; margin:0 auto; display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; }
-  .card-link { display:flex; align-items:center; gap:12px; padding:12px; color:inherit; text-decoration:none; }
-  .thumb { width:40px; height:52px; border-radius:8px; border:1px solid #24425e; display:flex; align-items:center; justify-content:center; flex:0 0 auto; }
-  .thumb span { font-size:16px; }
-  .meta { min-width:0; display:flex; flex-direction:column; gap:6px; }
-  .name { font-size:14px; white-space:normal; word-break:break-all; overflow:visible; }
-  .filesize { font-size:12px; color:#9aa4ad; }
-  .subj { color:#9aa4ad; font-size:12px; }
-  /* SUBJECT_CSS */
-  @media (max-width: 720px) {
-    .container { padding:0 6px; }
-    .page { padding:0 4px; }
-    input[type="search"] { min-width: 56vw; }
-    .grid { grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px; }
-    .thumb { width:36px; height:48px; }
-    section>h2 { scroll-margin-top: 150px; }
+  :root {
+    --bg: #06080a;
+    --bg-secondary: #0d1117;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --line: #21262d;
+    --card: #0d1117;
+    --card-hover: #161b22;
+    --accent: #58a6ff;
+    --accent-glow: rgba(88, 166, 255, 0.3);
+    --glass: rgba(13, 17, 23, 0.85);
+    --radius: 16px;
+    --radius-sm: 10px;
   }
-  .toast { position:fixed; right:16px; bottom:16px; background:#0f141a; border:1px solid #1f2a37; color:#e6edf3; padding:10px 12px; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.4); display:none; max-width:70vw; }
+  
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans CJK SC', sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    background: var(--bg);
+    color: var(--fg);
+    min-height: 100vh;
+  }
+  
+  /* Animated gradient background */
+  body::before {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 400px;
+    background: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(88, 166, 255, 0.15), transparent),
+                radial-gradient(ellipse 60% 40% at 80% 10%, rgba(139, 92, 246, 0.1), transparent);
+    pointer-events: none;
+    z-index: -1;
+  }
+  
+  /* Glassmorphism Header */
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    padding: 16px 20px;
+    background: var(--glass);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+  }
+  
+  .header-content {
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  
+  .brand {
+    text-align: center;
+    margin-bottom: 16px;
+  }
+  
+  .brand h1 {
+    font-size: 24px;
+    font-weight: 700;
+    background: linear-gradient(135deg, #58a6ff, #a78bfa, #f472b6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -0.5px;
+  }
+  
+  .brand .subtitle {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  
+  /* Statistics Bar */
+  .stats-bar {
+    display: flex;
+    justify-content: center;
+    gap: 24px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  
+  .stat-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 99px;
+  }
+  
+  .stat-icon { font-size: 16px; }
+  .stat-value { font-weight: 600; color: var(--accent); }
+  .stat-label { color: var(--muted); font-size: 12px; }
+  
+  /* Chips */
+  .chips {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: 99px;
+    font-size: 13px;
+    font-weight: 500;
+    text-decoration: none;
+    color: #fff;
+    border: 1px solid transparent;
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    cursor: pointer;
+  }
+  
+  .chip:hover {
+    transform: translateY(-2px);
+  }
+  
+  .chip-count {
+    font-size: 11px;
+    padding: 2px 6px;
+    background: rgba(255,255,255,0.15);
+    border-radius: 99px;
+  }
+  
+  .chip--all {
+    background: linear-gradient(135deg, #374151, #1f2937);
+    border-color: #4b5563;
+  }
+  .chip--all:hover, .chip--all.active {
+    background: linear-gradient(135deg, #4b5563, #374151);
+    box-shadow: 0 4px 20px rgba(75, 85, 99, 0.4);
+  }
+  
+  /* Search & Toolbar */
+  .toolbar {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  
+  .search-box {
+    position: relative;
+    flex: 0 1 320px;
+  }
+  
+  .search-box::before {
+    content: '🔍';
+    position: absolute;
+    left: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 14px;
+    pointer-events: none;
+  }
+  
+  .search-box input {
+    width: 100%;
+    padding: 12px 16px 12px 42px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: var(--radius);
+    color: var(--fg);
+    font-size: 14px;
+    outline: none;
+    transition: all 0.2s ease;
+  }
+  
+  .search-box input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+    background: rgba(255,255,255,0.06);
+  }
+  
+  .search-box input::placeholder { color: var(--muted); }
+  
+  .toolbar-link {
+    padding: 12px 20px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: var(--radius);
+    color: var(--fg);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all 0.2s ease;
+  }
+  
+  .toolbar-link:hover {
+    background: rgba(255,255,255,0.08);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  
+  /* Main Content */
+  main {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 24px 20px 60px;
+  }
+  
+  /* Sections */
+  section {
+    margin-bottom: 40px;
+    animation: fadeInUp 0.5s ease;
+  }
+  
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  
+  section > h2 {
+    font-size: 20px;
+    font-weight: 600;
+    margin-bottom: 20px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    scroll-margin-top: 160px;
+  }
+  
+  .section-icon { font-size: 22px; }
+  
+  .section-stats {
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--muted);
+  }
+  
+  /* Grid */
+  .grid {
+    list-style: none;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px;
+  }
+  
+  /* Cards */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    overflow: hidden;
+  }
+  
+  .card:hover {
+    transform: translateY(-4px);
+    background: var(--card-hover);
+  }
+  
+  .card.hidden { display: none; }
+  
+  .card-link {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 16px;
+    color: inherit;
+    text-decoration: none;
+  }
+  
+  .thumb {
+    width: 48px;
+    height: 60px;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(255,255,255,0.1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: transform 0.3s ease;
+  }
+  
+  .card:hover .thumb {
+    transform: scale(1.05);
+  }
+  
+  .pdf-icon { font-size: 24px; }
+  
+  .meta {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  
+  .name {
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  
+  .info-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  
+  .filesize {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  
+  .download-icon {
+    font-size: 18px;
+    opacity: 0;
+    transform: translateX(-8px);
+    transition: all 0.3s ease;
+  }
+  
+  .card:hover .download-icon {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  
+  /* Search highlight */
+  .highlight {
+    background: linear-gradient(135deg, rgba(88, 166, 255, 0.3), rgba(139, 92, 246, 0.3));
+    border-radius: 3px;
+    padding: 0 2px;
+  }
+  
+  /* Toast */
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: var(--glass);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.4);
+    transform: translateY(100px);
+    opacity: 0;
+    transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    z-index: 1000;
+    max-width: 320px;
+  }
+  
+  .toast.show {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  
+  /* Back to Top */
+  .scroll-top {
+    position: fixed;
+    bottom: 24px;
+    left: 24px;
+    width: 48px;
+    height: 48px;
+    background: var(--glass);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    cursor: pointer;
+    opacity: 0;
+    transform: scale(0.8);
+    transition: all 0.3s ease;
+    z-index: 100;
+  }
+  
+  .scroll-top.visible {
+    opacity: 1;
+    transform: scale(1);
+  }
+  
+  .scroll-top:hover {
+    background: rgba(88, 166, 255, 0.2);
+    border-color: var(--accent);
+  }
+  
+  /* No results */
+  .no-results {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--muted);
+    display: none;
+  }
+  
+  .no-results.show { display: block; }
+  .no-results-icon { font-size: 48px; margin-bottom: 16px; }
+  
+  /* Footer */
+  footer {
+    text-align: center;
+    padding: 24px;
+    color: var(--muted);
+    font-size: 12px;
+    border-top: 1px solid var(--line);
+  }
+  
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+
+  /* SUBJECT_CSS */
+  
+  /* Responsive */
+  @media (max-width: 768px) {
+    header { padding: 12px 16px; }
+    .brand h1 { font-size: 20px; }
+    .stats-bar { gap: 12px; }
+    .stat-item { padding: 6px 12px; }
+    .search-box { flex: 1 1 100%; }
+    .grid { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+    .card-link { padding: 12px; }
+    section > h2 { font-size: 18px; scroll-margin-top: 200px; }
+    main { padding: 16px 12px 40px; }
+  }
+  
+  @media (max-width: 480px) {
+    .chips { gap: 6px; }
+    .chip { padding: 6px 12px; font-size: 12px; }
+    .grid { grid-template-columns: 1fr; }
+    .thumb { width: 40px; height: 52px; }
+    .pdf-icon { font-size: 20px; }
+  }
 </style>
 </head>
 <body>
   <header>
-    <div class="container">
-      <div class="center chips">/*CHIPS*/</div>
-      <div class="center toolbar">
-        <input id="kw" type="search" placeholder="關鍵詞篩選（書名）">
-        <a class="link" href="https://bdfz.net/posts/jks/" target="_blank" rel="noopener">About</a>
+    <div class="header-content">
+      <div class="brand">
+        <h1>📖 BDFZ-Suen 教材庫</h1>
+        <p class="subtitle">智慧教育平台電子教材下載站 · 更新於 /*UPDATE_TIME*/</p>
+      </div>
+      <div class="stats-bar">
+        <div class="stat-item">
+          <span class="stat-icon">📚</span>
+          <span class="stat-value">/*TOTAL_BOOKS*/</span>
+          <span class="stat-label">本教材</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-icon">💾</span>
+          <span class="stat-value">/*TOTAL_SIZE*/</span>
+          <span class="stat-label">總容量</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-icon">📂</span>
+          <span class="stat-value">/*TOTAL_SUBJECTS*/</span>
+          <span class="stat-label">學科</span>
+        </div>
+      </div>
+      <div class="chips">/*CHIPS*/</div>
+      <div class="toolbar">
+        <div class="search-box">
+          <input id="kw" type="search" placeholder="搜尋教材名稱..." autocomplete="off">
+        </div>
+        <a class="toolbar-link" href="https://bdfz.net/posts/jks/" target="_blank" rel="noopener">📖 使用說明</a>
       </div>
     </div>
   </header>
+  
   <main>
-    <div class="page">
-      /*SECTIONS*/
+    /*SECTIONS*/
+    <div id="no-results" class="no-results">
+      <div class="no-results-icon">🔍</div>
+      <p>沒有找到符合的教材</p>
     </div>
   </main>
+  
   <div id="toast" class="toast"></div>
+  <div id="scroll-top" class="scroll-top">⬆️</div>
+  
+  <footer>
+    <p>© 2025 BDFZ-Suen · 教材來源：<a href="https://basic.smartedu.cn" target="_blank">國家智慧教育平台</a></p>
+  </footer>
+
 <script>
 (function(){
-  const kw=document.getElementById('kw');
-  function apply(){
-    const k=kw.value.trim().toLowerCase();
-    for(const li of document.querySelectorAll('.card')){
-      const title=(li.getAttribute('data-title')||'').toLowerCase();
-      li.style.display=(!k||title.includes(k))?'block':'none';
-    }
-  }
-  kw.addEventListener('input', apply);
-
-  // 学科 chips：點擊後只顯示該學科，滾動到標題；“全部”恢復
-  const chips=document.querySelectorAll('.chip');
-  chips.forEach(ch=>{
-    ch.addEventListener('click', (e)=>{
-      const all = ch.dataset.all === '1';
-      if(all){
-        e.preventDefault();
-        document.querySelectorAll('section').forEach(sec=>sec.style.display='block');
-        window.scrollTo({top:0, behavior:'smooth'}); return;
+  const kw = document.getElementById('kw');
+  const cards = document.querySelectorAll('.card');
+  const sections = document.querySelectorAll('section');
+  const chips = document.querySelectorAll('.chip');
+  const noResults = document.getElementById('no-results');
+  const scrollTopBtn = document.getElementById('scroll-top');
+  let activeSubj = null;
+  
+  // Search with highlight
+  function search() {
+    const q = kw.value.trim().toLowerCase();
+    let visibleCount = 0;
+    
+    cards.forEach(card => {
+      const title = (card.dataset.title || '').toLowerCase();
+      const nameEl = card.querySelector('.name');
+      const originalTitle = card.dataset.title || '';
+      
+      if (!q || title.includes(q)) {
+        card.classList.remove('hidden');
+        visibleCount++;
+        
+        // Highlight matching text
+        if (q && title.includes(q)) {
+          const regex = new RegExp(`(${q.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')})`, 'gi');
+          nameEl.innerHTML = originalTitle.replace(regex, '<span class="highlight">$1</span>');
+        } else {
+          nameEl.textContent = originalTitle;
+        }
+      } else {
+        card.classList.add('hidden');
       }
-      const subj = ch.dataset.subj; if(!subj) return;
-      e.preventDefault();
-      const id = 'subj-' + subj.replace(/\\s+/g,'-');
-      const sec = document.getElementById(id);
-      if(sec){
-        document.querySelectorAll('section').forEach(s=>s.style.display='none');
-        sec.style.display='block';
-        sec.querySelector('h2')?.scrollIntoView({behavior:'smooth', block:'start'});
-      }
-      chips.forEach(x=>x.style.outline='none');
-      ch.style.outline='2px solid rgba(255,255,255,.25)'; ch.style.outlineOffset='2px';
     });
+    
+    // Show/hide sections based on visible cards
+    sections.forEach(sec => {
+      const visibleCards = sec.querySelectorAll('.card:not(.hidden)');
+      sec.style.display = visibleCards.length > 0 ? 'block' : 'none';
+    });
+    
+    noResults.classList.toggle('show', visibleCount === 0 && q);
+  }
+  
+  kw.addEventListener('input', search);
+  
+  // Chip filtering
+  chips.forEach(ch => {
+    ch.addEventListener('click', e => {
+      e.preventDefault();
+      const isAll = ch.dataset.all === '1';
+      
+      // Update active state
+      chips.forEach(c => c.classList.remove('active'));
+      ch.classList.add('active');
+      
+      if (isAll) {
+        activeSubj = null;
+        sections.forEach(sec => sec.style.display = 'block');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else {
+        const subj = ch.dataset.subj;
+        if (!subj) return;
+        activeSubj = subj;
+        
+        const id = 'subj-' + subj.replace(/\\s+/g, '-');
+        const targetSec = document.getElementById(id);
+        
+        sections.forEach(s => s.style.display = 'none');
+        if (targetSec) {
+          targetSec.style.display = 'block';
+          targetSec.querySelector('h2')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      }
+      
+      // Clear search when switching
+      kw.value = '';
+      search();
+    });
+  });
+  
+  // Scroll to top button
+  window.addEventListener('scroll', () => {
+    scrollTopBtn.classList.toggle('visible', window.scrollY > 400);
+  });
+  
+  scrollTopBtn.addEventListener('click', () => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+  
+  // Toast notification
+  function showToast(msg, duration = 3000) {
+    const toast = document.getElementById('toast');
+    toast.textContent = msg;
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), duration);
+  }
+  
+  // Keyboard shortcut: / to focus search
+  document.addEventListener('keydown', e => {
+    if (e.key === '/' && document.activeElement !== kw) {
+      e.preventDefault();
+      kw.focus();
+    }
+    if (e.key === 'Escape') {
+      kw.blur();
+      kw.value = '';
+      search();
+    }
   });
 })();
 </script>
 </body>
 </html>
-"""
+'''
+    # Replace placeholders
+    total_size_str = f"{total_size_gb:.2f} GB" if total_size_gb >= 1 else f"{total_size/1024/1024:.1f} MB"
     chips_html = chips_html
     sections_html = "".join(sections)
     html = (HTML_TMPL
+            .replace("/* SUBJECT_CSS */", subject_css)
             .replace("/*SUBJECT_CSS*/", subject_css)
             .replace("/*CHIPS*/", chips_html)
-            .replace("/*SECTIONS*/", sections_html))
+            .replace("/*SECTIONS*/", sections_html)
+            .replace("/*TOTAL_BOOKS*/", str(total_books))
+            .replace("/*TOTAL_SIZE*/", total_size_str)
+            .replace("/*TOTAL_SUBJECTS*/", str(len(subjects)))
+            .replace("/*UPDATE_TIME*/", update_time))
     (out_dir/"index.html").write_text(html, "utf-8")
 
 # ---------------- 主流程 ----------------
@@ -878,6 +1485,22 @@ async def resolve_all_books(session: aiohttp.ClientSession, st: Settings) -> Lis
     LOGGER.info("目標條目: %d", len(books))
     return books
 
+async def resolve_one_book(session: aiohttp.ClientSession, book: Dict[str,Any], st: Settings, sem: asyncio.Semaphore) -> Optional[Tuple[str,str,str,str,Optional[int]]]:
+    """Resolve a single book's download URL with semaphore limiting."""
+    async with sem:
+        bid = book.get("id") or book.get("content_id")
+        if not bid:
+            return None
+        title = canon_title(book.get("title") or (book.get("global_title") or {}).get("zh-CN") or bid)
+        subj = next((s for s in st.SUBJECTS if any(s in t for t in book_tags(book))), "綜合")
+        ref = build_referer(bid)
+        urls = await resolve_candidates(session, bid)
+        for u in urls:
+            ok, rlen = await probe_url(session, u, ref)
+            if ok:
+                return (bid, title, subj, u, rlen)
+        return None
+
 async def main():
     st = load_settings_from_env()
     out_dir: Path = st.OUT_DIR
@@ -885,42 +1508,71 @@ async def main():
     setup_logging(out_dir)
     LOGGER.info("📁 下載目錄: %s", out_dir)
     LOGGER.info("🌐 網頁目錄: %s", web_dir)
-    LOGGER.info("階段=%s | 學科=%s | 匹配='%s' | 只重試失敗=%s | 自動重試輪=%d",
-                st.PHASE, ",".join(st.SUBJECTS), st.MATCH, st.ONLY_FAILED, st.POST_RETRY)
+    LOGGER.info("階段=%s | 學科=%s | 匹配='%s' | 只重試失敗=%s | 強制覆蓋=%s | 自動重試輪=%d",
+                st.PHASE, ",".join(st.SUBJECTS), st.MATCH, st.ONLY_FAILED, st.FORCE, st.POST_RETRY)
 
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=180)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        books = await resolve_all_books(session, st)
+        # ========= ONLY_FAILED 模式：讀取 failed.json =========
+        if st.ONLY_FAILED:
+            failed_file = out_dir / "failed.json"
+            if not failed_file.exists():
+                LOGGER.warning("failed.json 不存在，沒有需要重試的項目。")
+                books = []
+            else:
+                try:
+                    failed_items = json.loads(failed_file.read_text("utf-8"))
+                    LOGGER.info("📋 讀取 failed.json，共 %d 項待重試", len(failed_items))
+                    # 轉換為 books 格式供後續處理
+                    books = [
+                        {
+                            "id": f.get("id"),
+                            "title": f.get("title"),
+                            "tag_list": [{"tag_name": f.get("subject", "綜合")}, {"tag_name": f.get("phase", st.PHASE)}],
+                            "_cached_subject": f.get("subject", "綜合"),
+                        }
+                        for f in failed_items if f.get("id")
+                    ]
+                except Exception as e:
+                    LOGGER.error("讀取 failed.json 失敗: %s", e)
+                    books = []
+        else:
+            books = await resolve_all_books(session, st)
+        
         if not books:
             LOGGER.warning("沒有匹配的條目。仍將刷新網頁索引。")
 
         # 構建現有文件映射（合併 OUT_DIR 與 WEB_DIR，保留更大者）
         exist_map = merge_maps(build_existing_map(out_dir), build_existing_map(web_dir))
 
-        # 準備下載隊列（解析直鏈）
+        # ========= 真正並發解析直鏈 =========
         sem = asyncio.Semaphore(st.HCON)
-        queue: List[Tuple[str,str,str,str,Optional[int]]] = []  # (bid,title,subj,url,remote_len)
-        pbar = tqdm(total=len(books), desc="解析直鏈", unit="本")
-        for book in books:
-            async with sem:
-                bid = book.get("id") or book.get("content_id")
-                title = canon_title(book.get("title") or (book.get("global_title") or {}).get("zh-CN") or bid)
-                subj  = next((s for s in st.SUBJECTS if any(s in t for t in book_tags(book))), "綜合")
-                if not bid: pbar.update(1); continue
-                ref = build_referer(bid)
-                urls = await resolve_candidates(session, bid)
-                remote_len = None
-                chosen = None
-                # 取第一個探測可用的直鏈，同時獲取 Content-Length
-                for u in urls:
-                    ok, rlen = await probe_url(session, u, ref)
-                    if ok:
-                        chosen=u; remote_len=rlen; break
-                if not chosen:
-                    pbar.update(1); continue
-                queue.append((bid, title, subj, chosen, remote_len))
+        queue: List[Tuple[str,str,str,str,Optional[int]]] = []
+        
+        if books:
+            LOGGER.info("🔗 並發解析 %d 本教材的下載鏈接（並發數: %d）...", len(books), st.HCON)
+            
+            # 為 ONLY_FAILED 模式特殊處理 subject
+            async def resolve_with_subject_override(book):
+                cached_subj = book.get("_cached_subject")
+                result = await resolve_one_book(session, book, st, sem)
+                if result and cached_subj:
+                    # 使用緩存的 subject
+                    bid, title, _, url, rlen = result
+                    return (bid, title, cached_subj, url, rlen)
+                return result
+            
+            tasks = [resolve_with_subject_override(b) for b in books]
+            pbar = tqdm(total=len(tasks), desc="解析直鏈", unit="本")
+            
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
                 pbar.update(1)
-        pbar.close()
+                if result:
+                    queue.append(result)
+            
+            pbar.close()
+            LOGGER.info("✅ 成功解析 %d / %d 本", len(queue), len(books))
 
         # 下載（支持斷點與跳過），按 DCON 控制並發
         async def worker(items):
@@ -931,22 +1583,24 @@ async def main():
                 dest = dest_dir / canon_filename(title)
                 key  = logic_key(subj, title)
 
-                # 若已有相同 key 的文件（任何學段），且檔案有效、大小 >= 遠端（若已知），跳過
-                exist = exist_map.get(key)
-                if exist:
-                    p = Path(exist.get("path",""))
-                    p = (out_dir/p) if not p.is_absolute() else p
-                    if p.exists() and have_pdf_head(p):
-                        if rlen is None or p.stat().st_size >= rlen:
-                            LOGGER.info("跳過（已存在更大/相等）: %s", title); 
-                            continue
+                # 強制模式跳過所有存在性檢查
+                if not st.FORCE:
+                    # 若已有相同 key 的文件（任何學段），且檔案有效、大小 >= 遠端（若已知），跳過
+                    exist = exist_map.get(key)
+                    if exist:
+                        p = Path(exist.get("path",""))
+                        p = (out_dir/p) if not p.is_absolute() else p
+                        if p.exists() and have_pdf_head(p):
+                            if rlen is None or p.stat().st_size >= rlen:
+                                LOGGER.info("跳過（已存在更大/相等）: %s", title)
+                                continue
 
-                # 若目標路徑已有有效 PDF，亦跳過
-                if have_pdf_head(dest):
-                    LOGGER.info("跳過（本地已完整）: %s", dest.name); 
-                    continue
+                    # 若目標路徑已有有效 PDF，亦跳過
+                    if have_pdf_head(dest):
+                        LOGGER.info("跳過（本地已完整）: %s", dest.name)
+                        continue
 
-                ok = await download_pdf(session, url, dest, build_referer(bid))
+                ok = await download_pdf(session, url, dest, build_referer(bid), force=st.FORCE)
                 if ok:
                     exist_map[key] = {"title": title, "subject": subj, "phase": st.PHASE, "path": str(dest.relative_to(out_dir)), "size": dest.stat().st_size}
                 else:
