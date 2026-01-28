@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean, Telegram notify
-# version: v1.5-2025-12-03
-# changes from v1.4-2025-12-03:
-# - 移除所有硬編碼的 Telegram token / chat_id
-# - systemd 使用 EnvironmentFile=-/etc/ytweb.env 注入 TG_BOT_TOKEN / TG_CHAT_ID
-# - 安裝腳本首次安裝時生成 /etc/ytweb.env 模板（不含任何真實祕鑰）
+# version: v1.6-2026-01-28
+# changes from v1.5-2025-12-03:
+# - 全新 Geek 風格 Glassmorphism UI（暗色主題、漸變背景、動畫效果）
+# - 新增下載格式選項（偏好 MP4、最高解析度限制、僅音訊）
+# - 新增進階選項（嵌入字幕、嵌入縮略圖、提取 MP3、僅下載單個視頻）
+# - Terminal 風格日誌顯示
+# - 使用 Inter + JetBrains Mono 字體
 # domain: xz.bdfz.net
 
 set -euo pipefail
@@ -19,7 +21,7 @@ DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 
-echo "[ytweb] installing version v1.5-2025-12-03 ..."
+echo "[ytweb] installing version v1.6-2026-01-28 ..."
 
 # 必須 root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -242,12 +244,15 @@ def send_telegram_notification(task: dict, filename: str, download_path: str) ->
     pass
 
 
-def run_ytdlp_task(task_id, url, fmt):
+def run_ytdlp_task(task_id, url, fmt, options=None):
   """執行 yt-dlp 下載任務。
 
   如果 fmt 為 None，則不傳 -f，讓 yt-dlp 使用預設策略（bestvideo+bestaudio）。
   限制檔名長度，避免 Errno 36。
+  options: dict with keys embed_subs, embed_thumbnail, extract_audio, no_playlist
   """
+  if options is None:
+    options = {}
   with LOCK:
     task = TASKS.get(task_id)
   if not task:
@@ -265,6 +270,17 @@ def run_ytdlp_task(task_id, url, fmt):
   ]
   if fmt:
     cmd += ["-f", fmt]
+  
+  # 進階選項
+  if options.get("embed_subs"):
+    cmd += ["--embed-subs", "--sub-langs", "all"]
+  if options.get("embed_thumbnail"):
+    cmd += ["--embed-thumbnail"]
+  if options.get("extract_audio"):
+    cmd += ["-x", "--audio-format", "mp3"]
+  if options.get("no_playlist"):
+    cmd += ["--no-playlist"]
+  
   cmd += [
     "-o",
     output_tpl,
@@ -395,6 +411,14 @@ def download():
   if not url:
     return render_template("index.html", error="URL is required.")
 
+  # 進階選項
+  options = {
+    "embed_subs": request.form.get("embed_subs") == "1",
+    "embed_thumbnail": request.form.get("embed_thumbnail") == "1",
+    "extract_audio": request.form.get("extract_audio") == "1",
+    "no_playlist": request.form.get("no_playlist") == "1",
+  }
+
   # 取得客戶端 IP（優先 X-Forwarded-For 第一個）
   xff = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
   client_ip = xff or (request.remote_addr or "")
@@ -422,7 +446,7 @@ def download():
 
   t = threading.Thread(
     target=run_ytdlp_task,
-    args=(task_id, url, fmt_for_worker),
+    args=(task_id, url, fmt_for_worker, options),
     daemon=True,
   )
   t.start()
@@ -477,194 +501,767 @@ if __name__ == "__main__":
   app.run(host="127.0.0.1", port=5001, debug=False)
 PY
 
-# 5) mobile-friendly template
+# 5) geek-style glassmorphism template
 cat > "$APP_DIR/templates/index.html" <<'HTML'
 <!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>yt-dlp web · bdfz</title>
+  <title>yt-dlp web · BDFZ-SUEN</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- Favicon / Icons (WEBP, cache-busted) -->
-  <link rel="icon" href="https://img.bdfz.net/20250503004.webp?v=20251122" type="image/webp">
-  <link rel="shortcut icon" href="https://img.bdfz.net/20250503004.webp?v=20251122" type="image/webp">
-  <link rel="apple-touch-icon" href="https://img.bdfz.net/20250503004.webp?v=20251122">
+  <meta name="description" content="Geek-style yt-dlp web interface for downloading videos">
+  <!-- Favicon / Icons -->
+  <link rel="icon" href="https://img.bdfz.net/20250503004.webp" type="image/webp">
+  <link rel="shortcut icon" href="https://img.bdfz.net/20250503004.webp" type="image/webp">
+  <link rel="apple-touch-icon" href="https://img.bdfz.net/20250503004.webp">
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
     :root {
-      --gap: 1rem;
-      --radius: 6px;
-      --primary: #0d6efd;
-      --bg-soft: #e8fff1;
+      --bg: #0a0e14;
+      --bg-secondary: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --line: #21262d;
+      --card: rgba(13, 17, 23, 0.8);
+      --glass: rgba(13, 17, 23, 0.85);
+      --accent: #58a6ff;
+      --accent-glow: rgba(88, 166, 255, 0.4);
+      --success: #3fb950;
+      --success-glow: rgba(63, 185, 80, 0.3);
+      --error: #f85149;
+      --warning: #d29922;
+      --radius: 12px;
+      --radius-sm: 8px;
     }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
-      max-width: 720px;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 14px;
+      line-height: 1.6;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+    }
+
+    /* Animated gradient background */
+    body::before {
+      content: '';
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: 500px;
+      background: 
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(88, 166, 255, 0.15), transparent),
+        radial-gradient(ellipse 60% 40% at 80% 10%, rgba(139, 92, 246, 0.12), transparent),
+        radial-gradient(ellipse 50% 30% at 20% 20%, rgba(236, 72, 153, 0.08), transparent);
+      pointer-events: none;
+      z-index: -1;
+      animation: gradientShift 8s ease-in-out infinite alternate;
+    }
+
+    @keyframes gradientShift {
+      0% { opacity: 0.8; transform: scale(1); }
+      100% { opacity: 1; transform: scale(1.05); }
+    }
+
+    /* Header */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 16px 20px;
+      background: var(--glass);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+
+    .header-content {
+      max-width: 960px;
       margin: 0 auto;
-      padding: 1rem 1rem 3rem;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      line-height: 1.5;
-      background: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
     }
-    h1 {
-      margin-top: 0.5rem;
-      margin-bottom: 1rem;
-      font-size: 1.6rem;
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
     }
-    .top-note {
-      background: #f3f4f6;
-      border: 1px solid #e5e7eb;
-      border-radius: 9999px;
-      padding: 0.35rem 0.9rem;
-      font-size: 0.78rem;
-      margin-bottom: 1rem;
-      display: inline-block;
+
+    .brand-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      object-fit: cover;
+      border: 2px solid rgba(255,255,255,0.1);
     }
-    input, select, button, textarea {
-      width: 100%;
-      padding: 0.6rem 0.55rem;
-      margin-bottom: 0.8rem;
-      border: 1px solid #d1d5db;
+
+    .brand h1 {
+      font-size: 20px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #58a6ff, #a78bfa, #f472b6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: -0.5px;
+    }
+
+    .brand .version {
+      font-size: 10px;
+      color: var(--muted);
+      font-weight: 500;
+      padding: 2px 6px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 4px;
+      margin-left: 8px;
+    }
+
+    .stats-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 99px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .stats-badge .dot {
+      width: 8px;
+      height: 8px;
+      background: var(--success);
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    /* Main Content */
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 32px 20px 60px;
+    }
+
+    /* Info Banner */
+    .info-banner {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      background: linear-gradient(135deg, rgba(88, 166, 255, 0.1), rgba(139, 92, 246, 0.08));
+      border: 1px solid rgba(88, 166, 255, 0.2);
       border-radius: var(--radius);
-      font-size: 1rem;
-      box-sizing: border-box;
+      margin-bottom: 24px;
+      font-size: 13px;
     }
-    button {
-      background: #4b5563;
-      color: #fff;
-      border: none;
+
+    .info-banner .icon { font-size: 16px; }
+
+    /* Form Card */
+    .form-card {
+      background: var(--card);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: var(--radius);
+      padding: 24px;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+    }
+
+    .form-title {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--fg);
+      margin-bottom: 6px;
+    }
+
+    label .hint {
+      color: var(--muted);
+      font-weight: 400;
+      font-size: 11px;
+    }
+
+    input[type="url"],
+    input[type="text"],
+    select {
+      width: 100%;
+      padding: 12px 14px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: var(--radius-sm);
+      color: var(--fg);
+      font-size: 14px;
+      font-family: inherit;
+      outline: none;
+      transition: all 0.2s ease;
+    }
+
+    input:focus, select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+      background: rgba(255,255,255,0.05);
+    }
+
+    input::placeholder { color: var(--muted); }
+
+    select {
       cursor: pointer;
-      font-weight: 600;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%238b949e'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+      background-size: 16px;
+      padding-right: 40px;
     }
-    button:hover {
-      background: #374151;
+
+    select option {
+      background: var(--bg-secondary);
+      color: var(--fg);
     }
-    .log-wrap {
-      margin-top: 0.5rem;
+
+    /* Options Grid */
+    .options-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
     }
-    .log {
-      white-space: pre-wrap;
-      background: #f6f6f6;
-      padding: 0.75rem;
-      border: 1px solid #ddd;
-      border-radius: var(--radius);
-      max-height: 220px;
-      overflow-y: auto;
-      font-size: 0.8rem;
+
+    .option-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.2s ease;
     }
-    .log.is-collapsed {
-      max-height: 0;
-      padding: 0;
-      border-width: 0;
-      overflow: hidden;
+
+    .option-item:hover {
+      background: rgba(255,255,255,0.04);
+      border-color: rgba(255,255,255,0.1);
     }
-    .ok {
-      background: var(--bg-soft);
-      padding: 1rem;
-      border: 1px solid #bde5c8;
-      border-radius: var(--radius);
-      margin-bottom: 1rem;
+
+    .option-item input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+      cursor: pointer;
     }
-    .err {
-      background: #ffe8e8;
-      padding: 1rem;
-      border: 1px solid #f5c2c2;
-      border-radius: var(--radius);
-      margin-bottom: 1rem;
+
+    .option-item span {
+      font-size: 13px;
     }
-    a.btn {
-      display: inline-block;
-      background: var(--primary);
-      color: #fff;
-      padding: 0.6rem 0.75rem;
-      text-decoration: none;
-      border-radius: var(--radius);
-      font-weight: 600;
+
+    .form-help {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 8px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.02);
+      border-radius: var(--radius-sm);
+      border-left: 3px solid var(--accent);
+    }
+
+    .form-help code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      background: rgba(255,255,255,0.06);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    /* Collapsible Advanced Options */
+    .advanced-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 0;
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--accent);
+      border: none;
+      background: none;
       width: 100%;
-      text-align: center;
-      box-sizing: border-box;
+      text-align: left;
     }
+
+    .advanced-toggle:hover { color: #79b8ff; }
+
+    .advanced-toggle .arrow {
+      transition: transform 0.2s ease;
+    }
+
+    .advanced-toggle.open .arrow {
+      transform: rotate(90deg);
+    }
+
+    .advanced-section {
+      display: none;
+      padding-top: 12px;
+      border-top: 1px solid rgba(255,255,255,0.06);
+      margin-top: 8px;
+    }
+
+    .advanced-section.show {
+      display: block;
+      animation: fadeIn 0.3s ease;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Submit Button */
+    button[type="submit"] {
+      width: 100%;
+      padding: 14px 20px;
+      background: linear-gradient(135deg, var(--accent), #3b82f6);
+      border: none;
+      border-radius: var(--radius-sm);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      margin-top: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    button[type="submit"]:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px var(--accent-glow);
+    }
+
+    button[type="submit"]:active {
+      transform: translateY(0);
+    }
+
+    /* Status Messages */
+    .status-box {
+      margin-top: 24px;
+      padding: 20px;
+      border-radius: var(--radius);
+      animation: fadeIn 0.3s ease;
+    }
+
+    .status-box.running {
+      background: linear-gradient(135deg, rgba(88, 166, 255, 0.1), rgba(88, 166, 255, 0.05));
+      border: 1px solid rgba(88, 166, 255, 0.3);
+    }
+
+    .status-box.done {
+      background: linear-gradient(135deg, rgba(63, 185, 80, 0.1), rgba(63, 185, 80, 0.05));
+      border: 1px solid rgba(63, 185, 80, 0.3);
+    }
+
+    .status-box.error {
+      background: linear-gradient(135deg, rgba(248, 81, 73, 0.1), rgba(248, 81, 73, 0.05));
+      border: 1px solid rgba(248, 81, 73, 0.3);
+    }
+
+    .status-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .status-header .icon { font-size: 20px; }
+
+    .status-header h3 {
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .status-info {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .status-info code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      background: rgba(255,255,255,0.06);
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: var(--fg);
+    }
+
+    /* Progress Bar */
+    .progress-container {
+      margin: 16px 0;
+    }
+
     .progress-bar {
       width: 100%;
-      background: #e5e7eb;
-      height: 12px;
-      border-radius: 9999px;
+      height: 8px;
+      background: rgba(255,255,255,0.1);
+      border-radius: 99px;
       overflow: hidden;
-      margin-bottom: 0.5rem;
+      position: relative;
     }
+
     .progress-bar-inner {
       height: 100%;
-      background: var(--primary);
+      background: linear-gradient(90deg, var(--accent), #a78bfa);
       width: 0%;
-      transition: width .3s ease;
+      transition: width 0.3s ease;
+      border-radius: 99px;
+      position: relative;
     }
-    @media (min-width: 720px) {
-      body { padding-top: 2rem; }
-      a.btn { width: auto; }
-      .log.is-collapsed { max-height: 220px; padding: 0.75rem; border-width: 1px; }
+
+    .progress-bar-inner::after {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+      animation: shimmer 1.5s infinite;
+    }
+
+    @keyframes shimmer {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(100%); }
+    }
+
+    .progress-text {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+
+    /* Download Button */
+    .download-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 14px 20px;
+      background: linear-gradient(135deg, var(--success), #22c55e);
+      color: #fff;
+      text-decoration: none;
+      border-radius: var(--radius-sm);
+      font-size: 15px;
+      font-weight: 600;
+      transition: all 0.2s ease;
+      margin-top: 12px;
+    }
+
+    .download-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px var(--success-glow);
+    }
+
+    /* Terminal-style Log */
+    .log-container {
+      margin-top: 16px;
+    }
+
+    .log-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      background: rgba(0,0,0,0.3);
+      border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-bottom: none;
+    }
+
+    .log-header .dots {
+      display: flex;
+      gap: 6px;
+    }
+
+    .log-header .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+
+    .log-header .dot.red { background: #f85149; }
+    .log-header .dot.yellow { background: #d29922; }
+    .log-header .dot.green { background: #3fb950; }
+
+    .log-header .title {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .log {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+      background: rgba(0,0,0,0.4);
+      padding: 16px;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-top: none;
+      border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+      max-height: 300px;
+      overflow-y: auto;
+      color: #7ee787;
+    }
+
+    .log::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    .log::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .log::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.1);
+      border-radius: 3px;
+    }
+
+    .log.collapsed {
+      display: none;
+    }
+
+    /* Footer */
+    footer {
+      text-align: center;
+      padding: 24px 20px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    footer a:hover {
+      text-decoration: underline;
+    }
+
+    /* Responsive */
+    @media (max-width: 640px) {
+      .header-content {
+        justify-content: center;
+      }
+      .stats-badge {
+        display: none;
+      }
+      .options-grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="top-note">檔案會在 8 小時後自動刪除</div>
-  <h1>yt-dlp web</h1>
-  <form method="post" action="/download">
-    <label for="url" style="font-weight:600;font-size:0.85rem;">URL</label>
-    <input type="url" id="url" name="url" required placeholder="https://www.youtube.com/watch?v=... / https://youtu.be/... / https://www.bilibili.com/...">
-    <label for="format" style="font-weight:600;font-size:0.85rem;">常用格式 (yt-dlp -f)</label>
-    <select id="format" name="format">
-      <option value="" selected>auto (推薦：自動 bestvideo+bestaudio)</option>
-      <option value="best">best (單文件，可能不是最佳)</option>
-      <option value="bestaudio">bestaudio (最佳音訊)</option>
-      <option value="bestvideo+bestaudio/best">bestvideo+bestaudio/best</option>
-      <option value="worst">worst</option>
-    </select>
-    <label for="custom_format" style="font-weight:600;font-size:0.85rem;">自定義格式 (可選)</label>
-    <input type="text" id="custom_format" name="custom_format" placeholder="例如：bv[ext=mp4]+ba/best">
-    <p style="font-size:0.78rem;color:#6b7280;margin-top:-0.35rem;">進階示例：<code>bv[ext=mp4]+ba/best</code>（優先 MP4）、<code>bv[height&lt;=720]+ba/best</code>（最高 720p）。更多語法可參考 yt-dlp 文檔。</p>
-    <button type="submit">開始下載</button>
-  </form>
+  <header>
+    <div class="header-content">
+      <div class="brand">
+        <img src="https://img.bdfz.net/20250503004.webp" alt="BDFZ" class="brand-icon">
+        <h1>yt-dlp web<span class="version">v1.6</span></h1>
+      </div>
+      <div class="stats-badge">
+        <span class="dot"></span>
+        <span>Service Online</span>
+      </div>
+    </div>
+  </header>
 
-  {% if error %}
-    <div class="err">{{ error }}</div>
-  {% endif %}
+  <main>
+    <div class="info-banner">
+      <span class="icon">⏱️</span>
+      <span>下載的檔案會在 <strong>8 小時</strong>後自動刪除，請及時保存</span>
+    </div>
 
-  {% if started %}
-    <div id="status-box" class="ok">
-      <p style="margin-top:0;">任務已建立，正在下載中…（幾秒後進度才會跳）</p>
-      <p style="margin-bottom:0.2rem;">任務ID：<code id="task-id">{{ task_id }}</code></p>
-      {% if normalized_url %}
-      <p style="margin-bottom:0.2rem;">已規整鏈接：<code>{{ normalized_url }}</code></p>
-      {% endif %}
-      {% if expires_at %}
-      <p style="margin-bottom:0;">將在 <strong id="expire-time">{{ expires_at }}</strong> 之後刪除。</p>
-      {% endif %}
+    <div class="form-card">
+      <div class="form-title">
+        <span>🎬</span>
+        <span>下載視頻</span>
+      </div>
+
+      <form method="post" action="/download">
+        <div class="form-group">
+          <label for="url">視頻 URL <span class="hint">(必填)</span></label>
+          <input type="url" id="url" name="url" required 
+                 placeholder="YouTube / Bilibili / Twitter / TikTok / 其他支援的網站...">
+        </div>
+
+        <div class="form-group">
+          <label for="format">下載格式</label>
+          <select id="format" name="format">
+            <option value="" selected>🚀 自動最佳 (bestvideo+bestaudio)</option>
+            <option value="bv[ext=mp4]+ba[ext=m4a]/best[ext=mp4]/best">📹 偏好 MP4 容器</option>
+            <option value="bv[height<=1080]+ba/best">📺 最高 1080p</option>
+            <option value="bv[height<=720]+ba/best">📱 最高 720p (省流量)</option>
+            <option value="bv[height<=480]+ba/best">📼 最高 480p (極致省流)</option>
+            <option value="bestaudio[ext=m4a]/bestaudio">🎵 僅音訊 (M4A)</option>
+            <option value="bestaudio">🎶 僅音訊 (最佳格式)</option>
+            <option value="best">📦 單文件最佳</option>
+          </select>
+        </div>
+
+        <button type="button" class="advanced-toggle" onclick="toggleAdvanced()">
+          <span class="arrow">▶</span>
+          <span>進階選項</span>
+        </button>
+
+        <div class="advanced-section" id="advancedSection">
+          <div class="form-group">
+            <label for="custom_format">自定義格式 <span class="hint">(覆蓋上方選擇)</span></label>
+            <input type="text" id="custom_format" name="custom_format" 
+                   placeholder="例如: bv*[height<=720][ext=mp4]+ba/best">
+          </div>
+
+          <div class="options-grid">
+            <label class="option-item">
+              <input type="checkbox" name="embed_subs" value="1">
+              <span>📝 嵌入字幕</span>
+            </label>
+            <label class="option-item">
+              <input type="checkbox" name="embed_thumbnail" value="1">
+              <span>🖼️ 嵌入縮略圖</span>
+            </label>
+            <label class="option-item">
+              <input type="checkbox" name="extract_audio" value="1">
+              <span>🎵 提取為 MP3</span>
+            </label>
+            <label class="option-item">
+              <input type="checkbox" name="no_playlist" value="1" checked>
+              <span>🔗 僅下載單個視頻</span>
+            </label>
+          </div>
+
+          <div class="form-help">
+            📖 <strong>格式語法示例：</strong><br>
+            <code>bv[ext=mp4]+ba/best</code> - 優先 MP4<br>
+            <code>bv[height&lt;=720]+ba</code> - 最高 720p<br>
+            <code>bv*+ba/b</code> - 視頻+音訊合併
+          </div>
+        </div>
+
+        <button type="submit">
+          <span>⬇️</span>
+          <span>開始下載</span>
+        </button>
+      </form>
     </div>
-    <div class="progress-bar">
-      <div id="pb" class="progress-bar-inner"></div>
+
+    {% if error %}
+    <div class="status-box error">
+      <div class="status-header">
+        <span class="icon">❌</span>
+        <h3>發生錯誤</h3>
+      </div>
+      <p class="status-info">{{ error }}</p>
     </div>
-    <div class="log-wrap">
-      <div id="logs" class="log is-collapsed"></div>
+    {% endif %}
+
+    {% if started %}
+    <div id="status-box" class="status-box running">
+      <div class="status-header">
+        <span class="icon">⏳</span>
+        <h3>正在下載中...</h3>
+      </div>
+      <p class="status-info">
+        任務 ID: <code id="task-id">{{ task_id }}</code>
+        {% if normalized_url %}<br>已解析: <code>{{ normalized_url }}</code>{% endif %}
+        {% if expires_at %}<br>過期時間: <code id="expire-time">{{ expires_at }}</code>{% endif %}
+      </p>
+      <div class="progress-container">
+        <div class="progress-bar">
+          <div id="pb" class="progress-bar-inner"></div>
+        </div>
+        <div class="progress-text">
+          <span id="progress-pct">0%</span>
+          <span>下載中...</span>
+        </div>
+      </div>
+      <div class="log-container">
+        <div class="log-header">
+          <div class="dots">
+            <span class="dot red"></span>
+            <span class="dot yellow"></span>
+            <span class="dot green"></span>
+          </div>
+          <span class="title">~/yt-dlp/output.log</span>
+        </div>
+        <div id="logs" class="log collapsed"></div>
+      </div>
     </div>
-  {% endif %}
+    {% endif %}
+  </main>
+
+  <footer>
+    Powered by <a href="https://github.com/yt-dlp/yt-dlp" target="_blank">yt-dlp</a> · 
+    Built by <a href="https://bdfz.net" target="_blank">BDFZ-SUEN</a>
+  </footer>
 
   <script>
+  function toggleAdvanced() {
+    const btn = document.querySelector('.advanced-toggle');
+    const section = document.getElementById('advancedSection');
+    btn.classList.toggle('open');
+    section.classList.toggle('show');
+  }
+
   (function() {
     const taskIdEl = document.getElementById('task-id');
     if (!taskIdEl) return;
     const taskId = taskIdEl.textContent.trim();
     const pb = document.getElementById('pb');
+    const pctEl = document.getElementById('progress-pct');
     const logsEl = document.getElementById('logs');
     const statusBox = document.getElementById('status-box');
 
-    function expandLog() {
-      if (logsEl) logsEl.classList.remove('is-collapsed');
+    function showLog() {
+      if (logsEl) logsEl.classList.remove('collapsed');
     }
 
     function poll() {
       fetch('/progress/' + taskId)
         .then(r => r.json())
         .then(data => {
-          if (data.progress !== undefined && pb) {
-            pb.style.width = data.progress + '%';
+          if (data.progress !== undefined) {
+            const pct = Math.round(data.progress);
+            if (pb) pb.style.width = pct + '%';
+            if (pctEl) pctEl.textContent = pct + '%';
           }
           if (data.logs && logsEl) {
             logsEl.textContent = data.logs;
@@ -675,13 +1272,54 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
             if (et) et.textContent = data.expires_at;
           }
           if (data.status === 'done' && data.download_url) {
-            expandLog();
-            statusBox.innerHTML = '<p>下載完成：</p><p><a class="btn" href="' + data.download_url + '">點此下載 ' + (data.filename || '') + '</a></p><p>檔案將在 8 小時後刪除。</p>';
+            showLog();
+            statusBox.className = 'status-box done';
+            statusBox.innerHTML = `
+              <div class="status-header">
+                <span class="icon">✅</span>
+                <h3>下載完成！</h3>
+              </div>
+              <p class="status-info">文件: <code>${data.filename || 'video'}</code></p>
+              <a class="download-btn" href="${data.download_url}">
+                <span>📥</span>
+                <span>點擊下載文件</span>
+              </a>
+              <p class="status-info" style="margin-top:12px;">⏱️ 檔案將在 8 小時後自動刪除</p>
+              <div class="log-container">
+                <div class="log-header">
+                  <div class="dots">
+                    <span class="dot red"></span>
+                    <span class="dot yellow"></span>
+                    <span class="dot green"></span>
+                  </div>
+                  <span class="title">~/yt-dlp/output.log</span>
+                </div>
+                <div class="log">${logsEl ? logsEl.textContent : ''}</div>
+              </div>
+            `;
           } else if (data.status === 'error') {
-            expandLog();
-            statusBox.innerHTML = '<p>下載失敗，下面是日誌。</p>';
+            showLog();
+            statusBox.className = 'status-box error';
+            statusBox.innerHTML = `
+              <div class="status-header">
+                <span class="icon">❌</span>
+                <h3>下載失敗</h3>
+              </div>
+              <p class="status-info">請查看下方日誌了解詳情</p>
+              <div class="log-container">
+                <div class="log-header">
+                  <div class="dots">
+                    <span class="dot red"></span>
+                    <span class="dot yellow"></span>
+                    <span class="dot green"></span>
+                  </div>
+                  <span class="title">~/yt-dlp/error.log</span>
+                </div>
+                <div class="log" style="color:#f85149;">${logsEl ? logsEl.textContent : ''}</div>
+              </div>
+            `;
           } else {
-            setTimeout(poll, 2000);
+            setTimeout(poll, 1500);
           }
         })
         .catch(() => {
