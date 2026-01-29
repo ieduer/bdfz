@@ -1,0 +1,11 @@
+# ipmenu runtime / privacy
+.config/
+sapdb/
+launchd.out.log
+launchd.err.log
+*.log
+
+# macOS / python
+.DS_Store
+__pycache__/
+*.pyc

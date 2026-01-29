@@ -34,74 +34,40 @@ else
   # 預設參數
   PHASE="高中"
   SUBJECTS="语文,数学,英语,思想政治,历史,地理,物理,化学,生物"
-  MATCH=""
-  IDS=""
-  OUT_DIR=""
-  ONLY_FAILED="0"
+  FORCE_OVERWRITE="0"
+  CATALOG_ONLY="0"
+  WORKER_URL=""
   HCON=12
   DCON=5
-  LIMIT=""
   POST_RETRY=2
-  AUTO_RUN="0"
-  FORCE_OVERWRITE="0"
+  
+  # ---- 交互式配置（始終開啟） ----
+  if [ -t 0 ]; then
+    printf "\n================ 📚 智慧教育教材下載器 ================\n"
+    printf "歡迎使用！本工具將幫助您下載國家教材或生成目錄。\n\n"
 
-  usage() {
-    cat >&2 <<'USAGE'
-用法:
-  bash smartedu_fetch_all.sh [選項]
+    # 1. 模式選擇
+    printf "👉 [1/4] 請問您想做什麼？\n"
+    printf "   1) 下載教材 PDF 到本地（默認，適合打印或離線閱讀）\n"
+    printf "   2) 僅生成網站目錄（不下載 PDF，生成一個網頁版目錄）\n"
+    read -r -p "請輸入數字 [1-2] (默認 1): " ans
+    if [ "$ans" = "2" ]; then
+        CATALOG_ONLY="1"
+        printf "\n   [i] 已選擇「僅目錄模式」。將生成包含下載鏈接的網頁。\n"
+        if [ -z "$WORKER_URL" ]; then
+             printf "   [?] 請輸入 Cloudflare Worker 代理地址 (可選，防止 403 錯誤)\n"
+             printf "       (如果沒有，可直接回車，但直接鏈接可能失效)\n"
+             read -r -p "       Worker URL: " w_ans
+             [ -n "$w_ans" ] && WORKER_URL="$w_ans"
+        fi
+    else
+        CATALOG_ONLY="0"
+    fi
 
-選項:
-  -p PHASE         教育階段：小学|初中|高中|特殊教育|小学54|初中54    (預設: 高中)
-  -s SUBJECTS      學科逗號分隔 (預設: 语文,数学,英语,思想政治,历史,地理,物理,化学,生物)
-  -m KEYWORD       書名關鍵詞（子串匹配，可多詞以空格分隔）
-  -i IDS           指定 contentId 列表，逗號分隔（跳過索引過濾，直達）
-  -o OUT_DIR       自定義輸出目錄（預設: ./smartedu_textbooks）
-  -R               僅重試上次失敗（讀 OUT_DIR/failed.json）
-  -c N             解析直鏈並發 (HEAD 檢查)，預設 12
-  -d N             下載並發，預設 5
-  -n N             只處理前 N 本（調試用）
-  -T N             整輪結束後自動重試 N 輪（預設 2；0=關閉）
-  -f               強制覆蓋：忽略已存在文件，重新下載（確保版本更新）
-  -y               非互動直跑（跳過交互選擇，使用當前參數）
-  -h               顯示此幫助
-
-示例:
-  bash smartedu_fetch_all.sh -p 高中
-  bash smartedu_fetch_all.sh -p 高中 -s 语文,数学 -m "必修 第一册" -T 3
-  bash smartedu_fetch_all.sh -p 小学54 -o ~/Downloads/textbooks
-USAGE
-  }
-
-  while getopts ":p:s:m:i:o:w:Rc:d:n:T:fhy" opt; do
-    case "$opt" in
-      p) PHASE="$OPTARG" ;;
-      s) SUBJECTS="$OPTARG" ;;
-      m) MATCH="$OPTARG" ;;
-      i) IDS="$OPTARG" ;;
-      o) OUT_DIR="$OPTARG" ;;
-      w) WEB_DIR="$OPTARG" ;;
-      R) ONLY_FAILED="1" ;;
-      c) HCON="$OPTARG" ;;
-      d) DCON="$OPTARG" ;;
-      n) LIMIT="$OPTARG" ;;
-      T) POST_RETRY="$OPTARG" ;;
-      f) FORCE_OVERWRITE="1" ;;
-      y) AUTO_RUN="1" ;;
-      h) usage; exit 0 ;;
-      :) echo "錯誤：選項 -$OPTARG 需要一個參數。" >&2; usage; exit 2 ;;
-      \?) echo "錯誤：未知選項 -$OPTARG" >&2; usage; exit 2 ;;
-    esac
-  done
-
-  # ---- 交互式配置（默認開啟；用 -y 跳過） ----
-  if [ "$AUTO_RUN" != "1" ] && [ -t 0 ]; then
-    printf "\n================ 下載配置嚮導 ================\n"
-    printf "只需選擇 教育階段 和 學科；其餘保持默認並自動開始。\n"
-
-    # 教育階段（數字選擇）
-    printf "\n[1] 教育階段：\n"
-    printf "   1) 小学    2) 初中    3) 高中    4) 特殊教育    5) 小学54    6) 初中54\n"
-    read -r -p "輸入數字 1-6（默認: $PHASE）: " ans
+    # 2. 教育階段
+    printf "\n👉 [2/4] 選擇教育階段：\n"
+    printf "   1) 小学    2) 初中    3) 高中 (默認)    4) 特殊教育    5) 小学54    6) 初中54\n"
+    read -r -p "請輸入數字 [1-6]: " ans
     case "$ans" in
       1) PHASE="小学";;
       2) PHASE="初中";;
@@ -109,38 +75,69 @@ USAGE
       4) PHASE="特殊教育";;
       5) PHASE="小学54";;
       6) PHASE="初中54";;
-      "") : ;;
-      *) printf "[i] 非法選擇，保持: %s\n" "$PHASE";;
+      *) [ -z "$PHASE" ] && PHASE="高中";;
     esac
+    printf "   [i] 已選擇: %s\n" "$PHASE"
 
-    # 學科（僅此一步；留空沿用當前預設）
-    printf "\n[2] 學科（逗號分隔，留空=全部預設）\n"
-    printf "    當前: %s\n" "$SUBJECTS"
-    read -r -p "輸入學科: " ans
-    [ -n "$ans" ] && SUBJECTS="$ans"
+    # 3. 學科選擇 (Simplified menu)
+    printf "\n👉 [3/4] 選擇學科：\n"
+    printf "   0) 全部下載 (默認)\n"
+    
+    # Common subjects list
+    menu_subjs=("语文" "数学" "英语" "物理" "化学" "生物" "历史" "地理" "思想政治" "科学" "道德与法治" "信息技术" "体育" "音乐" "美术")
+    i=1
+    for s in "${menu_subjs[@]}"; do
+        printf "   %2d) %-10s" "$i" "$s"
+        if [ $((i % 4)) -eq 0 ]; then echo ""; fi
+        i=$((i+1))
+    done
+    echo ""
+    printf "   Tip: 可輸入多個數字(如 1,2,3) 或直接輸入學科名稱\n"
+    
+    read -r -p "請輸入 (默認 0): " ans
+    if [ -n "$ans" ]; then
+        if [ "$ans" = "0" ]; then
+            # Keep default SUBJECTS but maybe expand it if user wants ALL?
+            # Actually default SUBJECTS in env variable is quite limited. 
+            # If user selects ALL (0), we should probably set it to a very broad list or special value.
+            # For now, let's set it to the full menu list plus defaults to be safe.
+            SUBJECTS="语文,数学,英语,物理,化学,生物,历史,地理,思想政治,科学,道德与法治,信息技术,体育与健康,音乐,美术,艺术,劳动,综合实践活动"
+        elif [[ "$ans" =~ ^[0-9,]+$ ]]; then
+            # Parse numbers
+            new_subjs=""
+            IFS=',' read -ra ADDR <<< "$ans"
+            for id in "${ADDR[@]}"; do
+                idx=$((id-1))
+                if [ $idx -ge 0 ] && [ $idx -lt ${#menu_subjs[@]} ]; then
+                    if [ -z "$new_subjs" ]; then new_subjs="${menu_subjs[$idx]}"; else new_subjs="$new_subjs,${menu_subjs[$idx]}"; fi
+                fi
+            done
+            [ -n "$new_subjs" ] && SUBJECTS="$new_subjs"
+        else
+            # Assume manual text input
+            SUBJECTS="$ans"
+        fi
+    fi
+    printf "   [i] 已選擇: %s\n" "$SUBJECTS"
 
-    # 詢問是否強制覆蓋
-    printf "\n[3] 是否強制重新下載（覆蓋已有文件）？\n"
-    read -r -p "輸入 y 強制覆蓋，留空跳過: " ans
-    if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
-      FORCE_OVERWRITE="1"
+    # 4. 強制覆蓋
+    if [ "$CATALOG_ONLY" = "0" ]; then
+        printf "\n👉 [4/4] 是否重新下載已存在且完整的文件？\n"
+        read -r -p "輸入 y 重新下載，直接回車跳過 (默認跳過): " ans
+        if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+             FORCE_OVERWRITE="1"
+        fi
     fi
 
-    # 直接開始——不再詢問：僅重試/限制/重試輪數/輸出目錄/確認
+    printf "\n✅ 配置完成！即將開始任務...\n"
+    printf "==============================================\n\n"
+    sleep 1
   fi
 
-  # 若使用強制模式，詢問是否清除舊 PDF（僅在交互模式下）
-  if [ "$FORCE_OVERWRITE" = "1" ] && [ -t 0 ] && [ "$AUTO_RUN" != "1" ]; then
+  # 若使用強制模式，詢問是否清除舊 PDF
+  if [ "$FORCE_OVERWRITE" = "1" ] && [ -t 0 ]; then
     # 檢查輸出目錄是否存在 PDF 文件
-    if [ -z "$OUT_DIR" ]; then
-      if [ -d /srv/smartedu_textbooks ]; then
-        _CHECK_DIR="/srv/smartedu_textbooks"
-      else
-        _CHECK_DIR="./smartedu_textbooks"
-      fi
-    else
-      _CHECK_DIR="$OUT_DIR"
-    fi
+    _CHECK_DIR="./smartedu_textbooks"
     
     if [ -d "$_CHECK_DIR" ]; then
       _PDF_COUNT=$(find "$_CHECK_DIR" -name "*.pdf" -type f 2>/dev/null | wc -l | tr -d ' ')
@@ -162,10 +159,10 @@ USAGE
 
   # 交互輸入後再做一次數值校驗
   int_re='^[0-9]+$'
-  if ! [[ "$HCON" =~ $int_re ]]; then echo "[!] -c 必須為整數" >&2; exit 2; fi
-  if ! [[ "$DCON" =~ $int_re ]]; then echo "[!] -d 必須為整數" >&2; exit 2; fi
-  if [[ -n "$LIMIT" ]] && ! [[ "$LIMIT" =~ $int_re ]]; then echo "[!] -n 必須為整數" >&2; exit 2; fi
-  if ! [[ "$POST_RETRY" =~ $int_re ]]; then echo "[!] -T 必須為整數" >&2; exit 2; fi
+  # 交互輸入後再做一次數值校驗 (Optional, kept for safety)
+  int_re='^[0-9]+$'
+  if ! [[ "$HCON" =~ $int_re ]]; then HCON=12; fi
+  if ! [[ "$DCON" =~ $int_re ]]; then DCON=5; fi
 
   # --- 權限與包管理器偵測 ---
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
@@ -308,38 +305,22 @@ PY
 
   export SMARTEDU_PHASE="$PHASE"
   export SMARTEDU_SUBJ="$SUBJECTS"
-  export SMARTEDU_MATCH="$MATCH"
-  export SMARTEDU_IDS="$IDS"
-  # --- 確定輸出目錄（預設優先 /srv/smartedu_textbooks；否則用相對目錄） ---
-  if [ -z "$OUT_DIR" ]; then
-    if [ -d /srv/smartedu_textbooks ] || [ -w /srv ]; then
-      OUT_DIR="/srv/smartedu_textbooks"
-      mkdir -p "$OUT_DIR"
-    else
-      OUT_DIR="./smartedu_textbooks"
-    fi
-  fi
+  # --- 確定輸出目錄（固定為 ./smartedu_textbooks） ---
+  OUT_DIR="./smartedu_textbooks"
+  mkdir -p "$OUT_DIR"
   export SMARTEDU_OUT_DIR="$OUT_DIR"
   echo "[i] 下載輸出目錄: $SMARTEDU_OUT_DIR"
 
-  # --- 確定網頁根目錄（WEB_DIR）：未指定則默認 /srv/smartedu_textbooks，否則沿用 OUT_DIR ---
-  if [ -z "${WEB_DIR:-}" ]; then
-    if [ -d /srv/smartedu_textbooks ] || [ -w /srv ]; then
-      WEB_DIR="/srv/smartedu_textbooks"
-      mkdir -p "$WEB_DIR"
-    else
-      WEB_DIR="$OUT_DIR"
-    fi
-  fi
+  # --- 確定網頁根目錄（WEB_DIR）：沿用 OUT_DIR ---
+  WEB_DIR="$OUT_DIR"
   export SMARTEDU_WEB_DIR="$WEB_DIR"
-  echo "[i] 網頁根目錄: $SMARTEDU_WEB_DIR"
-  export SMARTEDU_ONLY_FAILED="$ONLY_FAILED"
+  
   export SMARTEDU_HCON="$HCON"
   export SMARTEDU_DCON="$DCON"
-  export SMARTEDU_LIMIT="$LIMIT"
   export SMARTEDU_POST_RETRY="$POST_RETRY"
-  export SMARTEDU_WEB_DIR="$WEB_DIR"
   export SMARTEDU_FORCE="$FORCE_OVERWRITE"
+  export SMARTEDU_CATALOG_ONLY="$CATALOG_ONLY"
+  export SMARTEDU_WORKER_URL="$WORKER_URL"
   export PYTHON_EXEC=1
 
   # --- 清理孤立的 .part 文件（超過 24 小時） ---
@@ -412,8 +393,8 @@ from tqdm import tqdm
 
 # ---------------- 基本配置 / 常量 ----------------
 Settings = namedtuple("Settings", [
-    "PHASE","SUBJECTS","MATCH","IDS","OUT_DIR","WEB_DIR","ONLY_FAILED",
-    "HCON","DCON","LIMIT","POST_RETRY","FORCE"
+    "PHASE","SUBJECTS","FORCE","CATALOG_ONLY","WORKER_URL",
+    "HCON","DCON","POST_RETRY"
 ])
 
 PHASE_TAGS = {
@@ -513,27 +494,19 @@ def logic_key(subject: str, name_or_title: str) -> str:
     return f"{subject}::{key}"
 
 def load_settings_from_env() -> Settings:
-    out_env = os.getenv("SMARTEDU_OUT_DIR")
-    out_dir = Path(os.path.expanduser(out_env)) if out_env else Path.cwd() / "smartedu_textbooks"
     pr_raw = os.getenv("SMARTEDU_POST_RETRY", "2").strip()
     try: pr = max(0, min(5, int(pr_raw)))
     except ValueError: pr = 2
-    web_env = os.getenv("SMARTEDU_WEB_DIR","").strip()
-    web_dir = Path(os.path.expanduser(web_env)) if web_env else out_dir
     force = os.getenv("SMARTEDU_FORCE", "0") == "1"
     return Settings(
         PHASE=os.getenv("SMARTEDU_PHASE","高中"),
         SUBJECTS=[s.strip().replace(" ","") for s in os.getenv("SMARTEDU_SUBJ","语文,数学,英语,思想政治,历史,地理,物理,化学,生物").split(",") if s.strip()],
-        MATCH=os.getenv("SMARTEDU_MATCH","").strip(),
-        IDS=[s.strip() for s in os.getenv("SMARTEDU_IDS","").split(",") if s.strip()],
-        OUT_DIR=out_dir,
-        WEB_DIR=web_dir,
-        ONLY_FAILED=os.getenv("SMARTEDU_ONLY_FAILED","0")=="1",
         HCON=int(os.getenv("SMARTEDU_HCON","12")),
         DCON=int(os.getenv("SMARTEDU_DCON","5")),
-        LIMIT=int(v) if (v:=os.getenv("SMARTEDU_LIMIT","").strip()).isdigit() else None,
         POST_RETRY=pr,
         FORCE=force,
+        CATALOG_ONLY=os.getenv("SMARTEDU_CATALOG_ONLY","0")=="1",
+        WORKER_URL=os.getenv("SMARTEDU_WORKER_URL","").strip(),
     )
 
 def build_referer(book_id: str) -> str:
@@ -574,9 +547,6 @@ def match_phase_subject_keyword(book: Dict[str, Any], st: Settings) -> bool:
     wants = PHASE_TAGS.get(st.PHASE, [])
     if wants and not any(any(w in t for w in wants) for t in tags): return False
     if st.SUBJECTS and not any(any(s in t for s in st.SUBJECTS) for t in tags): return False
-    if st.MATCH:
-        title = (book.get("title") or (book.get("global_title") or {}).get("zh-CN") or "").lower()
-        if not all(k.lower() in title for k in st.MATCH.split()): return False
     return True
 
 def derive_filename(item: dict, book_id: str) -> Optional[str]:
@@ -669,41 +639,6 @@ def build_existing_map(out_dir: Path) -> Dict[str, Dict[str,Any]]:
             m[key] = {"title": canon_title(p.stem), "subject": subj_guess, "phase": "", "path": str(p), "size": p.stat().st_size}
     return m
 
-# --- 合併現有文件映射：primary 覆蓋 secondary，保留更大者 ---
-def merge_maps(primary: Dict[str,Any], secondary: Dict[str,Any]) -> Dict[str,Any]:
-    """按 key 合併，保留 size 更大者；相等時保留路徑更短者。"""
-    out = dict(secondary)
-    for k,v in primary.items():
-        ov = out.get(k)
-        if not ov:
-            out[k]=v; continue
-        try:
-            sz1 = int(v.get("size") or 0)
-            sz2 = int(ov.get("size") or 0)
-        except Exception:
-            sz1 = int(v.get("size") or 0); sz2 = int(ov.get("size") or 0)
-        if (sz1 > sz2) or (sz1==sz2 and len(str(v.get("path",""))) < len(str(ov.get("path","")))):
-            out[k]=v
-    return out
-
-def mirror_to_web_dir(out_dir: Path, web_dir: Path, combined: Dict[str,Any]) -> None:
-    """把 OUT_DIR 的文件鏡像到 WEB_DIR：若目標不存在或更小則覆蓋，保留目錄結構。"""
-    for it in combined.values():
-        p = Path(it.get("path",""))
-        src = (out_dir / p) if not p.is_absolute() else p
-        if not src.exists(): 
-            continue
-        try:
-            rel = src.relative_to(out_dir)
-        except Exception:
-            continue
-        dst = web_dir / rel
-        try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if (not dst.exists()) or (dst.stat().st_size < src.stat().st_size):
-                shutil.copy2(src, dst)
-        except Exception as e:
-            LOGGER.warning("鏡像到網頁目錄失敗: %s -> %s (%s)", src, dst, e)
 
 async def download_pdf(session: aiohttp.ClientSession, url: str, dest: Path, referer: str, force: bool = False) -> bool:
     """Download PDF with exponential backoff retry and optional force overwrite."""
@@ -787,16 +722,23 @@ def render_html(out_dir: Path, items: List[Dict[str,Any]]):
         subj = it.get("subject") or "綜合"
         title= canon_title(it.get("title") or Path(it.get("path","")).stem)
         path = Path(it.get("path",""))
-        if not (out_dir/path).exists(): 
+        is_remote = it.get("is_remote", False)
+        
+        if not is_remote and not (out_dir/path).exists(): 
             if path.exists(): pass
             else: continue
-        size = (out_dir/path).stat().st_size if (out_dir/path).exists() else path.stat().st_size
+            
+        if is_remote:
+            size = it.get("size", 0)
+        else:
+            size = (out_dir/path).stat().st_size if (out_dir/path).exists() else path.stat().st_size
+            
         key  = logic_key(subj, title)
         old  = collected.get(key)
         if (not old) or (size > old["_size"]) or (size==old["_size"] and len(str(path))<len(old["_rel"])):
             if old:
                 total_size -= old["_size"]
-            collected[key]={"_rel":str(path), "_size":size, "_disp":title, "subject":subj, "_fname":Path(path).name}
+            collected[key]={"_rel":str(path), "_size":size, "_disp":title, "subject":subj, "_fname":Path(path).name, "_url":it.get("url"), "_is_remote":is_remote, "_referer":it.get("referer")}
             total_size += size
 
     # —— 分組與排序 ——
@@ -842,11 +784,32 @@ f""".chip--{cls}{{background:linear-gradient(135deg,{th['chip']}dd,{th['chip']}8
         cards=[]
         for v in by[s]:
             rel = v["_rel"].replace(os.sep,"/")
-            href = quote(rel, safe="/")
+            
+            if v.get("_is_remote"):
+                # 使用 Worker 代理鏈接
+                raw_url = v.get("_url","")
+                ref = v.get("_referer","")
+                fname = v.get("_fname","")
+                # 如果配置了 Worker URL，則構造代理鏈接
+                worker = os.getenv("SMARTEDU_WORKER_URL","")
+                if worker:
+                    # 確保 worker url 結尾無斜杠
+                    worker = worker.rstrip("/")
+                    # 構造: WORKER?url=...&referer=...&filename=...
+                    href = f"{worker}?url={quote(raw_url)}&referer={quote(ref)}&filename={quote(fname)}"
+                    target_attr = 'target="_blank"' # 代理下載不需要 no-referrer
+                else:
+                    # Fallback (仍然不可用，但保持邏輯完整)
+                    href = raw_url
+                    target_attr = 'target="_blank" referrerpolicy="no-referrer"'
+            else:
+                href = quote(rel, safe="/")
+                target_attr = 'target="_blank"'
+                
             size_mb = f"{(v['_size']/1024/1024):.1f} MB"
             cards.append(
                 f'<li class="card" data-title="{esc(v["_disp"])}" data-size="{v["_size"]}">'
-                f'  <a class="card-link" href="{href}" target="_blank" download title="下載 {esc(v["_fname"])}">'
+                f'  <a class="card-link" href="{href}" {target_attr} download title="下載 {esc(v["_fname"])}">'
                 f'    <div class="thumb" aria-hidden="true"><span class="pdf-icon">📕</span></div>'
                 f'    <div class="meta">'
                 f'      <div class="name">{esc(v["_disp"])}</div>'
@@ -1506,10 +1469,6 @@ f""".chip--{cls}{{background:linear-gradient(135deg,{th['chip']}dd,{th['chip']}8
 
 # ---------------- 主流程 ----------------
 async def resolve_all_books(session: aiohttp.ClientSession, st: Settings) -> List[Dict[str,Any]]:
-    # 指定 IDS 直達
-    if st.IDS:
-        return [{"id": i, "title": i, "tag_list":[{"tag_name": st.PHASE}]} for i in st.IDS]
-
     LOGGER.info("🔎 讀取遠程索引...")
     urls = await get_data_urls(session)
     if not urls:
@@ -1519,7 +1478,6 @@ async def resolve_all_books(session: aiohttp.ClientSession, st: Settings) -> Lis
         js = await get_json(session, url)
         if isinstance(js, list): books.extend(js)
     books = [b for b in books if match_phase_subject_keyword(b, st)]
-    if st.LIMIT: books = books[:st.LIMIT]
     LOGGER.info("目標條目: %d", len(books))
     return books
 
@@ -1541,47 +1499,21 @@ async def resolve_one_book(session: aiohttp.ClientSession, book: Dict[str,Any], 
 
 async def main():
     st = load_settings_from_env()
-    out_dir: Path = st.OUT_DIR
-    web_dir: Path = st.WEB_DIR
+    out_dir = Path("./smartedu_textbooks")
     setup_logging(out_dir)
     LOGGER.info("📁 下載目錄: %s", out_dir)
-    LOGGER.info("🌐 網頁目錄: %s", web_dir)
-    LOGGER.info("階段=%s | 學科=%s | 匹配='%s' | 只重試失敗=%s | 強制覆蓋=%s | 自動重試輪=%d",
-                st.PHASE, ",".join(st.SUBJECTS), st.MATCH, st.ONLY_FAILED, st.FORCE, st.POST_RETRY)
+    LOGGER.info("階段=%s | 學科=%s | 強制覆蓋=%s | 自動重試輪=%d | 僅目錄模式=%s",
+                st.PHASE, ",".join(st.SUBJECTS), st.FORCE, st.POST_RETRY, st.CATALOG_ONLY)
 
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=180)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # ========= ONLY_FAILED 模式：讀取 failed.json =========
-        if st.ONLY_FAILED:
-            failed_file = out_dir / "failed.json"
-            if not failed_file.exists():
-                LOGGER.warning("failed.json 不存在，沒有需要重試的項目。")
-                books = []
-            else:
-                try:
-                    failed_items = json.loads(failed_file.read_text("utf-8"))
-                    LOGGER.info("📋 讀取 failed.json，共 %d 項待重試", len(failed_items))
-                    # 轉換為 books 格式供後續處理
-                    books = [
-                        {
-                            "id": f.get("id"),
-                            "title": f.get("title"),
-                            "tag_list": [{"tag_name": f.get("subject", "綜合")}, {"tag_name": f.get("phase", st.PHASE)}],
-                            "_cached_subject": f.get("subject", "綜合"),
-                        }
-                        for f in failed_items if f.get("id")
-                    ]
-                except Exception as e:
-                    LOGGER.error("讀取 failed.json 失敗: %s", e)
-                    books = []
-        else:
-            books = await resolve_all_books(session, st)
+        books = await resolve_all_books(session, st)
         
         if not books:
-            LOGGER.warning("沒有匹配的條目。仍將刷新網頁索引。")
+            LOGGER.warning("沒有匹配的條目。")
 
-        # 構建現有文件映射（合併 OUT_DIR 與 WEB_DIR，保留更大者）
-        exist_map = merge_maps(build_existing_map(out_dir), build_existing_map(web_dir))
+        # 構建現有文件映射
+        exist_map = build_existing_map(out_dir)
 
         # ========= 真正並發解析直鏈 =========
         sem = asyncio.Semaphore(st.HCON)
@@ -1590,17 +1522,7 @@ async def main():
         if books:
             LOGGER.info("🔗 並發解析 %d 本教材的下載鏈接（並發數: %d）...", len(books), st.HCON)
             
-            # 為 ONLY_FAILED 模式特殊處理 subject
-            async def resolve_with_subject_override(book):
-                cached_subj = book.get("_cached_subject")
-                result = await resolve_one_book(session, book, st, sem)
-                if result and cached_subj:
-                    # 使用緩存的 subject
-                    bid, title, _, url, rlen = result
-                    return (bid, title, cached_subj, url, rlen)
-                return result
-            
-            tasks = [resolve_with_subject_override(b) for b in books]
+            tasks = [resolve_one_book(session, b, st, sem) for b in books]
             pbar = tqdm(total=len(tasks), desc="解析直鏈", unit="本")
             
             for coro in asyncio.as_completed(tasks):
@@ -1612,83 +1534,120 @@ async def main():
             pbar.close()
             LOGGER.info("✅ 成功解析 %d / %d 本", len(queue), len(books))
 
-        # 下載（支持斷點與跳過），按 DCON 控制並發
-        async def worker(items):
-            for bid, title, subj, url, rlen in items:
-                # 目錄：out/學段/學科/
-                dest_dir = out_dir / st.PHASE / subj
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                dest = dest_dir / canon_filename(title)
-                key  = logic_key(subj, title)
-
-                # 強制模式跳過所有存在性檢查
-                if not st.FORCE:
-                    # 若已有相同 key 的文件（任何學段），且檔案有效、大小 >= 遠端（若已知），跳過
-                    exist = exist_map.get(key)
-                    if exist:
-                        p = Path(exist.get("path",""))
-                        p = (out_dir/p) if not p.is_absolute() else p
-                        if p.exists() and have_pdf_head(p):
-                            if rlen is None or p.stat().st_size >= rlen:
-                                LOGGER.info("跳過（已存在更大/相等）: %s", title)
-                                continue
-
-                    # 若目標路徑已有有效 PDF，亦跳過
-                    if have_pdf_head(dest):
-                        LOGGER.info("跳過（本地已完整）: %s", dest.name)
-                        continue
-
-                ok = await download_pdf(session, url, dest, build_referer(bid), force=st.FORCE)
-                if ok:
-                    exist_map[key] = {"title": title, "subject": subj, "phase": st.PHASE, "path": str(dest.relative_to(out_dir)), "size": dest.stat().st_size}
-                else:
-                    failures.append({"id": bid, "title": title, "subject": subj, "phase": st.PHASE, "url": url})
-
-        # 拆分給 DCON 個 worker
         failures: List[Dict[str,Any]] = []
-        if queue:
-            chunks = [queue[i::max(1,st.DCON)] for i in range(max(1,st.DCON))]
-            tasks = [asyncio.create_task(worker(ch)) for ch in chunks]
-            await asyncio.gather(*tasks)
+        if st.CATALOG_ONLY:
+            LOGGER.info("📚 僅目錄模式：跳過下載，生成直接鏈接...")
+            for bid, title, subj, url, rlen in queue:
+                key = logic_key(subj, title)
+                # 記錄為遠程項目
+                exist_map[key] = {
+                    "title": title, "subject": subj, "phase": st.PHASE,
+                    "url": url, "size": rlen or 0, "is_remote": True,
+                    "referer": build_referer(bid),
+                    "path": f"REMOTE/{bid}/{canon_filename(title)}" # 虛擬路徑
+                }
+        else:
+            # 下載（支持斷點與跳過），按 DCON 控制並發
+            async def worker(items):
+                for bid, title, subj, url, rlen in items:
+                    # 目錄：out/學段/學科/
+                    dest_dir = out_dir / st.PHASE / subj
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    dest = dest_dir / canon_filename(title)
+                    key  = logic_key(subj, title)
+    
+                    # 強制模式跳過所有存在性檢查
+                    if not st.FORCE:
+                        # 若已有相同 key 的文件（任何學段），且檔案有效、大小 >= 遠端（若已知），跳過
+                        exist = exist_map.get(key)
+                        if exist:
+                            p = Path(exist.get("path",""))
+                            p = (out_dir/p) if not p.is_absolute() else p
+                            if p.exists() and have_pdf_head(p):
+                                if rlen is None or p.stat().st_size >= rlen:
+                                    LOGGER.info("跳過（已存在更大/相等）: %s", title)
+                                    continue
+    
+                        # 若目標路徑已有有效 PDF，亦跳過
+                        if have_pdf_head(dest):
+                            LOGGER.info("跳過（本地已完整）: %s", dest.name)
+                            continue
+    
+                    ok = await download_pdf(session, url, dest, build_referer(bid), force=st.FORCE)
+                    if ok:
+                        exist_map[key] = {"title": title, "subject": subj, "phase": st.PHASE, "path": str(dest.relative_to(out_dir)), "size": dest.stat().st_size}
+                    else:
+                        failures.append({"id": bid, "title": title, "subject": subj, "phase": st.PHASE, "url": url})
+    
+                # 拆分給 DCON 個 worker
+                if queue:
+                    chunks = [queue[i::max(1,st.DCON)] for i in range(max(1,st.DCON))]
+                    tasks = [asyncio.create_task(worker(ch)) for ch in chunks]
+                    await asyncio.gather(*tasks)
+    
+                # 自動重試輪：只針對失敗清單，再跑 st.POST_RETRY 輪
+                for round_i in range(st.POST_RETRY):
+                    if not failures: break
+                    LOGGER.info("♻️ 自動重試輪 %d / %d，剩餘 %d 本", round_i+1, st.POST_RETRY, len(failures))
+                    retrying = failures; failures=[]
+                    # 重新解析+下載
+                    q2=[]
+                    for f in retrying:
+                        bid=f["id"]; title=f["title"]; subj=f["subject"]; ref=build_referer(bid)
+                        urls = await resolve_candidates(session, bid)
+                        chosen=None; rlen=None
+                        for u in urls:
+                            ok, rlen = await probe_url(session, u, ref)
+                            if ok: chosen=u; break
+                        if chosen: q2.append((bid,title,subj,chosen,rlen))
+                    if q2:
+                        chunks = [q2[i::max(1,st.DCON)] for i in range(max(1,st.DCON))]
+                        tasks = [asyncio.create_task(worker(ch)) for ch in chunks]
+                        await asyncio.gather(*tasks)
 
-        # 自動重試輪：只針對失敗清單，再跑 st.POST_RETRY 輪
-        for round_i in range(st.POST_RETRY):
-            if not failures: break
-            LOGGER.info("♻️ 自動重試輪 %d / %d，剩餘 %d 本", round_i+1, st.POST_RETRY, len(failures))
-            retrying = failures; failures=[]
-            # 重新解析+下載
-            q2=[]
-            for f in retrying:
-                bid=f["id"]; title=f["title"]; subj=f["subject"]; ref=build_referer(bid)
-                urls = await resolve_candidates(session, bid)
-                chosen=None; rlen=None
-                for u in urls:
-                    ok, rlen = await probe_url(session, u, ref)
-                    if ok: chosen=u; break
-                if chosen: q2.append((bid,title,subj,chosen,rlen))
-            if q2:
-                chunks = [q2[i::max(1,st.DCON)] for i in range(max(1,st.DCON))]
-                tasks = [asyncio.create_task(worker(ch)) for ch in chunks]
-                await asyncio.gather(*tasks)
-
-        # —— 把 OUT_DIR 的新增/更大檔鏡像到 WEB_DIR —— 
-        mirror_to_web_dir(out_dir, web_dir, exist_map)
-
-        # —— 以 WEB_DIR 為準重建 index.json 與頁面 —— 
-        web_map = build_existing_map(web_dir)
+        # —— 生成 index.json 與頁面 —— 
         items = []
-        for k,it in web_map.items():
-            p = Path(it["path"])
-            abs_p = (web_dir/p) if not p.is_absolute() else p
-            if abs_p.exists() and have_pdf_head(abs_p):
-                it["size"] = abs_p.stat().st_size
-                it["title"]= canon_title(it.get("title") or p.stem)
-                try:
-                    rel = abs_p.relative_to(web_dir).as_posix()
-                except Exception:
-                    rel = str(abs_p)
-                it["path"] = rel
-                items.append(it)
+        
+        # 遍歷 exist_map (包含本地與遠程)
+        # Scan out_dir to be sure about local files? 
+        # But exist_map is updated during download. 
+        # Let's trust exist_map + pure scan to be safe? 
+        # The safest way is to rebuild exist_map from disk for local files if not skipping checks.
+        # But we just downloaded. 
+        # Let's iterate exist_map.
+        
+        for k, v in exist_map.items():
+            if v.get("is_remote"):
+                items.append(v)
+            else:
+                p = Path(v.get("path",""))
+                abs_p = (out_dir/p) if not p.is_absolute() else p
+                if abs_p.exists() and have_pdf_head(abs_p):
+                    v["size"] = abs_p.stat().st_size
+                    v["title"]= canon_title(v.get("title") or abs_p.stem)
+                    try:
+                       rel = abs_p.relative_to(out_dir).as_posix()
+                    except:
+                       rel = str(abs_p)
+                    v["path"] = rel
+                    items.append(v)
+        
+        # 保存索引
+        items.sort(key=lambda x: (x.get("subject",""), x.get("title","")))
+        (out_dir / "index.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), "utf-8")
+        LOGGER.info("📝 索引已保存: %s/index.json (共 %d 條)", out_dir, len(items))
+
+        # 生成 HTML
+        render_html(out_dir, items)
+        
+        if failures:
+            LOGGER.error("❌ 以下 %d 本下載失敗 (已重試 %d 輪):", len(failures), st.POST_RETRY)
+            for f in failures:
+                LOGGER.error("   [%s] %s | %s", f["subject"], f["title"], f["id"])
+            (out_dir / "failed.json").write_text(json.dumps(failures, ensure_ascii=False, indent=2), "utf-8")
+        else:
+            if not st.CATALOG_ONLY and queue:
+                LOGGER.info("🎉 所有任務完成！")
         (web_dir/"index.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), "utf-8")
 
         # 失敗清單
@@ -1702,7 +1661,6 @@ async def main():
 
         # 生成最終版網頁（寫入 WEB_DIR）
         render_html(web_dir, items)
-        LOGGER.info("🧭 已更新 %s", (web_dir/"index.html"))
 
 if __name__ == "__main__":
     try:
