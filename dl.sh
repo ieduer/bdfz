@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean, Telegram notify
-# version: v1.6-2026-01-28
+# version: v1.7-2026-01-30
 # changes from v1.5-2025-12-03:
 # - 全新 Geek 風格 Glassmorphism UI（暗色主題、漸變背景、動畫效果）
 # - 新增下載格式選項（偏好 MP4、最高解析度限制、僅音訊）
@@ -21,7 +21,7 @@ DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 
-echo "[ytweb] installing version v1.6-2026-01-28 ..."
+echo "[ytweb] installing version v1.7-2026-01-30 ..."
 
 # 必須 root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -45,10 +45,10 @@ pkill -f "$APP_DIR/app.py" 2>/dev/null || true
 
 # 1) base packages
 PYTHON_BIN="python3"
-echo "[ytweb] installing base packages (python3, venv, pip, nginx, certbot, ffmpeg, curl) ..."
+echo "[ytweb] installing base packages (python3, venv, pip, nginx, certbot, ffmpeg, curl, unzip) ..."
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
-  apt-get install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx ffmpeg curl
+  apt-get install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx ffmpeg curl unzip
 elif command -v dnf >/dev/null 2>&1; then
   dnf install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx ffmpeg curl || true
 elif command -v yum >/dev/null 2>&1; then
@@ -57,9 +57,43 @@ else
   echo "[ytweb] could not detect apt/dnf/yum. Please install python3 + nginx + certbot + ffmpeg + curl manually." >&2
 fi
 
+
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "[ytweb] python3 not found after package installation. Abort." >&2
   exit 1
+fi
+
+# 1.5) deno (for yt-dlp youtube JS runtime)
+# yt-dlp: Only deno is enabled by default; installing deno avoids YouTube 403/SABR issues.
+if ! command -v deno >/dev/null 2>&1; then
+  echo "[ytweb] installing deno (JS runtime for yt-dlp) ..."
+  ARCH="$(uname -m)"
+  case "$ARCH" in
+    x86_64|amd64) DENO_ZIP="deno-x86_64-unknown-linux-gnu.zip" ;;
+    aarch64|arm64) DENO_ZIP="deno-aarch64-unknown-linux-gnu.zip" ;;
+    *)
+      echo "[ytweb] unsupported arch for deno: $ARCH (skip)" >&2
+      DENO_ZIP=""
+      ;;
+  esac
+
+  if [ -n "$DENO_ZIP" ]; then
+    TMPDIR="$(mktemp -d)"
+    (
+      set -e
+      cd "$TMPDIR"
+      curl -fL -o deno.zip "https://github.com/denoland/deno/releases/latest/download/${DENO_ZIP}"
+      unzip -o deno.zip
+      install -m 0755 deno /usr/local/bin/deno
+    )
+    rm -rf "$TMPDIR" || true
+  fi
+else
+  echo "[ytweb] deno already installed: $(command -v deno)"
+fi
+
+if command -v deno >/dev/null 2>&1; then
+  echo "[ytweb] deno version: $(deno --version | head -n 1)"
 fi
 
 # 2) dirs
@@ -85,12 +119,34 @@ V_PY="$VENV_DIR/bin/python"
 
 echo "[ytweb] upgrading pip and installing/refreshing dependencies (flask, dotenv, yt-dlp, werkzeug, requests) ..."
 "$V_PY" -m pip install --upgrade pip
-"$V_PY" -m pip install --upgrade flask python-dotenv yt-dlp werkzeug requests
+"$V_PY" -m pip install --upgrade flask python-dotenv "yt-dlp[default]" werkzeug requests
 
 # 更新後的 yt-dlp 路徑 & 版本
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 YTDLP_VERSION="$("$YTDLP_BIN" --version 2>/dev/null || echo "unknown")"
 echo "[ytweb] yt-dlp version: $YTDLP_VERSION (path: $YTDLP_BIN)"
+
+# 3.5) yt-dlp system config (enable deno runtime; mitigate YouTube SABR/403)
+if command -v deno >/dev/null 2>&1; then
+  echo "[ytweb] writing /etc/yt-dlp.conf (deno runtime + youtube extractor args) ..."
+  cat >/etc/yt-dlp.conf <<'CONF'
+# yt-dlp global config (installed by ytweb dl.sh)
+# Enable JS runtime (deno) for YouTube extraction
+--js-runtimes deno:/usr/local/bin/deno
+
+# Workaround for SABR/403: avoid android_sdkless client
+--extractor-args youtube:player_client=default,-android_sdkless
+
+# Reduce flaky fragment downloading
+--concurrent-fragments 1
+--retries 10
+--fragment-retries 10
+--retry-sleep 1
+CONF
+  chmod 0644 /etc/yt-dlp.conf
+else
+  echo "[ytweb] deno not found; skip /etc/yt-dlp.conf (YouTube may be flaky)" >&2
+fi
 
 # 4) app.py
 cat > "$APP_DIR/app.py" <<'PY'
@@ -98,7 +154,7 @@ cat > "$APP_DIR/app.py" <<'PY'
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v1.4-2025-12-03
+version: v1.5-2026-01-30
 
 - explicit yt-dlp path via env YTDLP_BIN
 - youtube url normalization (watch/shorts/live/youtu.be)
@@ -268,6 +324,17 @@ def run_ytdlp_task(task_id, url, fmt, options=None):
     "--trim-filenames",
     "80",
   ]
+  # YouTube: prefer enabling JS runtime (deno) + mitigate SABR/403
+  try:
+    uhost = (urlparse(url).netloc or "").lower()
+  except Exception:
+    uhost = ""
+  if "youtube.com" in uhost or "youtu.be" in uhost:
+    if os.path.isfile("/usr/local/bin/deno"):
+      cmd += ["--js-runtimes", "deno:/usr/local/bin/deno"]
+    cmd += ["--extractor-args", "youtube:player_client=default,-android_sdkless"]
+    # a bit more robust for fragments
+    cmd += ["--concurrent-fragments", "1", "--retries", "10", "--fragment-retries", "10", "--retry-sleep", "1"]
   if fmt:
     cmd += ["-f", fmt]
   
