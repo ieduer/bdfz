@@ -45,33 +45,33 @@ _tg_json_get() {
   # Example: _tg_json_get result.username
   # Reads JSON from stdin and prints value or empty.
   local path="$1"
-  python3 - <<'PY'
-import json,sys
-path=sys.argv[1].split('.')
+  python3 - "$path" <<'PY'
+import json, sys
+path = (sys.argv[1] if len(sys.argv) > 1 else "").split(".")
 try:
-  d=json.load(sys.stdin)
+    d = json.load(sys.stdin)
 except Exception:
-  print("")
-  raise SystemExit(0)
-cur=d
+    print("")
+    raise SystemExit(0)
+cur = d
 for k in path:
-  if isinstance(cur, dict):
-    cur=cur.get(k)
-  else:
-    cur=None
-    break
+    if isinstance(cur, dict):
+        cur = cur.get(k)
+    else:
+        cur = None
+        break
 if cur is None:
-  print("")
-elif isinstance(cur,(str,int,float,bool)):
-  print(cur)
+    print("")
+elif isinstance(cur, (str, int, float, bool)):
+    print(cur)
 else:
-  try:
-    import json as _json
-    print(_json.dumps(cur, ensure_ascii=False))
-  except Exception:
-    print(str(cur))
+    try:
+        import json as _json
+        print(_json.dumps(cur, ensure_ascii=False))
+    except Exception:
+        print(str(cur))
 PY
-  "$path"
+}
 }
 
 _tg_get_webhook_url() {
