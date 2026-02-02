@@ -1,7 +1,7 @@
 #!/bin/bash
 export LANG=en_US.UTF-8
 
-SBG_VERSION="v0.2.0-game-accel"
+SBG_VERSION="v0.2.1-game-accel"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -63,7 +63,6 @@ VLESS_UUID=""
 REALITY_PRIV=""
 REALITY_PUB=""
 
-
 die(){ _red "$1"; exit 1; }
 
 need_root(){
@@ -97,15 +96,35 @@ v4v6(){
   v6="$(curl -s6m5 -k icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
 }
 
-rand_port(){
+rand_port_udp(){
   while true; do
     local p
     p="$(shuf -i 10000-65535 -n 1)"
-    if ! ss -tunlp 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qx "$p"; then
+    if ! ss -ulnp 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qx "$p"; then
       echo "$p"
       return
     fi
   done
+}
+
+rand_port_tcp(){
+  while true; do
+    local p
+    p="$(shuf -i 10000-65535 -n 1)"
+    if ! ss -tlnp 2>/dev/null | awk '{print $4}' | sed 's/.*://g' | grep -qx "$p"; then
+      echo "$p"
+      return
+    fi
+  done
+}
+
+port_in_use(){
+  local proto="$1" port="$2"
+  if [[ "$proto" == "tcp" ]]; then
+    ss -tlnp 2>/dev/null | awk '{print $4}' | sed 's/.*://g' | grep -qx "$port"
+  else
+    ss -ulnp 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qx "$port"
+  fi
 }
 
 rand_str(){
@@ -181,9 +200,17 @@ choose_ports(){
   sel="${sel:-1}"
 
   if [[ "$sel" == "2" ]]; then
-    PORT_HY2="$(rand_port)"
+    PORT_HY2="$(rand_port_udp)"
   else
     PORT_HY2="443"
+  fi
+
+  # If 443/udp is already occupied, fall back automatically.
+  if [[ "$PORT_HY2" == "443" ]] && port_in_use udp 443; then
+    local p2
+    p2="$(rand_port_udp)"
+    _yellow "Port 443/udp is already in use on this server. Switching HY2 to ${p2}/udp."
+    PORT_HY2="$p2"
   fi
 
   _green "Enable TUIC as a second UDP option?"
@@ -197,7 +224,15 @@ choose_ports(){
     if [[ "$PORT_HY2" == "443" ]]; then
       PORT_TUIC="8443"
     else
-      PORT_TUIC="$(rand_port)"
+      PORT_TUIC="$(rand_port_udp)"
+    fi
+
+    # If chosen TUIC udp port is occupied, fall back automatically.
+    if [[ -n "$PORT_TUIC" ]] && port_in_use udp "$PORT_TUIC"; then
+      local p3
+      p3="$(rand_port_udp)"
+      _yellow "Port ${PORT_TUIC}/udp is already in use on this server. Switching TUIC to ${p3}/udp."
+      PORT_TUIC="$p3"
     fi
   else
     ENABLE_TUIC="0"
@@ -208,6 +243,17 @@ choose_ports(){
   ENABLE_VLESS="1"
   PORT_VLESS="443"
 
+  # If 443/tcp is already occupied (common cause of service start failure), fall back.
+  if port_in_use tcp 443; then
+    local p4
+    p4="8444"
+    if port_in_use tcp "$p4"; then
+      p4="$(rand_port_tcp)"
+    fi
+    _yellow "Port 443/tcp is already in use on this server. Switching VLESS Reality to ${p4}/tcp."
+    PORT_VLESS="$p4"
+  fi
+
   readp "Reality SNI (default apple.com): " REALITY_SNI
   REALITY_SNI="${REALITY_SNI:-apple.com}"
   readp "Reality handshake server (default apple.com): " REALITY_HS_SERVER
@@ -216,6 +262,37 @@ choose_ports(){
   REALITY_HS_PORT="${REALITY_HS_PORT:-443}"
 
   REALITY_SHORT_ID="$(rand_hex 4)" # 8 hex chars
+}
+
+# -------------------- TLS helpers --------------------
+get_saved_domain(){
+  local d=""
+  if [[ -s "${SBG_DOMAIN_LOG}" ]]; then
+    d="$(head -n1 "${SBG_DOMAIN_LOG}" | tr -d '\r\n ' )"
+  fi
+  echo "$d"
+}
+
+has_tls_files(){
+  [[ -s "${SBG_CERT}" && -s "${SBG_KEY}" ]]
+}
+
+load_previous_tls_info(){
+  # Best effort: if a previous install wrote public.info, reuse those flags.
+  if [[ -s "${SBG_PUBLIC_INFO}" ]]; then
+    # shellcheck disable=SC1090
+    source "${SBG_PUBLIC_INFO}" || true
+    # Normalize the key vars
+    if [[ -n "${DOMAIN:-}" ]]; then
+      domain_name="${DOMAIN}"
+    fi
+    if [[ -n "${TLS_MODE:-}" ]]; then
+      TLS_MODE="${TLS_MODE}"
+    fi
+    if [[ -n "${TLS_INSECURE_CLIENT:-}" ]]; then
+      TLS_INSECURE_CLIENT="${TLS_INSECURE_CLIENT}"
+    fi
+  fi
 }
 
 # -------------------- TLS (self-signed) --------------------
@@ -257,7 +334,12 @@ apply_acme(){
   _green "Your domain must resolve to this server IP:"
   echo -e "IPv4: ${v4:-<none>}"
   echo -e "IPv6: ${v6:-<none>}"
-  readp "Enter your domain (e.g. example.com): " domain_name
+
+  local saved
+  saved="$(get_saved_domain)"
+  readp "Enter your domain (e.g. example.com) (default ${saved:-none}): " domain_name
+  domain_name="${domain_name:-$saved}"
+
   domain_name="$(echo "$domain_name" | tr -d ' \r\n')"
   [[ -z "$domain_name" ]] && die "Domain cannot be empty."
 
@@ -306,11 +388,48 @@ apply_acme(){
 }
 
 choose_tls_mode(){
+  load_previous_tls_info
+
+  local prev_domain
+  prev_domain="$(get_saved_domain)"
+
   _green "TLS mode:"
+
+  if has_tls_files; then
+    echo "0) Use existing certificate/key under ${SBG_DIR}$( [[ -n \"$prev_domain\" ]] && echo \" (saved domain: $prev_domain)\" )"
+  fi
+
   echo "1) Self-signed (game-only, no domain required)  [recommended for quick start]"
   echo "2) ACME / Let's Encrypt (needs domain + port 80 reachable)"
-  readp "Choose [1/2] (default 1): " t
+  readp "Choose [0/1/2] (default 1): " t
   t="${t:-1}"
+
+  if [[ "$t" == "0" ]]; then
+    # Reuse existing cert/key files.
+    has_tls_files || die "No existing TLS files found under ${SBG_DIR}."
+
+    # If we have previous public.info, keep its flags; otherwise assume ACME-like (trusted).
+    if [[ -z "${TLS_MODE:-}" ]]; then
+      TLS_MODE="acme"
+    fi
+    if [[ -z "${TLS_INSECURE_CLIENT:-}" ]]; then
+      TLS_INSECURE_CLIENT="0"
+    fi
+
+    if [[ -n "$prev_domain" ]]; then
+      domain_name="$prev_domain"
+    elif [[ -z "${domain_name}" ]]; then
+      domain_name="${REALITY_SNI}"
+    fi
+
+    chmod 644 "${SBG_CERT}" 2>/dev/null || true
+    chmod 600 "${SBG_KEY}" 2>/dev/null || true
+
+    _green "Reusing existing TLS files: ${SBG_CERT} + ${SBG_KEY}"
+    echo "${domain_name}" > "${SBG_DOMAIN_LOG}"
+    chmod 600 "${SBG_DOMAIN_LOG}" || true
+    return 0
+  fi
 
   if [[ "$t" == "2" ]]; then
     TLS_MODE="acme"
@@ -370,7 +489,7 @@ setup_firewall_gameonly(){
     ufw reload >/dev/null 2>&1 || true
   fi
 
-  _green "UFW ready. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp), VLESS(${PORT_VLESS}/tcp)$( [[ "${ENABLE_TUIC}" == "1" ]] && echo ", TUIC(${PORT_TUIC}/udp)" )"
+  _green "UFW ready. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp), VLESS(${PORT_VLESS}/tcp)$( [[ "${ENABLE_TUIC}" == "1" ]] && echo \", TUIC(${PORT_TUIC}/udp)\" )"
 }
 
 gen_ids_and_keys(){
@@ -510,10 +629,8 @@ conf = {
       },
       "masquerade": {
         "type": "proxy",
-        "proxy": {
-          "url": "https://www.cloudflare.com/",
-          "rewrite_host": True
-        }
+        "url": "https://www.cloudflare.com/",
+        "rewrite_host": True
       }
     }
   ],
@@ -600,11 +717,66 @@ restart_sbg(){
     return 0
   fi
   _red "sbg is NOT active ❌"
+  _yellow "Quick diagnostics:"
+  if [[ -x "${SBG_BIN}" ]]; then
+    "${SBG_BIN}" check -c "${SBG_CONF}" >/dev/null 2>&1 || _yellow "sing-box config check reported issues (see logs below)."
+  fi
+  echo "---- systemctl status sbg (last 80 lines) ----"
+  systemctl status sbg -l --no-pager 2>/dev/null | tail -n 80 || true
+  echo "---- journalctl -u sbg (last 120 lines) ----"
+  journalctl -u sbg -n 120 --no-pager 2>/dev/null || true
+  echo "---- ports in use (443/8443/8444) ----"
+  ss -tulnp 2>/dev/null | egrep ':(443|8443|8444)\b' || true
   return 1
 }
 
 view_logs(){
   journalctl -u sbg -n 200 --no-pager 2>/dev/null || _red "No journalctl output."
+}
+
+fix_config_schema(){
+  [[ -s "${SBG_CONF}" ]] || die "Missing ${SBG_CONF}"
+  _green "Fixing known sing-box config schema issues (safe in-place patch)..."
+
+  # Stop service first to avoid race while rewriting config.
+  systemctl stop sbg >/dev/null 2>&1 || true
+
+  python3 - <<'PY'
+import json
+p = '/etc/sbg/sbg.json'
+with open(p,'r',encoding='utf-8') as f:
+  conf = json.load(f)
+changed = False
+
+# Fix hysteria2 masquerade schema: old style used masquerade.proxy.{url,rewrite_host}
+for ib in conf.get('inbounds', []) or []:
+  if ib.get('type') == 'hysteria2':
+    m = ib.get('masquerade')
+    if isinstance(m, dict) and 'proxy' in m and isinstance(m.get('proxy'), dict):
+      proxy = m.get('proxy')
+      # Only rewrite when the new fields are missing.
+      if 'url' not in m and 'rewrite_host' not in m:
+        m['url'] = proxy.get('url', 'https://www.cloudflare.com/')
+        m['rewrite_host'] = bool(proxy.get('rewrite_host', True))
+        changed = True
+      # Always remove nested proxy if present.
+      if 'proxy' in m:
+        m.pop('proxy', None)
+        changed = True
+
+if changed:
+  with open(p,'w',encoding='utf-8') as f:
+    json.dump(conf, f, indent=2)
+  print('patched')
+else:
+  print('no_change')
+PY
+
+  if [[ -x "${SBG_BIN}" ]]; then
+    "${SBG_BIN}" check -c "${SBG_CONF}" || die "Config check still failing after patch. Please view logs."
+  fi
+
+  restart_sbg || die "Restart still failed after patch. Please view logs."
 }
 
 update_core(){
@@ -615,7 +787,7 @@ update_core(){
 
 lnsbg(){
   rm -f /usr/bin/sbg
-  curl -fL -o /usr/bin/sbg -# --retry 2 --insecure "${UPDATE_URL}" || die "Download update script failed."
+  curl -fL -o /usr/bin/sbg -# --retry 2 "${UPDATE_URL}" || die "Download update script failed."
   chmod +x /usr/bin/sbg
   _green "Updated /usr/bin/sbg"
 }
@@ -632,18 +804,13 @@ show_sub(){
 
   mkdir -p "${SBG_DIR}"
 
-  # HY2 link (common format)
-  # hysteria2://<password>@<host>:<port>?security=tls&alpn=h3&sni=<sni>&insecure=1&obfs=salamander&obfs-password=xxx#HY2
   local hy2_link tuic_link vless_link
   hy2_link="hysteria2://${HY2_PASSWORD}@${host}:${PORT_HY2}?security=tls&alpn=h3&sni=${DOMAIN}&insecure=${TLS_INSECURE_CLIENT}&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}#HY2-${hostname}"
 
-  # VLESS Reality link
-  # vless://uuid@host:port?encryption=none&security=reality&sni=xxx&fp=chrome&pbk=xxx&sid=xxxx&type=tcp&flow=xtls-rprx-vision#VLESS-REALITY
   vless_link="vless://${VLESS_UUID}@${host}:${PORT_VLESS}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&flow=xtls-rprx-vision#VLESS-REALITY-${hostname}"
 
   echo "${hy2_link}" > "${SBG_SUB_TXT}"
   if [[ "${ENABLE_TUIC}" == "1" && -n "${PORT_TUIC}" && "${PORT_TUIC}" != "0" ]]; then
-    # tuic://uuid:password@host:port?...&allow_insecure=1
     tuic_link="tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${host}:${PORT_TUIC}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&allow_insecure=${TLS_INSECURE_CLIENT}#TUIC-${hostname}"
     echo "${tuic_link}" >> "${SBG_SUB_TXT}"
   fi
@@ -824,6 +991,7 @@ menu(){
   _green " 6. Restart service"
   _green " 7. Update sing-box core"
   _green " 8. Show client config (TUN)"
+  _green " 9. Fix config schema (quick patch)"
   echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
   readp "Select: " Input
 
@@ -836,6 +1004,7 @@ menu(){
     6) restart_sbg || { _red "Restart failed."; } ;;
     7) update_core ;;
     8) show_client_config ;;
+    9) fix_config_schema ;;
     *) exit 0 ;;
   esac
 }
