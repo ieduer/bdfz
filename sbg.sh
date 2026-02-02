@@ -1,7 +1,7 @@
 #!/bin/bash
 export LANG=en_US.UTF-8
 
-SBG_VERSION="v0.2.1-game-accel"
+SBG_VERSION="v0.2.2-game-accel"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -396,7 +396,9 @@ choose_tls_mode(){
   _green "TLS mode:"
 
   if has_tls_files; then
-    echo "0) Use existing certificate/key under ${SBG_DIR}$( [[ -n \"$prev_domain\" ]] && echo \" (saved domain: $prev_domain)\" )"
+    local domain_hint=""
+    [[ -n "${prev_domain}" ]] && domain_hint=" (saved domain: ${prev_domain})"
+    echo "0) Use existing certificate/key under ${SBG_DIR}${domain_hint}"
   fi
 
   echo "1) Self-signed (game-only, no domain required)  [recommended for quick start]"
@@ -489,7 +491,9 @@ setup_firewall_gameonly(){
     ufw reload >/dev/null 2>&1 || true
   fi
 
-  _green "UFW ready. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp), VLESS(${PORT_VLESS}/tcp)$( [[ "${ENABLE_TUIC}" == "1" ]] && echo \", TUIC(${PORT_TUIC}/udp)\" )"
+  local tuic_suffix=""
+  if [[ "${ENABLE_TUIC}" == "1" && -n "${PORT_TUIC}" ]]; then tuic_suffix=", TUIC(${PORT_TUIC}/udp)"; fi
+  _green "UFW ready. Allowed: SSH(${ssh_port}/tcp), HY2(${PORT_HY2}/udp), VLESS(${PORT_VLESS}/tcp)${tuic_suffix}"
 }
 
 gen_ids_and_keys(){
