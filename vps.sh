@@ -10,9 +10,92 @@
 #
 # 依赖：Debian/Ubuntu + systemd
 
+
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
+
+# --- Telegram helpers (robust JSON + webhook handling) ---
+_tg_curl() {
+  # Usage: _tg_curl <URL>
+  # Notes:
+  # - Force HTTP/1.1 to reduce weird truncation/chunk issues on some paths.
+  # - Retry on transient network errors.
+  local url="$1"
+  curl -sS --http1.1 --connect-timeout 5 -m 20 \
+    --retry 3 --retry-delay 1 --retry-connrefused \
+    -H 'Accept: application/json' \
+    "$url" || true
+}
+
+_tg_json_ok() {
+  # Reads JSON from stdin. Prints 1 if ok:true else 0.
+  python3 - <<'PY'
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  print("1" if d.get("ok") else "0")
+except Exception:
+  print("0")
+PY
+}
+
+_tg_json_get() {
+  # Usage: _tg_json_get <field_path>
+  # Example: _tg_json_get result.username
+  # Reads JSON from stdin and prints value or empty.
+  local path="$1"
+  python3 - <<'PY'
+import json,sys
+path=sys.argv[1].split('.')
+try:
+  d=json.load(sys.stdin)
+except Exception:
+  print("")
+  raise SystemExit(0)
+cur=d
+for k in path:
+  if isinstance(cur, dict):
+    cur=cur.get(k)
+  else:
+    cur=None
+    break
+if cur is None:
+  print("")
+elif isinstance(cur,(str,int,float,bool)):
+  print(cur)
+else:
+  try:
+    import json as _json
+    print(_json.dumps(cur, ensure_ascii=False))
+  except Exception:
+    print(str(cur))
+PY
+  "$path"
+}
+
+_tg_get_webhook_url() {
+  # Prints webhook URL if set, else empty.
+  local j
+  j="$(_tg_curl "https://api.telegram.org/bot${TELE_TOKEN}/getWebhookInfo")"
+  echo "$j" | _tg_json_get "result.url"
+}
+
+_tg_delete_webhook() {
+  _tg_curl "https://api.telegram.org/bot${TELE_TOKEN}/deleteWebhook?drop_pending_updates=true" >/dev/null
+}
+
+_tg_debug_json_hint() {
+  # Usage: _tg_debug_json_hint <json_string>
+  local s="$1"
+  local n
+  n="${#s}"
+  echo "[debug] response length: ${n} bytes" >&2
+  echo "[debug] head(220): ${s:0:220}" >&2
+  if (( n > 220 )); then
+    echo "[debug] tail(220): ${s: -220}" >&2
+  fi
+}
 
 # --- 辅助函数：获取并验证 Telegram 配置 ---
 _setup_telegram_config() {
@@ -50,43 +133,56 @@ _setup_telegram_config() {
 
     if [[ ! "$TELE_TOKEN" =~ ^[0-9]+:[a-zA-Z0-9_-]+$ ]]; then
       echo "Invalid Token format. It should look like '123456:ABC-DEF1234...'. Please try again."
+      TELE_TOKEN=""
       continue
     fi
 
     echo ">>> Verifying token with Telegram API (getMe)..."
     local ME_JSON
-    ME_JSON="$(curl -sS -m 15 "https://api.telegram.org/bot${TELE_TOKEN}/getMe" || true)"
+    ME_JSON="$(_tg_curl "https://api.telegram.org/bot${TELE_TOKEN}/getMe")"
 
     local OK
-    OK="$(echo "$ME_JSON" | python3 - <<'PY'
-import json,sys
-try:
-  d=json.load(sys.stdin)
-  print("1" if d.get("ok") else "0")
-except Exception:
-  print("0")
-PY
-)"
+    OK="$(echo "$ME_JSON" | _tg_json_ok)"
+
+    # 兼容极端情况下 JSON 被截断/污染：允许用最小特征串兜底判定
+    if [[ "$OK" != "1" ]]; then
+      if [[ "$ME_JSON" == *'"ok":true'* && "$ME_JSON" == *'"result"'* ]]; then
+        OK="1"
+      fi
+    fi
 
     if [[ "$OK" != "1" ]]; then
-      echo "!!! ERROR: Token verification failed. Telegram response (first 200 chars):" >&2
-      echo "${ME_JSON:0:200}" >&2
-      echo "Please double-check your token and try again."
+      echo "!!! ERROR: Token verification failed." >&2
+      _tg_debug_json_hint "$ME_JSON"
+      echo "Please double-check your token and try again." >&2
       TELE_TOKEN=""
       continue
     fi
 
-    BOT_USERNAME="$(echo "$ME_JSON" | python3 - <<'PY'
-import json,sys
-try:
-  d=json.load(sys.stdin)
-  u=(d.get("result") or {}).get("username") or ""
-  print(u)
-except Exception:
-  print("")
-PY
-)"
+    BOT_USERNAME="$(echo "$ME_JSON" | _tg_json_get "result.username" | tr -d '\r\n')"
     echo ">>> Token OK. Bot: @${BOT_USERNAME:-unknown}"
+
+    # 关键：如果设置了 webhook，那么 getUpdates 永远拿不到更新
+    local WH_URL
+    WH_URL="$(_tg_get_webhook_url | tr -d '\r\n')"
+    if [[ -n "$WH_URL" ]]; then
+      echo ""
+      echo "!!! [WARN] This bot currently has a webhook configured:" >&2
+      echo "    $WH_URL" >&2
+      echo "When webhook is set, Telegram will NOT deliver updates to getUpdates, so Chat ID auto-detect will fail." >&2
+      echo ""
+      local ans=""
+      read -r -p "Delete webhook now (recommended for this bot)? [Y/n]: " ans
+      ans="${ans:-Y}"
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        echo ">>> Deleting webhook (drop_pending_updates=true)..."
+        _tg_delete_webhook
+        echo ">>> Webhook removed. Please send /start to the bot again when prompted."
+      else
+        echo ">>> Keeping webhook. Auto-detect via getUpdates may fail; you can enter TELE_CHAT_ID manually."
+      fi
+    fi
+
     break
   done
 
@@ -96,6 +192,7 @@ PY
   if [[ -n "${BOT_USERNAME:-}" ]]; then
     echo ">>> You can also open: https://t.me/${BOT_USERNAME}?start=sentinel"
   fi
+  echo ">>> IMPORTANT: send the message AFTER this prompt."
   read -r -p ">>> After sending the message, press [Enter] here to continue..."
 
   echo "Fetching Chat ID from Telegram API (getUpdates)..."
@@ -103,8 +200,10 @@ PY
   local API_RESPONSE=""
   local TELE_CHAT_ID_CANDIDATES=""
   local i
+
+  # Long-poll style: give Telegram time to deliver the message
   for i in 1 2 3 4 5 6; do
-    API_RESPONSE="$(curl -sS -m 20 "https://api.telegram.org/bot${TELE_TOKEN}/getUpdates?limit=50" || true)"
+    API_RESPONSE="$(_tg_curl "https://api.telegram.org/bot${TELE_TOKEN}/getUpdates?limit=50&timeout=25")"
 
     TELE_CHAT_ID_CANDIDATES="$(echo "$API_RESPONSE" | python3 - <<'PY'
 import json,sys
@@ -142,7 +241,8 @@ for it in d.get("result", []) or []:
 
 seen=set(); out=[]
 for cid in ids:
-  if cid in seen: continue
+  if cid in seen:
+    continue
   seen.add(cid)
   out.append(cid)
 
@@ -165,12 +265,9 @@ PY
   fi
 
   if [[ -z "${TELE_CHAT_ID:-}" ]]; then
-    echo ""
+    echo "" >&2
     echo "!!! ERROR: Could not automatically detect your Chat ID from getUpdates." >&2
-    echo "Common causes:" >&2
-    echo "  1) You didn't send a message to the bot." >&2
-    echo "  2) Your message was not delivered to the bot (privacy mode / you messaged the wrong bot)." >&2
-    echo "  3) You want to send alerts to a group/channel (group ids are often negative)." >&2
+    echo "Most common cause: webhook is still configured OR you didn't send /start after the prompt." >&2
     echo "" >&2
     echo "Fallback: please manually enter TELE_CHAT_ID." >&2
     echo "Tips:" >&2
@@ -196,24 +293,24 @@ PY
 
   echo ">>> Testing Telegram sendMessage..."
   local TEST_RESP
-  TEST_RESP="$(curl -sS -m 15 -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
+  # We need POST with data; run separately to keep _tg_curl simple
+  TEST_RESP="$(curl -sS --http1.1 --connect-timeout 5 -m 20 \
+    --retry 3 --retry-delay 1 --retry-connrefused \
+    -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
     -d "chat_id=${TELE_CHAT_ID}" \
     --data-urlencode "text=✅ Sentinel Telegram setup OK on $(hostname -f)" || true)"
 
   local TEST_OK
-  TEST_OK="$(echo "$TEST_RESP" | python3 - <<'PY'
-import json,sys
-try:
-  d=json.load(sys.stdin)
-  print("1" if d.get("ok") else "0")
-except Exception:
-  print("0")
-PY
-)"
+  TEST_OK="$(echo "$TEST_RESP" | _tg_json_ok)"
+  if [[ "$TEST_OK" != "1" ]]; then
+    if [[ "$TEST_RESP" == *'"ok":true'* ]]; then
+      TEST_OK="1"
+    fi
+  fi
 
   if [[ "$TEST_OK" != "1" ]]; then
-    echo "!!! ERROR: sendMessage test failed. Telegram response (first 300 chars):" >&2
-    echo "${TEST_RESP:0:300}" >&2
+    echo "!!! ERROR: sendMessage test failed." >&2
+    _tg_debug_json_hint "$TEST_RESP"
     echo "Please verify your TELE_CHAT_ID and bot permissions, then rerun the script." >&2
     exit 1
   fi
