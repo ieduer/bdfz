@@ -15,7 +15,7 @@ function _setup_telegram_config() {
     export TELE_TOKEN TELE_CHAT_ID
     return 0
   fi
-  
+
   # 如果配置文件存在且包含有效配置，则跳过
   if [[ -f /etc/sentinel/sentinel.env ]]; then
     set -a
@@ -46,8 +46,41 @@ function _setup_telegram_config() {
   read -p ">>> After sending the message, press [Enter] here to continue..."
 
   echo "Fetching your Chat ID from Telegram API..."
-  API_RESPONSE=$(curl -s -m 15 "https://api.telegram.org/bot${TELE_TOKEN}/getUpdates")
-  TELE_CHAT_ID=$(echo "$API_RESPONSE" | grep -o '"chat":{"id":[^,]*' | tail -n 1 | sed 's/.*"id"://')
+  API_RESPONSE=$(curl -s -m 15 "https://api.telegram.org/bot${TELE_TOKEN}/getUpdates?limit=20")
+
+  TELE_CHAT_ID=$(echo "$API_RESPONSE" | python3 - <<'PY'
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+# Telegram updates may contain different shapes (message/callback_query/etc.)
+chat_ids = []
+for it in data.get("result", []) or []:
+    # message
+    msg = it.get("message") or it.get("edited_message")
+    if isinstance(msg, dict):
+        chat = msg.get("chat") or {}
+        cid = chat.get("id")
+        if cid is not None:
+            chat_ids.append(cid)
+            continue
+
+    # callback_query
+    cq = it.get("callback_query")
+    if isinstance(cq, dict):
+        msg2 = cq.get("message") or {}
+        chat = (msg2.get("chat") or {})
+        cid = chat.get("id")
+        if cid is not None:
+            chat_ids.append(cid)
+
+# pick the last seen chat id
+print(chat_ids[-1] if chat_ids else "")
+PY
+  )
 
   if [[ -z "$TELE_CHAT_ID" ]]; then
     echo ""
@@ -137,6 +170,13 @@ CERT_AUTO_DISCOVER=1
 CERT_SEARCH_GLOBS=/etc/letsencrypt/live/*/fullchain.pem,/var/discourse/shared/standalone/ssl/*,/etc/nginx/ssl/*/*.pem
 
 # === SSH 暴力破解监控 ===
+
+# === 内核/磁盘 I/O 错误监控（强烈建议开启）===
+KERNEL_WATCH=1
+# 可自定义关键字/正则（Python re），为空则使用内置默认规则
+KERNEL_PATTERNS=
+# 优先 journalctl -k -f；若不可用则尝试 /var/log/kern.log
+KERNEL_LOG_FALLBACK=/var/log/kern.log
 AUTH_LOG_PATH=/var/log/auth.log
 AUTH_FAIL_COUNT=30
 AUTH_FAIL_WINDOW_MIN=10
@@ -263,6 +303,37 @@ CERT_SEARCH_GLOBS = [x.strip() for x in (E("CERT_SEARCH_GLOBS","/etc/letsencrypt
 AUTH_LOG_PATH = E("AUTH_LOG_PATH","/var/log/auth.log")
 AUTH_FAIL_COUNT = int(E("AUTH_FAIL_COUNT","30"))
 AUTH_FAIL_WINDOW_MIN = int(E("AUTH_FAIL_WINDOW_MIN","10"))
+
+# Kernel / Disk I/O error watch
+KERNEL_WATCH = (E("KERNEL_WATCH", "1") == "1")
+KERNEL_PATTERNS_RAW = (E("KERNEL_PATTERNS", "") or "").strip()
+KERNEL_LOG_FALLBACK = E("KERNEL_LOG_FALLBACK", "/var/log/kern.log")
+
+_DEFAULT_KERNEL_PATTERNS = [
+    r"blk_update_request: I/O error",
+    r"Buffer I/O error",
+    r"EXT4-fs (error|warning)",
+    r"ext4_end_bio:.*I/O error",
+    r"journal.*I/O error",
+    r"Remounting filesystem read-only",
+    r"I/O error, dev",
+    r"critical medium error",
+    r"nvme.*reset",
+    r"nvme.*I/O",
+    r"ata\d+\.\d+: (failed command|exception Emask|error)",
+    r"sd \S+: \[\S+\] (I/O error|FAILED Result)",
+]
+
+if KERNEL_PATTERNS_RAW:
+    # split by comma/newline, keep non-empty
+    _parts = []
+    for line in KERNEL_PATTERNS_RAW.replace("\n", ",").split(","):
+        s = line.strip()
+        if s:
+            _parts.append(s)
+    KERNEL_PATTERNS = [re.compile(p, re.I) for p in _parts] if _parts else [re.compile(p, re.I) for p in _DEFAULT_KERNEL_PATTERNS]
+else:
+    KERNEL_PATTERNS = [re.compile(p, re.I) for p in _DEFAULT_KERNEL_PATTERNS]
 
 def _log_ex():
     if not LOG_SILENT: traceback.print_exc(file=sys.stderr)
@@ -493,7 +564,7 @@ def root_usage_pct():
 # 1) 自定義："host" ip "req" status size ... "ua"
 # 2) combined：ip - - [ts] "req" status size "ref" "ua"
 LOG_RE_Q = re.compile(r'^"(?P<host>[^"]+)"\s+(?P<ip>[0-9a-fA-F\.:]+)\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+).+"(?P<ua>[^"]*)"$')
-LOG_RE_COMBINED = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>[^"]*)"')
+LOG_RE_COMBINED = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+$begin:math:display$\[\^$end:math:display$]+\]\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>[^"]*)"')
 def log_watch():
     path = NGINX_ACCESS.strip()
     if not path: return
@@ -593,6 +664,77 @@ def ssh_watch():
                 send("🛡️ SSH brute-force", [f"src {ip}", f"fails ≥ {AUTH_FAIL_COUNT} in {AUTH_FAIL_WINDOW_MIN} min"])
     except Exception: _log_ex()
 
+# ==== Kernel / Disk I/O errors (journalctl -k -f) ====
+def kernel_watch():
+    if not KERNEL_WATCH:
+        return
+
+    # Prefer journald kernel stream
+    p = None
+    try:
+        p = subprocess.Popen(
+            ["journalctl", "-k", "-f", "-n", "0", "--no-pager"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        p = None
+    except Exception:
+        _log_ex()
+        p = None
+
+    # Fallback to kern.log if journald isn't available
+    if p is None:
+        try:
+            if KERNEL_LOG_FALLBACK and os.path.exists(KERNEL_LOG_FALLBACK):
+                p = subprocess.Popen(
+                    ["tail", "-n", "0", "-F", KERNEL_LOG_FALLBACK],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+        except Exception:
+            _log_ex()
+            p = None
+
+    if p is None or p.stdout is None:
+        return
+
+    try:
+        for line in p.stdout:
+            s = (line or "").strip()
+            if not s:
+                continue
+
+            hit = False
+            for pat in KERNEL_PATTERNS:
+                if pat.search(s):
+                    hit = True
+                    key = pat.pattern
+                    break
+
+            if not hit:
+                continue
+
+            # Stronger classification
+            icon = "🧨"
+            title = "Kernel/Disk I/O issue"
+            if re.search(r"Remounting filesystem read-only", s, re.I):
+                icon = "🧱"
+                title = "Filesystem remounted read-only"
+
+            # cooldown per signature
+            ck = f"kernel_{hash(key) % 1000000}"
+            if state.cooldown(ck):
+                continue
+
+            send(title, [s[:220]], icon=icon)
+    except Exception:
+        _log_ex()
+
 # ==== TLS certificate checks ====
 def cert_days_from_file(p):
     try:
@@ -647,7 +789,7 @@ def cert_check_loop():
                     for p in glob.glob(pat):
                         if os.path.exists(p): paths_to_check.add(p)
                 paths_to_check.update(discover_nginx_certs())
-            
+
             for p in sorted(list(paths_to_check)):
                 d = cert_days_from_file(p)
                 if d is not None and d <= CERT_MIN_DAYS:
@@ -725,7 +867,7 @@ def check_monthly_traffic():
                 f"Up:    {used_tx/(1024**3):.2f} GB",
                 f"Total: {total/(1024**3):.2f} GB",
             ], icon="📦")
-        
+
         d_new = {"month": month_key, "start_rx": rx, "start_tx": tx, "last_report_day": 0}
         state.set("traffic", d_new)
         if not d: # First run
@@ -801,13 +943,13 @@ def probe_thread():
         time.sleep(PING_INTERVAL)
 
 if __name__=="__main__":
-    for target in (log_watch, probe_thread, ssh_watch, cert_check_loop):
+    for target in (log_watch, probe_thread, ssh_watch, kernel_watch, cert_check_loop):
         threading.Thread(target=target, daemon=True).start()
-    
+
     if not state.cooldown("startup_beacon"):
         watch_list = effective_watch_list()
         send("Sentinel started", ["service up and watching", f"watching: {','.join(watch_list) if watch_list else 'auto'}"], icon="🚀")
-    
+
     metrics_loop()
 PY
 chmod +x /usr/local/bin/sentinel.py
@@ -846,7 +988,7 @@ systemctl enable --now sentinel.service
   set -a
   . /etc/sentinel/sentinel.env
   set +a
-  hostip="$(ip -o route get 1.1.1.1 | sed -n 's/.* src \([0-9.]\+\).*/\1/p' || echo 'N/A')"
+  hostip="$(ip -o route get 1.1.1.1 | sed -n 's/.* src $begin:math:text$\[0\-9\.\]\\\+$end:math:text$.*/\1/p' || echo 'N/A')"
   TEXT="✅ Sentinel on $(hostname -f) (${hostip}) has been installed/updated successfully."
   # 使用 tmsg 工具发送，更简洁
   /usr/local/bin/tmsg "$TEXT"
