@@ -1,7 +1,7 @@
 #!/bin/bash
 export LANG=en_US.UTF-8
 
-SBG_VERSION="v0.2.2-game-accel"
+SBG_VERSION="v0.2.3-game-accel"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -652,7 +652,6 @@ if enable_tuic:
     "listen_port": port_tuic,
     "users": [{"uuid": tuic_uuid, "password": tuic_pass}],
     "congestion_control": "bbr",
-    "udp_relay_mode": "native",
     "tls": {
       "enabled": True,
       "alpn": ["h3"],
@@ -729,8 +728,9 @@ restart_sbg(){
   systemctl status sbg -l --no-pager 2>/dev/null | tail -n 80 || true
   echo "---- journalctl -u sbg (last 120 lines) ----"
   journalctl -u sbg -n 120 --no-pager 2>/dev/null || true
-  echo "---- ports in use (443/8443/8444) ----"
+  echo "---- ports in use (443/8443/8444/random) ----"
   ss -tulnp 2>/dev/null | egrep ':(443|8443|8444)\b' || true
+  ss -tulnp 2>/dev/null | tail -n 30 || true
   return 1
 }
 
@@ -767,6 +767,13 @@ for ib in conf.get('inbounds', []) or []:
       if 'proxy' in m:
         m.pop('proxy', None)
         changed = True
+
+# Fix TUIC inbound schema: some versions do not accept udp_relay_mode on inbound.
+for ib in conf.get('inbounds', []) or []:
+  if ib.get('type') == 'tuic':
+    if 'udp_relay_mode' in ib:
+      ib.pop('udp_relay_mode', None)
+      changed = True
 
 if changed:
   with open(p,'w',encoding='utf-8') as f:
