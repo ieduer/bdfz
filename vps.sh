@@ -72,7 +72,6 @@ else:
         print(str(cur))
 PY
 }
-}
 
 _tg_get_webhook_url() {
   # Prints webhook URL if set, else empty.
@@ -132,7 +131,7 @@ _setup_telegram_config() {
     fi
 
     if [[ ! "$TELE_TOKEN" =~ ^[0-9]+:[a-zA-Z0-9_-]+$ ]]; then
-      echo "Invalid Token format. It should look like '123456:ABC-DEF1234...'. Please try again."
+      echo "Invalid Token format. It should look like '<BOT_ID>:<TOKEN>' (e.g., bot_id:secret). Please try again."
       TELE_TOKEN=""
       continue
     fi
@@ -855,7 +854,7 @@ def root_usage_pct():
 # 1) 自定义："host" ip "req" status size ... "ua"
 # 2) combined：ip - - [ts] "req" status size "ref" "ua"
 LOG_RE_Q = re.compile(r'^"(?P<host>[^"]+)"\s+(?P<ip>[0-9a-fA-F\.:]+)\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+).+"(?P<ua>[^"]*)"$')
-LOG_RE_COMBINED = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>[^"]*)"')
+LOG_RE_COMBINED = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+$begin:math:display$\[\^$end:math:display$]+\]\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>[^"]*)"')
 
 def log_watch():
     path = (NGINX_ACCESS or "").strip()
@@ -1380,7 +1379,7 @@ systemctl enable --now sentinel.service
   # shellcheck disable=SC1091
   . /etc/sentinel/sentinel.env
   set +a
-  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]\+\).*/\1/p' | head -n1 || echo 'N/A')"
+  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src $begin:math:text$\[0\-9\.\]\\\+$end:math:text$.*/\1/p' | head -n1 || echo 'N/A')"
   TEXT="✅ Sentinel on $(hostname -f) (${hostip}) has been installed/updated successfully."
   /usr/local/bin/tmsg "$TEXT"
 )
