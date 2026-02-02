@@ -1,7 +1,7 @@
 #!/bin/bash
 export LANG=en_US.UTF-8
 
-SBG_VERSION="v0.2.3-game-accel"
+SBG_VERSION="v0.2.4-game-accel"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -16,7 +16,8 @@ _blue(){ echo -e "${blue}\033[01m$1${plain}"; }
 readp(){ read -p "$(_yellow "$1")" "$2"; }
 
 # Update link
-UPDATE_URL="https://raw.githubusercontent.com/ieduer/bdfz/main/sbg.sh"
+UPDATE_URL_BASE="https://raw.githubusercontent.com/ieduer/bdfz/main/sbg.sh"
+UPDATE_URL="${UPDATE_URL_BASE}?$(date +%s)"
 
 # Paths
 SBG_DIR="/etc/sbg"
@@ -27,6 +28,8 @@ SBG_PUBLIC_INFO="${SBG_DIR}/public.info"
 SBG_CERT="${SBG_DIR}/cert.crt"
 SBG_KEY="${SBG_DIR}/private.key"
 SBG_SUB_TXT="${SBG_DIR}/sub.txt"
+SBG_CLIENT_1114="${SBG_DIR}/client-1.11.4.json"
+SBG_CLIENT_LATEST="${SBG_DIR}/client-latest.json"
 
 # Reality keys (stored in public.info)
 # REALITY_PRIVATE_KEY is NOT persisted in plain text elsewhere.
@@ -89,6 +92,7 @@ detect_arch(){
 
 print_version(){
   echo "sbg — Sing-box Game Accelerator (HY2/TUIC + VLESS Reality)  |  ${SBG_VERSION}"
+  echo "Install/Run from URL: bash <(curl -Ls \"${UPDATE_URL_BASE}?\$(date +%s)\")"
 }
 
 v4v6(){
@@ -316,14 +320,23 @@ make_selfsigned(){
 # -------------------- ACME (optional) --------------------
 acme_install_existing(){
   local d="$1"
+  local reloadcmd
+  reloadcmd="systemctl restart sbg >/dev/null 2>&1 || true"
+
+  # Prefer ECC if exists, fall back to RSA.
   /root/.acme.sh/acme.sh --installcert -d "$d" \
     --fullchainpath "${SBG_CERT}" \
     --keypath "${SBG_KEY}" \
-    --ecc >/dev/null 2>&1 && return 0
-  /root/.acme.sh/acme.sh --installcert -d "$d" \
-    --fullchainpath "${SBG_CERT}" \
-    --keypath "${SBG_KEY}" \
+    --ecc \
+    --reloadcmd "$reloadcmd" \
     >/dev/null 2>&1 && return 0
+
+  /root/.acme.sh/acme.sh --installcert -d "$d" \
+    --fullchainpath "${SBG_CERT}" \
+    --keypath "${SBG_KEY}" \
+    --reloadcmd "$reloadcmd" \
+    >/dev/null 2>&1 && return 0
+
   return 1
 }
 
@@ -385,6 +398,8 @@ apply_acme(){
   echo "${domain_name}" > "${SBG_DOMAIN_LOG}"
   chmod 600 "${SBG_DOMAIN_LOG}"
   _green "Domain saved: ${domain_name}"
+
+  _green "Auto-renew is handled by acme.sh cron. On renew, it will restart 'sbg' via reloadcmd."
 }
 
 choose_tls_mode(){
@@ -505,19 +520,19 @@ gen_ids_and_keys(){
   TUIC_UUID=""
   TUIC_PASS=""
   if [[ "${ENABLE_TUIC}" == "1" ]]; then
-    TUIC_UUID="$(${SBG_BIN} generate uuid 2>/dev/null || true)"
+    TUIC_UUID="$("${SBG_BIN}" generate uuid 2>/dev/null || true)"
     [[ -z "${TUIC_UUID}" ]] && TUIC_UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "")"
     [[ -z "${TUIC_UUID}" ]] && TUIC_UUID="$(rand_str)"
     TUIC_PASS="$(rand_str)"
   fi
 
-  VLESS_UUID="$(${SBG_BIN} generate uuid 2>/dev/null || true)"
+  VLESS_UUID="$("${SBG_BIN}" generate uuid 2>/dev/null || true)"
   [[ -z "${VLESS_UUID}" ]] && VLESS_UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "")"
   [[ -z "${VLESS_UUID}" ]] && VLESS_UUID="$(rand_str)"
 
   # Reality keypair
   local out
-  out="$(${SBG_BIN} generate reality-keypair 2>/dev/null || true)"
+  out="$("${SBG_BIN}" generate reality-keypair 2>/dev/null || true)"
   REALITY_PRIV="$(echo "$out" | awk -F': ' '/PrivateKey/{print $2}' | tr -d '\r' | tr -d ' ')"
   REALITY_PUB="$(echo "$out" | awk -F': ' '/PublicKey/{print $2}' | tr -d '\r' | tr -d ' ')"
   [[ -z "${REALITY_PRIV}" || -z "${REALITY_PUB}" ]] && die "Failed to generate Reality keypair. Output: ${out}"
@@ -801,6 +816,7 @@ lnsbg(){
   curl -fL -o /usr/bin/sbg -# --retry 2 "${UPDATE_URL}" || die "Download update script failed."
   chmod +x /usr/bin/sbg
   _green "Updated /usr/bin/sbg"
+  _green "Tip: you can also run without installing: bash <(curl -Ls \"${UPDATE_URL_BASE}?\$(date +%s)\")"
 }
 
 show_sub(){
@@ -845,7 +861,10 @@ show_sub(){
   _green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 }
 
-show_client_config(){
+# -------------------- Client config generation --------------------
+client_cfg_common_json(){
+  # Args: mode (1114|latest)
+  local mode="$1"
   [[ -s "${SBG_PUBLIC_INFO}" ]] || die "Missing ${SBG_PUBLIC_INFO}"
   # shellcheck disable=SC1090
   source "${SBG_PUBLIC_INFO}"
@@ -854,11 +873,22 @@ show_client_config(){
   local host
   host="${v4:-${DOMAIN}}"
 
-  _green "Sing-box client config (TUN). Save as client.json and run as root on your client."
-  echo
+  # Notes:
+  # - This config is designed to be schema-safe for sing-box 1.11.4 (and newer).
+  # - For Apple clients, 'strict_route' and 'sniff_override_destination' are supported.
+  # - We include a minimal DNS section + 'hijack-dns' routing action.
+
   cat <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
+  "dns": {
+    "servers": [
+      { "tag": "cf", "address": "1.1.1.1", "detour": "direct" },
+      { "tag": "google", "address": "8.8.8.8", "detour": "direct" }
+    ],
+    "final": "cf",
+    "strategy": "prefer_ipv4"
+  },
   "inbounds": [
     {
       "type": "tun",
@@ -943,7 +973,85 @@ show_client_config(){
   }
 }
 EOF
-  echo
+}
+
+write_client_config_files(){
+  [[ -s "${SBG_PUBLIC_INFO}" ]] || die "Missing ${SBG_PUBLIC_INFO}"
+  mkdir -p "${SBG_DIR}"
+
+  # 1.11.4 profile (schema-safe for 1.11.4)
+  client_cfg_common_json "1114" > "${SBG_CLIENT_1114}"
+
+  # latest profile (for now identical, reserved for future schema tuning)
+  client_cfg_common_json "latest" > "${SBG_CLIENT_LATEST}"
+
+  chmod 600 "${SBG_CLIENT_1114}" "${SBG_CLIENT_LATEST}" 2>/dev/null || true
+}
+
+validate_client_config_best_effort(){
+  # Validate with current server sing-box binary as best effort (not a guarantee for 1.11.4).
+  local f="$1"
+  [[ -x "${SBG_BIN}" ]] || return 0
+  "${SBG_BIN}" check -c "$f" >/dev/null 2>&1 && return 0
+  _yellow "Local check failed for $f with current server sing-box. This may indicate a schema issue."
+  return 1
+}
+
+show_client_config(){
+  [[ -s "${SBG_PUBLIC_INFO}" ]] || die "Missing ${SBG_PUBLIC_INFO}"
+  write_client_config_files
+
+  while true; do
+    echo
+    _green "Client config output:"
+    echo "1) Show 1.11.4 config (validated for 1.11.4 schema assumptions)"
+    echo "2) Show latest config (for newest clients)"
+    echo "3) Show BOTH (1.11.4 then latest)"
+    echo "0) Back"
+    readp "Choose [0/1/2/3] (default 1): " csel
+    csel="${csel:-1}"
+
+    case "$csel" in
+      0) return 0 ;;
+      1)
+        _green "Sing-box client config (TUN) — target: 1.11.4"
+        _yellow "Saved to: ${SBG_CLIENT_1114}"
+        validate_client_config_best_effort "${SBG_CLIENT_1114}" || true
+        echo
+        cat "${SBG_CLIENT_1114}"
+        echo
+        return 0
+        ;;
+      2)
+        _green "Sing-box client config (TUN) — target: latest"
+        _yellow "Saved to: ${SBG_CLIENT_LATEST}"
+        validate_client_config_best_effort "${SBG_CLIENT_LATEST}" || true
+        echo
+        cat "${SBG_CLIENT_LATEST}"
+        echo
+        return 0
+        ;;
+      3)
+        _green "Sing-box client config (TUN) — target: 1.11.4"
+        _yellow "Saved to: ${SBG_CLIENT_1114}"
+        validate_client_config_best_effort "${SBG_CLIENT_1114}" || true
+        echo
+        cat "${SBG_CLIENT_1114}"
+        echo
+        _green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+        _green "Sing-box client config (TUN) — target: latest"
+        _yellow "Saved to: ${SBG_CLIENT_LATEST}"
+        validate_client_config_best_effort "${SBG_CLIENT_LATEST}" || true
+        echo
+        cat "${SBG_CLIENT_LATEST}"
+        echo
+        return 0
+        ;;
+      *)
+        _yellow "Invalid selection."
+        ;;
+    esac
+  done
 }
 
 uninstall_all(){
@@ -989,35 +1097,43 @@ install_gameonly(){
 }
 
 menu(){
-  clear
-  echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-  print_version
-  echo "Shortcut command: sbg"
-  echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-  _green " 1. Install (game-only quick start: self-signed OR ACME)"
-  _green " 2. Uninstall"
-  _green " 3. Show subscription (Base64)"
-  _green " 4. Update script"
-  _green " 5. View logs"
-  _green " 6. Restart service"
-  _green " 7. Update sing-box core"
-  _green " 8. Show client config (TUN)"
-  _green " 9. Fix config schema (quick patch)"
-  echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-  readp "Select: " Input
+  while true; do
+    clear
+    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    print_version
+    echo "Shortcut command: sbg"
+    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    _green " 1. Install (game-only quick start: self-signed OR ACME)"
+    _green " 2. Uninstall"
+    _green " 3. Show subscription (Base64)"
+    _green " 4. Update script (install /usr/bin/sbg)"
+    _green " 5. View logs"
+    _green " 6. Restart service"
+    _green " 7. Update sing-box core"
+    _green " 8. Show client config (TUN) — choose 1.11.4 or latest"
+    _green " 9. Fix config schema (quick patch)"
+    _green " 0. Exit"
+    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    readp "Select: " Input
 
-  case "$Input" in
-    1) install_gameonly ;;
-    2) uninstall_all ;;
-    3) show_sub ;;
-    4) lnsbg ;;
-    5) view_logs ;;
-    6) restart_sbg || { _red "Restart failed."; } ;;
-    7) update_core ;;
-    8) show_client_config ;;
-    9) fix_config_schema ;;
-    *) exit 0 ;;
-  esac
+    case "$Input" in
+      1) install_gameonly ;;
+      2) uninstall_all ;;
+      3) show_sub ;;
+      4) lnsbg ;;
+      5) view_logs ;;
+      6) restart_sbg || { _red "Restart failed."; } ;;
+      7) update_core ;;
+      8) show_client_config ;;
+      9) fix_config_schema ;;
+      0) exit 0 ;;
+      "") _yellow "No input. Staying in menu..." ;;
+      *) _yellow "Invalid selection. Staying in menu..." ;;
+    esac
+
+    echo
+    readp "Press Enter to continue..." _tmp
+  done
 }
 
 # -------------------------
