@@ -1,215 +1,4 @@
-#!/bin/bash
-# ===== Sentinel 安装/更新脚本 (生产优化版) =====
-# 适用于包括超低内存VPS在内的所有环境，可重复执行。
-# 已移除硬编码的 Telegram Secret，改为交互式安全设置。
-
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
-
-# --- 辅助函数：获取并验证 Telegram 配置 ---
-function _setup_telegram_config() {
-  # 快速通道：如果环境变量已存在，直接使用，跳过所有交互
-  if [[ -n "${TELE_TOKEN:-}" && -n "${TELE_CHAT_ID:-}" ]]; then
-    echo ">>> [INFO] Using TELE_TOKEN and TELE_CHAT_ID from environment. Skipping interactive setup."
-    export TELE_TOKEN TELE_CHAT_ID
-    return 0
-  fi
-
-  # 如果配置文件存在且包含有效配置，则跳过
-  if [[ -f /etc/sentinel/sentinel.env ]]; then
-    set -a
-    . /etc/sentinel/sentinel.env
-    set +a
-    if [[ -n "${TELE_TOKEN:-}" && -n "${TELE_CHAT_ID:-}" ]]; then
-      echo ">>> [INFO] Found existing Telegram configuration in /etc/sentinel/sentinel.env. Skipping interactive setup."
-      return 0
-    fi
-  fi
-
-  echo "--- Telegram Bot Setup ---"
-  while true; do
-    read -p "Please enter your Telegram Bot Token: " -s TELE_TOKEN
-    echo ""
-    if [[ -z "$TELE_TOKEN" ]]; then
-      echo "Token cannot be empty. Please try again."
-    elif [[ ! "$TELE_TOKEN" =~ ^[0-9]+:[a-zA-Z0-9_-]+$ ]]; then
-      echo "Invalid Token format. It should look like '123456:ABC-DEF1234...'. Please try again."
-    else
-      break
-    fi
-  done
-
-  echo "Token received. Now, let's get your Chat ID."
-  echo ""
-  echo ">>> Please open your Telegram app and send a message (e.g., /start) to your bot."
-  read -p ">>> After sending the message, press [Enter] here to continue..."
-
-  echo "Fetching your Chat ID from Telegram API..."
-  API_RESPONSE=$(curl -s -m 15 "https://api.telegram.org/bot${TELE_TOKEN}/getUpdates?limit=20")
-
-  TELE_CHAT_ID=$(echo "$API_RESPONSE" | python3 - <<'PY'
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    print("")
-    raise SystemExit(0)
-
-# Telegram updates may contain different shapes (message/callback_query/etc.)
-chat_ids = []
-for it in data.get("result", []) or []:
-    # message
-    msg = it.get("message") or it.get("edited_message")
-    if isinstance(msg, dict):
-        chat = msg.get("chat") or {}
-        cid = chat.get("id")
-        if cid is not None:
-            chat_ids.append(cid)
-            continue
-
-    # callback_query
-    cq = it.get("callback_query")
-    if isinstance(cq, dict):
-        msg2 = cq.get("message") or {}
-        chat = (msg2.get("chat") or {})
-        cid = chat.get("id")
-        if cid is not None:
-            chat_ids.append(cid)
-
-# pick the last seen chat id
-print(chat_ids[-1] if chat_ids else "")
-PY
-  )
-
-  if [[ -z "$TELE_CHAT_ID" ]]; then
-    echo ""
-    echo "!!! ERROR: Could not automatically detect your Chat ID." >&2
-    echo "Please make sure you sent a message to the bot AFTER the script prompted you to." >&2
-    echo "You may need to run this script again." >&2
-    exit 1
-  fi
-
-  echo "✅ Success! Your Chat ID is: ${TELE_CHAT_ID}"
-  export TELE_TOKEN TELE_CHAT_ID
-}
-
-echo ">>> [1/5] Installing dependencies..."
-apt-get update -qq
-# 已加入 openssl 依赖，用于本地证书检查
-apt-get install -yq python3 ca-certificates curl iproute2 iputils-ping openssl procps
-# 确保不会因 needrestart 卡住；若不存在 needrestart 则忽略
-if command -v needrestart >/dev/null 2>&1; then
-  needrestart -r a || true
-fi
-
-echo ">>> [2/5] Creating directories and handling configuration..."
-mkdir -p /etc/sentinel /var/lib/sentinel
-
-_setup_telegram_config
-
-# === 配置 ===
-cat >/etc/sentinel/sentinel.env <<EOF
-# === Telegram (由脚本自动填充或从现有配置加载) ===
-TELE_TOKEN=${TELE_TOKEN}
-TELE_CHAT_ID=${TELE_CHAT_ID}
-
-# === 可选 Nginx 日志监控 ===
-# 注意: 日志格式需匹配 sentinel.py 中的 LOG_RE 正则表达式，通常是类似 "host ip req status size ua" 的组合格式。
-NGINX_ACCESS_LOG=/var/log/nginx/access.log
-
-# === 主动网络探测 (超低内存优化) ===
-PING_TARGETS=1.1.1.1,cloudflare.com
-PING_INTERVAL_SEC=60
-PING_TIMEOUT_MS=1500
-PING_ENGINE=tcp
-PING_TCP_PORT=443
-PING_ROUND_ROBIN=1
-LOSS_WINDOW=20
-LOSS_ALERT_PCT=60
-LATENCY_ALERT_MS=400
-JITTER_ALERT_MS=150
-FLAP_SUPPRESS_SEC=300
-
-# === 通用窗口与冷却 ===
-COOLDOWN_SEC=600
-
-# === 内存/Swap ===
-MEM_AVAIL_PCT_MIN=10
-SWAP_USED_PCT_MAX=50
-SWAPIN_PPS_MAX=1000
-
-# === CPU/Load ===
-LOAD1_PER_CORE_MAX=1.5
-CPU_IOWAIT_PCT_MAX=50
-
-# === 网卡总量（排除虚拟网卡）===
-NET_RX_BPS_ALERT=5242880
-NET_TX_BPS_ALERT=5242880
-NET_RX_PPS_ALERT=2000
-NET_TX_PPS_ALERT=2000
-
-# === 磁盘 ===
-ROOT_FS_PCT_MAX=90
-
-# === Web 扫描特征 ===
-SCAN_SIGS='/(?:\.env(?:\.|/|$)|wp-admin|wp-login|phpmyadmin|manager/html|hudson|actuator(?:/|$)|solr/admin|HNAP1|vendor/phpunit|\.git/|etc/passwd|boaform|shell|config\.php|id_rsa)'
-
-# === 心跳与进程看护 ===
-HEARTBEAT_HOURS=24
-WATCH_PROCS=auto
-WATCH_PROCS_REQUIRE_ENABLED=1
-
-# === 每天北京时间12点快照 ===
-DAILY_BJ_SNAPSHOT_HOUR=12
-
-# === TLS 证书到期提醒 ===
-CERT_CHECK_DOMAINS=
-CERT_MIN_DAYS=3
-CERT_AUTO_DISCOVER=1
-CERT_SEARCH_GLOBS=/etc/letsencrypt/live/*/fullchain.pem,/var/discourse/shared/standalone/ssl/*,/etc/nginx/ssl/*/*.pem
-
-# === SSH 暴力破解监控 ===
-
-# === 内核/磁盘 I/O 错误监控（强烈建议开启）===
-KERNEL_WATCH=1
-# 可自定义关键字/正则（Python re），为空则使用内置默认规则
-KERNEL_PATTERNS=
-# 优先 journalctl -k -f；若不可用则尝试 /var/log/kern.log
-KERNEL_LOG_FALLBACK=/var/log/kern.log
-AUTH_LOG_PATH=/var/log/auth.log
-AUTH_FAIL_COUNT=30
-AUTH_FAIL_WINDOW_MIN=10
-
-# === 日志静默（0 打印异常到 journalctl；1 静默）===
-LOG_SILENT=0
-
-# === 月度流量统计 ===
-TRAFFIC_REPORT_EVERY_DAYS=10
-TRAFFIC_TRACK_IF=""
-EOF
-chmod 600 /etc/sentinel/sentinel.env
-
-# === tmsg (Telegram 1-shot) ===
-cat >/usr/local/bin/tmsg <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-# 从 sentinel 配置文件加载变量
-if [[ -f /etc/sentinel/sentinel.env ]]; then
-  set -a
-  source /etc/sentinel/sentinel.env
-  set +a
-fi
-: "${TELE_TOKEN:?TELE_TOKEN is not set. Check /etc/sentinel/sentinel.env}"
-: "${TELE_CHAT_ID:?TELE_CHAT_ID is not set. Check /etc/sentinel/sentinel.env}"
-curl -sS -m 10 -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
-  -d "chat_id=${TELE_CHAT_ID}" \
-  --data-urlencode "text=${1}" >/dev/null || true
-EOF
-chmod +x /usr/local/bin/tmsg
-
-echo ">>> [3/5] Writing sentinel daemon script..."
-cat >/usr/local/bin/sentinel.py <<'PY'
+[REPLACE_WITH_NEW_SCRIPT]
 #!/usr/bin/env python3
 import os, re, time, subprocess, socket, threading, statistics, json, sys, traceback, tempfile, calendar, shlex, ssl, glob
 from collections import deque, defaultdict
@@ -952,6 +741,356 @@ if __name__=="__main__":
 
     metrics_loop()
 PY
+# ===== Sentinel 安装/更新脚本 (生产优化版) =====
+# 适用于包括超低内存VPS在内的所有环境，可重复执行。
+# 已移除硬编码的 Telegram Secret，改为交互式安全设置。
+
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+# --- 辅助函数：获取并验证 Telegram 配置 ---
+function _setup_telegram_config() {
+  # 快速通道：如果环境变量已存在，直接使用，跳过所有交互
+  if [[ -n "${TELE_TOKEN:-}" && -n "${TELE_CHAT_ID:-}" ]]; then
+    echo ">>> [INFO] Using TELE_TOKEN and TELE_CHAT_ID from environment. Skipping interactive setup."
+    export TELE_TOKEN TELE_CHAT_ID
+    return 0
+  fi
+
+  # 如果配置文件存在且包含有效配置，则跳过
+  if [[ -f /etc/sentinel/sentinel.env ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    . /etc/sentinel/sentinel.env
+    set +a
+    if [[ -n "${TELE_TOKEN:-}" && -n "${TELE_CHAT_ID:-}" ]]; then
+      echo ">>> [INFO] Found existing Telegram configuration in /etc/sentinel/sentinel.env. Skipping interactive setup."
+      export TELE_TOKEN TELE_CHAT_ID
+      return 0
+    fi
+  fi
+
+  echo "--- Telegram Bot Setup ---"
+
+  local BOT_USERNAME=""
+
+  while true; do
+    read -p "Please enter your Telegram Bot Token: " -s TELE_TOKEN
+    echo ""
+
+    if [[ -z "${TELE_TOKEN:-}" ]]; then
+      echo "Token cannot be empty. Please try again."
+      continue
+    fi
+
+    if [[ ! "$TELE_TOKEN" =~ ^[0-9]+:[a-zA-Z0-9_-]+$ ]]; then
+      echo "Invalid Token format. It should look like '123456:ABC-DEF1234...'. Please try again."
+      continue
+    fi
+
+    # 先用 getMe 验证 token 是否真的可用，并拿到 bot 用户名
+    echo ">>> Verifying token with Telegram API (getMe)..."
+    local ME_JSON
+    ME_JSON=$(curl -sS -m 15 "https://api.telegram.org/bot${TELE_TOKEN}/getMe" || true)
+
+    local OK
+    OK=$(echo "$ME_JSON" | python3 - <<'PY'
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  print("1" if d.get("ok") else "0")
+except Exception:
+  print("0")
+PY
+)
+
+    if [[ "$OK" != "1" ]]; then
+      echo "!!! ERROR: Token verification failed. Telegram response (first 200 chars):" >&2
+      echo "${ME_JSON:0:200}" >&2
+      echo "Please double-check your token and try again."
+      TELE_TOKEN=""
+      continue
+    fi
+
+    BOT_USERNAME=$(echo "$ME_JSON" | python3 - <<'PY'
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  u=(d.get("result") or {}).get("username") or ""
+  print(u)
+except Exception:
+  print("")
+PY
+)
+
+    echo ">>> Token OK. Bot: @${BOT_USERNAME:-unknown}"
+    break
+  done
+
+  echo ""
+  echo "Token received. Now, let's get your Chat ID."
+  echo ""
+  echo ">>> Please open Telegram and send a message to your bot (e.g., /start)."
+  if [[ -n "${BOT_USERNAME:-}" ]]; then
+    echo ">>> You can also open: https://t.me/${BOT_USERNAME}?start=sentinel"
+  fi
+  read -p ">>> After sending the message, press [Enter] here to continue..."
+
+  echo "Fetching Chat ID from Telegram API (getUpdates)..."
+
+  # 多次尝试：有时 Telegram updates 到达有延迟，或者用户在脚本提示前已发过消息
+  local API_RESPONSE=""
+  local TELE_CHAT_ID_CANDIDATES=""
+  local i
+  for i in 1 2 3 4 5 6; do
+    API_RESPONSE=$(curl -sS -m 20 "https://api.telegram.org/bot${TELE_TOKEN}/getUpdates?limit=50" || true)
+
+    TELE_CHAT_ID_CANDIDATES=$(echo "$API_RESPONSE" | python3 - <<'PY'
+import json,sys
+try:
+  d=json.load(sys.stdin)
+except Exception:
+  print("")
+  raise SystemExit(0)
+
+ids=[]
+# Telegram updates may contain many shapes
+for it in d.get("result", []) or []:
+  # message / edited_message / channel_post
+  for k in ("message","edited_message","channel_post"):
+    msg = it.get(k)
+    if isinstance(msg, dict):
+      chat = msg.get("chat") or {}
+      cid = chat.get("id")
+      if cid is not None:
+        ids.append(cid)
+
+  # callback_query
+  cq = it.get("callback_query")
+  if isinstance(cq, dict):
+    msg2 = cq.get("message") or {}
+    chat = msg2.get("chat") or {}
+    cid = chat.get("id")
+    if cid is not None:
+      ids.append(cid)
+
+  # my_chat_member / chat_member
+  for k in ("my_chat_member","chat_member"):
+    x = it.get(k)
+    if isinstance(x, dict):
+      chat = x.get("chat") or {}
+      cid = chat.get("id")
+      if cid is not None:
+        ids.append(cid)
+
+# dedupe but keep order
+seen=set(); out=[]
+for cid in ids:
+  if cid in seen: continue
+  seen.add(cid)
+  out.append(cid)
+
+print("\n".join(str(x) for x in out))
+PY
+)
+
+    if [[ -n "${TELE_CHAT_ID_CANDIDATES:-}" ]]; then
+      break
+    fi
+
+    echo ">>> No chat id yet (try $i/6). Waiting 2s..."
+    sleep 2
+  done
+
+  if [[ -n "${TELE_CHAT_ID_CANDIDATES:-}" ]]; then
+    # 取最后一个候选，通常是最新互动的 chat
+    TELE_CHAT_ID=$(echo "$TELE_CHAT_ID_CANDIDATES" | tail -n 1)
+  else
+    TELE_CHAT_ID=""
+  fi
+
+  # 如果仍没拿到，提供手动输入兜底（很多场景都需要这个：
+  # - 用户从未给 bot 发过消息
+  # - bot 在群里/频道里
+  # - privacy mode / 权限等导致收不到 update
+  if [[ -z "${TELE_CHAT_ID:-}" ]]; then
+    echo ""
+    echo "!!! ERROR: Could not automatically detect your Chat ID from getUpdates." >&2
+    echo "Common causes:" >&2
+    echo "  1) You didn't send a message to the bot." >&2
+    echo "  2) Your message was not delivered to the bot (privacy mode / you messaged the wrong bot)." >&2
+    echo "  3) You want to send alerts to a group/channel (group ids are often negative)." >&2
+    echo "" >&2
+    echo "Fallback: please manually enter TELE_CHAT_ID." >&2
+    echo "Tips:" >&2
+    echo "  - For private chat, TELE_CHAT_ID is usually your Telegram user id." >&2
+    echo "  - You can use @userinfobot to get your user id." >&2
+    echo "  - For groups: add the bot to the group, send a message, then rerun; group id is negative." >&2
+    echo "" >&2
+
+    while true; do
+      read -p "Please enter TELE_CHAT_ID (number, can be negative): " TELE_CHAT_ID
+      TELE_CHAT_ID="${TELE_CHAT_ID//[[:space:]]/}"
+      if [[ -z "${TELE_CHAT_ID:-}" ]]; then
+        echo "Chat ID cannot be empty."
+        continue
+      fi
+      if [[ ! "${TELE_CHAT_ID}" =~ ^-?[0-9]+$ ]]; then
+        echo "Chat ID must be a number (can be negative)."
+        continue
+      fi
+      break
+    done
+  fi
+
+  # 最后做一次发送测试，确保 token/chat_id 组合真的能发出去
+  echo ">>> Testing Telegram sendMessage..."
+  local TEST_RESP
+  TEST_RESP=$(curl -sS -m 15 -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
+    -d "chat_id=${TELE_CHAT_ID}" \
+    --data-urlencode "text=✅ Sentinel Telegram setup OK on $(hostname -f)" || true)
+
+  local TEST_OK
+  TEST_OK=$(echo "$TEST_RESP" | python3 - <<'PY'
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  print("1" if d.get("ok") else "0")
+except Exception:
+  print("0")
+PY
+)
+
+  if [[ "$TEST_OK" != "1" ]]; then
+    echo "!!! ERROR: sendMessage test failed. Telegram response (first 300 chars):" >&2
+    echo "${TEST_RESP:0:300}" >&2
+    echo "Please verify your TELE_CHAT_ID and bot permissions, then rerun the script." >&2
+    exit 1
+  fi
+
+  echo "✅ Success! Using Chat ID: ${TELE_CHAT_ID}"
+  export TELE_TOKEN TELE_CHAT_ID
+}
+
+echo ">>> [1/5] Installing dependencies..."
+apt-get update -qq
+# 已加入 openssl 依赖，用于本地证书检查
+apt-get install -yq python3 ca-certificates curl iproute2 iputils-ping openssl procps
+# 确保不会因 needrestart 卡住；若不存在 needrestart 则忽略
+if command -v needrestart >/dev/null 2>&1; then
+  needrestart -r a || true
+fi
+
+echo ">>> [2/5] Creating directories and handling configuration..."
+mkdir -p /etc/sentinel /var/lib/sentinel
+
+_setup_telegram_config
+
+# === 配置 ===
+cat >/etc/sentinel/sentinel.env <<EOF
+# === Telegram (由脚本自动填充或从现有配置加载) ===
+TELE_TOKEN="${TELE_TOKEN}"
+TELE_CHAT_ID="${TELE_CHAT_ID}"
+
+# === 可选 Nginx 日志监控 ===
+# 注意: 日志格式需匹配 sentinel.py 中的 LOG_RE 正则表达式，通常是类似 "host ip req status size ua" 的组合格式。
+NGINX_ACCESS_LOG=/var/log/nginx/access.log
+
+# === 主动网络探测 (超低内存优化) ===
+PING_TARGETS=1.1.1.1,cloudflare.com
+PING_INTERVAL_SEC=60
+PING_TIMEOUT_MS=1500
+PING_ENGINE=tcp
+PING_TCP_PORT=443
+PING_ROUND_ROBIN=1
+LOSS_WINDOW=20
+LOSS_ALERT_PCT=60
+LATENCY_ALERT_MS=400
+JITTER_ALERT_MS=150
+FLAP_SUPPRESS_SEC=300
+
+# === 通用窗口与冷却 ===
+COOLDOWN_SEC=600
+
+# === 内存/Swap ===
+MEM_AVAIL_PCT_MIN=10
+SWAP_USED_PCT_MAX=50
+SWAPIN_PPS_MAX=1000
+
+# === CPU/Load ===
+LOAD1_PER_CORE_MAX=1.5
+CPU_IOWAIT_PCT_MAX=50
+
+# === 网卡总量（排除虚拟网卡）===
+NET_RX_BPS_ALERT=5242880
+NET_TX_BPS_ALERT=5242880
+NET_RX_PPS_ALERT=2000
+NET_TX_PPS_ALERT=2000
+
+# === 磁盘 ===
+ROOT_FS_PCT_MAX=90
+
+# === Web 扫描特征 ===
+SCAN_SIGS='/(?:\.env(?:\.|/|$)|wp-admin|wp-login|phpmyadmin|manager/html|hudson|actuator(?:/|$)|solr/admin|HNAP1|vendor/phpunit|\.git/|etc/passwd|boaform|shell|config\.php|id_rsa)'
+
+# === 心跳与进程看护 ===
+HEARTBEAT_HOURS=24
+WATCH_PROCS=auto
+WATCH_PROCS_REQUIRE_ENABLED=1
+
+# === 每天北京时间12点快照 ===
+DAILY_BJ_SNAPSHOT_HOUR=12
+
+# === TLS 证书到期提醒 ===
+CERT_CHECK_DOMAINS=
+CERT_MIN_DAYS=3
+CERT_AUTO_DISCOVER=1
+CERT_SEARCH_GLOBS=/etc/letsencrypt/live/*/fullchain.pem,/var/discourse/shared/standalone/ssl/*,/etc/nginx/ssl/*/*.pem
+
+# === SSH 暴力破解监控 ===
+
+# === 内核/磁盘 I/O 错误监控（强烈建议开启）===
+KERNEL_WATCH=1
+# 可自定义关键字/正则（Python re），为空则使用内置默认规则
+KERNEL_PATTERNS=
+# 优先 journalctl -k -f；若不可用则尝试 /var/log/kern.log
+KERNEL_LOG_FALLBACK=/var/log/kern.log
+AUTH_LOG_PATH=/var/log/auth.log
+AUTH_FAIL_COUNT=30
+AUTH_FAIL_WINDOW_MIN=10
+
+# === 日志静默（0 打印异常到 journalctl；1 静默）===
+LOG_SILENT=0
+
+# === 月度流量统计 ===
+TRAFFIC_REPORT_EVERY_DAYS=10
+TRAFFIC_TRACK_IF=""
+EOF
+chmod 600 /etc/sentinel/sentinel.env
+
+# === tmsg (Telegram 1-shot) ===
+cat >/usr/local/bin/tmsg <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# 从 sentinel 配置文件加载变量
+if [[ -f /etc/sentinel/sentinel.env ]]; then
+  set -a
+  source /etc/sentinel/sentinel.env
+  set +a
+fi
+: "${TELE_TOKEN:?TELE_TOKEN is not set. Check /etc/sentinel/sentinel.env}"
+: "${TELE_CHAT_ID:?TELE_CHAT_ID is not set. Check /etc/sentinel/sentinel.env}"
+curl -sS -m 10 -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
+  -d "chat_id=${TELE_CHAT_ID}" \
+  --data-urlencode "text=${1}" >/dev/null || true
+EOF
+chmod +x /usr/local/bin/tmsg
+
+echo ">>> [3/5] Writing sentinel daemon script..."
+cat >/usr/local/bin/sentinel.py <<'PY'
+[PYTHON_SCRIPT_BODY]
+PY
 chmod +x /usr/local/bin/sentinel.py
 
 # ---- systemd 服务 ----
@@ -986,9 +1125,10 @@ systemctl enable --now sentinel.service
 # 自检通知
 (
   set -a
+  # shellcheck disable=SC1091
   . /etc/sentinel/sentinel.env
   set +a
-  hostip="$(ip -o route get 1.1.1.1 | sed -n 's/.* src $begin:math:text$\[0\-9\.\]\\\+$end:math:text$.*/\1/p' || echo 'N/A')"
+  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]\+\).*/\1/p' | head -n1 || echo 'N/A')"
   TEXT="✅ Sentinel on $(hostname -f) (${hostip}) has been installed/updated successfully."
   # 使用 tmsg 工具发送，更简洁
   /usr/local/bin/tmsg "$TEXT"
