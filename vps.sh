@@ -10,9 +10,16 @@
 #
 # 依赖：Debian/Ubuntu + systemd
 
+
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
+export NEEDRESTART_MODE="a"
+
+# --- Versioning ---
+INSTALLER_VERSION="v2026-02-03-1"
+SENTINEL_VERSION="v2026-02-03-1"
+
+echo ">>> [INFO] vps.sh installer version: ${INSTALLER_VERSION}"
 
 # --- Telegram helpers (robust JSON + webhook handling) ---
 _tg_curl() {
@@ -323,11 +330,55 @@ if command -v needrestart >/dev/null 2>&1; then
   needrestart -r a || true
 fi
 
+# --- Stop existing service/processes to ensure clean overwrite ---
+if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'sentinel.service'; then
+  echo ">>> [INFO] Stopping existing sentinel.service (if running)..."
+  systemctl stop sentinel.service >/dev/null 2>&1 || true
+fi
+# Safety: if there is a stray process outside systemd, stop it too.
+pkill -f "/usr/local/bin/sentinel.py" >/dev/null 2>&1 || true
+
 echo ">>> [2/5] Creating directories and handling configuration..."
 mkdir -p /etc/sentinel /var/lib/sentinel
 
 _setup_telegram_config
 
+echo ">>> [2.5/5] Validating configuration..."
+_validate_config() {
+  local errors=0
+
+  # Required commands
+  for cmd in python3 curl tail pgrep systemctl openssl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "ERROR: Required command '$cmd' not found" >&2
+      ((errors++))
+    fi
+  done
+
+  # Python version
+  if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,6) else 1)' 2>/dev/null; then
+    echo "ERROR: Python 3.6+ required" >&2
+    ((errors++))
+  fi
+
+  # Minimal env sanity
+  if [[ -z "${TELE_TOKEN:-}" ]]; then
+    echo "ERROR: TELE_TOKEN is empty after setup" >&2
+    ((errors++))
+  fi
+  if [[ -z "${TELE_CHAT_ID:-}" ]]; then
+    echo "ERROR: TELE_CHAT_ID is empty after setup" >&2
+    ((errors++))
+  fi
+
+  if (( errors > 0 )); then
+    echo "Configuration validation failed with $errors error(s)" >&2
+    exit 1
+  fi
+}
+_validate_config
+
+# === 配置 ===
 # === 配置 ===
 cat >/etc/sentinel/sentinel.env <<EOF
 # === Telegram (由脚本自动填充或从现有配置加载) ===
@@ -339,6 +390,11 @@ TELE_CHAT_ID="${TELE_CHAT_ID}"
 # 1) 自定义："host" ip "req" status size ... "ua"
 # 2) combined：ip - - [ts] "req" status size "ref" "ua"
 NGINX_ACCESS_LOG=/var/log/nginx/access.log
+NGINX_5XX_BURST_THRESHOLD=50
+NGINX_5XX_BURST_WINDOW_SEC=60
+
+# === log_watch debug：打印无法匹配的行（默认关闭）===
+LOG_DEBUG_NOMATCH=0
 
 # === 主动网络探测 (超低内存优化) ===
 PING_TARGETS=1.1.1.1,cloudflare.com
@@ -419,18 +475,66 @@ TRAFFIC_TRACK_IF=""
 EOF
 chmod 600 /etc/sentinel/sentinel.env
 
+# --- Write version marker ---
+echo "${SENTINEL_VERSION}" >/etc/sentinel/version
+chmod 644 /etc/sentinel/version
+
 # === tmsg (Telegram 1-shot) ===
 cat >/usr/local/bin/tmsg <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ -f /etc/sentinel/sentinel.env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source /etc/sentinel/sentinel.env
-  set +a
+
+TMSG_VERSION="v2026-02-03-1"
+
+if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+  echo "tmsg ${TMSG_VERSION}"
+  exit 0
 fi
-: "${TELE_TOKEN:?TELE_TOKEN is not set. Check /etc/sentinel/sentinel.env}"
-: "${TELE_CHAT_ID:?TELE_CHAT_ID is not set. Check /etc/sentinel/sentinel.env}"
+
+ENV_FILE="/etc/sentinel/sentinel.env"
+
+# Safe .env parser: do NOT source/execute the file.
+_read_env_value() {
+  local key="$1"
+  local line val
+  [[ -f "$ENV_FILE" ]] || return 1
+
+  # Grab the last matching assignment line, strip leading spaces.
+  line="$(grep -E "^[[:space:]]*${key}=" "$ENV_FILE" | tail -n 1 || true)"
+  [[ -n "$line" ]] || return 1
+
+  # Remove `KEY=` prefix.
+  val="${line#*=}"
+
+  # Strip inline comments (everything after first #)
+  val="${val%%#*}"
+
+  # Trim whitespace.
+  val="$(echo "$val" | sed -e 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+  # Strip optional surrounding quotes.
+  if [[ "$val" == '"'*'"' ]]; then
+    val="${val#\"}"
+    val="${val%\"}"
+  elif [[ "$val" == "'"*"'" ]]; then
+    val="${val#\'}"
+    val="${val%\'}"
+  fi
+
+  # Reject suspicious values (command substitution / backticks / newlines)
+  if echo "$val" | grep -Eq '[$`\n\r]'; then
+    return 1
+  fi
+
+  printf '%s' "$val"
+}
+
+TELE_TOKEN="$(_read_env_value TELE_TOKEN || true)"
+TELE_CHAT_ID="$(_read_env_value TELE_CHAT_ID || true)"
+
+: "${TELE_TOKEN:?TELE_TOKEN is not set or invalid. Check /etc/sentinel/sentinel.env}"
+: "${TELE_CHAT_ID:?TELE_CHAT_ID is not set or invalid. Check /etc/sentinel/sentinel.env}"
+
 curl -sS -m 10 -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
   -d "chat_id=${TELE_CHAT_ID}" \
   --data-urlencode "text=${1}" >/dev/null || true
@@ -440,7 +544,7 @@ chmod +x /usr/local/bin/tmsg
 echo ">>> [3/5] Writing sentinel daemon script..."
 cat >/usr/local/bin/sentinel.py <<'PY'
 #!/usr/bin/env python3
-import os, re, time, subprocess, socket, threading, statistics, json, sys, traceback, tempfile, calendar, shlex, ssl, glob
+import os, re, time, subprocess, socket, threading, statistics, json, sys, traceback, tempfile, calendar, shlex, ssl, glob, signal, ipaddress
 from collections import deque, defaultdict
 from datetime import date, datetime, timedelta
 
@@ -448,9 +552,14 @@ from datetime import date, datetime, timedelta
 import urllib.request
 import urllib.parse
 
-# ===== Env & Constants =====
+ # ===== Env & Constants =====
 E = lambda k, d=None: os.getenv(k, d)
+SENTINEL_VERSION = "v2026-02-03-1"
 TELE_TOKEN, TELE_CHAT_ID = E("TELE_TOKEN"), E("TELE_CHAT_ID")
+
+# Reduce exposure: keep token/chat id in memory only.
+os.environ.pop("TELE_TOKEN", None)
+os.environ.pop("TELE_CHAT_ID", None)
 
 # --- sanitize numeric envs ---
 def _strip_inline_comment(v):
@@ -510,6 +619,10 @@ HEARTBEAT_HOURS = float(E("HEARTBEAT_HOURS","24"))
 # Others
 NGINX_ACCESS = E("NGINX_ACCESS_LOG","/var/log/nginx/access.log")
 
+# Nginx 5xx burst alert (time-window)
+NGINX_5XX_BURST_THRESHOLD = int(E("NGINX_5XX_BURST_THRESHOLD", "50"))
+NGINX_5XX_BURST_WINDOW_SEC = int(E("NGINX_5XX_BURST_WINDOW_SEC", "60"))
+
 _scan_sigs_raw = (E("SCAN_SIGS", "") or "").strip()
 if _scan_sigs_raw:
     _pat = _scan_sigs_raw.strip("'\"")
@@ -566,7 +679,7 @@ _DEFAULT_KERNEL_PATTERNS = [
     r"nvme.*reset",
     r"nvme.*I/O",
     r"ata\d+\.\d+: (failed command|exception Emask|error)",
-    r"sd \S+: \[\S+\] (I/O error|FAILED Result)",
+    r"sd \S+: $begin:math:display$\\S\+$end:math:display$ (I/O error|FAILED Result)",
 ]
 
 if KERNEL_PATTERNS_RAW:
@@ -579,14 +692,23 @@ if KERNEL_PATTERNS_RAW:
 else:
     KERNEL_PATTERNS = [re.compile(p, re.I) for p in _DEFAULT_KERNEL_PATTERNS]
 
-def _log_ex():
-    if not LOG_SILENT:
-        traceback.print_exc(file=sys.stderr)
+def _log_ex(context=""):
+    """Log exception with optional context."""
+    if LOG_SILENT:
+        return
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        ts = ""
+    ctx = f" [{context}]" if context else ""
+    print(f"\n[{ts}]{ctx} Exception:", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
 
 class State:
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
+        self.dirty = False
         self.data = {
             "last_alert": {},
             "last_beat": 0,
@@ -613,6 +735,7 @@ class State:
                 tf.flush()
                 os.fsync(tf.fileno())
                 os.replace(tf.name, self.path)
+            self.dirty = False
         except Exception:
             _log_ex()
 
@@ -624,10 +747,12 @@ class State:
         with self.lock:
             return self.data.get(k, d)
 
-    def set(self, k, v):
+    def set(self, k, v, flush=False):
         with self.lock:
             self.data[k] = v
-            self._save_unlocked()
+            self.dirty = True
+            if flush:
+                self._save_unlocked()
 
     def cooldown(self, key):
         now = time.time()
@@ -647,7 +772,7 @@ class State:
                 # Keep only the newest DIGEST_MAX_ITEMS
                 if len(q) > DIGEST_MAX_ITEMS:
                     self.data["digest"] = q[-DIGEST_MAX_ITEMS:]
-                self._save_unlocked()
+                self.dirty = True
         except Exception:
             _log_ex()
 
@@ -655,14 +780,17 @@ class State:
         with self.lock:
             q = self.data.get("digest", []) or []
             self.data["digest"] = []
-            self._save_unlocked()
+            self.dirty = True
             return q
 
 state = State(STATE_FILE)
 HOST = socket.getfqdn() or socket.gethostname()
 
+# Periodic state flush (for digest persistence without excessive fsync)
+_LAST_STATE_FLUSH = 0.0
+
 def esc(s):
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', str(s))
+    return re.sub(r'([_*$begin:math:display$$end:math:display$()~`>#+\-=|{}.!])', r'\\\1', str(s))
 
 # -------- Telegram sender (urllib, low overhead) --------
 def _tg_send(txt, parse_mode=None):
@@ -685,7 +813,8 @@ def _tg_send(txt, parse_mode=None):
 
     # A tiny retry loop for transient network issues.
     last_text = ""
-    for _ in range(3):
+    last_err = ""
+    for attempt in range(3):
         try:
             req = urllib.request.Request(
                 url,
@@ -705,11 +834,16 @@ def _tg_send(txt, parse_mode=None):
             except Exception:
                 ok = ('"ok":true' in last_text) or ('"ok": true' in last_text)
             return ok, last_text
-        except Exception:
-            _log_ex()
-            time.sleep(0.25)
-            continue
+        except Exception as e:
+            last_err = str(e) or repr(e)
+            if not LOG_SILENT:
+                print(f"Telegram API attempt {attempt+1}/3 failed: {last_err}", file=sys.stderr)
+            _log_ex("tg_send")
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
 
+    if not last_text and last_err:
+        last_text = f"Failed after 3 attempts: {last_err}"
     return False, last_text
 
 # -------- IP / route helpers (IPv4+IPv6 robust) --------
@@ -717,37 +851,55 @@ _IP_RE = re.compile(r"\bsrc\s+([0-9a-fA-F:.]+)\b")
 _DEV_RE = re.compile(r"\bdev\s+(\S+)")
 _VIA_RE = re.compile(r"\bvia\s+(\S+)")
 
-def get_primary_ip():
-    # Try IPv4 route
+def _is_public_ip(s: str) -> bool:
     try:
-        r = subprocess.run(["ip", "-o", "route", "get", "1.1.1.1"], capture_output=True, text=True, timeout=2)
-        out = r.stdout or ""
-        m = _IP_RE.search(out)
-        if m:
-            return m.group(1)
+        ip = ipaddress.ip_address(s)
+        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+            return False
+        # ip.is_private covers RFC1918 + many non-public ranges; also exclude reserved.
+        if getattr(ip, "is_private", False) or getattr(ip, "is_reserved", False):
+            return False
+        return True
     except Exception:
-        pass
+        return False
 
-    # IPv6 fallback (Cloudflare v6 resolver)
-    try:
-        r6 = subprocess.run(["ip", "-o", "-6", "route", "get", "2606:4700:4700::1111"], capture_output=True, text=True, timeout=2)
-        out6 = r6.stdout or ""
-        m6 = _IP_RE.search(out6)
-        if m6:
-            return m6.group(1)
-    except Exception:
-        pass
 
-    # Last resort: hostname -I (may contain multiple IPs)
+def _best_ip_from_hostname_I() -> str:
     try:
         r = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2)
-        cand = (r.stdout or "").strip().split()
-        if cand:
-            return cand[0]
+        ips = (r.stdout or "").strip().split()
+        if not ips:
+            return ""
+        # Prefer a globally routable address if present.
+        for x in ips:
+            if _is_public_ip(x):
+                return x
+        return ips[0]
     except Exception:
-        pass
+        return ""
 
-    return "0.0.0.0"
+
+def get_primary_ip():
+    # Dual-stack robust: explicitly try v4 then v6; tolerate v4-only or v6-only hosts.
+    targets = [
+        ("-4", "1.1.1.1"),
+        ("-6", "2606:4700:4700::1111"),
+    ]
+
+    for flag, target in targets:
+        try:
+            cmd = ["ip", "-o", flag, "route", "get", target]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            out = r.stdout or ""
+            m = _IP_RE.search(out)
+            if m:
+                return m.group(1)
+        except Exception:
+            continue
+
+    # Last resort: hostname -I (may contain multiple IPs)
+    ip = _best_ip_from_hostname_I()
+    return ip if ip else "0.0.0.0"
 
 def send(title, lines, icon="🔔", urgent=False):
     """Send alert.
@@ -770,7 +922,7 @@ def send(title, lines, icon="🔔", urgent=False):
     if urgent:
         head = f"{icon} *{esc(item['host'])}*\n`{esc(item['ip'])}`\n*{esc(item['title'])}*"
         body = "\n".join(f"• {esc(x)}" for x in item["lines"])
-        _tg_send(f"{head}\n{body}", "MarkdownV2")
+        threading.Thread(target=_tg_send, args=(f"{head}\n{body}", "MarkdownV2"), daemon=True).start()
         return
 
     # Non-urgent -> digest queue
@@ -795,13 +947,17 @@ def compute_watch_procs_auto():
     try:
         if systemd_active("nginx") or process_exists("nginx"):
             procs.append("nginx")
-    except Exception:
-        pass
+    except Exception as e:
+        if not LOG_SILENT:
+            print(f"Warning: Failed to check nginx status: {e}", file=sys.stderr)
+
     try:
         if systemd_active("docker") or process_exists("dockerd"):
             procs.append("dockerd")
-    except Exception:
-        pass
+    except Exception as e:
+        if not LOG_SILENT:
+            print(f"Warning: Failed to check docker status: {e}", file=sys.stderr)
+
     return procs
 
 def effective_watch_list():
@@ -867,8 +1023,34 @@ def route_sig():
     except Exception:
         return "?", "direct", get_primary_ip()
 
-def _delta(new, old):
-    return (new - old) if new >= old else (2**64 - old + new)
+def _delta(new, old, max_bits=64, max_delta=None):
+    """Compute monotonic counter delta with wrap handling + sanity checks.
+
+    - Handles counter wrap (32-bit preferred when both values fit; else uses max_bits).
+    - Optional `max_delta` caps physically impossible deltas (treat as 0).
+    - Hard safety net: absurdly large deltas are treated as 0.
+    """
+    if new >= old:
+        d = new - old
+    else:
+        # Prefer 32-bit if both values look 32-bit; else fall back to max_bits (default 64).
+        if new < 2**32 and old < 2**32:
+            max_val = 2**32
+        else:
+            max_val = 2**max_bits
+        d = max_val - old + new
+
+    # Physical / user-provided sanity cap.
+    if max_delta is not None and d > max_delta:
+        return 0
+
+    # Hard safety check: if delta is absurdly large, treat it as 0 (safer for monitoring).
+    if d > 2**40:  # ~1 TB
+        if not LOG_SILENT:
+            print(f"Warning: suspicious counter delta {d}; using 0", file=sys.stderr)
+        return 0
+
+    return d
 
 # ==== Metrics ====
 vm_prev, stat_prev, last_net = None, None, None
@@ -983,61 +1165,161 @@ def root_usage_pct():
     total = st.f_blocks * st.f_frsize or 1
     return int(used * 100 / total)
 
+# ==== Subprocess Termination Helper ====
+
+def _terminate_process(p):
+    """Terminate a subprocess reliably and reap it to avoid zombies."""
+    if p is None:
+        return
+    try:
+        p.terminate()
+    except Exception:
+        pass
+    try:
+        p.wait(timeout=1)
+        return
+    except Exception:
+        pass
+    try:
+        p.kill()
+    except Exception:
+        pass
+    try:
+        p.wait(timeout=1)
+    except Exception:
+        pass
+
 # ==== Log Watch (optional) ====
 # 支援两种常见格式：
 # 1) 自定义："host" ip "req" status size ... "ua"
 # 2) combined：ip - - [ts] "req" status size "ref" "ua"
-LOG_RE_Q = re.compile(r'^"(?P<host>[^"]+)"\s+(?P<ip>[0-9a-fA-F\.:]+)\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+).+"(?P<ua>[^"]*)"$')
-LOG_RE_COMBINED = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+$begin:math:display$\[\^$end:math:display$]+\]\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>[^"]*)"')
+LOG_RE_Q = re.compile(r'^"(?P<host>[^"]+)"\s+(?P<ip>[0-9a-fA-F\.:]+)\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+).+"(?P<ua>(?:\\.|[^"])*)"$')
+
+LOG_RE_COMBINED = re.compile(
+    r'^(?P<ip>[0-9a-fA-F\.:]+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(?P<req>.{0,2048}?)"\s+'
+    r'(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>(?:\\.|[^"])*)"(?:\s+.*)?$'
+)
 
 def log_watch():
-    path = (NGINX_ACCESS or "").strip()
-    if not path:
-        return
+    """Watch nginx access log for scan signatures + 5xx bursts.
 
-    p = None
-    try:
-        if path.startswith("container:"):
-            _, spec = path.split("container:", 1)
-            name, cpath = spec.split(":", 1)
-            p = subprocess.Popen(
-                ["docker", "exec", "-i", name, "bash", "-lc", f"tail -n0 -F {shlex.quote(cpath)}"],
-                stdout=subprocess.PIPE,
-                text=True,
-                bufsize=1
-            )
-        elif os.path.exists(path):
-            p = subprocess.Popen(["tail", "-n0", "-F", path], stdout=subprocess.PIPE, text=True, bufsize=1)
+    Design goals:
+    - Never "one-shot die" if the log doesn't exist yet or is rotated.
+    - Let tail -F handle file appearance/rotation.
+    - Respawn tail on exit.
+    - Avoid blocking log consumption on Telegram send: send() may enqueue digest; urgent sends are still bounded by urllib timeout.
+    """
 
-        if not p or p.stdout is None:
-            return
+    # Sliding window for 5xx burst detection (timestamps of 5xx events).
+    # Bound the deque to prevent memory blow-up under extreme 5xx floods.
+    burst = deque(maxlen=max(1000, int(NGINX_5XX_BURST_THRESHOLD) * 100))
 
-        for line in p.stdout:
-            s = (line or "").strip()
-            if not s:
-                continue
+    while True:
+        path = (NGINX_ACCESS or "").strip()
+        if not path:
+            time.sleep(30)
+            continue
 
-            m = LOG_RE_Q.match(s)
-            host = "-"
-            if not m:
-                m = LOG_RE_COMBINED.match(s)
-                if not m:
-                    continue
+        p = None
+        try:
+            if path.startswith("container:"):
+                _, spec = path.split("container:", 1)
+                name, cpath = spec.split(":", 1)
+                p = subprocess.Popen(
+                    ["docker", "exec", "-i", name, "bash", "-lc", f"tail -n0 -F {shlex.quote(cpath)}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
             else:
-                host = m["host"]
+                # Always use tail -F even if the file doesn't exist yet.
+                p = subprocess.Popen(
+                    ["tail", "-n0", "-F", path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
 
-            ip, req, ua = m["ip"], m["req"], m["ua"]
-            try:
-                path_part = req.split(" ", 2)[1]
-            except Exception:
-                continue
+            if p.stdout is None:
+                raise RuntimeError("tail stdout not available")
 
-            if SCAN_SIGS.search(path_part) and not state.cooldown(f"scan_{ip}"):
-                send("Scan signature", [f"src {ip}", f"Host {host}", f"Path {path_part}", f"UA {ua[:120]}"], icon="🚨", urgent=True)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        _log_ex()
+            for line in p.stdout:
+                s = (line or "").strip()
+                if not s:
+                    continue
+
+                # Hard cap to reduce regex work on pathological lines.
+                if len(s) > 8192:
+                    s = s[:8192]
+
+                m = LOG_RE_Q.match(s)
+                host = "-"
+                if not m:
+                    m = LOG_RE_COMBINED.match(s)
+                    if not m:
+                        # Optional debug: print unmatched lines when enabled.
+                        if (not LOG_SILENT) and (E("LOG_DEBUG_NOMATCH", "0") == "1"):
+                            print(f"[log_watch] No match: {s[:200]}", file=sys.stderr)
+                        continue
+                else:
+                    host = m["host"]
+
+                ip, req, ua = m["ip"], m["req"], m["ua"]
+                st = None
+                try:
+                    st = int(m["st"]) if "st" in m.groupdict() else None
+                except Exception:
+                    st = None
+
+                # 5xx burst (time-window)
+                if st is not None and 500 <= st <= 599:
+                    now = time.time()
+                    burst.append(now)
+                    win = max(1, int(NGINX_5XX_BURST_WINDOW_SEC))
+                    thr = max(1, int(NGINX_5XX_BURST_THRESHOLD))
+                    while burst and (now - burst[0]) > win:
+                        burst.popleft()
+                    if len(burst) >= thr and not state.cooldown("nginx_5xx_burst"):
+                        send(
+                            "Nginx 5xx burst",
+                            [
+                                f"{len(burst)} errors in {win}s",
+                                f"last status {st}",
+                                f"src {ip}",
+                                f"Host {host}",
+                                f"Req {req[:120]}",
+                            ],
+                            icon="💥",
+                            urgent=True,
+                        )
+
+                # Scan signatures
+                try:
+                    path_part = req.split(" ", 2)[1]
+                except Exception:
+                    continue
+
+                if SCAN_SIGS.search(path_part) and not state.cooldown(f"scan_{ip}"):
+                    send(
+                        "Scan signature",
+                        [f"src {ip}", f"Host {host}", f"Path {path_part}", f"UA {ua[:120]}"],
+                        icon="🚨",
+                        urgent=True,
+                    )
+
+        except FileNotFoundError:
+            # tail or docker might not exist yet.
+            time.sleep(5)
+        except Exception:
+            _log_ex("log_watch")
+            time.sleep(3)
+        finally:
+            _terminate_process(p)
+
+        # Respawn tail after it exits or on any failure.
+        time.sleep(2)
 
 # ==== Net Probe ====
 def _tcp_probe(host, port=443, timeout=0.9):
@@ -1118,29 +1400,52 @@ class NetProbe:
 # ==== SSH brute force (tail auth.log) ====
 def ssh_watch():
     path = AUTH_LOG_PATH
-    if not os.path.exists(path):
-        return
     patt = re.compile(r"(?:Failed password|Invalid user).+ from ([0-9.]+)")
     buckets = defaultdict(deque)  # ip -> timestamps
     win = AUTH_FAIL_WINDOW_MIN * 60
-    try:
-        p = subprocess.Popen(["tail", "-n", "0", "-F", path], stdout=subprocess.PIPE, text=True, bufsize=1)
-        if p.stdout is None:
-            return
-        for line in p.stdout:
-            m = patt.search(line or "")
-            if not m:
-                continue
-            ip = m.group(1)
-            now = time.time()
-            dq = buckets[ip]
-            dq.append(now)
-            while dq and now - dq[0] > win:
-                dq.popleft()
-            if len(dq) >= AUTH_FAIL_COUNT and not state.cooldown(f"ssh_bruteforce_{ip}"):
-                send("SSH brute-force", [f"src {ip}", f"fails ≥ {AUTH_FAIL_COUNT} in {AUTH_FAIL_WINDOW_MIN} min"], icon="🛡️", urgent=True)
-    except Exception:
-        _log_ex()
+
+    while True:
+        p = None
+        try:
+            # Use tail -F even if the file doesn't exist yet; it will wait.
+            p = subprocess.Popen(
+                ["tail", "-n", "0", "-F", path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            if p.stdout is None:
+                raise RuntimeError("tail stdout not available")
+
+            for line in p.stdout:
+                m = patt.search(line or "")
+                if not m:
+                    continue
+                ip = m.group(1)
+                now = time.time()
+                dq = buckets[ip]
+                dq.append(now)
+                while dq and now - dq[0] > win:
+                    dq.popleft()
+                if len(dq) >= AUTH_FAIL_COUNT and not state.cooldown(f"ssh_bruteforce_{ip}"):
+                    send(
+                        "SSH brute-force",
+                        [f"src {ip}", f"fails ≥ {AUTH_FAIL_COUNT} in {AUTH_FAIL_WINDOW_MIN} min"],
+                        icon="🛡️",
+                        urgent=True,
+                    )
+
+        except FileNotFoundError:
+            time.sleep(5)
+        except Exception:
+            _log_ex("ssh_watch")
+            time.sleep(3)
+        finally:
+            _terminate_process(p)
+
+        # Respawn tail on rotation/unlink or any failure.
+        time.sleep(2)
 
 # ==== Kernel / Disk I/O errors (journalctl -k -f) ====
 def kernel_watch():
@@ -1339,6 +1644,8 @@ def try_daily_digest():
         _tg_send(f"{head}\n{body}", "MarkdownV2")
 
         state.set("last_digest", key)
+        # Flush digest clearing once per day (explicit, avoids per-item fsync)
+        state._save()
     except Exception:
         _log_ex()
 
@@ -1502,6 +1809,13 @@ def metrics_loop():
             try_daily_snapshot()
             try_daily_digest()
 
+            # Persist digest queue periodically to avoid data loss on sudden stop.
+            global _LAST_STATE_FLUSH
+            now_ts = time.time()
+            if state.dirty and (now_ts - _LAST_STATE_FLUSH) >= 60:
+                state._save()
+                _LAST_STATE_FLUSH = now_ts
+
         except Exception:
             _log_ex()
 
@@ -1519,12 +1833,34 @@ def probe_thread():
         time.sleep(PING_INTERVAL)
 
 if __name__ == "__main__":
+    if any(a in ("--version", "-V") for a in sys.argv[1:]):
+        print(f"sentinel.py {SENTINEL_VERSION}")
+        raise SystemExit(0)
+
+    def _shutdown_handler(signum, frame):
+        """Graceful shutdown on SIGTERM/SIGINT."""
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = ""
+        if not LOG_SILENT:
+            print(f"\n[{ts}] Received signal {signum}, shutting down gracefully...", file=sys.stderr)
+        raise SystemExit(0)
+
+    # Register signal handlers
+    try:
+        signal.signal(signal.SIGTERM, _shutdown_handler)
+        signal.signal(signal.SIGINT, _shutdown_handler)
+    except Exception:
+        # Some environments (very restricted) may not allow signal registration.
+        pass
+
     for target in (log_watch, probe_thread, ssh_watch, kernel_watch, cert_check_loop):
         threading.Thread(target=target, daemon=True).start()
 
     if not state.cooldown("startup_beacon"):
         watch_list = effective_watch_list()
-        send("Sentinel started", ["service up and watching", f"watching: {','.join(watch_list) if watch_list else 'auto'}"], icon="🚀")
+        send("Sentinel started", [f"version {SENTINEL_VERSION}", "service up and watching", f"watching: {','.join(watch_list) if watch_list else 'auto'}"], icon="🚀")
 
     metrics_loop()
 PY
@@ -1537,6 +1873,8 @@ cat >/etc/systemd/system/sentinel.service <<'EOF'
 Description=Sentinel - Lightweight Host Watcher
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 EnvironmentFile=/etc/sentinel/sentinel.env
@@ -1544,9 +1882,18 @@ ExecStart=/usr/bin/python3 /usr/local/bin/sentinel.py
 Restart=always
 RestartSec=5
 Nice=10
+CPUQuota=10%
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel
 NoNewPrivileges=true
+PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
 # 资源保护（超低内存 VPS 友好）
 MemoryMax=150M
 TasksMax=64
@@ -1558,6 +1905,10 @@ EOF
 echo ">>> [5/5] Enabling & starting service..."
 systemctl daemon-reload
 systemctl enable --now sentinel.service
+
+mkdir -p /var/lib/sentinel
+echo "${SENTINEL_VERSION}" >/var/lib/sentinel/version
+chmod 644 /var/lib/sentinel/version
 
 # 自检通知
 (
@@ -1578,4 +1929,5 @@ echo "-> To view live logs: journalctl -u sentinel.service -f"
 echo "-> To check status:   systemctl status sentinel.service --no-pager"
 echo "-> Configuration:     /etc/sentinel/sentinel.env"
 echo "-> Persistent State:  /var/lib/sentinel/state.json"
+echo "-> Installed Version: $(cat /etc/sentinel/version 2>/dev/null || echo ${SENTINEL_VERSION})"
 echo "========================================================"
