@@ -6,10 +6,9 @@
 # - 支持交互式安全配置 Telegram（也支持环境变量直供）
 #
 # 用法：
-#   sudo bash sentinel-install.sh
+#   sudo bash vps.sh
 #
 # 依赖：Debian/Ubuntu + systemd
-
 
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -292,7 +291,6 @@ PY
 
   echo ">>> Testing Telegram sendMessage..."
   local TEST_RESP
-  # We need POST with data; run separately to keep _tg_curl simple
   TEST_RESP="$(curl -sS --http1.1 --connect-timeout 5 -m 20 \
     --retry 3 --retry-delay 1 --retry-connrefused \
     -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
@@ -387,6 +385,13 @@ WATCH_PROCS_REQUIRE_ENABLED=1
 # === 每天北京时间 12 点快照 ===
 DAILY_BJ_SNAPSHOT_HOUR=12
 
+# === 非紧急告警：每天北京时间 17:00 合并推送一次 ===
+DIGEST_BJ_HOUR=17
+# 发送窗口（分钟）：例如 5 表示 17:00-17:05 之间任一轮询触发一次
+DIGEST_SEND_MINUTE_MAX=5
+# 合并推送最多包含多少条（超出保留最新）
+DIGEST_MAX_ITEMS=120
+
 # === TLS 证书到期提醒 ===
 CERT_CHECK_DOMAINS=
 CERT_MIN_DAYS=3
@@ -463,7 +468,8 @@ _clean_env_numbers([
     "NET_RX_BPS_ALERT","NET_TX_BPS_ALERT","NET_RX_PPS_ALERT","NET_TX_PPS_ALERT",
     "ROOT_FS_PCT_MAX","HEARTBEAT_HOURS","TRAFFIC_REPORT_EVERY_DAYS",
     "CERT_MIN_DAYS","AUTH_FAIL_COUNT","AUTH_FAIL_WINDOW_MIN","DAILY_BJ_SNAPSHOT_HOUR",
-    "PING_TCP_PORT"
+    "PING_TCP_PORT",
+    "DIGEST_BJ_HOUR","DIGEST_SEND_MINUTE_MAX","DIGEST_MAX_ITEMS",
 ])
 
 COOL = int(E("COOLDOWN_SEC","600"))
@@ -523,6 +529,11 @@ WATCH_PROCS_REQUIRE_ENABLED = _raw_req in ("1","true","yes","on")
 
 DAILY_BJ_SNAPSHOT_HOUR = int(E("DAILY_BJ_SNAPSHOT_HOUR","12"))
 
+# Daily digest (Beijing time)
+DIGEST_BJ_HOUR = int(E("DIGEST_BJ_HOUR","17"))
+DIGEST_SEND_MINUTE_MAX = int(E("DIGEST_SEND_MINUTE_MAX","5"))
+DIGEST_MAX_ITEMS = int(E("DIGEST_MAX_ITEMS","120"))
+
 # TLS cert check
 CERT_CHECK_DOMAINS = [x.strip() for x in (E("CERT_CHECK_DOMAINS","").split(",")) if x.strip()]
 CERT_MIN_DAYS = int(E("CERT_MIN_DAYS","3"))
@@ -571,7 +582,14 @@ def _log_ex():
 class State:
     def __init__(self, path):
         self.path = path
-        self.data = {"last_alert": {}, "last_beat": 0, "traffic": {}, "last_daily": ""}
+        self.data = {
+            "last_alert": {},
+            "last_beat": 0,
+            "traffic": {},
+            "last_daily": "",
+            "digest": [],
+            "last_digest": "",
+        }
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
             with open(path, "r") as f:
@@ -603,6 +621,23 @@ class State:
         self._save()
         return False
 
+    def digest_add(self, item):
+        try:
+            q = self.data.setdefault("digest", [])
+            q.append(item)
+            # Keep only the newest DIGEST_MAX_ITEMS
+            if len(q) > DIGEST_MAX_ITEMS:
+                self.data["digest"] = q[-DIGEST_MAX_ITEMS:]
+            self._save()
+        except Exception:
+            _log_ex()
+
+    def digest_take_all(self):
+        q = self.data.get("digest", []) or []
+        self.data["digest"] = []
+        self._save()
+        return q
+
 state = State(STATE_FILE)
 HOST = socket.getfqdn() or socket.gethostname()
 
@@ -629,14 +664,6 @@ def _tg_send(txt, parse_mode=None):
         _log_ex()
         return False, ""
 
-def send(title, lines, icon="🔔"):
-    if not TELE_TOKEN or not TELE_CHAT_ID:
-        return
-    ip = get_primary_ip()
-    head = f"{icon} *{esc(HOST)}*\n`{esc(ip)}`\n*{esc(title)}*"
-    body = "\n".join(f"• {esc(x)}" for x in lines)
-    _tg_send(f"{head}\n{body}", "MarkdownV2")
-
 def get_primary_ip():
     try:
         r = subprocess.run(["ip","-o","route","get","1.1.1.1"], capture_output=True, text=True, timeout=2)
@@ -646,6 +673,33 @@ def get_primary_ip():
     except Exception:
         pass
     return "0.0.0.0"
+
+def send(title, lines, icon="🔔", urgent=False):
+    """Send alert.
+
+    urgent=True  -> push immediately
+    urgent=False -> queue into daily digest (Beijing 17:00)
+    """
+    if not TELE_TOKEN or not TELE_CHAT_ID:
+        return
+
+    item = {
+        "ts": int(time.time()),
+        "host": HOST,
+        "ip": get_primary_ip(),
+        "title": str(title),
+        "icon": str(icon),
+        "lines": [str(x) for x in (lines or [])],
+    }
+
+    if urgent:
+        head = f"{icon} *{esc(item['host'])}*\n`{esc(item['ip'])}`\n*{esc(item['title'])}*"
+        body = "\n".join(f"• {esc(x)}" for x in item["lines"])
+        _tg_send(f"{head}\n{body}", "MarkdownV2")
+        return
+
+    # Non-urgent -> digest queue
+    state.digest_add(item)
 
 def systemd_active(unit):
     try:
@@ -854,8 +908,7 @@ def root_usage_pct():
 # 1) 自定义："host" ip "req" status size ... "ua"
 # 2) combined：ip - - [ts] "req" status size "ref" "ua"
 LOG_RE_Q = re.compile(r'^"(?P<host>[^"]+)"\s+(?P<ip>[0-9a-fA-F\.:]+)\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+).+"(?P<ua>[^"]*)"$')
-# FIX: restore proper combined format bracket timestamp matcher: [ ... ]
-LOG_RE_COMBINED = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>[^"]*)"')
+LOG_RE_COMBINED = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+$begin:math:display$\[\^$end:math:display$]+\]\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>[^"]*)"')
 
 def log_watch():
     path = (NGINX_ACCESS or "").strip()
@@ -900,7 +953,7 @@ def log_watch():
                 continue
 
             if SCAN_SIGS.search(path_part) and not state.cooldown(f"scan_{ip}"):
-                send("🚨 Scan signature", [f"src {ip}", f"Host {host}", f"Path {path_part}", f"UA {ua[:120]}"])
+                send("Scan signature", [f"src {ip}", f"Host {host}", f"Path {path_part}", f"UA {ua[:120]}"], icon="🚨", urgent=True)
     except FileNotFoundError:
         pass
     except Exception:
@@ -948,13 +1001,13 @@ class NetProbe:
         if all(h and not any(x[0] for x in list(h)[-3:]) for h in self.hist.values()):
             if self.last_down is None and not state.cooldown("net_down"):
                 self.last_down = time.time()
-                send("Network down", [f"targets {', '.join(self.targets)}"], icon="🛑")
+                send("Network down", [f"targets {', '.join(self.targets)}"], icon="🛑", urgent=True)
         elif self.last_down is not None and (time.time() - self.last_up) > FLAP_SUPPRESS:
             dur = time.time() - self.last_down
             self.last_up = time.time()
             self.last_down = None
             if not state.cooldown("net_up"):
-                send("Network recovered", [f"duration {dur:.0f}s"], icon="✅")
+                send("Network recovered", [f"duration {dur:.0f}s"], icon="✅", urgent=True)
 
         wins, losses, samples = [], 0, 0
         for h in self.hist.values():
@@ -1005,7 +1058,7 @@ def ssh_watch():
             while dq and now - dq[0] > win:
                 dq.popleft()
             if len(dq) >= AUTH_FAIL_COUNT and not state.cooldown(f"ssh_bruteforce_{ip}"):
-                send("🛡️ SSH brute-force", [f"src {ip}", f"fails ≥ {AUTH_FAIL_COUNT} in {AUTH_FAIL_WINDOW_MIN} min"])
+                send("SSH brute-force", [f"src {ip}", f"fails ≥ {AUTH_FAIL_COUNT} in {AUTH_FAIL_WINDOW_MIN} min"], icon="🛡️", urgent=True)
     except Exception:
         _log_ex()
 
@@ -1072,7 +1125,7 @@ def kernel_watch():
             if state.cooldown(ck):
                 continue
 
-            send(title, [s[:220]], icon=icon)
+            send(title, [s[:220]], icon=icon, urgent=True)
     except Exception:
         _log_ex()
 
@@ -1149,7 +1202,7 @@ def cert_check_loop():
                     alerts.append(f"{host} expires in {d}d")
 
             if alerts and not state.cooldown("cert_expire"):
-                send("🔐 TLS certificate expiring", alerts)
+                send("TLS certificate expiring", alerts, icon="🔐", urgent=True)
         except Exception:
             _log_ex()
         time.sleep(60)
@@ -1157,6 +1210,57 @@ def cert_check_loop():
 # ==== Beijing-time daily snapshot ====
 def bj_now():
     return datetime.utcnow() + timedelta(hours=8)
+
+def _fmt_ts_bj(ts):
+    try:
+        return (datetime.utcfromtimestamp(ts) + timedelta(hours=8)).strftime("%m-%d %H:%M")
+    except Exception:
+        return ""
+
+def try_daily_digest():
+    """At Beijing DIGEST_BJ_HOUR, send queued non-urgent alerts as one message."""
+    try:
+        bj = bj_now()
+        if bj.hour != DIGEST_BJ_HOUR:
+            return
+        if bj.minute > DIGEST_SEND_MINUTE_MAX:
+            return
+
+        key = bj.strftime("%Y-%m-%d")
+        if state.get("last_digest", "") == key:
+            return
+
+        items = state.digest_take_all()
+        if not items:
+            state.set("last_digest", key)
+            return
+
+        # Keep newest DIGEST_MAX_ITEMS
+        if len(items) > DIGEST_MAX_ITEMS:
+            items = items[-DIGEST_MAX_ITEMS:]
+
+        head = f"🧾 *{esc(HOST)}*\n`{esc(get_primary_ip())}`\n*Daily Digest (Beijing {esc(bj.strftime('%Y-%m-%d %H:%M'))})*"
+
+        lines = []
+        for it in items:
+            t = _fmt_ts_bj(int(it.get("ts", 0)))
+            icon = it.get("icon", "•")
+            title = it.get("title", "")
+            ls = it.get("lines", []) or []
+            summary = ls[0] if ls else ""
+            if len(summary) > 140:
+                summary = summary[:140] + "…"
+            one = f"{icon} {t} {title}"
+            if summary:
+                one += f" | {summary}"
+            lines.append(one)
+
+        body = "\n".join(f"• {esc(x)}" for x in lines)
+        _tg_send(f"{head}\n{body}", "MarkdownV2")
+
+        state.set("last_digest", key)
+    except Exception:
+        _log_ex()
 
 def try_daily_snapshot():
     try:
@@ -1224,7 +1328,7 @@ def check_monthly_traffic():
             used_rx = _delta(rx, d.get("start_rx", rx))
             used_tx = _delta(tx, d.get("start_tx", tx))
             total = used_rx + used_tx
-            send("📦 Last Month Traffic", [
+            send("Last Month Traffic", [
                 f"Period: {d.get('month','unknown')}",
                 f"Down:  {used_rx/(1024**3):.2f} GB",
                 f"Up:    {used_tx/(1024**3):.2f} GB",
@@ -1235,9 +1339,9 @@ def check_monthly_traffic():
         state.set("traffic", d_new)
 
         if not d:
-            send("📊 Traffic Counter Initialized", [f"Tracking from {month_key}"], icon="🔄")
+            send("Traffic Counter Initialized", [f"Tracking from {month_key}"], icon="🔄")
         else:
-            send("🔄 Traffic Counter Reset", [f"New cycle {month_key}"], icon="🔄")
+            send("Traffic Counter Reset", [f"New cycle {month_key}"], icon="🔄")
         return
 
     used_rx = _delta(rx, d.get("start_rx", rx))
@@ -1251,7 +1355,7 @@ def check_monthly_traffic():
     report_days.add(last_day)
 
     if day in report_days and d.get("last_report_day") != day:
-        send("🗓️ Monthly Traffic", [
+        send("Monthly Traffic", [
             f"Period: {month_key}",
             f"Down:  {used_rx/(1024**3):.2f} GB",
             f"Up:    {used_tx/(1024**3):.2f} GB",
@@ -1277,11 +1381,11 @@ def metrics_loop():
             swap_pct = (su * 100.0 / max(1, st)) if st > 0 else 0.0
 
             if avail_pct <= MEM_AVAIL_MIN and not state.cooldown("mem_low"):
-                send("Memory low", [f"avail {avail_pct:.1f}%"], icon="🧠")
+                send("Memory low", [f"avail {avail_pct:.1f}%"], icon="🧠", urgent=True)
             if swap_pct >= SWAP_USED_MAX and not state.cooldown("swap_high"):
-                send("Swap high", [f"swap {swap_pct:.0f}%"], icon="🧠")
+                send("Swap high", [f"swap {swap_pct:.0f}%"], icon="🧠", urgent=True)
             if pin >= SWAPIN_PPS_MAX and not state.cooldown("swap_thrash"):
-                send("Swap thrash", [f"swapin {pin:.0f} p/s"], icon="🧠")
+                send("Swap thrash", [f"swapin {pin:.0f} p/s"], icon="🧠", urgent=True)
 
             l1, over, cores = load1_over()
             if over and not state.cooldown("load_high"):
@@ -1305,17 +1409,18 @@ def metrics_loop():
 
             rpct = root_usage_pct()
             if rpct >= ROOT_FS_PCT_MAX and not state.cooldown("disk_full"):
-                send("Root FS high", [f"/ usage {rpct}%"], icon="🧱")
+                send("Root FS high", [f"/ usage {rpct}%"], icon="🧱", urgent=True)
 
             for p in effective_watch_list():
                 try:
                     subprocess.run(["pgrep", "-f", p], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except subprocess.CalledProcessError:
                     if not state.cooldown(f"proc_down_{p}"):
-                        send("Process down", [f"{p} not running"], icon="💀")
+                        send("Process down", [f"{p} not running"], icon="💀", urgent=True)
 
             check_monthly_traffic()
             try_daily_snapshot()
+            try_daily_digest()
 
         except Exception:
             _log_ex()
@@ -1380,7 +1485,7 @@ systemctl enable --now sentinel.service
   # shellcheck disable=SC1091
   . /etc/sentinel/sentinel.env
   set +a
-  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]\+\).*/\1/p' | head -n1 || echo 'N/A')"
+  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src $begin:math:text$\[0\-9\.\]\\\+$end:math:text$.*/\1/p' | head -n1 || echo 'N/A')"
   TEXT="✅ Sentinel on $(hostname -f) (${hostip}) has been installed/updated successfully."
   /usr/local/bin/tmsg "$TEXT"
 )
