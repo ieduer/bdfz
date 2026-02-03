@@ -855,7 +855,7 @@ def root_usage_pct():
 # 2) combined：ip - - [ts] "req" status size "ref" "ua"
 LOG_RE_Q = re.compile(r'^"(?P<host>[^"]+)"\s+(?P<ip>[0-9a-fA-F\.:]+)\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+).+"(?P<ua>[^"]*)"$')
 # FIX: restore proper combined format bracket timestamp matcher: [ ... ]
-LOG_RE_COMBINED = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+$begin:math:display$\[\^$end:math:display$]+\]\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>[^"]*)"')
+LOG_RE_COMBINED = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(?P<req>[^"]+)"\s+(?P<st>\d{3})\s+(?P<sz>\S+)\s+"[^"]*"\s+"(?P<ua>[^"]*)"')
 
 def log_watch():
     path = (NGINX_ACCESS or "").strip()
@@ -1380,7 +1380,7 @@ systemctl enable --now sentinel.service
   # shellcheck disable=SC1091
   . /etc/sentinel/sentinel.env
   set +a
-  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src $begin:math:text$\[0\-9\.\]\\\+$end:math:text$.*/\1/p' | head -n1 || echo 'N/A')"
+  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]\+\).*/\1/p' | head -n1 || echo 'N/A')"
   TEXT="✅ Sentinel on $(hostname -f) (${hostip}) has been installed/updated successfully."
   /usr/local/bin/tmsg "$TEXT"
 )
