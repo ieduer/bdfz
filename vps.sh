@@ -207,6 +207,7 @@ _setup_telegram_config() {
   local i
 
   # Long-poll style: give Telegram time to deliver the message
+  # After several failures, offer an early manual TELE_CHAT_ID input path.
   for i in 1 2 3 4 5 6; do
     API_RESPONSE="$(_tg_curl "https://api.telegram.org/bot${TELE_TOKEN}/getUpdates?limit=50&timeout=25")"
 
@@ -257,6 +258,19 @@ PY
 
     if [[ -n "${TELE_CHAT_ID_CANDIDATES:-}" ]]; then
       break
+    fi
+
+    # After several failures, let the user switch to manual entry immediately.
+    if (( i == 3 )); then
+      echo ""
+      local early_manual=""
+      read -r -p ">>> Still no updates after 3 tries. Enter TELE_CHAT_ID manually now? [y/N]: " early_manual
+      early_manual="${early_manual:-N}"
+      if [[ "$early_manual" =~ ^[Yy]$ ]]; then
+        TELE_CHAT_ID_CANDIDATES=""
+        break
+      fi
+      echo ""
     fi
 
     echo ">>> No chat id yet (try $i/6). Waiting 2s..."
