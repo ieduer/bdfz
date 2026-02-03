@@ -444,6 +444,10 @@ import os, re, time, subprocess, socket, threading, statistics, json, sys, trace
 from collections import deque, defaultdict
 from datetime import date, datetime, timedelta
 
+# urllib is stdlib; used to avoid spawning curl subprocesses on low-memory VPS.
+import urllib.request
+import urllib.parse
+
 # ===== Env & Constants =====
 E = lambda k, d=None: os.getenv(k, d)
 TELE_TOKEN, TELE_CHAT_ID = E("TELE_TOKEN"), E("TELE_CHAT_ID")
@@ -582,6 +586,7 @@ def _log_ex():
 class State:
     def __init__(self, path):
         self.path = path
+        self.lock = threading.Lock()
         self.data = {
             "last_alert": {},
             "last_beat": 0,
@@ -593,85 +598,155 @@ class State:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
             with open(path, "r") as f:
-                self.data.update(json.load(f))
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                self.data.update(loaded)
         except Exception:
             pass
 
-    def _save(self):
+    def _save_unlocked(self):
+        # Atomic write: dump -> flush+fsync -> os.replace
         try:
-            with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(self.path), delete=False) as tf:
+            dpath = os.path.dirname(self.path) or "."
+            with tempfile.NamedTemporaryFile("w", dir=dpath, delete=False) as tf:
                 json.dump(self.data, tf)
+                tf.flush()
+                os.fsync(tf.fileno())
                 os.replace(tf.name, self.path)
         except Exception:
             _log_ex()
 
+    def _save(self):
+        with self.lock:
+            self._save_unlocked()
+
     def get(self, k, d=None):
-        return self.data.get(k, d)
+        with self.lock:
+            return self.data.get(k, d)
 
     def set(self, k, v):
-        self.data[k] = v
-        self._save()
+        with self.lock:
+            self.data[k] = v
+            self._save_unlocked()
 
     def cooldown(self, key):
         now = time.time()
-        last = self.data.setdefault("last_alert", {})
-        if now - last.get(key, 0) < COOL:
-            return True
-        last[key] = now
-        self._save()
-        return False
+        with self.lock:
+            last = self.data.setdefault("last_alert", {})
+            if now - last.get(key, 0) < COOL:
+                return True
+            last[key] = now
+            self._save_unlocked()
+            return False
 
     def digest_add(self, item):
         try:
-            q = self.data.setdefault("digest", [])
-            q.append(item)
-            # Keep only the newest DIGEST_MAX_ITEMS
-            if len(q) > DIGEST_MAX_ITEMS:
-                self.data["digest"] = q[-DIGEST_MAX_ITEMS:]
-            self._save()
+            with self.lock:
+                q = self.data.setdefault("digest", [])
+                q.append(item)
+                # Keep only the newest DIGEST_MAX_ITEMS
+                if len(q) > DIGEST_MAX_ITEMS:
+                    self.data["digest"] = q[-DIGEST_MAX_ITEMS:]
+                self._save_unlocked()
         except Exception:
             _log_ex()
 
     def digest_take_all(self):
-        q = self.data.get("digest", []) or []
-        self.data["digest"] = []
-        self._save()
-        return q
+        with self.lock:
+            q = self.data.get("digest", []) or []
+            self.data["digest"] = []
+            self._save_unlocked()
+            return q
 
 state = State(STATE_FILE)
 HOST = socket.getfqdn() or socket.gethostname()
 
 def esc(s):
-    return re.sub(r'([_*\[\]()~`>#+\-={}|.!])', r'\\\1', str(s))
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', str(s))
 
+# -------- Telegram sender (urllib, low overhead) --------
 def _tg_send(txt, parse_mode=None):
-    try:
-        args = [
-            "curl","-sS","-m","10","-X","POST",
-            f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage",
-            "-d", f"chat_id={TELE_CHAT_ID}",
-            "--data-urlencode", f"text={txt}",
-        ]
-        if parse_mode:
-            args += ["-d", f"parse_mode={parse_mode}"]
-        proc = subprocess.run(args, capture_output=True, text=True)
-        ok = (proc.returncode == 0) and (
-            ('"ok":true' in (proc.stdout or '')) or
-            ('"ok": true' in (proc.stdout or ''))
-        )
-        return ok, (proc.stdout or '').strip()
-    except Exception:
-        _log_ex()
+    """Send a Telegram message with minimal overhead (no subprocess).
+
+    Returns: (ok: bool, resp_text: str)
+    """
+    if not TELE_TOKEN or not TELE_CHAT_ID:
         return False, ""
 
+    url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELE_CHAT_ID,
+        "text": txt,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+
+    # A tiny retry loop for transient network issues.
+    last_text = ""
+    for _ in range(3):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "User-Agent": "sentinel.py",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                last_text = (resp.read() or b"").decode("utf-8", errors="replace").strip()
+            try:
+                j = json.loads(last_text) if last_text else {}
+                ok = bool(j.get("ok"))
+            except Exception:
+                ok = ('"ok":true' in last_text) or ('"ok": true' in last_text)
+            return ok, last_text
+        except Exception:
+            _log_ex()
+            time.sleep(0.25)
+            continue
+
+    return False, last_text
+
+# -------- IP / route helpers (IPv4+IPv6 robust) --------
+_IP_RE = re.compile(r"\bsrc\s+([0-9a-fA-F:.]+)\b")
+_DEV_RE = re.compile(r"\bdev\s+(\S+)")
+_VIA_RE = re.compile(r"\bvia\s+(\S+)")
+
 def get_primary_ip():
+    # Try IPv4 route
     try:
-        r = subprocess.run(["ip","-o","route","get","1.1.1.1"], capture_output=True, text=True, timeout=2)
-        m = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", r.stdout or "")
+        r = subprocess.run(["ip", "-o", "route", "get", "1.1.1.1"], capture_output=True, text=True, timeout=2)
+        out = r.stdout or ""
+        m = _IP_RE.search(out)
         if m:
             return m.group(1)
     except Exception:
         pass
+
+    # IPv6 fallback (Cloudflare v6 resolver)
+    try:
+        r6 = subprocess.run(["ip", "-o", "-6", "route", "get", "2606:4700:4700::1111"], capture_output=True, text=True, timeout=2)
+        out6 = r6.stdout or ""
+        m6 = _IP_RE.search(out6)
+        if m6:
+            return m6.group(1)
+    except Exception:
+        pass
+
+    # Last resort: hostname -I (may contain multiple IPs)
+    try:
+        r = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2)
+        cand = (r.stdout or "").strip().split()
+        if cand:
+            return cand[0]
+    except Exception:
+        pass
+
     return "0.0.0.0"
 
 def send(title, lines, icon="🔔", urgent=False):
@@ -757,12 +832,16 @@ def _default_dev_via_proc():
     return None
 
 def route_sig():
+    """Return (dev, via, src) with robust parsing for varied iproute2 output."""
     try:
+        # prefer v4; if fails, v6 will still be available via get_primary_ip()
         r = subprocess.run(["ip","-o","route","get","1.1.1.1"], capture_output=True, text=True, timeout=2)
         out = r.stdout or ""
-        m_dev = re.search(r" dev (\S+)", out)
-        m_via = re.search(r" via (\S+)", out)
-        m_src = re.search(r" src (\S+)", out)
+
+        m_dev = _DEV_RE.search(out)
+        m_via = _VIA_RE.search(out)
+        m_src = _IP_RE.search(out)
+
         dev = m_dev.group(1) if m_dev else None
         via = m_via.group(1) if m_via else "direct"
         src = m_src.group(1) if m_src else None
@@ -771,11 +850,11 @@ def route_sig():
             r2 = subprocess.run(["ip","-o","route","show","default"], capture_output=True, text=True, timeout=2)
             out2 = r2.stdout or ""
             if not dev:
-                m2 = re.search(r" dev (\S+)", out2)
+                m2 = _DEV_RE.search(out2)
                 if m2:
                     dev = m2.group(1)
-            if src is None:
-                m2s = re.search(r" src (\S+)", out2)
+            if not src:
+                m2s = _IP_RE.search(out2)
                 if m2s:
                     src = m2s.group(1)
 
@@ -783,6 +862,7 @@ def route_sig():
             dev = _default_dev_via_proc()
         if not src:
             src = get_primary_ip()
+
         return dev or "?", via or "direct", src or get_primary_ip()
     except Exception:
         return "?", "direct", get_primary_ip()
@@ -1485,7 +1565,7 @@ systemctl enable --now sentinel.service
   # shellcheck disable=SC1091
   . /etc/sentinel/sentinel.env
   set +a
-  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src $begin:math:text$\[0\-9\.\]\\\+$end:math:text$.*/\1/p' | head -n1 || echo 'N/A')"
+  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -nE 's/.*\bsrc\s+([0-9a-fA-F:.]+).*/\1/p' | head -n1 || echo 'N/A')"
   TEXT="✅ Sentinel on $(hostname -f) (${hostip}) has been installed/updated successfully."
   /usr/local/bin/tmsg "$TEXT"
 )
