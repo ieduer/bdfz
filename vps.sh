@@ -206,10 +206,32 @@ _setup_telegram_config() {
   local TELE_CHAT_ID_CANDIDATES=""
   local i
 
+  # IMPORTANT: this block is user-interactive and network-dependent.
+  # Protect it from `set -e` aborting the whole installer due to transient curl/python/read issues.
+  local _old_errexit=0
+  if [[ "$-" == *e* ]]; then
+    _old_errexit=1
+    set +e
+  fi
+
+  # If stdin is not a TTY (e.g., piped execution), skip auto-detect to avoid sudden EOF.
+  if [[ ! -t 0 ]]; then
+    echo "!!! [WARN] Non-interactive stdin detected; skipping getUpdates auto-detect and using manual TELE_CHAT_ID input." >&2
+    TELE_CHAT_ID_CANDIDATES=""
+  fi
+
   # Long-poll style: give Telegram time to deliver the message
   # After several failures, offer an early manual TELE_CHAT_ID input path.
   for i in 1 2 3 4 5 6; do
-    API_RESPONSE="$(_tg_curl "https://api.telegram.org/bot${TELE_TOKEN}/getUpdates?limit=50&timeout=25")"
+    # Keep SSH session alive: print before each long poll.
+    echo ">>> Polling Telegram updates (try $i/6)..."
+
+    # NOTE: _tg_curl has -m 20, so keep Telegram long-poll timeout <= 15 to avoid curl max-time truncation.
+    API_RESPONSE="$(_tg_curl "https://api.telegram.org/bot${TELE_TOKEN}/getUpdates?limit=50&timeout=15")"
+
+    if [[ -z "${API_RESPONSE:-}" ]]; then
+      echo ">>> [WARN] Telegram getUpdates returned empty response (network hiccup?)."
+    fi
 
     TELE_CHAT_ID_CANDIDATES="$(echo "$API_RESPONSE" | python3 - <<'PY'
 import json,sys
@@ -273,9 +295,15 @@ PY
       echo ""
     fi
 
-    echo ">>> No chat id yet (try $i/6). Waiting 2s..."
-    sleep 2
+    echo ">>> No chat id yet (try $i/6). Waiting 1s..."
+    sleep 1
+    true
   done
+
+  # Restore errexit if it was originally enabled.
+  if (( _old_errexit == 1 )); then
+    set -e
+  fi
 
   if [[ -n "${TELE_CHAT_ID_CANDIDATES:-}" ]]; then
     TELE_CHAT_ID="$(echo "$TELE_CHAT_ID_CANDIDATES" | tail -n 1)"
