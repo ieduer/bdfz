@@ -16,8 +16,8 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE="a"
 
 # --- Versioning ---
-INSTALLER_VERSION="v2026-02-03-2"
-SENTINEL_VERSION="v2026-02-03-2"
+INSTALLER_VERSION="v2026-02-03-3"
+SENTINEL_VERSION="v2026-02-03-3"
 
 echo ">>> [INFO] vps.sh installer version: ${INSTALLER_VERSION}"
 
@@ -102,25 +102,54 @@ _tg_debug_json_hint() {
   fi
 }
 
-# --- 辅助函数：获取并验证 Telegram 配置 ---
 _setup_telegram_config() {
   # 快速通道：如果环境变量已存在，直接使用，跳过所有交互
-  if [[ -n "${TELE_TOKEN:-}" && -n "${TELE_CHAT_ID:-}" ]]; then
+  # 允许通过 FORCE_TELEGRAM_RECONFIG=1 强制进入重配流程（方便批量覆盖旧配置）
+  if [[ "${FORCE_TELEGRAM_RECONFIG:-0}" != "1" && -n "${TELE_TOKEN:-}" && -n "${TELE_CHAT_ID:-}" ]]; then
     echo ">>> [INFO] Using TELE_TOKEN and TELE_CHAT_ID from environment. Skipping interactive setup."
     export TELE_TOKEN TELE_CHAT_ID
     return 0
   fi
 
-  # 如果配置文件存在且包含有效配置，则跳过
+  # 如果配置文件存在且包含有效配置：
+  # - 非交互模式（无 /dev/tty）下：只能直接使用它
+  # - 交互模式下：让用户选择是否沿用（因为旧机器上的 bot 可能不是这次要用的）
   if [[ -f /etc/sentinel/sentinel.env ]]; then
+    local _old_token="" _old_chat=""
     set -a
     # shellcheck disable=SC1091
     . /etc/sentinel/sentinel.env
     set +a
-    if [[ -n "${TELE_TOKEN:-}" && -n "${TELE_CHAT_ID:-}" ]]; then
-      echo ">>> [INFO] Found existing Telegram configuration in /etc/sentinel/sentinel.env. Skipping interactive setup."
-      export TELE_TOKEN TELE_CHAT_ID
-      return 0
+
+    _old_token="${TELE_TOKEN:-}"
+    _old_chat="${TELE_CHAT_ID:-}"
+
+    if [[ -n "${_old_token:-}" && -n "${_old_chat:-}" && "${FORCE_TELEGRAM_RECONFIG:-0}" != "1" ]]; then
+      if [[ ! -r /dev/tty ]]; then
+        echo ">>> [INFO] Found existing Telegram configuration in /etc/sentinel/sentinel.env (non-interactive). Using it."
+        export TELE_TOKEN TELE_CHAT_ID
+        return 0
+      fi
+
+      # interactive: ask user whether to reuse existing config
+      local _mask=""
+      _mask="${_old_token:0:5}...${_old_token: -5}"
+      echo ">>> [INFO] Found existing Telegram configuration in /etc/sentinel/sentinel.env."
+      echo ">>> [INFO] Existing TELE_TOKEN: ${_mask}"
+      echo ">>> [INFO] Existing TELE_CHAT_ID: ${_old_chat}"
+      local _reuse=""
+      read -r -p ">>> Reuse this Telegram config for THIS install? [Y/n]: " _reuse </dev/tty
+      _reuse="${_reuse:-Y}"
+      if [[ "$_reuse" =~ ^[Yy]$ ]]; then
+        export TELE_TOKEN TELE_CHAT_ID
+        return 0
+      fi
+
+      # user chose to reconfigure; clear loaded values so we don't accidentally reuse them
+      TELE_TOKEN=""
+      TELE_CHAT_ID=""
+      unset TELE_TOKEN TELE_CHAT_ID
+      echo ">>> [INFO] Reconfiguring Telegram for this install..."
     fi
   fi
 
@@ -128,7 +157,7 @@ _setup_telegram_config() {
   # In `curl ... | bash`, stdin is the script itself; reading it will corrupt variables and execution.
   if [[ ! -r /dev/tty ]]; then
     echo "!!! [ERROR] No /dev/tty (non-interactive). Provide TELE_TOKEN and TELE_CHAT_ID via environment variables, or pre-create /etc/sentinel/sentinel.env." >&2
-    echo "    Example: TELE_TOKEN='<BOT_ID>:<TOKEN>' TELE_CHAT_ID='<CHAT_ID>' sudo -E bash vps.sh" >&2
+    echo "    Example: TELE_TOKEN='<BOT_ID>:<TOKEN>' TELE_CHAT_ID='<CHAT_ID>' FORCE_TELEGRAM_RECONFIG=1 sudo -E bash vps.sh" >&2
     exit 1
   fi
 
@@ -201,6 +230,65 @@ _setup_telegram_config() {
 
   echo ""
   echo "Token received. Now, let's get your Chat ID."
+
+  echo ""
+  echo ">>> Choose Chat ID input mode:"
+  echo "    [1] Auto-detect via Telegram getUpdates (recommended)"
+  echo "    [2] Manually enter TELE_CHAT_ID now"
+  local _mode=""
+  while true; do
+    read -r -p ">>> Enter 1 or 2 [1]: " _mode </dev/tty
+    _mode="${_mode:-1}"
+    if [[ "$_mode" == "1" || "$_mode" == "2" ]]; then
+      break
+    fi
+    echo ">>> Invalid choice. Please enter 1 or 2."
+  done
+
+  if [[ "$_mode" == "2" ]]; then
+    while true; do
+      read -r -p "Please enter TELE_CHAT_ID (number, can be negative): " TELE_CHAT_ID </dev/tty
+      TELE_CHAT_ID="${TELE_CHAT_ID//[[:space:]]/}"
+      if [[ -z "${TELE_CHAT_ID:-}" ]]; then
+        echo "Chat ID cannot be empty."
+        continue
+      fi
+      if [[ ! "${TELE_CHAT_ID}" =~ ^-?[0-9]+$ ]]; then
+        echo "Chat ID must be a number (can be negative)."
+        continue
+      fi
+      break
+    done
+
+    echo ">>> Testing Telegram sendMessage..."
+    local TEST_RESP
+    TEST_RESP="$(curl -sS --http1.1 --connect-timeout 5 -m 20 \
+      --retry 3 --retry-delay 1 --retry-connrefused \
+      -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
+      -d "chat_id=${TELE_CHAT_ID}" \
+      --data-urlencode "text=✅ Sentinel Telegram setup OK on $(hostname -f)" || true)"
+
+    local TEST_OK
+    TEST_OK="$(echo "$TEST_RESP" | _tg_json_ok)"
+    if [[ "$TEST_OK" != "1" ]]; then
+      if [[ "$TEST_RESP" == *'"ok":true'* ]]; then
+        TEST_OK="1"
+      fi
+    fi
+
+    if [[ "$TEST_OK" != "1" ]]; then
+      echo "!!! ERROR: sendMessage test failed." >&2
+      _tg_debug_json_hint "$TEST_RESP"
+      echo "Please verify your TELE_CHAT_ID and bot permissions, then rerun the script." >&2
+      exit 1
+    fi
+
+    echo "✅ Success! Using Chat ID: ${TELE_CHAT_ID}"
+    export TELE_TOKEN TELE_CHAT_ID
+    return 0
+  fi
+
+  # Auto-detect mode (getUpdates)
   echo ">>> Please open Telegram and send a message to your bot (e.g., /start)."
   if [[ -n "${BOT_USERNAME:-}" ]]; then
     echo ">>> You can also open: https://t.me/${BOT_USERNAME}?start=sentinel"
@@ -529,7 +617,7 @@ cat >/usr/local/bin/tmsg <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-TMSG_VERSION="v2026-02-03-2"
+TMSG_VERSION="v2026-02-03-3"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
   echo "tmsg ${TMSG_VERSION}"
@@ -686,7 +774,7 @@ def E(k, d=None):
     cv = _clean_env_value(v)
     return cv if cv is not None else d
 
-SENTINEL_VERSION = "v2026-02-03-2"
+SENTINEL_VERSION = "v2026-02-03-3"
 TELE_TOKEN, TELE_CHAT_ID = E("TELE_TOKEN"), E("TELE_CHAT_ID")
 
 # Reduce exposure: keep token/chat id in memory only.
