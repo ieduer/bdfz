@@ -574,15 +574,25 @@ _read_env_value() {
   printf '%s' "$val"
 }
 
-TELE_TOKEN="$(_read_env_value TELE_TOKEN || true)"
-TELE_CHAT_ID="$(_read_env_value TELE_CHAT_ID || true)"
+# Prefer already-exported env vars (e.g., from systemd EnvironmentFile);
+# fall back to reading /etc/sentinel/sentinel.env only if needed.
+TELE_TOKEN="${TELE_TOKEN:-$(_read_env_value TELE_TOKEN || true)}"
+TELE_CHAT_ID="${TELE_CHAT_ID:-$(_read_env_value TELE_CHAT_ID || true)}"
 
 : "${TELE_TOKEN:?TELE_TOKEN is not set or invalid. Check /etc/sentinel/sentinel.env}"
 : "${TELE_CHAT_ID:?TELE_CHAT_ID is not set or invalid. Check /etc/sentinel/sentinel.env}"
 
-curl -sS -m 10 -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
+msg="$*"
+if [[ -z "${msg}" ]]; then
+  echo "tmsg: empty message" >&2
+  exit 0
+fi
+
+curl -sS --http1.1 --connect-timeout 5 -m 20 \
+  --retry 3 --retry-delay 1 --retry-connrefused \
+  -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
   -d "chat_id=${TELE_CHAT_ID}" \
-  --data-urlencode "text=${1}" >/dev/null || true
+  --data-urlencode "text=${msg}" >/dev/null || true
 EOF
 chmod +x /usr/local/bin/tmsg
 
@@ -2080,6 +2090,7 @@ RestrictNamespaces=true
 # 资源保护（超低内存 VPS 友好）
 MemoryMax=150M
 TasksMax=64
+PermissionsStartOnly=true
 
 [Install]
 WantedBy=multi-user.target
@@ -2093,16 +2104,23 @@ mkdir -p /var/lib/sentinel
 echo "${SENTINEL_VERSION}" >/var/lib/sentinel/version
 chmod 644 /var/lib/sentinel/version
 
-# 自检通知
-(
-  set -a
-  # shellcheck disable=SC1091
-  . /etc/sentinel/sentinel.env
-  set +a
-  hostip="$(ip -o route get 1.1.1.1 2>/dev/null | sed -nE 's/.*\bsrc\s+([0-9a-fA-F:.]+).*/\1/p' | head -n1 || echo 'N/A')"
-  TEXT="✅ Sentinel on $(hostname -f) (${hostip}) has been installed/updated successfully."
-  /usr/local/bin/tmsg "$TEXT"
-)
+# --- Post-install notification (best-effort, never fail the installer) ---
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl is-active --quiet sentinel.service; then
+    # Export env for tmsg (works even if /etc/sentinel/sentinel.env is 600)
+    set -a
+    # shellcheck disable=SC1091
+    . /etc/sentinel/sentinel.env
+    set +a
+
+    host_fqdn="$(hostname -f 2>/dev/null || hostname)"
+    primary_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+
+    /usr/local/bin/tmsg "✅ Sentinel installed/updated: ${INSTALLER_VERSION} on ${host_fqdn} (${primary_ip})" || true
+  else
+    echo "!!! [WARN] sentinel.service is not active; skip Telegram install notification." >&2
+  fi
+fi
 
 echo ""
 echo "========================================================"
