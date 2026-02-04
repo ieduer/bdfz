@@ -16,8 +16,8 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE="a"
 
 # --- Versioning ---
-INSTALLER_VERSION="v2026-02-03-1"
-SENTINEL_VERSION="v2026-02-03-1"
+INSTALLER_VERSION="v2026-02-03-2"
+SENTINEL_VERSION="v2026-02-03-2"
 
 echo ">>> [INFO] vps.sh installer version: ${INSTALLER_VERSION}"
 
@@ -124,11 +124,19 @@ _setup_telegram_config() {
     fi
   fi
 
+  # Pipe-safety: in non-interactive mode (no /dev/tty), NEVER read from stdin.
+  # In `curl ... | bash`, stdin is the script itself; reading it will corrupt variables and execution.
+  if [[ ! -r /dev/tty ]]; then
+    echo "!!! [ERROR] No /dev/tty (non-interactive). Provide TELE_TOKEN and TELE_CHAT_ID via environment variables, or pre-create /etc/sentinel/sentinel.env." >&2
+    echo "    Example: TELE_TOKEN='<BOT_ID>:<TOKEN>' TELE_CHAT_ID='<CHAT_ID>' sudo -E bash vps.sh" >&2
+    exit 1
+  fi
+
   echo "--- Telegram Bot Setup ---"
 
   local BOT_USERNAME=""
   while true; do
-    read -r -p "Please enter your Telegram Bot Token: " -s TELE_TOKEN
+    read -r -p "Please enter your Telegram Bot Token: " -s TELE_TOKEN </dev/tty
     echo ""
 
     if [[ -z "${TELE_TOKEN:-}" ]]; then
@@ -177,7 +185,7 @@ _setup_telegram_config() {
       echo "When webhook is set, Telegram will NOT deliver updates to getUpdates, so Chat ID auto-detect will fail." >&2
       echo ""
       local ans=""
-      read -r -p "Delete webhook now (recommended for this bot)? [Y/n]: " ans
+      read -r -p "Delete webhook now (recommended for this bot)? [Y/n]: " ans </dev/tty
       ans="${ans:-Y}"
       if [[ "$ans" =~ ^[Yy]$ ]]; then
         echo ">>> Deleting webhook (drop_pending_updates=true)..."
@@ -198,7 +206,7 @@ _setup_telegram_config() {
     echo ">>> You can also open: https://t.me/${BOT_USERNAME}?start=sentinel"
   fi
   echo ">>> IMPORTANT: send the message AFTER this prompt."
-  read -r -p ">>> After sending the message, press [Enter] here to continue..."
+  read -r -p ">>> After sending the message, press [Enter] here to continue..." </dev/tty
 
   echo "Fetching Chat ID from Telegram API (getUpdates)..."
 
@@ -214,11 +222,6 @@ _setup_telegram_config() {
     set +e
   fi
 
-  # If stdin is not a TTY (e.g., piped execution), skip auto-detect to avoid sudden EOF.
-  if [[ ! -t 0 ]]; then
-    echo "!!! [WARN] Non-interactive stdin detected; skipping getUpdates auto-detect and using manual TELE_CHAT_ID input." >&2
-    TELE_CHAT_ID_CANDIDATES=""
-  fi
 
   # Long-poll style: give Telegram time to deliver the message
   # After several failures, offer an early manual TELE_CHAT_ID input path.
@@ -286,7 +289,7 @@ PY
     if (( i == 3 )); then
       echo ""
       local early_manual=""
-      read -r -p ">>> Still no updates after 3 tries. Enter TELE_CHAT_ID manually now? [y/N]: " early_manual
+      read -r -p ">>> Still no updates after 3 tries. Enter TELE_CHAT_ID manually now? [y/N]: " early_manual </dev/tty
       early_manual="${early_manual:-N}"
       if [[ "$early_manual" =~ ^[Yy]$ ]]; then
         TELE_CHAT_ID_CANDIDATES=""
@@ -324,7 +327,7 @@ PY
     echo "" >&2
 
     while true; do
-      read -r -p "Please enter TELE_CHAT_ID (number, can be negative): " TELE_CHAT_ID
+      read -r -p "Please enter TELE_CHAT_ID (number, can be negative): " TELE_CHAT_ID </dev/tty
       TELE_CHAT_ID="${TELE_CHAT_ID//[[:space:]]/}"
       if [[ -z "${TELE_CHAT_ID:-}" ]]; then
         echo "Chat ID cannot be empty."
@@ -526,7 +529,7 @@ cat >/usr/local/bin/tmsg <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-TMSG_VERSION="v2026-02-03-1"
+TMSG_VERSION="v2026-02-03-2"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
   echo "tmsg ${TMSG_VERSION}"
@@ -586,34 +589,105 @@ chmod +x /usr/local/bin/tmsg
 echo ">>> [3/5] Writing sentinel daemon script..."
 cat >/usr/local/bin/sentinel.py <<'PY'
 #!/usr/bin/env python3
-import os, re, time, subprocess, socket, threading, statistics, json, sys, traceback, tempfile, calendar, shlex, ssl, glob, signal, ipaddress
+import os, re, time, subprocess, socket, threading, json, sys, traceback, tempfile, calendar, shlex, ssl, glob, signal, ipaddress
+
+# statistics is stdlib, but some minimal/distroless builds may omit parts.
+try:
+    import statistics  # type: ignore
+except Exception:  # pragma: no cover
+    statistics = None  # type: ignore
+
+class _StatisticsError(Exception):
+    pass
+
+def _median(xs):
+    xs = sorted(float(x) for x in xs)
+    n = len(xs)
+    if n == 0:
+        raise _StatisticsError("no median for empty data")
+    mid = n // 2
+    if n % 2 == 1:
+        return xs[mid]
+    return (xs[mid - 1] + xs[mid]) / 2.0
 from collections import deque, defaultdict
 from datetime import date, datetime, timedelta
+
+# ---- statistics.quantiles polyfill (Py<3.8 / minimal builds) ----
+try:
+    _quantiles_fn = statistics.quantiles if statistics is not None else None  # type: ignore[attr-defined]
+except Exception:
+    _quantiles_fn = None
+
+def _quantiles(data, n=4):
+    """Return n-1 cut points like statistics.quantiles(data, n=n).
+
+    Compatible fallback for Python 3.6/3.7.
+    Uses inclusive method with linear interpolation.
+    """
+    xs = sorted(float(x) for x in data)
+    if not xs or n <= 1:
+        return []
+    m = len(xs)
+    out = []
+    for i in range(1, n):
+        # position in [0, m-1]
+        pos = (m - 1) * (i / n)
+        lo = int(pos)
+        hi = min(m - 1, lo + 1)
+        frac = pos - lo
+        out.append(xs[lo] + (xs[hi] - xs[lo]) * frac)
+    return out
 
 # urllib is stdlib; used to avoid spawning curl subprocesses on low-memory VPS.
 import urllib.request
 import urllib.parse
 
  # ===== Env & Constants =====
-E = lambda k, d=None: os.getenv(k, d)
-SENTINEL_VERSION = "v2026-02-03-1"
+def _strip_inline_comment(v):
+    """Strip inline comments from an env value.
+
+    Systemd EnvironmentFile treats `#` as part of the value, so users sometimes
+    accidentally add `VAR=val # comment` and break parsing.
+
+    We only strip `# ...` when it is preceded by whitespace to avoid damaging
+    regex/pattern values that legitimately include `#`.
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    s = re.sub(r"\s+#.*$", "", s).strip()
+    return s
+
+def _strip_quotes(v: str) -> str:
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        s = s[1:-1]
+    return s
+
+def _clean_env_value(v):
+    if v is None:
+        return None
+    return _strip_quotes(_strip_inline_comment(v))
+
+def E(k, d=None):
+    v = os.getenv(k, d)
+    cv = _clean_env_value(v)
+    return cv if cv is not None else d
+
+SENTINEL_VERSION = "v2026-02-03-2"
 TELE_TOKEN, TELE_CHAT_ID = E("TELE_TOKEN"), E("TELE_CHAT_ID")
 
 # Reduce exposure: keep token/chat id in memory only.
 os.environ.pop("TELE_TOKEN", None)
 os.environ.pop("TELE_CHAT_ID", None)
 
-# --- sanitize numeric envs ---
-def _strip_inline_comment(v):
-    if v is None:
-        return None
-    return v.split('#', 1)[0].strip()
-
 def _clean_env_numbers(keys):
     for k in keys:
         v = os.getenv(k)
         if v is not None:
-            os.environ[k] = _strip_inline_comment(v)
+            os.environ[k] = _clean_env_value(v) or ""
 
 _clean_env_numbers([
     "COOLDOWN_SEC","PING_INTERVAL_SEC","PING_TIMEOUT_MS","LOSS_WINDOW",
@@ -758,6 +832,7 @@ class State:
             "last_daily": "",
             "digest": [],
             "last_digest": "",
+            "daily_src": {"date": "", "scan": {}, "ssh": {}},
         }
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
@@ -824,6 +899,25 @@ class State:
             self.data["digest"] = []
             self.dirty = True
             return q
+
+    def daily_hit(self, kind: str, src: str, inc: int = 1):
+        """Accumulate noisy sources (scan/ssh) for one-per-day summary (Beijing day)."""
+        try:
+            if not src:
+                return
+            # Beijing day key
+            day = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d")
+            with self.lock:
+                ds = self.data.setdefault("daily_src", {"date": "", "scan": {}, "ssh": {}})
+                if ds.get("date") != day:
+                    ds["date"] = day
+                    ds["scan"] = {}
+                    ds["ssh"] = {}
+                bucket = ds.setdefault(kind, {})
+                bucket[src] = int(bucket.get(src, 0)) + int(inc)
+                self.dirty = True
+        except Exception:
+            _log_ex()
 
 state = State(STATE_FILE)
 HOST = socket.getfqdn() or socket.gethostname()
@@ -1343,13 +1437,9 @@ def log_watch():
                 except Exception:
                     continue
 
-                if SCAN_SIGS.search(path_part) and not state.cooldown(f"scan_{ip}"):
-                    send(
-                        "Scan signature",
-                        [f"src {ip}", f"Host {host}", f"Path {path_part}", f"UA {ua[:120]}"],
-                        icon="🚨",
-                        urgent=True,
-                    )
+                if SCAN_SIGS.search(path_part):
+                    # Noisy category: accumulate and send once per day in digest.
+                    state.daily_hit("scan", ip)
 
         except FileNotFoundError:
             # tail or docker might not exist yet.
@@ -1424,14 +1514,18 @@ class NetProbe:
 
         if len(wins) > 3:
             try:
-                med = statistics.median(wins)
-                q = statistics.quantiles(wins, n=4)
+                med = statistics.median(wins) if statistics is not None else _median(wins)
+                if _quantiles_fn is not None:
+                    q = _quantiles_fn(wins, n=4)
+                else:
+                    q = _quantiles(wins, n=4)
                 jitter = q[2] - q[0]
                 if med >= LATENCY_ALERT_MS and not state.cooldown("rtt_high"):
                     send("High latency", [f"median {med:.0f} ms (n={len(wins)})"], icon="⌛")
                 if jitter >= JITTER_ALERT_MS and not state.cooldown("jitter_high"):
                     send("High jitter", [f"IQR {jitter:.0f} ms (n={len(wins)})"], icon="〰️")
-            except statistics.StatisticsError:
+            except Exception:
+                # statistics may be missing or data may be insufficient
                 pass
 
         rs = route_sig()
@@ -1470,13 +1564,19 @@ def ssh_watch():
                 dq.append(now)
                 while dq and now - dq[0] > win:
                     dq.popleft()
+
+                # Memory-leak fix: delete empty buckets so a flood of unique IPs
+                # doesn't leave behind thousands of empty deques.
+                if not dq:
+                    try:
+                        del buckets[ip]
+                    except Exception:
+                        pass
+                    continue
+
                 if len(dq) >= AUTH_FAIL_COUNT and not state.cooldown(f"ssh_bruteforce_{ip}"):
-                    send(
-                        "SSH brute-force",
-                        [f"src {ip}", f"fails ≥ {AUTH_FAIL_COUNT} in {AUTH_FAIL_WINDOW_MIN} min"],
-                        icon="🛡️",
-                        urgent=True,
-                    )
+                    # Noisy category: accumulate and send once per day in digest.
+                    state.daily_hit("ssh", ip)
 
         except FileNotFoundError:
             time.sleep(5)
@@ -1658,7 +1758,33 @@ def try_daily_digest():
             return
 
         items = state.digest_take_all()
-        if not items:
+
+        # Daily noisy-source summary (scan/ssh) — merged by src, sent once per day.
+        ds = state.get("daily_src", {"date": "", "scan": {}, "ssh": {}}) or {"date": "", "scan": {}, "ssh": {}}
+        scan_map = ds.get("scan", {}) if ds.get("date") == key else {}
+        ssh_map = ds.get("ssh", {}) if ds.get("date") == key else {}
+
+        def _fmt_src_map(title, mp, limit=60):
+            if not mp:
+                return []
+            # sort by count desc then ip
+            items2 = sorted(mp.items(), key=lambda x: (-int(x[1]), str(x[0])))
+            shown = items2[:limit]
+            more = len(items2) - len(shown)
+            out = []
+            out.append(f"{title}: {len(items2)} src")
+            # inline list: ip(x)
+            parts = [f"{k}({v})" for k, v in shown]
+            if more > 0:
+                parts.append(f"+{more} more")
+            out.append(" ".join(parts))
+            return out
+
+        noisy_lines = []
+        noisy_lines += _fmt_src_map("Scan", scan_map)
+        noisy_lines += _fmt_src_map("SSH brute-force", ssh_map)
+
+        if not items and not noisy_lines:
             state.set("last_digest", key)
             return
 
@@ -1669,6 +1795,10 @@ def try_daily_digest():
         head = f"🧾 *{esc(HOST)}*\n`{esc(get_primary_ip())}`\n*Daily Digest (Beijing {esc(bj.strftime('%Y-%m-%d %H:%M'))})*"
 
         lines = []
+        # Put noisy-source summary at the top.
+        for x in (noisy_lines or []):
+            lines.append(x)
+
         for it in items:
             t = _fmt_ts_bj(int(it.get("ts", 0)))
             icon = it.get("icon", "•")
@@ -1686,6 +1816,16 @@ def try_daily_digest():
         _tg_send(f"{head}\n{body}", "MarkdownV2")
 
         state.set("last_digest", key)
+        # Clear noisy daily accumulators for the day we just sent.
+        try:
+            ds2 = state.get("daily_src", {"date": "", "scan": {}, "ssh": {}}) or {"date": "", "scan": {}, "ssh": {}}
+            if ds2.get("date") == key:
+                ds2["scan"] = {}
+                ds2["ssh"] = {}
+                state.set("daily_src", ds2)
+        except Exception:
+            _log_ex()
+
         # Flush digest clearing once per day (explicit, avoids per-item fsync)
         state._save()
     except Exception:
@@ -1920,6 +2060,7 @@ StartLimitIntervalSec=300
 
 [Service]
 EnvironmentFile=/etc/sentinel/sentinel.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /usr/local/bin/sentinel.py
 Restart=always
 RestartSec=5
