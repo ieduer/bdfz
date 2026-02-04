@@ -1047,29 +1047,173 @@ INDEX_HTML = r"""<!DOCTYPE html>
       color:var(--text-dim);
       opacity:0.98;
       text-align:center;
-      pointer-events:none;
+      /* ✅ 啟用互動 */
+      pointer-events:auto;
+      cursor:pointer;
       text-shadow:none;
+      transition: transform 240ms ease;
     }
-    .pixel-cat-walk{ display:inline-block; animation:catWalk 9s ease-in-out infinite alternate; }
+    
+    .pixel-cat:hover {
+      transform: scale(1.04);
+    }
+    
+    .pixel-cat:active {
+      transform: scale(0.97);
+    }
+    
+    .pixel-cat-walk{ 
+      display:inline-block; 
+      animation:catWalk 9s ease-in-out infinite alternate;
+      will-change: transform;
+    }
+    
     .pixel-cat-art svg{
       width:120px;
       height:96px;
       image-rendering:pixelated;
+      
+      /* ✅ 更強霓虹發光 */
       filter:
         drop-shadow(0 8px 18px rgba(15,23,42,0.90))
-        drop-shadow(0 0 20px rgba(var(--accent-rgb),0.10));
+        drop-shadow(0 0 28px rgba(var(--accent-rgb),0.24))
+        drop-shadow(0 0 46px rgba(var(--accent-rgb),0.14));
       animation:catFloat 3.8s ease-in-out infinite;
+      will-change: transform;
     }
-    .pixel-cat-eye{ transform-origin:center center; animation:catBlink 4.2s infinite; }
-    .pixel-cat-meow{ opacity:0; transform-origin:left bottom; animation:catMeow 11s ease-in-out infinite; }
+    
+    /* 移動端縮小 */
+    @media(max-width:600px){
+      .pixel-cat-art svg{
+        width:96px;
+        height:76px;
+      }
+    }
+    
+    /* ✅ 眼睛動畫 - 更自然的眨眼 */
+    .pixel-cat-eye{ 
+      transform-origin:center center; 
+      animation:catBlink 4.2s infinite;
+      will-change: transform;
+    }
+    
+    /* ✅ 對話框動畫 */
+    .pixel-cat-meow{ 
+      opacity:0; 
+      transform-origin:left bottom; 
+      animation:catMeow 11s ease-in-out infinite;
+      will-change: opacity, transform;
+    }
+    
+    /* ✅ 尾巴擺動 */
+    .pixel-cat-tail{
+      transform-origin: top center;
+      animation: catTailWag 2.4s ease-in-out infinite;
+      will-change: transform;
+    }
+    
+    /* ✅ 鬍鬚閃爍 */
+    .pixel-cat-whisker{
+      animation: whiskerGlow 3.6s ease-in-out infinite;
+      will-change: opacity;
+    }
+    
+    /* ✅ 鼻子發光脈衝 */
+    .pixel-cat-nose{
+      animation: noseGlow 2.8s ease-in-out infinite;
+      will-change: filter;
+    }
+    
+    /* ✅ 表情狀態類 */
+    .pixel-cat.mood-happy .pixel-cat-eye{
+      animation: catHappyBlink 3s infinite;
+    }
+    
+    .pixel-cat.mood-sleepy .pixel-cat-eye{
+      transform: scaleY(0.35);
+      animation: none;
+    }
+    
+    .pixel-cat.mood-excited .pixel-cat-walk{
+      animation: catWalkFast 4s ease-in-out infinite alternate;
+    }
 
-    @keyframes catFloat{0%,100%{transform:translateY(0);}50%{transform:translateY(-3px);} }
-    @keyframes catBlink{0%,86%,100%{transform:scaleY(1);}88%{transform:scaleY(0.15);}92%{transform:scaleY(1);} }
-    @keyframes catWalk{0%{transform:translateX(-14px);}50%{transform:translateX(14px);}100%{transform:translateX(-6px);} }
+    /* ===== 動畫定義 ===== */
+    
+    @keyframes catFloat{
+      0%,100%{transform:translateY(0);}
+      50%{transform:translateY(-3px);}
+    }
+    
+    @keyframes catBlink{
+      0%,86%,100%{transform:scaleY(1);}
+      88%{transform:scaleY(0.15);}
+      92%{transform:scaleY(1);}
+    }
+    
+    @keyframes catHappyBlink{
+      0%,92%,100%{transform:scaleY(1) scaleX(1.08);}
+      94%{transform:scaleY(0.15) scaleX(1.08);}
+      96%{transform:scaleY(1) scaleX(1.08);}
+    }
+    
+    @keyframes catWalk{
+      0%{transform:translateX(-14px);}
+      50%{transform:translateX(14px);}
+      100%{transform:translateX(-6px);}
+    }
+    
+    @keyframes catWalkFast{
+      0%{transform:translateX(-22px);}
+      50%{transform:translateX(22px);}
+      100%{transform:translateX(-10px);}
+    }
+    
     @keyframes catMeow{
       0%,58%{opacity:0;transform:scale(0.95) translateY(0);}
       62%,72%{opacity:1;transform:scale(1) translateY(-2px);}
       78%,100%{opacity:0;transform:scale(0.96) translateY(0);}
+    }
+    
+    @keyframes catTailWag{
+      0%,100%{transform:rotate(-8deg);}
+      25%{transform:rotate(12deg);}
+      50%{transform:rotate(-10deg);}
+      75%{transform:rotate(10deg);}
+    }
+    
+    @keyframes whiskerGlow{
+      0%,100%{opacity:0.82;}
+      50%{opacity:1;}
+    }
+    
+    @keyframes noseGlow{
+      0%,100%{filter:drop-shadow(0 0 2px rgba(var(--accent-rgb),0.32));}
+      50%{filter:drop-shadow(0 0 6px rgba(var(--accent-rgb),0.68));}
+    }
+    
+    /* ✅ 無障礙：減少動畫 */
+    @media (prefers-reduced-motion: reduce) {
+      .pixel-cat-walk,
+      .pixel-cat-art svg,
+      .pixel-cat-tail {
+        animation: none;
+      }
+      
+      .pixel-cat-eye {
+        animation: catBlinkSlow 6s infinite;
+      }
+      
+      .pixel-cat-meow {
+        animation: none;
+        opacity: 0;
+      }
+      
+      @keyframes catBlinkSlow{
+        0%,94%,100%{transform:scaleY(1);}
+        96%{transform:scaleY(0.15);}
+        98%{transform:scaleY(1);}
+      }
     }
 
     @media(max-width:600px){
@@ -1145,31 +1289,69 @@ INDEX_HTML = r"""<!DOCTYPE html>
             </div>
           </form>
 
-          <div class="pixel-cat" aria-hidden="true">
+          <div class="pixel-cat" id="pixelCat">
             <div class="pixel-cat-walk">
               <div class="pixel-cat-art">
                 <svg viewBox="0 0 96 64" aria-hidden="true">
+                  <!-- MEOW 對話框 -->
                   <g class="pixel-cat-meow">
-                    <rect x="8" y="6" width="48" height="18" fill="var(--panel)" stroke="var(--border2)" stroke-width="1" />
+                    <rect x="8" y="6" width="48" height="18" fill="var(--panel)" stroke="var(--border2)" stroke-width="1" rx="3" />
                     <rect x="22" y="24" width="8" height="6" fill="var(--panel)" stroke="var(--border2)" stroke-width="1" />
                     <text x="14" y="18" font-family="monospace" font-size="8" fill="var(--text)">MEOW!</text>
                   </g>
 
+                  <!-- ✅ 尾巴 -->
+                  <g class="pixel-cat-tail">
+                    <rect x="18" y="28" width="6" height="14" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
+                    <rect x="16" y="20" width="6" height="10" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
+                    <rect x="14" y="14" width="6" height="8" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
+                    <rect x="15" y="15" width="4" height="6" fill="rgba(var(--accent-rgb), 0.12)" />
+                  </g>
+
+                  <!-- 身體 -->
                   <rect x="30" y="18" width="32" height="26" fill="var(--panel)" stroke="var(--border2)" stroke-width="1" />
                   <rect x="32" y="20" width="28" height="22" fill="var(--panel2)" stroke="var(--border)" stroke-width="1" />
 
+                  <!-- ✅ 耳朵+內部陰影 -->
                   <rect x="30" y="14" width="8" height="8" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
+                  <rect x="32" y="16" width="4" height="4" fill="rgba(var(--accent-rgb), 0.16)" />
                   <rect x="54" y="14" width="8" height="8" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
+                  <rect x="56" y="16" width="4" height="4" fill="rgba(var(--accent-rgb), 0.16)" />
 
-                  <rect class="pixel-cat-eye" x="36" y="26" width="4" height="5" fill="rgba(var(--accent-rgb), 0.60)" />
-                  <rect class="pixel-cat-eye" x="52" y="26" width="4" height="5" fill="rgba(var(--accent-rgb), 0.60)" />
+                  <!-- ✅ 眼睛+高光 -->
+                  <g class="pixel-cat-eye">
+                    <rect x="36" y="26" width="4" height="5" fill="rgba(var(--accent-rgb), 0.85)" />
+                    <rect x="37" y="27" width="2" height="2" fill="rgba(255,255,255,0.72)" />
+                  </g>
+                  <g class="pixel-cat-eye">
+                    <rect x="52" y="26" width="4" height="5" fill="rgba(var(--accent-rgb), 0.85)" />
+                    <rect x="53" y="27" width="2" height="2" fill="rgba(255,255,255,0.72)" />
+                  </g>
 
-                  <rect x="44" y="31" width="4" height="2" fill="var(--accent)" />
-                  <rect x="38" y="31" width="3" height="2" fill="rgba(var(--accent-rgb), 0.82)" />
-                  <rect x="51" y="31" width="3" height="2" fill="rgba(var(--accent-rgb), 0.82)" />
+                  <!-- ✅ 鼻子+高光 -->
+                  <g class="pixel-cat-nose">
+                    <rect x="44" y="31" width="4" height="2" fill="var(--accent)" />
+                    <rect x="45" y="32" width="2" height="1" fill="rgba(255,255,255,0.48)" />
+                  </g>
 
+                  <!-- ✅ 鬍鬚 -->
+                  <g class="pixel-cat-whisker">
+                    <rect x="28" y="31" width="3" height="1" fill="rgba(var(--accent-rgb), 0.76)" />
+                    <rect x="26" y="33" width="5" height="1" fill="rgba(var(--accent-rgb), 0.68)" />
+                    <rect x="27" y="35" width="4" height="1" fill="rgba(var(--accent-rgb), 0.72)" />
+                    <rect x="61" y="31" width="3" height="1" fill="rgba(var(--accent-rgb), 0.76)" />
+                    <rect x="61" y="33" width="5" height="1" fill="rgba(var(--accent-rgb), 0.68)" />
+                    <rect x="61" y="35" width="4" height="1" fill="rgba(var(--accent-rgb), 0.72)" />
+                  </g>
+
+                  <!-- ✅ 嘴巴 -->
                   <rect x="43" y="34" width="2" height="1" fill="var(--accent)" />
                   <rect x="47" y="34" width="2" height="1" fill="var(--accent)" />
+                  <rect x="45" y="35" width="2" height="1" fill="rgba(var(--accent-rgb), 0.65)" />
+                  
+                  <!-- ✅ 身體高光 -->
+                  <rect x="34" y="22" width="2" height="2" fill="rgba(255,255,255,0.14)" />
+                  <rect x="56" y="38" width="2" height="2" fill="rgba(var(--accent-rgb),0.18)" />
                 </svg>
               </div>
             </div>
@@ -1457,6 +1639,53 @@ INDEX_HTML = r"""<!DOCTYPE html>
     (async function init() {
       await loadRecent();
       await loadRandom();
+    })();
+  </script>
+  <script>
+    (function initCat() {
+      const cat = document.getElementById("pixelCat");
+      if (!cat) return;
+      let clicks = 0, timer, mood = "normal";
+      
+      function setM(m) {
+        if (mood === m) return;
+        mood = m;
+        cat.classList.remove("mood-happy", "mood-sleepy", "mood-excited");
+        if (m !== "normal") cat.classList.add("mood-" + m);
+      }
+      
+      function updateM() {
+        const h = new Date().getHours();
+        setM(h < 6 ? "sleepy" : (totalPosts > 10 ? "excited" : "normal"));
+      }
+      
+      cat.onclick = function() {
+        clicks++;
+        clearTimeout(timer);
+        if (clicks === 1) {
+          timer = setTimeout(function() {
+            const i = ACCENTS.findIndex(function(a) { return document.documentElement.classList.contains("accent-" + a); });
+            applyAccent(ACCENTS[(i + 1) % ACCENTS.length]);
+            setM("happy");
+            setTimeout(updateM, 1200);
+            clicks = 0;
+          }, 250);
+        } else {
+          clicks = 0;
+          loadRandom();
+          setM("excited");
+          setTimeout(updateM, 2000);
+        }
+      };
+      
+      updateM();
+      setInterval(updateM, 60000);
+      
+      const orig = setStatus;
+      window.setStatus = function(msg, type) {
+        orig(msg, type);
+        if (type === "ok") { setM("happy"); setTimeout(updateM, 2400); }
+      };
     })();
   </script>
 </body>

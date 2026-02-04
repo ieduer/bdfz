@@ -467,12 +467,19 @@ fi
 if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'sentinel.service'; then
   echo ">>> [INFO] Stopping existing sentinel.service (if running)..."
   systemctl stop sentinel.service >/dev/null 2>&1 || true
+  # Wait for graceful shutdown
+  sleep 2
 fi
-# Safety: if there is a stray process outside systemd, stop it too.
-pkill -f "/usr/local/bin/sentinel.py" >/dev/null 2>&1 || true
+# Safety: if there is a stray process outside systemd, force kill it
+pkill -9 -f "/usr/local/bin/sentinel.py" >/dev/null 2>&1 || true
+sleep 1
 
 echo ">>> [2/5] Creating directories and handling configuration..."
 mkdir -p /etc/sentinel /var/lib/sentinel
+
+# Clear old state to prevent accumulated notifications from being sent
+echo ">>> [INFO] Clearing old state file to prevent stale notifications..."
+rm -f /var/lib/sentinel/state.json
 
 _setup_telegram_config
 
