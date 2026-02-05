@@ -1069,8 +1069,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     
     .pixel-cat-art svg{
-      width:120px;
-      height:96px;
+      width:138px;
+      height:80px;
       image-rendering:pixelated;
       
       /* ✅ 更強霓虹發光 */
@@ -1085,8 +1085,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     /* 移動端縮小 */
     @media(max-width:600px){
       .pixel-cat-art svg{
-        width:96px;
-        height:76px;
+        width:110px;
+        height:64px;
       }
     }
     
@@ -1105,11 +1105,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
       will-change: opacity, transform;
     }
     
-    /* ✅ 尾巴擺動 */
+    /* ✅ 尾巴擺動 - 增強版多層動畫 */
     .pixel-cat-tail{
-      transform-origin: top center;
-      animation: catTailWag 2.4s ease-in-out infinite;
+      transform-origin: 76px 44px;
+      animation: catTailWag 1.8s ease-in-out infinite;
       will-change: transform;
+    }
+    
+    .pixel-cat-tail-mid{
+      transform-origin: 84px 36px;
+      animation: catTailWagMid 1.6s ease-in-out infinite;
+      will-change: transform;
+    }
+    
+    .pixel-cat-tail-tip{
+      transform-origin: 86px 24px;
+      animation: catTailWagTip 1.4s ease-in-out infinite;
+      will-change: transform;
+      filter: drop-shadow(0 0 4px rgba(var(--accent-rgb), 0.45));
     }
     
     /* ✅ 鬍鬚閃爍 */
@@ -1176,10 +1189,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     
     @keyframes catTailWag{
-      0%,100%{transform:rotate(-8deg);}
-      25%{transform:rotate(12deg);}
-      50%{transform:rotate(-10deg);}
-      75%{transform:rotate(10deg);}
+      0%,100%{transform:rotate(-16deg);}
+      25%{transform:rotate(22deg);}
+      50%{transform:rotate(-18deg);}
+      75%{transform:rotate(20deg);}
+    }
+    
+    @keyframes catTailWagMid{
+      0%,100%{transform:rotate(-10deg);}
+      20%{transform:rotate(15deg);}
+      45%{transform:rotate(-12deg);}
+      70%{transform:rotate(14deg);}
+    }
+    
+    @keyframes catTailWagTip{
+      0%,100%{transform:rotate(-8deg) scale(1);}
+      15%{transform:rotate(18deg) scale(1.08);}
+      35%{transform:rotate(-14deg) scale(1.04);}
+      60%{transform:rotate(16deg) scale(1.06);}
+      85%{transform:rotate(-10deg) scale(1.02);}
     }
     
     @keyframes whiskerGlow{
@@ -1196,7 +1224,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
     @media (prefers-reduced-motion: reduce) {
       .pixel-cat-walk,
       .pixel-cat-art svg,
-      .pixel-cat-tail {
+      .pixel-cat-tail,
+      .pixel-cat-tail-mid,
+      .pixel-cat-tail-tip {
         animation: none;
       }
       
@@ -1292,7 +1322,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <div class="pixel-cat" id="pixelCat">
             <div class="pixel-cat-walk">
               <div class="pixel-cat-art">
-                <svg viewBox="0 0 96 64" aria-hidden="true">
+                <svg viewBox="0 0 110 64" aria-hidden="true">
                   <!-- MEOW 對話框 -->
                   <g class="pixel-cat-meow">
                     <rect x="8" y="6" width="48" height="18" fill="var(--panel)" stroke="var(--border2)" stroke-width="1" rx="3" />
@@ -1300,12 +1330,41 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <text x="14" y="18" font-family="monospace" font-size="8" fill="var(--text)">MEOW!</text>
                   </g>
 
-                  <!-- ✅ 尾巴 -->
+                  <!-- ✅ 尾巴 - 重新設計：更大、更顯眼、多段動畫 -->
                   <g class="pixel-cat-tail">
-                    <rect x="18" y="28" width="6" height="14" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
-                    <rect x="16" y="20" width="6" height="10" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
-                    <rect x="14" y="14" width="6" height="8" fill="var(--panel2)" stroke="var(--border2)" stroke-width="1" />
-                    <rect x="15" y="15" width="4" height="6" fill="rgba(var(--accent-rgb), 0.12)" />
+                    <!-- 尾巴根部 - 連接身體 -->
+                    <rect x="60" y="36" width="8" height="10" fill="var(--panel2)" stroke="rgba(var(--accent-rgb), 0.34)" stroke-width="1.2" />
+                    <rect x="62" y="38" width="4" height="6" fill="rgba(var(--accent-rgb), 0.14)" />
+                    
+                    <!-- 尾巴中段 - 帶獨立動畫 -->
+                    <g class="pixel-cat-tail-mid">
+                      <rect x="66" y="26" width="10" height="12" fill="var(--panel)" stroke="rgba(var(--accent-rgb), 0.42)" stroke-width="1.2" rx="1" />
+                      <rect x="68" y="28" width="6" height="8" fill="rgba(var(--accent-rgb), 0.18)" />
+                      <!-- 毛髮紋理 -->
+                      <rect x="70" y="29" width="2" height="1" fill="rgba(var(--accent-rgb), 0.28)" />
+                      <rect x="69" y="32" width="2" height="1" fill="rgba(var(--accent-rgb), 0.24)" />
+                      
+                      <!-- 尾巴尖端 - 蓬鬆毛球效果 -->
+                      <g class="pixel-cat-tail-tip">
+                        <!-- 主體毛球 -->
+                        <rect x="72" y="14" width="12" height="14" fill="var(--panel)" stroke="rgba(var(--accent-rgb), 0.56)" stroke-width="1.4" rx="2" />
+                        <rect x="74" y="16" width="8" height="10" fill="rgba(var(--accent-rgb), 0.22)" />
+                        
+                        <!-- 蓬鬆毛髮細節 -->
+                        <rect x="70" y="18" width="3" height="3" fill="var(--panel)" stroke="rgba(var(--accent-rgb), 0.48)" stroke-width="0.8" />
+                        <rect x="83" y="16" width="3" height="3" fill="var(--panel)" stroke="rgba(var(--accent-rgb), 0.48)" stroke-width="0.8" />
+                        <rect x="75" y="12" width="4" height="3" fill="var(--panel)" stroke="rgba(var(--accent-rgb), 0.52)" stroke-width="0.8" />
+                        <rect x="80" y="13" width="3" height="2" fill="rgba(var(--accent-rgb), 0.38)" />
+                        
+                        <!-- 尖端高光 -->
+                        <rect x="76" y="18" width="3" height="2" fill="rgba(255,255,255,0.32)" />
+                        <rect x="78" y="20" width="2" height="2" fill="rgba(var(--accent-rgb), 0.45)" />
+                        
+                        <!-- 霓虹發光點 -->
+                        <rect x="84" y="18" width="2" height="2" fill="rgba(var(--accent-rgb), 0.72)" />
+                        <rect x="71" y="20" width="2" height="2" fill="rgba(var(--accent-rgb), 0.65)" />
+                      </g>
+                    </g>
                   </g>
 
                   <!-- 身體 -->
