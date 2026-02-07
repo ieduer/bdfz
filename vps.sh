@@ -16,8 +16,8 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE="a"
 
 # --- Versioning ---
-INSTALLER_VERSION="v2026-02-03-3"
-SENTINEL_VERSION="v2026-02-03-3"
+INSTALLER_VERSION="v2026-02-07"
+SENTINEL_VERSION="v2026-02-07"
 
 echo ">>> [INFO] vps.sh installer version: ${INSTALLER_VERSION}"
 
@@ -624,7 +624,7 @@ cat >/usr/local/bin/tmsg <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-TMSG_VERSION="v2026-02-03-3"
+TMSG_VERSION="v2026-02-07"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
   echo "tmsg ${TMSG_VERSION}"
@@ -781,7 +781,7 @@ def E(k, d=None):
     cv = _clean_env_value(v)
     return cv if cv is not None else d
 
-SENTINEL_VERSION = "v2026-02-03-3"
+SENTINEL_VERSION = "v2026-02-07"
 TELE_TOKEN, TELE_CHAT_ID = E("TELE_TOKEN"), E("TELE_CHAT_ID")
 
 # Reduce exposure: keep token/chat id in memory only.
@@ -1918,8 +1918,15 @@ def try_daily_digest():
             lines.append(one)
 
         body = "\n".join(f"• {esc(x)}" for x in lines)
-        _tg_send(f"{head}\n{body}", "MarkdownV2")
-
+        ok, _ = _tg_send(f"{head}\n{body}", "MarkdownV2")
+        if not ok:
+            # Fallback: retry without MarkdownV2 (plain text)
+            plain_head = f"🧾 {HOST} ({get_primary_ip()})\nDaily Digest (Beijing {bj.strftime('%Y-%m-%d %H:%M')})"
+            plain_body = "\n".join(f"• {x}" for x in lines)
+            ok, _ = _tg_send(f"{plain_head}\n{plain_body}")
+        if not ok:
+            # Send failed, do NOT mark last_digest so we retry next loop
+            return
         state.set("last_digest", key)
         # Clear noisy daily accumulators for the day we just sent.
         try:
@@ -1979,7 +1986,7 @@ def try_daily_snapshot():
             f"/ usage {rp}%",
             f"Traffic {month} ↓{used_rx/(1024**3):.2f} GB ↑{used_tx/(1024**3):.2f} GB Σ{(used_rx+used_tx)/(1024**3):.2f} GB",
             f"Route dev {dev} via {via} src {src}",
-        ], icon="🕛")
+        ], icon="🕛", urgent=True)
 
         state.set("last_daily", key)
     except Exception:
