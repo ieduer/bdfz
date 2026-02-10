@@ -16,10 +16,9 @@
 8. SeiueStu → Telegram
 9. Mentee：導師約談記錄
 10. YDW：臨時文件下載
-11. Vps-Boost 多機器
-12. yue-auto-mark：K12media AI 閱卷
-13. quiz-submit：年度考核自動提交
-14. k12media_download_imgs：閱卷原卷圖下載
+11. yue-auto-mark：K12media AI 閱卷
+12. quiz-submit：年度考核自動提交
+13. k12media_download_imgs：閱卷原卷圖下載
 
 ⸻
 
@@ -155,18 +154,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/dl.sh)
 
 ⸻
 
-## 11. Vps-Boost 多機器
-
-五色令人目盲，Terminal 優化。
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/vps-boost.sh)
-```
-
-
-⸻
-
-## 12. yue-auto-mark：K12media AI 閱卷
+## 11.yue-auto-mark：K12media AI 閱卷
 
 K12media AI 閱卷。
 
@@ -185,7 +173,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/yue-auto-mark
 
 ⸻
 
-## 13. quiz-submit：年度考核自動提交
+## 12. quiz-submit：年度考核自動提交
 
 前世冤。年度考核 AI 化。
 
@@ -203,7 +191,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/quiz-submit.s
 
 ⸻
 
-## 14. k12media_download_imgs：閱卷原卷圖下載
+## 13. k12media_download_imgs：閱卷原卷圖下載
 
 有圖有手寫。
 
