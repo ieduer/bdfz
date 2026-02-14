@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean, Telegram notify
-# version: v1.7-2026-01-30
+# version: v1.8-2026-02-13
 # changes from v1.5-2025-12-03:
 # - 全新 Geek 風格 Glassmorphism UI（暗色主題、漸變背景、動畫效果）
 # - 新增下載格式選項（偏好 MP4、最高解析度限制、僅音訊）
@@ -21,7 +21,7 @@ DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 
-echo "[ytweb] installing version v1.7-2026-01-30 ..."
+echo "[ytweb] installing version v1.8-2026-02-13 ..."
 
 # 必須 root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -117,9 +117,9 @@ fi
 
 V_PY="$VENV_DIR/bin/python"
 
-echo "[ytweb] upgrading pip and installing/refreshing dependencies (flask, dotenv, yt-dlp, werkzeug, requests) ..."
+echo "[ytweb] upgrading pip and installing/refreshing dependencies (flask, dotenv, yt-dlp + curl_cffi, werkzeug, requests) ..."
 "$V_PY" -m pip install --upgrade pip
-"$V_PY" -m pip install --upgrade flask python-dotenv "yt-dlp[default]" werkzeug requests
+"$V_PY" -m pip install --upgrade flask python-dotenv "yt-dlp[default,curl-cffi]" werkzeug requests
 
 # 更新後的 yt-dlp 路徑 & 版本
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
@@ -154,7 +154,7 @@ cat > "$APP_DIR/app.py" <<'PY'
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v1.5-2026-01-30
+version: v1.8-2026-02-13
 
 - explicit yt-dlp path via env YTDLP_BIN
 - youtube url normalization (watch/shorts/live/youtu.be)
@@ -335,6 +335,11 @@ def run_ytdlp_task(task_id, url, fmt, options=None):
     cmd += ["--extractor-args", "youtube:player_client=default,-android_sdkless"]
     # a bit more robust for fragments
     cmd += ["--concurrent-fragments", "1", "--retries", "10", "--fragment-retries", "10", "--retry-sleep", "1"]
+
+  # X/Twitter: often needs browser impersonation to pass GraphQL/guest-token checks
+  if any(h in uhost for h in ("x.com", "twitter.com")):
+    cmd += ["--impersonate", "chrome"]
+
   if fmt:
     cmd += ["-f", fmt]
   
@@ -1162,7 +1167,7 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
     <div class="header-content">
       <div class="brand">
         <img src="https://img.bdfz.net/20250503004.webp" alt="BDFZ" class="brand-icon">
-        <h1>yt-dlp web<span class="version">v1.6</span></h1>
+        <h1>yt-dlp web<span class="version">v1.8</span></h1>
       </div>
       <div class="stats-badge">
         <span class="dot"></span>
