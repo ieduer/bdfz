@@ -14,6 +14,8 @@ SB_CERT_RENEW_SCRIPT="/etc/s-box/cert_renew.sh"
 SB_CERT_RENEW_STATUS="/etc/s-box/cert_renew.status"
 SB_CERT_RENEW_LOG="/etc/s-box/cert_renew.log"
 SB_CERT_RENEW_CRON_MARK="# sb-cert-renew"
+SB_HY2_HOP_SCRIPT="/etc/s-box/hy2_port_hop.sh"
+SB_HY2_HOP_SERVICE="sb-hy2-hop.service"
 
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
@@ -50,8 +52,22 @@ load_runtime_env(){
     SB_TELEGRAM_BOT_TOKEN="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_BOT_TOKEN" 2>/dev/null || true)"
     SB_TELEGRAM_CHAT_ID="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_CHAT_ID" 2>/dev/null || true)"
     SB_TELEGRAM_THREAD_ID="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_THREAD_ID" 2>/dev/null || true)"
+    SB_HY2_OBFS_ENABLED="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_OBFS_ENABLED" 2>/dev/null || true)"
+    SB_HY2_OBFS_PASSWORD="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" 2>/dev/null || true)"
+    SB_HY2_MASQUERADE_URL="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_MASQUERADE_URL" 2>/dev/null || true)"
+    SB_HY2_HOP_ENABLED="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_ENABLED" 2>/dev/null || true)"
+    SB_HY2_HOP_START="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_START" 2>/dev/null || true)"
+    SB_HY2_HOP_END="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_END" 2>/dev/null || true)"
+    SB_HY2_HOP_INTERVAL="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_INTERVAL" 2>/dev/null || true)"
+    SB_HY2_HOP_TARGET_PORT="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_TARGET_PORT" 2>/dev/null || true)"
     [[ -z "$SB_TELEGRAM_ENABLED" ]] && SB_TELEGRAM_ENABLED="0"
+    [[ -z "$SB_HY2_OBFS_ENABLED" ]] && SB_HY2_OBFS_ENABLED="1"
+    [[ -z "$SB_HY2_HOP_ENABLED" ]] && SB_HY2_HOP_ENABLED="1"
+    [[ -z "$SB_HY2_HOP_INTERVAL" ]] && SB_HY2_HOP_INTERVAL="30s"
+    [[ -z "$SB_HY2_MASQUERADE_URL" ]] && SB_HY2_MASQUERADE_URL="https://www.cloudflare.com/"
     export SB_TELEGRAM_ENABLED SB_TELEGRAM_BOT_TOKEN SB_TELEGRAM_CHAT_ID SB_TELEGRAM_THREAD_ID
+    export SB_HY2_OBFS_ENABLED SB_HY2_OBFS_PASSWORD SB_HY2_MASQUERADE_URL
+    export SB_HY2_HOP_ENABLED SB_HY2_HOP_START SB_HY2_HOP_END SB_HY2_HOP_INTERVAL SB_HY2_HOP_TARGET_PORT
 }
 
 # 内部调用 sb 时重新执行当前脚本
@@ -133,7 +149,7 @@ install_depend(){
         green "安装必要依赖..."
         apt update -y
         # 增加 ufw, socat (acme需要)
-        apt install -y jq openssl iproute2 iputils-ping coreutils expect git socat grep util-linux curl wget tar python3 cron ufw
+        apt install -y jq openssl iproute2 iputils-ping coreutils expect git socat grep util-linux curl wget tar python3 cron ufw iptables
         mkdir -p /etc/s-box
         touch /etc/s-box/sbyg_update
     fi
@@ -176,6 +192,146 @@ v4v6_refresh(){
     _v4_cache=""
     _v6_cache=""
     v4v6
+}
+
+is_valid_port_number(){
+    local p="$1"
+    [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
+
+is_valid_hop_interval(){
+    local v="$1"
+    [[ "$v" =~ ^[0-9]+[smh]$ ]]
+}
+
+gen_random_alnum(){
+    local n="${1:-20}"
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$n"
+}
+
+pick_hy2_hop_range(){
+    local width=79
+    local attempts=0
+    local start end
+    local in_use=""
+
+    in_use=$(ss -ulnH 2>/dev/null | awk '{print $5}' | sed -E 's/.*[:.]([0-9]+)$/\1/' | grep -E '^[0-9]+$' | sort -u)
+
+    while (( attempts < 120 )); do
+        start=$(shuf -i 20000-56000 -n 1)
+        end=$((start + width))
+        (( end > 65000 )) && { attempts=$((attempts + 1)); continue; }
+
+        # 避免覆蓋當前 Sing-box 端口
+        if is_valid_port_number "$port_vl_re" && (( port_vl_re >= start && port_vl_re <= end )); then attempts=$((attempts + 1)); continue; fi
+        if is_valid_port_number "$port_vm_ws" && (( port_vm_ws >= start && port_vm_ws <= end )); then attempts=$((attempts + 1)); continue; fi
+        if is_valid_port_number "$port_hy2" && (( port_hy2 >= start && port_hy2 <= end )); then attempts=$((attempts + 1)); continue; fi
+        if is_valid_port_number "$port_tu" && (( port_tu >= start && port_tu <= end )); then attempts=$((attempts + 1)); continue; fi
+
+        local conflict=0 p
+        for p in $in_use; do
+            if (( p >= start && p <= end )); then
+                conflict=1
+                break
+            fi
+        done
+        if (( conflict == 0 )); then
+            echo "$start $end"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+    done
+
+    # fallback：盡量保守但可用
+    echo "24000 24079"
+}
+
+init_hy2_transport_env(){
+    ensure_sbox_dir
+    load_runtime_env
+    local changed=0
+    local hop_range
+
+    if [[ "${SB_HY2_OBFS_ENABLED:-1}" != "0" ]]; then
+        SB_HY2_OBFS_ENABLED="1"
+        if [[ -z "${SB_HY2_OBFS_PASSWORD:-}" ]]; then
+            SB_HY2_OBFS_PASSWORD="$(gen_random_alnum 20)"
+            changed=1
+        fi
+    fi
+
+    if [[ -z "${SB_HY2_MASQUERADE_URL:-}" ]]; then
+        SB_HY2_MASQUERADE_URL="https://www.cloudflare.com/"
+        changed=1
+    fi
+
+    if [[ "${SB_HY2_HOP_ENABLED:-1}" != "0" ]]; then
+        SB_HY2_HOP_ENABLED="1"
+    fi
+
+    if [[ -z "${SB_HY2_HOP_INTERVAL:-}" ]] || ! is_valid_hop_interval "$SB_HY2_HOP_INTERVAL"; then
+        SB_HY2_HOP_INTERVAL="30s"
+        changed=1
+    fi
+
+    if [[ "${SB_HY2_HOP_ENABLED:-1}" == "1" ]]; then
+        if ! is_valid_port_number "${SB_HY2_HOP_START:-}" || ! is_valid_port_number "${SB_HY2_HOP_END:-}" || (( SB_HY2_HOP_START >= SB_HY2_HOP_END )); then
+            hop_range="$(pick_hy2_hop_range)"
+            SB_HY2_HOP_START="${hop_range%% *}"
+            SB_HY2_HOP_END="${hop_range##* }"
+            changed=1
+        fi
+    fi
+
+    if ! is_valid_port_number "${SB_HY2_HOP_TARGET_PORT:-}" || [[ "${SB_HY2_HOP_TARGET_PORT:-}" != "$port_hy2" ]]; then
+        SB_HY2_HOP_TARGET_PORT="$port_hy2"
+        changed=1
+    fi
+
+    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_ENABLED" "${SB_HY2_OBFS_ENABLED:-1}"
+    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" "${SB_HY2_OBFS_PASSWORD:-}"
+    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_MASQUERADE_URL" "${SB_HY2_MASQUERADE_URL:-https://www.cloudflare.com/}"
+    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_ENABLED" "${SB_HY2_HOP_ENABLED:-1}"
+    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_START" "${SB_HY2_HOP_START:-}"
+    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_END" "${SB_HY2_HOP_END:-}"
+    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_INTERVAL" "${SB_HY2_HOP_INTERVAL:-30s}"
+    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_TARGET_PORT" "${SB_HY2_HOP_TARGET_PORT:-$port_hy2}"
+    load_runtime_env
+
+    green "HY2 抗封鎖增強: obfs=salamander, masquerade=${SB_HY2_MASQUERADE_URL}"
+    if [[ "${SB_HY2_HOP_ENABLED:-1}" == "1" ]]; then
+        green "HY2 端口跳躍: ${SB_HY2_HOP_START}:${SB_HY2_HOP_END} -> ${SB_HY2_HOP_TARGET_PORT} (${SB_HY2_HOP_INTERVAL})"
+    else
+        yellow "HY2 端口跳躍: 已停用"
+    fi
+    [[ "$changed" == "1" ]] && green "HY2 增強參數已寫入 ${SB_ENV_FILE}"
+}
+
+load_hy2_runtime_from_server_files(){
+    load_runtime_env
+
+    if [[ -z "${SB_HY2_OBFS_PASSWORD:-}" && -f /etc/s-box/sb.json ]]; then
+        SB_HY2_OBFS_PASSWORD="$(jq -r '.inbounds[]? | select(.type=="hysteria2") | .obfs.password // empty' /etc/s-box/sb.json 2>/dev/null)"
+    fi
+    if [[ -z "${SB_HY2_MASQUERADE_URL:-}" && -f /etc/s-box/sb.json ]]; then
+        SB_HY2_MASQUERADE_URL="$(jq -r '.inbounds[]? | select(.type=="hysteria2") | .masquerade // empty' /etc/s-box/sb.json 2>/dev/null)"
+    fi
+    if [[ -z "${SB_HY2_HOP_TARGET_PORT:-}" && -f /etc/s-box/sb.json ]]; then
+        SB_HY2_HOP_TARGET_PORT="$(jq -r '.inbounds[]? | select(.type=="hysteria2") | .listen_port // empty' /etc/s-box/sb.json 2>/dev/null)"
+    fi
+
+    if [[ -z "${SB_HY2_HOP_START:-}" || -z "${SB_HY2_HOP_END:-}" ]]; then
+        local hop_range
+        hop_range=$(grep '^HY2_HOP_RANGE=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
+        if [[ "$hop_range" =~ ^([0-9]+):([0-9]+)$ ]]; then
+            SB_HY2_HOP_START="${BASH_REMATCH[1]}"
+            SB_HY2_HOP_END="${BASH_REMATCH[2]}"
+        fi
+    fi
+
+    [[ -z "${SB_HY2_OBFS_ENABLED:-}" ]] && SB_HY2_OBFS_ENABLED="1"
+    [[ -z "${SB_HY2_HOP_ENABLED:-}" ]] && SB_HY2_HOP_ENABLED="1"
+    [[ -z "${SB_HY2_HOP_INTERVAL:-}" ]] && SB_HY2_HOP_INTERVAL="30s"
 }
 
 # 安装 Sing-box 核心
@@ -942,9 +1098,130 @@ ensure_domain_and_cert(){
     fi
 }
 
+create_hy2_hop_script(){
+    ensure_sbox_dir
+    cat > "$SB_HY2_HOP_SCRIPT" <<'EOF'
+#!/bin/bash
+set -u
+
+ENV_FILE="/etc/s-box/sb.env"
+
+read_env(){
+    local key="$1"
+    [[ -f "$ENV_FILE" ]] || return 0
+    grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2-
+}
+
+is_valid_port(){
+    local p="$1"
+    [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
+
+clean_bin_chain(){
+    local bin="$1" chain="SB_HY2_HOP"
+    command -v "$bin" >/dev/null 2>&1 || return 0
+    "$bin" -t nat -F "$chain" >/dev/null 2>&1 || true
+    while "$bin" -t nat -C PREROUTING -j "$chain" >/dev/null 2>&1; do
+        "$bin" -t nat -D PREROUTING -j "$chain" >/dev/null 2>&1 || break
+    done
+    while "$bin" -t nat -C OUTPUT -m addrtype --dst-type LOCAL -j "$chain" >/dev/null 2>&1; do
+        "$bin" -t nat -D OUTPUT -m addrtype --dst-type LOCAL -j "$chain" >/dev/null 2>&1 || break
+    done
+    "$bin" -t nat -X "$chain" >/dev/null 2>&1 || true
+}
+
+apply_bin_chain(){
+    local bin="$1" start="$2" end="$3" target="$4" chain="SB_HY2_HOP"
+    command -v "$bin" >/dev/null 2>&1 || return 0
+
+    "$bin" -t nat -N "$chain" >/dev/null 2>&1 || true
+    "$bin" -t nat -C PREROUTING -j "$chain" >/dev/null 2>&1 || "$bin" -t nat -A PREROUTING -j "$chain"
+    "$bin" -t nat -C OUTPUT -m addrtype --dst-type LOCAL -j "$chain" >/dev/null 2>&1 || "$bin" -t nat -A OUTPUT -m addrtype --dst-type LOCAL -j "$chain"
+    "$bin" -t nat -F "$chain" >/dev/null 2>&1 || true
+    "$bin" -t nat -A "$chain" -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target" >/dev/null 2>&1 || true
+}
+
+mode="${1:-apply}"
+if [[ "$mode" == "remove" ]]; then
+    clean_bin_chain iptables
+    clean_bin_chain ip6tables
+    exit 0
+fi
+
+hop_enabled="$(read_env SB_HY2_HOP_ENABLED)"
+hop_start="$(read_env SB_HY2_HOP_START)"
+hop_end="$(read_env SB_HY2_HOP_END)"
+target_port="$(read_env SB_HY2_HOP_TARGET_PORT)"
+
+[[ -z "$hop_enabled" ]] && hop_enabled="0"
+if [[ "$hop_enabled" != "1" ]]; then
+    clean_bin_chain iptables
+    clean_bin_chain ip6tables
+    exit 0
+fi
+
+if ! is_valid_port "$hop_start" || ! is_valid_port "$hop_end" || ! is_valid_port "$target_port" || (( hop_start >= hop_end )); then
+    exit 1
+fi
+
+apply_bin_chain iptables "$hop_start" "$hop_end" "$target_port"
+apply_bin_chain ip6tables "$hop_start" "$hop_end" "$target_port"
+exit 0
+EOF
+    chmod +x "$SB_HY2_HOP_SCRIPT"
+}
+
+setup_hy2_port_hopping(){
+    load_hy2_runtime_from_server_files
+    create_hy2_hop_script
+
+    cat > "/etc/systemd/system/${SB_HY2_HOP_SERVICE}" <<EOF
+[Unit]
+Description=Sing-box HY2 Port Hopping Redirect Rules
+After=network-online.target
+Wants=network-online.target
+Before=sing-box.service
+
+[Service]
+Type=oneshot
+ExecStart=${SB_HY2_HOP_SCRIPT} apply
+ExecStop=${SB_HY2_HOP_SCRIPT} remove
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    if [[ "${SB_HY2_HOP_ENABLED:-0}" == "1" ]]; then
+        systemctl enable "${SB_HY2_HOP_SERVICE}" >/dev/null 2>&1 || true
+        if systemctl restart "${SB_HY2_HOP_SERVICE}" >/dev/null 2>&1; then
+            green "HY2 端口跳躍規則已啟用。"
+        else
+            yellow "HY2 端口跳躍規則啟用失敗，請檢查 iptables 是否可用。"
+        fi
+    else
+        systemctl disable --now "${SB_HY2_HOP_SERVICE}" >/dev/null 2>&1 || true
+    fi
+}
+
+cleanup_hy2_port_hopping(){
+    if [[ -x "$SB_HY2_HOP_SCRIPT" ]]; then
+        "$SB_HY2_HOP_SCRIPT" remove >/dev/null 2>&1 || true
+    fi
+    systemctl disable --now "${SB_HY2_HOP_SERVICE}" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${SB_HY2_HOP_SERVICE}" "$SB_HY2_HOP_SCRIPT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 # 3. 配置防火墙 (安全模式：只添加必要端口)
 setup_firewall(){
     green "正在配置防火墙 (UFW - 安全模式)..."
+    load_hy2_runtime_from_server_files
+    local hy2_hop_range=""
+    if [[ "${SB_HY2_HOP_ENABLED:-0}" == "1" ]] && is_valid_port_number "${SB_HY2_HOP_START:-}" && is_valid_port_number "${SB_HY2_HOP_END:-}" && (( SB_HY2_HOP_START < SB_HY2_HOP_END )); then
+        hy2_hop_range="${SB_HY2_HOP_START}:${SB_HY2_HOP_END}"
+    fi
     
     # ========== 端口保留功能（預設關閉，避免意外暴露內部服務）==========
     # 可通過 PRESERVE_EXISTING_PORTS=1 環境變量啟用
@@ -1047,6 +1324,9 @@ setup_firewall(){
     ufw_allow "$port_vl_re" tcp "VLESS-Reality"
     ufw_allow "$port_vm_ws" tcp "VMess-WS"
     ufw_allow "$port_hy2" udp "Hysteria2"
+    if [[ -n "$hy2_hop_range" ]]; then
+        ufw_allow "$hy2_hop_range" udp "HY2-PortHop"
+    fi
     ufw_allow "$port_tu" udp "TUIC5"
     
     # ========== 第五步：詢問是否啟用 UFW ==========
@@ -1062,6 +1342,7 @@ SSH_PORT=$ssh_port
 VLESS_PORT=$port_vl_re
 VMESS_PORT=$port_vm_ws
 HY2_PORT=$port_hy2
+HY2_HOP_RANGE=$hy2_hop_range
 TUIC_PORT=$port_tu
 EOF
     
@@ -1089,6 +1370,7 @@ EOF
     echo -e "  VLESS-Reality: ${yellow}$port_vl_re/tcp${plain}"
     echo -e "  VMess-WS: ${yellow}$port_vm_ws/tcp${plain}"
     echo -e "  Hysteria2: ${yellow}$port_hy2/udp${plain}"
+    [[ -n "$hy2_hop_range" ]] && echo -e "  HY2-PortHop: ${yellow}${hy2_hop_range}/udp -> $port_hy2${plain}"
     echo -e "  TUIC5: ${yellow}$port_tu/udp${plain}"
     [[ ${#preserve_tcp_ports[@]} -gt 0 ]] && echo -e "  保留的TCP端口: ${yellow}${preserve_tcp_ports[*]}${plain}"
     [[ ${#preserve_udp_ports[@]} -gt 0 ]] && echo -e "  保留的UDP端口: ${yellow}${preserve_udp_ports[*]}${plain}"
@@ -1102,6 +1384,15 @@ gen_config(){
     public_key_reality=$(echo "$key_pair" | awk '/PublicKey/ {print $2}' | tr -d '"')
     short_id=$(/etc/s-box/sing-box generate rand --hex 4)
     echo "$public_key_reality" > /etc/s-box/public.key
+
+    load_hy2_runtime_from_server_files
+    local hy2_obfs_password="${SB_HY2_OBFS_PASSWORD:-}"
+    local hy2_masquerade_url="${SB_HY2_MASQUERADE_URL:-https://www.cloudflare.com/}"
+    if [[ -z "$hy2_obfs_password" ]]; then
+        hy2_obfs_password="$(gen_random_alnum 20)"
+        upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" "$hy2_obfs_password"
+        load_runtime_env
+    fi
 
     # GeoIP/GeoSite 資料庫下載（預設關閉，因為服務端配置未啟用分流）
     # 可通過 DOWNLOAD_GEO_DB=1 環境變量啟用
@@ -1187,6 +1478,11 @@ cat > /etc/s-box/sb.json <<EOF
       "listen_port": ${port_hy2},
       "users": [{"password": "${uuid}"}],
       "ignore_client_bandwidth": false,
+      "obfs": {
+        "type": "salamander",
+        "password": "${hy2_obfs_password}"
+      },
+      "masquerade": "${hy2_masquerade_url}",
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
@@ -1409,11 +1705,13 @@ install_singbox(){
     setup_tun
     inssb
     insport
+    init_hy2_transport_env
     ensure_domain_and_cert  # 确认证书与域名 (如已有则复用)
     maybe_prompt_telegram_on_install
     setup_firewall  # 自动配置 UFW 防火墙
     gen_config
     sbservice
+    setup_hy2_port_hopping
     
     # 不再自动注册每日重启 cron (会导致用户断流)
     # 如需自动重启，可手动添加: (crontab -l; echo "0 4 * * * systemctl restart sing-box") | crontab -
@@ -1468,6 +1766,15 @@ sbshare(){
     if [[ -z "$host" ]]; then
         host="$domain"
     fi
+    load_hy2_runtime_from_server_files
+    local hy2_query="security=tls&alpn=h3&insecure=0&sni=$domain"
+    local hy2_hop_range=""
+    if [[ "${SB_HY2_OBFS_ENABLED:-1}" == "1" && -n "${SB_HY2_OBFS_PASSWORD:-}" ]]; then
+        hy2_query="${hy2_query}&obfs=salamander&obfs-password=${SB_HY2_OBFS_PASSWORD}"
+    fi
+    if [[ "${SB_HY2_HOP_ENABLED:-0}" == "1" ]] && is_valid_port_number "${SB_HY2_HOP_START:-}" && is_valid_port_number "${SB_HY2_HOP_END:-}" && (( SB_HY2_HOP_START < SB_HY2_HOP_END )); then
+        hy2_hop_range="${SB_HY2_HOP_START}-${SB_HY2_HOP_END}"
+    fi
 
     # 生成链接
     vl_link="vless://$uuid@$host:$port_vl?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reality_sni_share&fp=chrome&pbk=$pk&sid=$sid&type=tcp&headerType=none#VL-$hostname"
@@ -1489,12 +1796,17 @@ sbshare(){
         '{add:$add, aid:$aid, host:$host, id:$id, net:$net, path:$path, port:$port, ps:$ps, tls:$tls, sni:$sni, type:$type, v:$v}')
     vm_link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
     
-    hy_link="hysteria2://$uuid@$host:$port_hy?security=tls&alpn=h3&insecure=0&sni=$domain#HY2-$hostname"
+    hy_link="hysteria2://$uuid@$host:$port_hy?${hy2_query}#HY2-$hostname"
+    hy_hop_link=""
+    if [[ -n "$hy2_hop_range" ]]; then
+        hy_hop_link="hysteria2://$uuid@$host:$hy2_hop_range?${hy2_query}#HY2-Hop-$hostname"
+    fi
     tu_link="tuic://$uuid:$uuid@$host:$port_tu?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$domain&allow_insecure=0#TU5-$hostname"
     
     echo "$vl_link" > /etc/s-box/sub.txt
     echo "$vm_link" >> /etc/s-box/sub.txt
     echo "$hy_link" >> /etc/s-box/sub.txt
+    [[ -n "$hy_hop_link" ]] && echo "$hy_hop_link" >> /etc/s-box/sub.txt
     echo "$tu_link" >> /etc/s-box/sub.txt
     
     sub_base64=$(base64 -w 0 < /etc/s-box/sub.txt)
@@ -1507,7 +1819,12 @@ sbshare(){
     echo -e "VLESS-Reality 端口: ${yellow}$port_vl${plain}"
     echo -e "VMess-WS-TLS  端口: ${yellow}$port_vm${plain}"
     echo -e "Hysteria2     端口: ${yellow}$port_hy${plain}"
+    [[ -n "$hy2_hop_range" ]] && echo -e "Hysteria2-Hop  端口段: ${yellow}${hy2_hop_range}/udp${plain}"
     echo -e "Tuic V5       端口: ${yellow}$port_tu${plain}"
+    if [[ "${SB_HY2_OBFS_ENABLED:-1}" == "1" ]]; then
+        echo -e "HY2 obfs      模式: ${yellow}salamander${plain}"
+    fi
+    [[ -n "${SB_HY2_MASQUERADE_URL:-}" ]] && echo -e "HY2 masquerade: ${yellow}${SB_HY2_MASQUERADE_URL}${plain}"
     echo
     red "🚀【 聚合订阅 (Base64) 】"
     echo -e "${yellow}$sub_base64${plain}"
@@ -1556,6 +1873,13 @@ client_conf(){
     if [[ -n "$v4" ]]; then
         host="$v4"
     fi
+    load_hy2_runtime_from_server_files
+    local hy2_server_ports="$port_hy"
+    local hy2_hop_interval="${SB_HY2_HOP_INTERVAL:-30s}"
+    local hy2_obfs_password="${SB_HY2_OBFS_PASSWORD:-}"
+    if [[ "${SB_HY2_HOP_ENABLED:-0}" == "1" ]] && is_valid_port_number "${SB_HY2_HOP_START:-}" && is_valid_port_number "${SB_HY2_HOP_END:-}" && (( SB_HY2_HOP_START < SB_HY2_HOP_END )); then
+        hy2_server_ports="${SB_HY2_HOP_START}:${SB_HY2_HOP_END}"
+    fi
 
     # 顯示版本選擇菜單
     echo
@@ -1570,15 +1894,15 @@ client_conf(){
     readp "   選擇版本 [0-2]: " ver_choice
     
     case "$ver_choice" in
-        1) show_client_conf_latest "$host" "$domain" "$uuid" "$port_vl" "$port_vm" "$port_hy" "$port_tu" "$pk" "$sid" "$reality_sni_client" "$vm_path";;
-        2) show_client_conf_legacy "$host" "$domain" "$uuid" "$port_vl" "$port_vm" "$port_hy" "$port_tu" "$pk" "$sid" "$reality_sni_client" "$vm_path";;
+        1) show_client_conf_latest "$host" "$domain" "$uuid" "$port_vl" "$port_vm" "$port_hy" "$port_tu" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password";;
+        2) show_client_conf_legacy "$host" "$domain" "$uuid" "$port_vl" "$port_vm" "$port_hy" "$port_tu" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password";;
         0|*) return;;
     esac
 }
 
 # ==================== 1.12+ 最新版客戶端配置 ====================
 show_client_conf_latest(){
-    local host="$1" domain="$2" uuid="$3" port_vl="$4" port_vm="$5" port_hy="$6" port_tu="$7" pk="$8" sid="$9" reality_sni_client="${10}" vm_path="${11}"
+    local host="$1" domain="$2" uuid="$3" port_vl="$4" port_vm="$5" port_hy="$6" port_tu="$7" pk="$8" sid="$9" reality_sni_client="${10}" vm_path="${11}" hy2_server_ports="${12}" hy2_hop_interval="${13}" hy2_obfs_password="${14}"
     
     green "══════════════════════════════════════════════════════════════"
     green "  Sing-box 1.12+ / 最新版 客戶端配置 (tun 全局模式)"
@@ -1639,7 +1963,9 @@ show_client_conf_latest(){
     },
     {
       "type": "hysteria2", "tag": "hy2-sb", "server": "$host", "server_port": $port_hy,
+      "server_ports": ["$hy2_server_ports"], "hop_interval": "$hy2_hop_interval",
       "password": "$uuid",
+      "obfs": { "type": "salamander", "password": "$hy2_obfs_password" },
       "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "alpn": ["h3"] }
     },
     {
@@ -1683,7 +2009,7 @@ EOF
 
 # ==================== iOS SFI 1.11.4 客戶端配置 ====================
 show_client_conf_legacy(){
-    local host="$1" domain="$2" uuid="$3" port_vl="$4" port_vm="$5" port_hy="$6" port_tu="$7" pk="$8" sid="$9" reality_sni_client="${10}" vm_path="${11}"
+    local host="$1" domain="$2" uuid="$3" port_vl="$4" port_vm="$5" port_hy="$6" port_tu="$7" pk="$8" sid="$9" reality_sni_client="${10}" vm_path="${11}" hy2_server_ports="${12}" hy2_hop_interval="${13}" hy2_obfs_password="${14}"
     
     green "══════════════════════════════════════════════════════════════"
     green "  Sing-box iOS SFI 1.11.4 客戶端配置 (tun 全局模式)"
@@ -1744,7 +2070,9 @@ show_client_conf_legacy(){
     },
     {
       "type": "hysteria2", "tag": "hy2-sb", "server": "$host", "server_port": $port_hy,
+      "server_ports": ["$hy2_server_ports"], "hop_interval": "$hy2_hop_interval",
       "password": "$uuid",
+      "obfs": { "type": "salamander", "password": "$hy2_obfs_password" },
       "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "alpn": ["h3"] }
     },
     {
@@ -1800,12 +2128,14 @@ unins(){
         local VLESS_PORT=$(grep '^VLESS_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
         local VMESS_PORT=$(grep '^VMESS_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
         local HY2_PORT=$(grep '^HY2_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
+        local HY2_HOP_RANGE=$(grep '^HY2_HOP_RANGE=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
         local TUIC_PORT=$(grep '^TUIC_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
         
         # 刪除本腳本添加的端口規則
         [[ -n "$VLESS_PORT" ]] && ufw delete allow "$VLESS_PORT"/tcp >/dev/null 2>&1
         [[ -n "$VMESS_PORT" ]] && ufw delete allow "$VMESS_PORT"/tcp >/dev/null 2>&1
         [[ -n "$HY2_PORT" ]] && ufw delete allow "$HY2_PORT"/udp >/dev/null 2>&1
+        [[ -n "$HY2_HOP_RANGE" ]] && ufw delete allow "$HY2_HOP_RANGE"/udp >/dev/null 2>&1
         [[ -n "$TUIC_PORT" ]] && ufw delete allow "$TUIC_PORT"/udp >/dev/null 2>&1
         
         # 80/443 可能被其他服務使用，詢問是否刪除
@@ -1822,6 +2152,8 @@ unins(){
         yellow "未找到防火牆端口記錄，可能需要手動清理 UFW 規則。"
         yellow "使用 'ufw status numbered' 查看並 'ufw delete <number>' 刪除。"
     fi
+
+    cleanup_hy2_port_hopping
     
     rm -rf /etc/s-box /usr/bin/sb /etc/systemd/system/sing-box.service /root/geoip.db /root/geosite.db
     systemctl daemon-reload 2>/dev/null
