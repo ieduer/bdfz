@@ -330,6 +330,35 @@ apply_acme(){
         return 1
     }
 
+    acme_renew_and_reinstall(){
+        local d="$1"
+        local renew_out rc
+        renew_out=$(mktemp /tmp/sb_acme_renew.XXXXXX)
+
+        /root/.acme.sh/acme.sh --register-account -m "admin@$d" --server letsencrypt >/dev/null 2>&1 || true
+
+        /root/.acme.sh/acme.sh --renew -d "$d" --ecc --server letsencrypt >"$renew_out" 2>&1
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+            /root/.acme.sh/acme.sh --renew -d "$d" --server letsencrypt >>"$renew_out" 2>&1
+            rc=$?
+        fi
+        if [[ $rc -ne 0 ]]; then
+            yellow "acme.sh 自动续期输出（最后 20 行）:"
+            tail -n 20 "$renew_out" 2>/dev/null || true
+            rm -f "$renew_out"
+            return 1
+        fi
+
+        if ! acme_install_existing "$d"; then
+            rm -f "$renew_out"
+            return 1
+        fi
+
+        rm -f "$renew_out"
+        return 0
+    }
+
     # 1) 若证书已存在（acme.sh 已签发过），直接安装即可；不需要占用/释放 80。
     if acme_install_existing "$domain_name"; then
         green "检测到 acme.sh 已存在证书，已直接安装到 /etc/s-box（无需重新签发）。"
@@ -444,6 +473,22 @@ apply_acme(){
     
     # 收紧私钥权限
     chmod 600 /etc/s-box/private.key
+
+    # 如果安装的是历史证书但已经过期/异常，自动续期后再继续（无需再次询问域名）
+    collect_cert_expiry_info
+    if [[ "$CERT_IS_EXPIRED" != "否" ]]; then
+        yellow "检测到证书状态异常（${CERT_IS_EXPIRED}，到期: ${CERT_EXPIRY_DATE:-未知}），自动续期中..."
+        if ! acme_renew_and_reinstall "$domain_name"; then
+            red "证书自动续期失败，请检查 ACME 解析与 80 端口可达性。"
+            exit 1
+        fi
+        collect_cert_expiry_info
+        if [[ "$CERT_IS_EXPIRED" != "否" ]]; then
+            red "续期后证书状态仍异常（${CERT_IS_EXPIRED}），请手动排查。"
+            exit 1
+        fi
+        green "证书自动续期成功，已安装新证书。"
+    fi
     
     # 輸出證書類型與校驗域名
     local cert_type="Unknown"
