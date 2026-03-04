@@ -827,13 +827,41 @@ cert_center_menu(){
 }
 
 ensure_domain_and_cert(){
+    local renew_jobs_done=0
     if [[ -f /etc/s-box/cert.crt && -s /etc/s-box/cert.crt && -f /etc/s-box/private.key && -s /etc/s-box/private.key && -f /etc/s-box/domain.log && -s /etc/s-box/domain.log ]]; then
         domain_name=$(head -n1 /etc/s-box/domain.log | tr -d '\r\n ')
-        green "检测到已存在证书与域名：${yellow}${domain_name}${plain}，跳过 ACME 申请。"
+        if [[ -z "$domain_name" ]]; then
+            yellow "检测到旧证书但域名记录为空，将重新走证书申请流程。"
+            apply_acme
+            install_cert_renew_jobs
+            renew_jobs_done=1
+            return 0
+        fi
+
+        collect_cert_expiry_info
+        if [[ "$CERT_IS_EXPIRED" != "否" ]]; then
+            if [[ "$CERT_IS_EXPIRED" == "是" ]]; then
+                yellow "检测到历史证书已过期（到期: ${CERT_EXPIRY_DATE:-未知}），开始自动续期..."
+            else
+                yellow "检测到历史证书状态异常（${CERT_IS_EXPIRED}），尝试自动续期修复..."
+            fi
+            install_cert_renew_jobs
+            renew_jobs_done=1
+            if "$SB_CERT_RENEW_SCRIPT" manual; then
+                green "旧证书自动续期成功（无需重新输入域名）。"
+            else
+                red "旧证书自动续期失败，请使用菜单 [9] 进行手动续期排查。"
+                exit 1
+            fi
+        else
+            green "检测到已存在有效证书与域名：${yellow}${domain_name}${plain}，跳过 ACME 申请。"
+        fi
     else
         apply_acme
     fi
-    install_cert_renew_jobs
+    if [[ "$renew_jobs_done" != "1" ]]; then
+        install_cert_renew_jobs
+    fi
 }
 
 # 3. 配置防火墙 (安全模式：只添加必要端口)
@@ -1191,8 +1219,41 @@ view_log(){
     fi
 }
 
+migrate_server_config_if_needed(){
+    local cfg="/etc/s-box/sb.json"
+    [[ -f "$cfg" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    # 官方迁移：outbound.domain_strategy -> route.default_domain_resolver
+    if ! jq -e '.outbounds[]? | select(.type=="direct") | has("domain_strategy")' "$cfg" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    green "检测到旧版配置，正在迁移 domain_strategy 到 default_domain_resolver..."
+    local strategy tmp
+    strategy=$(jq -r '[.outbounds[]? | select(.type=="direct") | .domain_strategy // empty][0]' "$cfg" 2>/dev/null)
+    [[ -z "$strategy" ]] && strategy="prefer_ipv4"
+    tmp="$(mktemp /tmp/sb_migrate.XXXXXX)"
+
+    if ! jq --arg strategy "$strategy" '
+        .dns = (.dns // {})
+        | .dns.servers = ((.dns.servers // []) + [{"type":"local","tag":"local"}] | unique_by(.tag))
+        | .outbounds = ((.outbounds // []) | map(if .type=="direct" then del(.domain_strategy) else . end))
+        | .route = (.route // {})
+        | .route.default_domain_resolver = {"server":"local","strategy":$strategy}
+    ' "$cfg" > "$tmp"; then
+        rm -f "$tmp"
+        red "自动迁移旧配置失败，请手动检查 $cfg。"
+        return 1
+    fi
+
+    mv "$tmp" "$cfg"
+    green "旧版配置迁移完成。"
+}
+
 restart_singbox(){
     green "正在重启 sing-box 服务..."
+    migrate_server_config_if_needed || true
     systemctl restart sing-box 2>/dev/null || {
         red "重启失败，请检查 sing-box 是否已安装。"
         return
@@ -1209,6 +1270,11 @@ update_core(){
     green "正在更新 Sing-box 内核..."
     systemctl stop sing-box 2>/dev/null || true
     inssb
+    migrate_server_config_if_needed || true
+    if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json; then
+        red "内核已更新，但配置校验失败。请先修复 /etc/s-box/sb.json 后再重启服务。"
+        return
+    fi
     systemctl restart sing-box 2>/dev/null || {
         yellow "内核已更新，但 sing-box 重启失败，请手动检查 systemctl status sing-box。"
         return
@@ -1455,9 +1521,9 @@ show_client_conf_latest(){
   },
   "dns": {
     "servers": [
-      { "tag": "proxydns", "address": "tls://8.8.8.8", "detour": "select" },
-      { "tag": "localdns", "address": "https://223.5.5.5/dns-query", "detour": "direct" },
-      { "tag": "dns_fakeip", "address": "fakeip" }
+      { "type": "tls", "tag": "proxydns", "server": "8.8.8.8", "server_port": 853, "detour": "select" },
+      { "type": "https", "tag": "localdns", "server": "223.5.5.5", "path": "/dns-query", "detour": "direct" },
+      { "type": "fakeip", "tag": "dns_fakeip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" }
     ],
     "rules": [
       { "clash_mode": "Global", "server": "proxydns" },
@@ -1466,7 +1532,6 @@ show_client_conf_latest(){
       { "rule_set": "geosite-geolocation-!cn", "server": "proxydns" },
       { "rule_set": "geosite-geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" }
     ],
-    "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" },
     "independent_cache": false,
     "final": "proxydns"
   },
@@ -1512,6 +1577,7 @@ show_client_conf_latest(){
     }
   ],
   "route": {
+    "default_domain_resolver": { "server": "proxydns" },
     "rule_set": [
       { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs", "download_detour": "select", "update_interval": "1d" },
       { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs", "download_detour": "select", "update_interval": "1d" },
