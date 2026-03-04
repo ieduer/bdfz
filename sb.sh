@@ -9,6 +9,11 @@ plain='\033[0m'
 
 # 更新链接定义
 UPDATE_URL="https://raw.githubusercontent.com/ieduer/bdfz/main/sb.sh"
+SB_ENV_FILE="/etc/s-box/sb.env"
+SB_CERT_RENEW_SCRIPT="/etc/s-box/cert_renew.sh"
+SB_CERT_RENEW_STATUS="/etc/s-box/cert_renew.status"
+SB_CERT_RENEW_LOG="/etc/s-box/cert_renew.log"
+SB_CERT_RENEW_CRON_MARK="# sb-cert-renew"
 
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
@@ -16,6 +21,38 @@ yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
 blue(){ echo -e "\033[36m\033[01m$1\033[0m";}
 white(){ echo -e "\033[37m\033[01m$1\033[0m";}
 readp(){ read -p "$(yellow "$1")" $2;}
+
+ensure_sbox_dir(){
+    mkdir -p /etc/s-box
+}
+
+read_kv_from_file(){
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 1
+    grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2-
+}
+
+upsert_kv_file(){
+    local file="$1" key="$2" value="$3"
+    local escaped_value
+    escaped_value=$(printf '%s' "$value" | sed 's/[&|\\]/\\&/g')
+    touch "$file"
+    chmod 600 "$file" 2>/dev/null || true
+    if grep -qE "^${key}=" "$file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${escaped_value}|" "$file"
+    else
+        echo "${key}=${value}" >> "$file"
+    fi
+}
+
+load_runtime_env(){
+    SB_TELEGRAM_ENABLED="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" 2>/dev/null || true)"
+    SB_TELEGRAM_BOT_TOKEN="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_BOT_TOKEN" 2>/dev/null || true)"
+    SB_TELEGRAM_CHAT_ID="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_CHAT_ID" 2>/dev/null || true)"
+    SB_TELEGRAM_THREAD_ID="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_THREAD_ID" 2>/dev/null || true)"
+    [[ -z "$SB_TELEGRAM_ENABLED" ]] && SB_TELEGRAM_ENABLED="0"
+    export SB_TELEGRAM_ENABLED SB_TELEGRAM_BOT_TOKEN SB_TELEGRAM_CHAT_ID SB_TELEGRAM_THREAD_ID
+}
 
 # 内部调用 sb 时重新执行当前脚本
 sb(){
@@ -62,6 +99,8 @@ case $(uname -m) in
     x86_64) cpu=amd64;;
     *) red "目前脚本不支持$(uname -m)架构" && exit;;
 esac
+
+load_runtime_env
 
 hostname=$(hostname)
 # VLESS-Reality 伪装域名，可通过环境变量 REALITY_SNI 覆盖
@@ -429,12 +468,362 @@ apply_acme(){
     green "證書類型: ${yellow}${cert_type}${plain}"
     [[ -n "$cert_expiry" ]] && green "證書到期: ${yellow}${cert_expiry}${plain}"
 
-    # 确保已安装自动续期计划任务
+    # 记录域名
+    echo "$domain_name" > /etc/s-box/domain.log
+}
+
+create_cert_renew_script(){
+    ensure_sbox_dir
+    cat > "$SB_CERT_RENEW_SCRIPT" <<'EOF'
+#!/bin/bash
+set -u
+
+ENV_FILE="/etc/s-box/sb.env"
+DOMAIN_FILE="/etc/s-box/domain.log"
+STATUS_FILE="/etc/s-box/cert_renew.status"
+LOG_FILE="/etc/s-box/cert_renew.log"
+ACME_BIN="/root/.acme.sh/acme.sh"
+
+mode="${1:-auto}"
+now_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+read_env_value(){
+    local key="$1"
+    [[ -f "$ENV_FILE" ]] || return 0
+    grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2-
+}
+
+record_status(){
+    local result="$1" detail="$2"
+    {
+        echo "LAST_RUN_AT=$now_utc"
+        echo "LAST_MODE=$mode"
+        echo "LAST_RESULT=$result"
+        echo "LAST_DETAIL=$detail"
+    } > "$STATUS_FILE"
+    chmod 600 "$STATUS_FILE" 2>/dev/null || true
+    echo "$now_utc|$mode|$result|$detail" >> "$LOG_FILE"
+}
+
+send_telegram_fail(){
+    local msg="$1"
+    [[ "${SB_TELEGRAM_ENABLED:-0}" == "1" ]] || return 0
+    [[ -n "${SB_TELEGRAM_BOT_TOKEN:-}" && -n "${SB_TELEGRAM_CHAT_ID:-}" ]] || return 0
+
+    local api="https://api.telegram.org/bot${SB_TELEGRAM_BOT_TOKEN}/sendMessage"
+    local text="[sb] 证书续期失败\n主机: $(hostname)\n域名: ${domain}\n模式: ${mode}\n时间(UTC): ${now_utc}\n原因: ${msg}"
+
+    if [[ -n "${SB_TELEGRAM_THREAD_ID:-}" ]]; then
+        curl -fsS -X POST "$api" \
+            --data-urlencode "chat_id=${SB_TELEGRAM_CHAT_ID}" \
+            --data-urlencode "message_thread_id=${SB_TELEGRAM_THREAD_ID}" \
+            --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+    else
+        curl -fsS -X POST "$api" \
+            --data-urlencode "chat_id=${SB_TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+    fi
+}
+
+SB_TELEGRAM_ENABLED="$(read_env_value SB_TELEGRAM_ENABLED)"
+SB_TELEGRAM_BOT_TOKEN="$(read_env_value SB_TELEGRAM_BOT_TOKEN)"
+SB_TELEGRAM_CHAT_ID="$(read_env_value SB_TELEGRAM_CHAT_ID)"
+SB_TELEGRAM_THREAD_ID="$(read_env_value SB_TELEGRAM_THREAD_ID)"
+[[ -z "$SB_TELEGRAM_ENABLED" ]] && SB_TELEGRAM_ENABLED="0"
+
+if [[ ! -x "$ACME_BIN" ]]; then
+    domain=""
+    record_status "failed" "acme_bin_missing"
+    send_telegram_fail "acme_bin_missing"
+    exit 1
+fi
+
+domain="$(head -n1 "$DOMAIN_FILE" 2>/dev/null | tr -d '\r\n ')"
+if [[ -z "$domain" ]]; then
+    record_status "failed" "domain_missing"
+    send_telegram_fail "domain_missing"
+    exit 1
+fi
+
+renew_out="$(mktemp /tmp/sb_renew.XXXXXX)"
+install_out="$(mktemp /tmp/sb_install.XXXXXX)"
+
+"$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+"$ACME_BIN" --renew -d "$domain" --ecc --server letsencrypt >"$renew_out" 2>&1
+renew_rc=$?
+
+if [[ $renew_rc -ne 0 ]]; then
+    if ! grep -qiE "not due|skip|domains not changed|is not due for renewal" "$renew_out"; then
+        record_status "failed" "renew_failed_rc${renew_rc}"
+        send_telegram_fail "renew_failed_rc${renew_rc}"
+        rm -f "$renew_out" "$install_out"
+        exit 1
+    fi
+fi
+
+if ! "$ACME_BIN" --installcert -d "$domain" \
+    --fullchainpath /etc/s-box/cert.crt \
+    --keypath /etc/s-box/private.key \
+    --ecc >"$install_out" 2>&1; then
+    if ! "$ACME_BIN" --installcert -d "$domain" \
+        --fullchainpath /etc/s-box/cert.crt \
+        --keypath /etc/s-box/private.key >"$install_out" 2>&1; then
+        record_status "failed" "installcert_failed"
+        send_telegram_fail "installcert_failed"
+        rm -f "$renew_out" "$install_out"
+        exit 1
+    fi
+fi
+
+chmod 600 /etc/s-box/private.key 2>/dev/null || true
+
+if [[ -f /etc/systemd/system/sing-box.service ]]; then
+    systemctl restart sing-box >/dev/null 2>&1 || true
+fi
+if pgrep -x nginx >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 || service nginx reload >/dev/null 2>&1 || true
+fi
+
+expiry="$(openssl x509 -in /etc/s-box/cert.crt -noout -enddate 2>/dev/null | cut -d= -f2)"
+if [[ -n "$expiry" ]]; then
+    record_status "success" "ok_expiry:${expiry// /_}"
+else
+    record_status "success" "ok"
+fi
+
+rm -f "$renew_out" "$install_out"
+exit 0
+EOF
+    chmod +x "$SB_CERT_RENEW_SCRIPT"
+}
+
+install_cert_renew_jobs(){
+    ensure_sbox_dir
+    create_cert_renew_script
+
+    # 保留 acme.sh 自带续期计划，兼容老版本行为
     /root/.acme.sh/acme.sh --install-cronjob >/dev/null 2>&1 || true
     green "已为 acme.sh 安装/更新自动续期任务 (cron)。"
 
-    # 记录域名
-    echo "$domain_name" > /etc/s-box/domain.log
+    if [[ ! -f /etc/crontab ]]; then
+        yellow "未找到 /etc/crontab，跳过 sb 证书续期任务写入。"
+        return
+    fi
+
+    if grep -Fq "$SB_CERT_RENEW_CRON_MARK" /etc/crontab 2>/dev/null; then
+        sed -i "\|${SB_CERT_RENEW_CRON_MARK}|d" /etc/crontab
+    fi
+    echo "17 3 * * * root ${SB_CERT_RENEW_SCRIPT} auto >/dev/null 2>&1 ${SB_CERT_RENEW_CRON_MARK}" >> /etc/crontab
+    green "已安装 sb 证书续期任务：每日 03:17 (UTC) 自动检查。"
+}
+
+configure_telegram_notify(){
+    ensure_sbox_dir
+    load_runtime_env
+
+    echo
+    yellow "Telegram 通知用于：证书自动续期失败时提醒。"
+    readp "启用 Telegram 失败通知？[y/N]: " tele_enable_choice
+    if [[ ! "${tele_enable_choice:-n}" =~ ^[Yy]$ ]]; then
+        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" "0"
+        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_BOT_TOKEN" ""
+        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_CHAT_ID" ""
+        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_THREAD_ID" ""
+        load_runtime_env
+        green "已关闭 Telegram 失败通知。"
+        return 0
+    fi
+
+    local token_input chat_input thread_input
+    readp "Bot Token [留空沿用当前值]: " token_input
+    token_input=$(echo "$token_input" | tr -d '[:space:]')
+    [[ -z "$token_input" ]] && token_input="$SB_TELEGRAM_BOT_TOKEN"
+    if [[ -z "$token_input" ]]; then
+        red "Bot Token 不能为空。"
+        return 1
+    fi
+
+    readp "Chat ID [留空沿用当前值]: " chat_input
+    chat_input=$(echo "$chat_input" | tr -d '[:space:]')
+    [[ -z "$chat_input" ]] && chat_input="$SB_TELEGRAM_CHAT_ID"
+    if [[ -z "$chat_input" ]]; then
+        red "Chat ID 不能为空。"
+        return 1
+    fi
+
+    readp "Thread ID (可选，输入 none 清空，留空沿用): " thread_input
+    thread_input=$(echo "$thread_input" | tr -d '[:space:]')
+    if [[ "$thread_input" == "none" || "$thread_input" == "NONE" ]]; then
+        thread_input=""
+    elif [[ -z "$thread_input" ]]; then
+        thread_input="$SB_TELEGRAM_THREAD_ID"
+    fi
+
+    upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" "1"
+    upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_BOT_TOKEN" "$token_input"
+    upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_CHAT_ID" "$chat_input"
+    upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_THREAD_ID" "$thread_input"
+    load_runtime_env
+    green "Telegram 参数已写入 ${SB_ENV_FILE}。"
+    green "后续证书自动续期失败将发送通知。"
+}
+
+maybe_prompt_telegram_on_install(){
+    local tele_enabled_saved
+    tele_enabled_saved="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" 2>/dev/null || true)"
+    if [[ -n "$tele_enabled_saved" ]]; then
+        load_runtime_env
+        return 0
+    fi
+
+    echo
+    yellow "可选设置：证书自动续期失败时发送 Telegram 通知。"
+    readp "现在配置 Telegram 参数？[y/N]: " tele_init_choice
+    if [[ "${tele_init_choice:-n}" =~ ^[Yy]$ ]]; then
+        configure_telegram_notify
+    else
+        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" "0"
+        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_BOT_TOKEN" ""
+        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_CHAT_ID" ""
+        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_THREAD_ID" ""
+        load_runtime_env
+        green "已跳过 Telegram 配置，可在证书菜单中随时修改。"
+    fi
+}
+
+collect_cert_expiry_info(){
+    CERT_EXPIRY_DATE=""
+    CERT_IS_EXPIRED="未知"
+    CERT_DAYS_LEFT="N/A"
+
+    if [[ ! -s /etc/s-box/cert.crt ]]; then
+        CERT_IS_EXPIRED="未检测到证书"
+        return
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        CERT_IS_EXPIRED="无法判断 (缺少 openssl)"
+        return
+    fi
+
+    CERT_EXPIRY_DATE=$(openssl x509 -in /etc/s-box/cert.crt -noout -enddate 2>/dev/null | cut -d= -f2)
+    if [[ -z "$CERT_EXPIRY_DATE" ]]; then
+        CERT_IS_EXPIRED="无法读取"
+        return
+    fi
+
+    local expire_epoch now_epoch diff overdue
+    expire_epoch=$(date -d "$CERT_EXPIRY_DATE" +%s 2>/dev/null || echo "")
+    now_epoch=$(date +%s)
+    if [[ -z "$expire_epoch" ]]; then
+        CERT_IS_EXPIRED="无法解析日期"
+        return
+    fi
+
+    diff=$((expire_epoch - now_epoch))
+    if (( diff < 0 )); then
+        overdue=$(( (-diff + 86399) / 86400 ))
+        CERT_IS_EXPIRED="是"
+        CERT_DAYS_LEFT="-$overdue"
+    else
+        CERT_IS_EXPIRED="否"
+        CERT_DAYS_LEFT="$((diff / 86400))"
+    fi
+}
+
+show_cert_validity_summary(){
+    local domain=""
+    if [[ -s /etc/s-box/domain.log ]]; then
+        domain=$(head -n1 /etc/s-box/domain.log | tr -d '\r\n ')
+    fi
+    [[ -z "$domain" ]] && domain="(未记录)"
+
+    collect_cert_expiry_info
+    load_runtime_env
+
+    local last_run last_mode last_result last_detail
+    last_run="$(read_kv_from_file "$SB_CERT_RENEW_STATUS" "LAST_RUN_AT" 2>/dev/null || true)"
+    last_mode="$(read_kv_from_file "$SB_CERT_RENEW_STATUS" "LAST_MODE" 2>/dev/null || true)"
+    last_result="$(read_kv_from_file "$SB_CERT_RENEW_STATUS" "LAST_RESULT" 2>/dev/null || true)"
+    last_detail="$(read_kv_from_file "$SB_CERT_RENEW_STATUS" "LAST_DETAIL" 2>/dev/null || true)"
+    [[ -z "$last_run" ]] && last_run="(暂无记录)"
+    [[ -z "$last_mode" ]] && last_mode="N/A"
+    [[ -z "$last_result" ]] && last_result="N/A"
+    [[ -z "$last_detail" ]] && last_detail="N/A"
+
+    local cron_state="未安装"
+    if grep -Fq "$SB_CERT_RENEW_CRON_MARK" /etc/crontab 2>/dev/null; then
+        cron_state="已安装"
+    fi
+
+    local tele_state="关闭"
+    if [[ "${SB_TELEGRAM_ENABLED:-0}" == "1" ]]; then
+        if [[ -n "${SB_TELEGRAM_BOT_TOKEN:-}" && -n "${SB_TELEGRAM_CHAT_ID:-}" ]]; then
+            tele_state="已启用"
+        else
+            tele_state="已启用(参数不完整)"
+        fi
+    fi
+
+    green "════════════════ 证书状态 ════════════════"
+    echo -e "  域名: ${yellow}${domain}${plain}"
+    echo -e "  到期日期: ${yellow}${CERT_EXPIRY_DATE:-N/A}${plain}"
+    echo -e "  是否到期: ${yellow}${CERT_IS_EXPIRED}${plain}"
+    echo -e "  剩余天数: ${yellow}${CERT_DAYS_LEFT}${plain}"
+    echo -e "  自动续期任务: ${yellow}${cron_state}${plain}"
+    echo -e "  上次续期: ${yellow}${last_run}${plain}"
+    echo -e "  上次模式: ${yellow}${last_mode}${plain}"
+    echo -e "  上次结果: ${yellow}${last_result}${plain}"
+    echo -e "  结果详情: ${yellow}${last_detail}${plain}"
+    echo -e "  Telegram通知: ${yellow}${tele_state}${plain}"
+    green "══════════════════════════════════════════"
+
+    if [[ "$last_mode" == "auto" && "$last_result" == "failed" ]]; then
+        yellow "检测到最近一次自动续期失败，可使用 [1] 手动续期证书。"
+    fi
+}
+
+renew_cert_manually(){
+    if [[ ! -x "$SB_CERT_RENEW_SCRIPT" ]]; then
+        yellow "未检测到续期脚本，正在重新安装续期任务..."
+        install_cert_renew_jobs
+    fi
+
+    green "正在执行手动证书续期..."
+    if "$SB_CERT_RENEW_SCRIPT" manual; then
+        green "✅ 手动续期完成。"
+    else
+        red "❌ 手动续期失败。"
+    fi
+    show_cert_validity_summary
+}
+
+cert_center_menu(){
+    while true; do
+        echo
+        show_cert_validity_summary
+        echo
+        yellow "  [1] 立即手动续期"
+        yellow "  [2] 配置/更新 Telegram 失败通知"
+        yellow "  [3] 重装自动续期任务"
+        yellow "  [4] 查看续期日志 (最近20行)"
+        yellow "  [0] 返回主菜单"
+        echo
+        readp "   请选择 [0-4]: " cert_choice
+        case "$cert_choice" in
+            1) renew_cert_manually;;
+            2) configure_telegram_notify;;
+            3) install_cert_renew_jobs;;
+            4)
+                if [[ -f "$SB_CERT_RENEW_LOG" ]]; then
+                    tail -n 20 "$SB_CERT_RENEW_LOG"
+                else
+                    yellow "暂无续期日志。"
+                fi
+                ;;
+            0) return 0;;
+            *) yellow "无效选项，请重试。";;
+        esac
+    done
 }
 
 ensure_domain_and_cert(){
@@ -444,6 +833,7 @@ ensure_domain_and_cert(){
     else
         apply_acme
     fi
+    install_cert_renew_jobs
 }
 
 # 3. 配置防火墙 (安全模式：只添加必要端口)
@@ -642,6 +1032,11 @@ cat > /etc/s-box/sb.json <<EOF
     "level": "info",
     "timestamp": true
   },
+  "dns": {
+    "servers": [
+      { "type": "local", "tag": "local" }
+    ]
+  },
   "inbounds": [
     {
       "type": "vless",
@@ -709,8 +1104,14 @@ cat > /etc/s-box/sb.json <<EOF
     }
   ],
   "outbounds": [
-    { "type": "direct", "tag": "direct", "domain_strategy": "${ipv}" }
-  ]
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "default_domain_resolver": {
+      "server": "local",
+      "strategy": "${ipv}"
+    }
+  }
 }
 EOF
 }
@@ -865,6 +1266,7 @@ install_singbox(){
     inssb
     insport
     ensure_domain_and_cert  # 确认证书与域名 (如已有则复用)
+    maybe_prompt_telegram_on_install
     setup_firewall  # 自动配置 UFW 防火墙
     gen_config
     sbservice
@@ -1283,7 +1685,19 @@ unins(){
 }
 
 # 更新脚本
+prompt_telegram_update_before_upgrade(){
+    echo
+    yellow "可选：更新前可修改 Telegram 通知参数。"
+    readp "是否现在更新 Telegram 参数？[y/N] (回车默认跳过): " tele_update_choice
+    if [[ "${tele_update_choice:-n}" =~ ^[Yy]$ ]]; then
+        configure_telegram_notify || yellow "Telegram 参数更新未完成，保留原参数。"
+    else
+        green "已保留现有 Telegram 参数。"
+    fi
+}
+
 upsbyg(){
+    prompt_telegram_update_before_upgrade
     lnsb
     green "脚本已更新，请重新运行 sb" && exit
 }
@@ -1380,6 +1794,7 @@ show_menu(){
     echo -e "   ${Y}  [6]${R} 📜 查看運行日誌"
     echo -e "   ${Y}  [7]${R} 🔄 重啟 Sing-box 服務"
     echo -e "   ${Y}  [8]${R} 📥 更新此腳本"
+    echo -e "   ${Y}  [9]${R} 🔐 證書狀態與續期設置"
     echo
     echo -e "   ${W}◆ 退出${R}"
     echo -e "   ${R}  [0]${R} ❌ 退出腳本"
@@ -1391,7 +1806,7 @@ show_banner
 show_status
 show_menu
 
-readp "   請選擇操作 [0-8]: " Input
+readp "   請選擇操作 [0-9]: " Input
 echo
 
 case "$Input" in  
@@ -1403,6 +1818,7 @@ case "$Input" in
     6 ) view_log;;
     7 ) restart_singbox;;
     8 ) upsbyg;;
+    9 ) cert_center_menu;;
     0 ) green "再見！" && exit 0;;
     * ) yellow "無效選項，請重新運行腳本。" && exit 1
 esac
