@@ -333,9 +333,21 @@ apply_acme(){
     acme_renew_and_reinstall(){
         local d="$1"
         local renew_out rc
+        local port80_pid="" p_name="" stopped_nginx=0
         renew_out=$(mktemp /tmp/sb_acme_renew.XXXXXX)
 
         /root/.acme.sh/acme.sh --register-account -m "admin@$d" --server letsencrypt >/dev/null 2>&1 || true
+
+        port80_pid=$(ss -tulnp 2>/dev/null | grep -E '(:|])80[[:space:]]' | awk '{print $NF}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1)
+        if [[ -n "$port80_pid" ]]; then
+            p_name=$(ps -p "$port80_pid" -o comm= 2>/dev/null || true)
+            if [[ "$p_name" == "nginx" ]]; then
+                yellow "检测到 Nginx 占用 80 端口，自动临时停止后续期..."
+                systemctl stop nginx 2>/dev/null || service nginx stop 2>/dev/null || true
+                stopped_nginx=1
+                sleep 1
+            fi
+        fi
 
         /root/.acme.sh/acme.sh --renew -d "$d" --ecc --server letsencrypt >"$renew_out" 2>&1
         rc=$?
@@ -343,6 +355,11 @@ apply_acme(){
             /root/.acme.sh/acme.sh --renew -d "$d" --server letsencrypt >>"$renew_out" 2>&1
             rc=$?
         fi
+
+        if [[ $stopped_nginx -eq 1 ]]; then
+            systemctl start nginx 2>/dev/null || service nginx start 2>/dev/null || true
+        fi
+
         if [[ $rc -ne 0 ]]; then
             yellow "acme.sh 自动续期输出（最后 20 行）:"
             tail -n 20 "$renew_out" 2>/dev/null || true
@@ -592,10 +609,26 @@ fi
 
 renew_out="$(mktemp /tmp/sb_renew.XXXXXX)"
 install_out="$(mktemp /tmp/sb_install.XXXXXX)"
+stopped_nginx=0
 
 "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+port80_pid=$(ss -tulnp 2>/dev/null | grep -E '(:|])80[[:space:]]' | awk '{print $NF}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1)
+if [[ -n "$port80_pid" ]]; then
+    p_name=$(ps -p "$port80_pid" -o comm= 2>/dev/null || true)
+    if [[ "$p_name" == "nginx" ]]; then
+        systemctl stop nginx >/dev/null 2>&1 || service nginx stop >/dev/null 2>&1 || true
+        stopped_nginx=1
+        sleep 1
+    fi
+fi
+
 "$ACME_BIN" --renew -d "$domain" --ecc --server letsencrypt >"$renew_out" 2>&1
 renew_rc=$?
+
+if [[ $stopped_nginx -eq 1 ]]; then
+    systemctl start nginx >/dev/null 2>&1 || service nginx start >/dev/null 2>&1 || true
+fi
 
 if [[ $renew_rc -ne 0 ]]; then
     if ! grep -qiE "not due|skip|domains not changed|is not due for renewal" "$renew_out"; then
