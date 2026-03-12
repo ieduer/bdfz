@@ -29,6 +29,7 @@ SB_CERT_RENEW_LOG="/etc/s-box/cert_renew.log"
 SB_CERT_RENEW_CRON_MARK="# sb-cert-renew"
 SB_HY2_HOP_SCRIPT="/etc/s-box/hy2_port_hop.sh"
 SB_HY2_HOP_SERVICE="sb-hy2-hop.service"
+SB_TUN_PREPARE_SERVICE="sb-tun-prepare.service"
 SB_NGINX_BACKUP_DIR="/etc/s-box/nginx-backups"
 SB_NGINX_STREAM_CONF="/etc/nginx/stream.d/sb_sni_dispatch.conf"
 SB_NGINX_HTTP_CONF="/etc/nginx/conf.d/sb_vmess_proxy.conf"
@@ -37,6 +38,7 @@ SB_SUPPORTED_STABLE_FAMILY="${SB_SUPPORTED_STABLE_FAMILY:-1.13}"
 SB_LEGACY_CLIENT_VERSION="1.11.4"
 SB_LATEST_STABLE_VERSION=""
 SB_LATEST_STABLE_PUBLISHED_AT=""
+SB_LATEST_STABLE_PROBED="0"
 SB_ROLLBACK_ACTIVE="0"
 SB_ROLLBACK_SNAPSHOT_DIR=""
 SB_ROLLBACK_CONTEXT=""
@@ -127,6 +129,9 @@ load_runtime_env(){
 
 probe_latest_stable_release(){
     local api_json=""
+    if [[ "${SB_LATEST_STABLE_PROBED:-0}" == "1" && -n "${SB_LATEST_STABLE_VERSION:-}" ]]; then
+        return 0
+    fi
     SB_LATEST_STABLE_VERSION=""
     SB_LATEST_STABLE_PUBLISHED_AT=""
 
@@ -143,7 +148,11 @@ probe_latest_stable_release(){
         SB_LATEST_STABLE_VERSION=$(curl -fsSL 'https://github.com/SagerNet/sing-box/releases/latest' 2>/dev/null | grep -oE 'releases/tag/v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's#.*v##')
     fi
 
-    [[ -n "$SB_LATEST_STABLE_VERSION" ]]
+    if [[ -n "$SB_LATEST_STABLE_VERSION" ]]; then
+        SB_LATEST_STABLE_PROBED="1"
+        return 0
+    fi
+    return 1
 }
 
 build_dns_hijack_rule_json(){
@@ -311,6 +320,7 @@ create_rollout_snapshot(){
         /etc/s-box \
         /etc/systemd/system/sing-box.service \
         "/etc/systemd/system/${SB_HY2_HOP_SERVICE}" \
+        "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" \
         "$SB_HY2_HOP_SCRIPT" \
         "$SB_CERT_RENEW_SCRIPT" \
         "$SB_CERT_RENEW_STATUS" \
@@ -324,6 +334,7 @@ create_rollout_snapshot(){
     [[ -d /etc/ufw ]] && tar czf "${dir}/etc-ufw.tgz" -C / etc/ufw >/dev/null 2>&1 || true
     [[ -f /etc/systemd/system/sing-box.service ]] && cp -a /etc/systemd/system/sing-box.service "${dir}/sing-box.service" >/dev/null 2>&1 || true
     [[ -f "/etc/systemd/system/${SB_HY2_HOP_SERVICE}" ]] && cp -a "/etc/systemd/system/${SB_HY2_HOP_SERVICE}" "${dir}/${SB_HY2_HOP_SERVICE}" >/dev/null 2>&1 || true
+    [[ -f "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" ]] && cp -a "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" "${dir}/${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
     [[ -f /usr/bin/sb ]] && cp -a /usr/bin/sb "${dir}/sb.bin" >/dev/null 2>&1 || true
     [[ -f /etc/crontab ]] && cp -a /etc/crontab "${dir}/crontab" >/dev/null 2>&1 || true
     [[ -f /etc/sysctl.conf ]] && cp -a /etc/sysctl.conf "${dir}/sysctl.conf" >/dev/null 2>&1 || true
@@ -348,6 +359,7 @@ restore_rollout_snapshot(){
     [[ -f "${dir}/etc-ufw.tgz" ]] && tar xzf "${dir}/etc-ufw.tgz" -C / >/dev/null 2>&1 || true
     [[ -f "${dir}/sing-box.service" ]] && cp -a "${dir}/sing-box.service" /etc/systemd/system/sing-box.service >/dev/null 2>&1 || true
     [[ -f "${dir}/${SB_HY2_HOP_SERVICE}" ]] && cp -a "${dir}/${SB_HY2_HOP_SERVICE}" "/etc/systemd/system/${SB_HY2_HOP_SERVICE}" >/dev/null 2>&1 || true
+    [[ -f "${dir}/${SB_TUN_PREPARE_SERVICE}" ]] && cp -a "${dir}/${SB_TUN_PREPARE_SERVICE}" "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
     [[ -f "${dir}/sb.bin" ]] && cp -a "${dir}/sb.bin" /usr/bin/sb >/dev/null 2>&1 || true
     [[ -f "${dir}/crontab" ]] && cp -a "${dir}/crontab" /etc/crontab >/dev/null 2>&1 || true
     [[ -f "${dir}/sysctl.conf" ]] && cp -a "${dir}/sysctl.conf" /etc/sysctl.conf >/dev/null 2>&1 || true
@@ -355,7 +367,15 @@ restore_rollout_snapshot(){
     if [[ -f "${dir}/absent_paths.txt" ]]; then
         while IFS= read -r path; do
             [[ -n "$path" ]] || continue
-            rm -rf "$path" >/dev/null 2>&1 || true
+            if [[ "$path" == "/etc/s-box" ]]; then
+                cleanup_managed_sbox_files
+                continue
+            fi
+            if [[ -d "$path" ]]; then
+                rmdir "$path" >/dev/null 2>&1 || true
+            else
+                rm -f "$path" >/dev/null 2>&1 || true
+            fi
         done < "${dir}/absent_paths.txt"
     fi
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -415,13 +435,6 @@ assert_latest_stable_supported(){
         return 1
     fi
     return 0
-}
-
-sb(){
-    local self="${BASH_SOURCE[0]:-$0}"
-    [[ -f "$self" ]] || { red "無法定位當前腳本文件。"; return 1; }
-    bash "$self"
-    exit 0
 }
 
 [[ $EUID -ne 0 ]] && yellow "請以root模式運行脚本" && exit
@@ -509,17 +522,27 @@ install_depend(){
 }
 
 setup_tun(){
+    sed -i '\|^@reboot root bash /root/tun.sh >/dev/null 2>&1|d' /etc/crontab 2>/dev/null || true
+    rm -f /root/tun.sh
     if [[ ! -c /dev/net/tun ]]; then
-        cat > /root/tun.sh <<'EOF'
-#!/bin/bash
-if [ ! -e /dev/net/tun ]; then
-    mkdir -p /dev/net
-    mknod /dev/net/tun c 10 200
-    chmod 0666 /dev/net/tun
-fi
+        cat > "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" <<EOF
+[Unit]
+Description=Prepare /dev/net/tun for sing-box
+DefaultDependencies=no
+After=local-fs.target
+Before=sing-box.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'if [ ! -c /dev/net/tun ]; then mkdir -p /dev/net; mknod /dev/net/tun c 10 200; fi; chmod 0600 /dev/net/tun'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
 EOF
-        chmod +x /root/tun.sh
-        grep -qE "^ *@reboot root bash /root/tun.sh >/dev/null 2>&1" /etc/crontab || echo "@reboot root bash /root/tun.sh >/dev/null 2>&1" >> /etc/crontab
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable "${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
+        systemctl start "${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
     fi
 }
 
@@ -664,6 +687,25 @@ pick_unused_high_port(){
         fi
         attempts=$((attempts + 1))
     done
+    return 1
+}
+
+tcp_port_listening(){
+    local port="$1"
+    ss -Htan "( sport = :${port} )" 2>/dev/null | grep -q .
+}
+
+udp_port_listening(){
+    local port="$1"
+    ss -Huan "( sport = :${port} )" 2>/dev/null | grep -q .
+}
+
+find_tcp_listener_pid(){
+    local port="$1" line pid
+    while IFS= read -r line; do
+        pid=$(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+        [[ -n "$pid" ]] && { printf '%s\n' "$pid"; return 0; }
+    done < <(ss -Hltnp "( sport = :${port} )" 2>/dev/null || true)
     return 1
 }
 
@@ -845,7 +887,7 @@ for line in lines:
     if stripped.startswith('#'):
         out.append(line)
         continue
-    m4 = re.match(r'^(\s*)listen\s+(?:0\.0\.0\.0:)?443(\s+[^;]*?)?;\s*$', line)
+    m4 = re.match(r'^(\s*)listen\s+(?:(?:0\.0\.0\.0|\*):)?443(\s+[^;]*?)?;\s*$', line)
     m6 = re.match(r'^(\s*)listen\s+\[::\]:443(\s+[^;]*?)?;\s*$', line)
     if m4:
         suffix = m4.group(2) or ''
@@ -1250,7 +1292,7 @@ apply_acme(){
         local d="$1" renew_out rc port80_pid="" p_name="" stopped_nginx=0
         renew_out=$(mktemp /tmp/sb_acme_renew.XXXXXX)
         /root/.acme.sh/acme.sh --register-account -m "admin@$d" --server letsencrypt >/dev/null 2>&1 || true
-        port80_pid=$(ss -tulnp 2>/dev/null | grep -E '(:|])80[[:space:]]' | awk '{print $NF}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1)
+        port80_pid=$(find_tcp_listener_pid 80 2>/dev/null || true)
         if [[ -n "$port80_pid" ]]; then
             p_name=$(ps -p "$port80_pid" -o comm= 2>/dev/null || true)
             if [[ "$p_name" == "nginx" ]]; then
@@ -1278,7 +1320,7 @@ apply_acme(){
         green "檢測到 acme.sh 已存在證書，已直接安裝到 /etc/s-box。"
     else
         local acme_mode="standalone" nginx_webroot=""
-        local port80_pid=$(ss -tulnp 2>/dev/null | grep -E '(:|])80[[:space:]]' | awk '{print $NF}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1)
+        local port80_pid=$(find_tcp_listener_pid 80 2>/dev/null || true)
         if [[ -n "$port80_pid" ]]; then
             local p_name=$(ps -p "$port80_pid" -o comm= 2>/dev/null)
             yellow "檢測到 80 端口已被進程 [${p_name:-未知}] (PID: $port80_pid) 佔用。"
@@ -1402,7 +1444,11 @@ if [[ ! -x "$ACME_BIN" ]]; then domain=""; record_status "failed" "acme_bin_miss
 domain="$(head -n1 "$DOMAIN_FILE" 2>/dev/null | tr -d '\r\n ')"; if [[ -z "$domain" ]]; then record_status "failed" "domain_missing"; send_telegram_fail "domain_missing"; exit 1; fi
 renew_out="$(mktemp /tmp/sb_renew.XXXXXX)"; install_out="$(mktemp /tmp/sb_install.XXXXXX)"; stopped_nginx=0
 "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-port80_pid=$(ss -tulnp 2>/dev/null | grep -E '(:|])80[[:space:]]' | awk '{print $NF}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1)
+port80_pid=""
+while IFS= read -r line; do
+    port80_pid=$(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+    [[ -n "$port80_pid" ]] && break
+done < <(ss -Hltnp "( sport = :80 )" 2>/dev/null || true)
 if [[ -n "$port80_pid" ]]; then p_name=$(ps -p "$port80_pid" -o comm= 2>/dev/null || true); if [[ "$p_name" == "nginx" ]]; then systemctl stop nginx >/dev/null 2>&1 || service nginx stop >/dev/null 2>&1 || true; stopped_nginx=1; sleep 1; fi; fi
 "$ACME_BIN" --renew -d "$domain" --ecc --server letsencrypt >"$renew_out" 2>&1; renew_rc=$?
 if [[ $stopped_nginx -eq 1 ]]; then systemctl start nginx >/dev/null 2>&1 || service nginx start >/dev/null 2>&1 || true; fi
@@ -1472,14 +1518,15 @@ setup_nginx_sni(){
     resolve_reality_sni
     load_runtime_env
     rm -f "$SB_NGINX_MANIFEST"
+    local tmp_stream_conf="" tmp_http_conf="" candidate_file=""
 
     if ! command -v nginx >/dev/null 2>&1; then
         green "安裝 Nginx..."
-        apt install -y nginx libnginx-mod-stream
+        apt install -y nginx libnginx-mod-stream || { red "安裝 Nginx 失敗。"; exit 1; }
     fi
     if ! nginx -V 2>&1 | grep -q "stream"; then
         yellow "安裝 Nginx stream 模塊..."
-        apt install -y libnginx-mod-stream
+        apt install -y libnginx-mod-stream || { red "安裝 Nginx stream 模塊失敗。"; exit 1; }
     fi
 
     mkdir -p /etc/nginx/stream.d
@@ -1497,12 +1544,14 @@ setup_nginx_sni(){
             [[ -f "$conf_file" ]] || continue
             [[ "$conf_file" == "$SB_NGINX_HTTP_CONF" ]] && continue
             [[ "$conf_file" == "$SB_NGINX_STREAM_CONF" ]] && continue
-            if grep -qE '^\s*listen\s+((0\.0\.0\.0:)?443|\[::\]:443)(\s+[^;]*)?;' "$conf_file" 2>/dev/null; then
+            if grep -qE '^\s*listen\s+((0\.0\.0\.0:|\*:)?443|\[::\]:443)(\s+[^;]*)?;' "$conf_file" 2>/dev/null; then
                 yellow "  遷移 $conf_file 的公網 TCP 443 到 127.0.0.1:${int_port_https_backend}"
-                backup_file_once "$conf_file" || { red "備份 $conf_file 失敗"; exit 1; }
-                rewrite_nginx_tcp_443_file "$conf_file" "$int_port_https_backend"
+                candidate_file=$(mktemp /tmp/sb_nginx_conf.XXXXXX) || { red "建立 $conf_file 候選文件失敗"; exit 1; }
+                cp -a "$conf_file" "$candidate_file" || { rm -f "$candidate_file"; red "複製 $conf_file 候選文件失敗"; exit 1; }
+                rewrite_nginx_tcp_443_file "$candidate_file" "$int_port_https_backend"
                 rewrite_rc=$?
                 if [[ "$rewrite_rc" -ne 0 ]]; then
+                    rm -f "$candidate_file"
                     if [[ "$rewrite_rc" -eq 3 ]]; then
                         yellow "  $conf_file 未檢測到需要遷移的 TCP 443 行，保持原樣。"
                     else
@@ -1511,13 +1560,17 @@ setup_nginx_sni(){
                         rm -f "$SB_NGINX_STREAM_CONF" "$SB_NGINX_HTTP_CONF"
                         exit 1
                     fi
+                else
+                    backup_file_once "$conf_file" || { rm -f "$candidate_file"; red "備份 $conf_file 失敗"; exit 1; }
+                    mv "$candidate_file" "$conf_file" || { rm -f "$candidate_file"; red "覆蓋 $conf_file 失敗"; exit 1; }
                 fi
             fi
         done
     done
 
     green "生成 Nginx stream SNI 分流配置..."
-    cat > "$SB_NGINX_STREAM_CONF" <<STREAMEOF
+    tmp_stream_conf=$(mktemp /tmp/sb_stream.XXXXXX) || { red "建立 Nginx stream 候選配置失敗"; exit 1; }
+    cat > "$tmp_stream_conf" <<STREAMEOF
 # ========== Sing-box SNI 分流 — 由 sb2.sh 自動生成 ==========
 # 請勿手動編輯，更新腳本時會覆蓋
 
@@ -1550,8 +1603,14 @@ STREAMEOF
     local vm_ws_path
     vm_ws_path="${SB_VM_WS_PATH:-}"
     [[ -z "$vm_ws_path" ]] && vm_ws_path=$(jq -r '.inbounds[]? | select(.type=="vmess") | .transport.path // empty' /etc/s-box/sb.json 2>/dev/null)
-    [[ -z "$vm_ws_path" ]] && { red "未找到 VMess-WS 路徑，停止生成 Nginx 反代配置以避免路徑漂移。"; restore_recorded_backups; exit 1; }
-    cat > "$SB_NGINX_HTTP_CONF" <<HTTPEOF
+    if [[ -z "$vm_ws_path" ]]; then
+        red "未找到 VMess-WS 路徑，停止生成 Nginx 反代配置以避免路徑漂移。"
+        restore_recorded_backups
+        rm -f "$tmp_stream_conf"
+        exit 1
+    fi
+    tmp_http_conf=$(mktemp /tmp/sb_http.XXXXXX) || { red "建立 Nginx HTTP 候選配置失敗"; restore_recorded_backups; rm -f "$tmp_stream_conf"; exit 1; }
+    cat > "$tmp_http_conf" <<HTTPEOF
 # ========== Sing-box VMess-WS 反代 — 由 sb2.sh 自動生成 ==========
 
 server {
@@ -1586,6 +1645,8 @@ server {
     }
 }
 HTTPEOF
+    mv "$tmp_stream_conf" "$SB_NGINX_STREAM_CONF" || { red "覆蓋 stream 分流配置失敗"; restore_recorded_backups; rm -f "$tmp_stream_conf" "$tmp_http_conf" "$SB_NGINX_STREAM_CONF" "$SB_NGINX_HTTP_CONF"; exit 1; }
+    mv "$tmp_http_conf" "$SB_NGINX_HTTP_CONF" || { red "覆蓋 HTTP 反代配置失敗"; restore_recorded_backups; rm -f "$tmp_http_conf" "$SB_NGINX_STREAM_CONF" "$SB_NGINX_HTTP_CONF"; exit 1; }
 
     green "驗證 Nginx 配置..."
     if nginx -t >/dev/null 2>&1; then
@@ -1606,6 +1667,7 @@ HTTPEOF
 # ==================== sing-box 配置生成（新架構）====================
 
 gen_config(){
+    local tmp_json="" tmp_public_key="" key_pair="" vm_ws_path="" hy2_obfs_password="" hy2_masquerade_url=""
     resolve_reality_sni
     uuid="${uuid:-$(/etc/s-box/sing-box generate uuid)}"
     if [[ -z "${private_key_reality:-}" || -z "${public_key_reality:-}" ]]; then
@@ -1614,30 +1676,25 @@ gen_config(){
         public_key_reality=$(echo "$key_pair" | awk '/PublicKey/ {print $2}' | tr -d '"')
     fi
     short_id="${short_id:-$(/etc/s-box/sing-box generate rand --hex 4)}"
-    local vm_ws_path="${SB_VM_WS_PATH:-}"
+    vm_ws_path="${SB_VM_WS_PATH:-}"
     [[ -z "$vm_ws_path" ]] && vm_ws_path="/$(gen_random_alnum 24)"
-    echo "$public_key_reality" > /etc/s-box/public.key
 
     load_hy2_runtime_from_server_files
-    local hy2_obfs_password="${SB_HY2_OBFS_PASSWORD:-}"
-    local hy2_masquerade_url="${SB_HY2_MASQUERADE_URL:-https://www.cloudflare.com/}"
+    hy2_obfs_password="${SB_HY2_OBFS_PASSWORD:-}"
+    hy2_masquerade_url="${SB_HY2_MASQUERADE_URL:-https://www.cloudflare.com/}"
     if [[ -z "$hy2_obfs_password" ]]; then
         hy2_obfs_password="$(gen_random_alnum 20)"
-        upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" "$hy2_obfs_password"
-        load_runtime_env
     fi
 
     v4v6
     if [[ -n $v4 ]]; then ipv="prefer_ipv4"; else ipv="prefer_ipv6"; fi
 
-    # 保存內部端口到環境文件（供後續函數讀取）
-    upsert_kv_file "$SB_ENV_FILE" "INT_PORT_REALITY" "$int_port_reality"
-    upsert_kv_file "$SB_ENV_FILE" "INT_PORT_VMWS" "$int_port_vmws"
-    upsert_kv_file "$SB_ENV_FILE" "INT_PORT_HTTPS_BACKEND" "$int_port_https_backend"
-    upsert_kv_file "$SB_ENV_FILE" "SB_VM_WS_PATH" "$vm_ws_path"
-    upsert_kv_file "$SB_ENV_FILE" "SB_REALITY_SNI" "$reality_sni"
+    tmp_json=$(mktemp /etc/s-box/sb.json.tmp.XXXXXX) || { red "建立臨時配置文件失敗。"; return 1; }
+    tmp_public_key=$(mktemp /etc/s-box/public.key.tmp.XXXXXX) || { rm -f "$tmp_json"; red "建立臨時公鑰文件失敗。"; return 1; }
+    printf '%s\n' "$public_key_reality" > "$tmp_public_key" || { rm -f "$tmp_json" "$tmp_public_key"; red "寫入臨時公鑰文件失敗。"; return 1; }
+    chmod 600 "$tmp_public_key" 2>/dev/null || true
 
-cat > /etc/s-box/sb.json <<EOF
+cat > "$tmp_json" <<EOF
 {
   "log": {
     "disabled": false,
@@ -1729,6 +1786,21 @@ cat > /etc/s-box/sb.json <<EOF
   }
 }
 EOF
+    if ! /etc/s-box/sing-box check -c "$tmp_json" >/dev/null 2>&1; then
+        red "生成的臨時 sing-box 配置未通過校驗，已取消覆蓋正式配置。"
+        rm -f "$tmp_json" "$tmp_public_key"
+        return 1
+    fi
+    mv "$tmp_public_key" /etc/s-box/public.key || { rm -f "$tmp_json" "$tmp_public_key"; red "覆蓋 public.key 失敗。"; return 1; }
+    mv "$tmp_json" /etc/s-box/sb.json || { rm -f "$tmp_json"; red "覆蓋 sb.json 失敗。"; return 1; }
+    chmod 600 /etc/s-box/public.key /etc/s-box/sb.json 2>/dev/null || true
+    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" "$hy2_obfs_password"
+    upsert_kv_file "$SB_ENV_FILE" "INT_PORT_REALITY" "$int_port_reality"
+    upsert_kv_file "$SB_ENV_FILE" "INT_PORT_VMWS" "$int_port_vmws"
+    upsert_kv_file "$SB_ENV_FILE" "INT_PORT_HTTPS_BACKEND" "$int_port_https_backend"
+    upsert_kv_file "$SB_ENV_FILE" "SB_VM_WS_PATH" "$vm_ws_path"
+    upsert_kv_file "$SB_ENV_FILE" "SB_REALITY_SNI" "$reality_sni"
+    load_runtime_env
 }
 
 validate_v3_runtime_health(){
@@ -1740,11 +1812,11 @@ validate_v3_runtime_health(){
         nginx -t >/dev/null 2>&1 || { sleep 2; continue; }
         [[ -s /etc/s-box/cert.crt && -s /etc/s-box/private.key ]] || { sleep 2; continue; }
         [[ -f "$SB_NGINX_STREAM_CONF" && -f "$SB_NGINX_HTTP_CONF" ]] || { sleep 2; continue; }
-        ss -tlnp 2>/dev/null | grep -q ":443 " || { sleep 2; continue; }
-        ss -tlnp 2>/dev/null | grep -q ":${int_port_reality} " || { sleep 2; continue; }
-        ss -tlnp 2>/dev/null | grep -q ":${int_port_vmws} " || { sleep 2; continue; }
-        ss -ulnp 2>/dev/null | grep -q ":${port_hy2} " || { sleep 2; continue; }
-        ss -ulnp 2>/dev/null | grep -q ":${port_tu} " || { sleep 2; continue; }
+        tcp_port_listening 443 || { sleep 2; continue; }
+        tcp_port_listening "${int_port_reality}" || { sleep 2; continue; }
+        tcp_port_listening "${int_port_vmws}" || { sleep 2; continue; }
+        udp_port_listening "${port_hy2}" || { sleep 2; continue; }
+        udp_port_listening "${port_tu}" || { sleep 2; continue; }
         return 0
     done
     return 1
@@ -2053,6 +2125,17 @@ cleanup_hy2_port_hopping(){
 
 # ==================== 防火牆（精簡：只暴露 443 + UDP）====================
 
+cleanup_managed_firewall_rules(){
+    local old_hy2 old_hop old_tu
+    [[ -f /etc/s-box/firewall_ports.log ]] || return 0
+    old_hy2=$(grep '^HY2_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
+    old_hop=$(grep '^HY2_HOP_RANGE=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
+    old_tu=$(grep '^TUIC_PORT=' /etc/s-box/firewall_ports.log 2>/dev/null | cut -d= -f2)
+    [[ -n "$old_hy2" ]] && ufw delete allow "${old_hy2}/udp" >/dev/null 2>&1 || true
+    [[ -n "$old_hop" ]] && ufw delete allow "${old_hop}/udp" >/dev/null 2>&1 || true
+    [[ -n "$old_tu" ]] && ufw delete allow "${old_tu}/udp" >/dev/null 2>&1 || true
+}
+
 setup_firewall(){
     green "正在配置防火牆 (UFW - 安全模式)..."
     load_hy2_runtime_from_server_files
@@ -2080,6 +2163,7 @@ setup_firewall(){
     else
         green "UFW 已啟用，採用增量模式..."
     fi
+    cleanup_managed_firewall_rules
 
     # 只暴露必要端口（新架構：TCP 只有 443）
     ufw_allow "$ssh_port" tcp "SSH"
@@ -2182,21 +2266,21 @@ post_install_check(){
     else red "❌ sing-box 服務未運行"; systemctl status sing-box --no-pager -n 5; fi
 
     # 443 端口由 Nginx 監聽
-    if ss -tlnp 2>/dev/null | grep -q ":443 "; then green "✅ TCP 443 正在監聽 (Nginx)"
+    if tcp_port_listening 443; then green "✅ TCP 443 正在監聽 (Nginx)"
     else yellow "⚠️ TCP 443 未監聽"; fi
 
     # 內部端口
-    if ss -tlnp 2>/dev/null | grep -q ":${int_port_reality} "; then green "✅ Reality 內部端口 $int_port_reality 監聽中"
+    if tcp_port_listening "${int_port_reality}"; then green "✅ Reality 內部端口 $int_port_reality 監聽中"
     else yellow "⚠️ Reality 內部端口 $int_port_reality 未監聽"; fi
 
-    if ss -tlnp 2>/dev/null | grep -q ":${int_port_vmws} "; then green "✅ VMess-WS 內部端口 $int_port_vmws 監聽中"
+    if tcp_port_listening "${int_port_vmws}"; then green "✅ VMess-WS 內部端口 $int_port_vmws 監聽中"
     else yellow "⚠️ VMess-WS 內部端口 $int_port_vmws 未監聽"; fi
 
     # UDP 端口
-    if ss -ulnp 2>/dev/null | grep -q ":${port_hy2} "; then green "✅ HY2 UDP $port_hy2 監聽中"
+    if udp_port_listening "${port_hy2}"; then green "✅ HY2 UDP $port_hy2 監聽中"
     else yellow "⚠️ HY2 UDP $port_hy2 未監聽"; fi
 
-    if ss -ulnp 2>/dev/null | grep -q ":${port_tu} "; then green "✅ TUIC UDP $port_tu 監聽中"
+    if udp_port_listening "${port_tu}"; then green "✅ TUIC UDP $port_tu 監聽中"
     else yellow "⚠️ TUIC UDP $port_tu 未監聽"; fi
 
     # 配置校驗
@@ -2727,13 +2811,18 @@ unins(){
         [[ -n "$HY2_HOP_RANGE" ]] && ufw delete allow "$HY2_HOP_RANGE"/udp >/dev/null 2>&1
         [[ -n "$TUIC_PORT" ]] && ufw delete allow "$TUIC_PORT"/udp >/dev/null 2>&1
         yellow "80/443 可能被其他服務使用，是否刪除？"
-        readp "   刪除 80/443 規則？[y/N]: " del_common_ports
+        if is_true "$SB_BATCH_MODE"; then
+            del_common_ports="n"
+        else
+            readp "   刪除 80/443 規則？[y/N]: " del_common_ports
+        fi
         [[ "$del_common_ports" =~ ^[Yy]$ ]] && { ufw delete allow 80/tcp >/dev/null 2>&1; ufw delete allow 443/tcp >/dev/null 2>&1; green "已刪除。"; }
     fi
 
     cleanup_hy2_port_hopping
+    systemctl disable --now "${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
     cleanup_managed_sbox_files
-    rm -f /usr/bin/sb /etc/systemd/system/sing-box.service
+    rm -f /usr/bin/sb /etc/systemd/system/sing-box.service "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" /root/tun.sh
     systemctl daemon-reload 2>/dev/null
     green "卸載完成 (BBR/Nginx 保留)。"
 }
