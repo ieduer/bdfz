@@ -161,8 +161,8 @@ load_runtime_env(){
     SB_HY2_HOP_ENABLED=""; SB_HY2_HOP_START=""; SB_HY2_HOP_END=""; SB_HY2_HOP_INTERVAL=""; SB_HY2_HOP_TARGET_PORT=""
     SB_CLIENT_UTLS_ENABLED=""; SB_CLIENT_HOST_MODE=""
     SB_REALITY_UTLS_FINGERPRINT=""; SB_VMESS_UTLS_FINGERPRINT=""
-    SB_NGINX_DEFAULT_BACKEND=""; SB_HTTP_FALLBACK_ROOT=""
-    SB_GEOSITE_GEOLOCATION_NONCN_URL=""; SB_GEOSITE_CN_URL=""; SB_GEOIP_CN_URL=""
+    SB_NGINX_DEFAULT_BACKEND="reality"; SB_HTTP_FALLBACK_ROOT=""
+    SB_GEOSITE_GEOLOCATION_NONCN_URL="https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"; SB_GEOSITE_CN_URL="https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs"; SB_GEOIP_CN_URL="https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs"
     SB_REALITY_SNI=""; SB_REALITY_SNI_CANDIDATES=""; SB_VM_WS_PATH=""
     INT_PORT_REALITY=""; INT_PORT_VMWS=""; INT_PORT_HTTPS_BACKEND=""
     for file in "$SB_LEGACY_ENV_FILE" "$SB_STATE_ENV_FILE" "$SB_USER_ENV_FILE"; do
@@ -2963,6 +2963,8 @@ lnsb(){
     local backup="/usr/bin/sb.bak"
     local source_url="${UPDATE_URL:-}"
     local script_path="${BASH_SOURCE[0]:-$0}"
+    local pseudo_source=0
+    [[ "$script_path" == /dev/fd/* || "$script_path" == /proc/self/fd/* ]] && pseudo_source=1
     if [[ -z "$source_url" ]]; then
         if [[ -f "$script_path" ]]; then
             [[ -f "$target" ]] && cp "$target" "$backup" 2>/dev/null || true
@@ -2970,6 +2972,11 @@ lnsb(){
             chmod +x "$target"
             green "已從當前腳本安裝快捷命令 /usr/bin/sb。"
             return 0
+        fi
+        if [[ "$pseudo_source" == 1 ]]; then
+            yellow "當前腳本是通過 bash <(curl ...) 或類似的臨時 FD 路徑執行，無法可靠自我複製到 /usr/bin/sb。"
+            yellow "請改用本地文件方式運行，或在執行後手動 install -m 755 <腳本文件> /usr/bin/sb。"
+            return 1
         fi
         yellow "本地版腳本未配置默認 UPDATE_URL，且無法從當前路徑複製自身。"
         yellow "請先 export UPDATE_URL=<可信腳本地址>，或使用本地文件方式運行此腳本。"
