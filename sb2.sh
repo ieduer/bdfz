@@ -22,7 +22,10 @@ SB_ROTATE_VM_WS_PATH_ON_MIGRATE="${SB_ROTATE_VM_WS_PATH_ON_MIGRATE:-1}"
 SB_DNS_PORT53_HIJACK="${SB_DNS_PORT53_HIJACK:-1}"
 SB_DNS_REJECT_BYPASS="${SB_DNS_REJECT_BYPASS:-0}"
 ACME_SH_VERSION="${ACME_SH_VERSION:-3.1.2}"
-SB_ENV_FILE="/etc/s-box/sb.env"
+SB_LEGACY_ENV_FILE="/etc/s-box/sb.env"
+SB_USER_ENV_FILE="/etc/s-box/sb.user.env"
+SB_STATE_ENV_FILE="/etc/s-box/sb.state.env"
+SB_ENV_FILE="$SB_STATE_ENV_FILE"
 SB_CERT_RENEW_SCRIPT="/etc/s-box/cert_renew.sh"
 SB_CERT_RENEW_STATUS="/etc/s-box/cert_renew.status"
 SB_CERT_RENEW_LOG="/etc/s-box/cert_renew.log"
@@ -36,6 +39,13 @@ SB_NGINX_HTTP_CONF="/etc/nginx/conf.d/sb_vmess_proxy.conf"
 SB_NGINX_MANIFEST="/etc/s-box/nginx_manifest.tsv"
 SB_SUPPORTED_STABLE_FAMILY="${SB_SUPPORTED_STABLE_FAMILY:-1.13}"
 SB_LEGACY_CLIENT_VERSION="1.11.4"
+SB_NGINX_DEFAULT_BACKEND="${SB_NGINX_DEFAULT_BACKEND:-reality}"
+SB_ALLOW_MULTI_HTTPS="${SB_ALLOW_MULTI_HTTPS:-0}"
+SB_HTTP_FALLBACK_ROOT="${SB_HTTP_FALLBACK_ROOT:-}"
+SB_GEOSITE_GEOLOCATION_NONCN_URL="${SB_GEOSITE_GEOLOCATION_NONCN_URL:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs}"
+SB_GEOSITE_CN_URL="${SB_GEOSITE_CN_URL:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs}"
+SB_GEOIP_CN_URL="${SB_GEOIP_CN_URL:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs}"
+SB_SERVER_PRIVATE_IP_POLICY="${SB_SERVER_PRIVATE_IP_POLICY:-block}"
 SB_LATEST_STABLE_VERSION=""
 SB_LATEST_STABLE_PUBLISHED_AT=""
 SB_LATEST_STABLE_PROBED="0"
@@ -64,6 +74,12 @@ read_kv_from_file(){
     grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2-
 }
 
+kv_exists_in_file(){
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 1
+    grep -q -E "^${key}=" "$file" 2>/dev/null
+}
+
 upsert_kv_file(){
     local file="$1" key="$2" value="$3"
     local tmp_file
@@ -88,26 +104,77 @@ upsert_kv_file(){
     chmod 600 "$file" 2>/dev/null || true
 }
 
+delete_kv_from_file(){
+    local file="$1" key="$2" tmp_file=""
+    [[ -f "$file" ]] || return 0
+    tmp_file=$(mktemp /tmp/sb_kv_delete.XXXXXX) || return 1
+    awk -v key="$key" 'index($0, key "=") != 1 { print }' "$file" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    mv "$tmp_file" "$file"
+    chmod 600 "$file" 2>/dev/null || true
+}
+
+env_file_for_key(){
+    local key="$1"
+    case "$key" in
+        SB_TELEGRAM_ENABLED|SB_TELEGRAM_BOT_TOKEN|SB_TELEGRAM_CHAT_ID|SB_TELEGRAM_THREAD_ID|SB_HY2_OBFS_ENABLED|SB_HY2_MASQUERADE_URL|SB_HY2_HOP_ENABLED|SB_HY2_HOP_INTERVAL|SB_CLIENT_UTLS_ENABLED|SB_CLIENT_HOST_MODE|SB_REALITY_UTLS_FINGERPRINT|SB_VMESS_UTLS_FINGERPRINT|SB_REALITY_SNI_CANDIDATES|SB_ACME_SH_VERSION|SB_NGINX_DEFAULT_BACKEND|SB_HTTP_FALLBACK_ROOT|SB_GEOSITE_GEOLOCATION_NONCN_URL|SB_GEOSITE_CN_URL|SB_GEOIP_CN_URL)
+            printf '%s\n' "$SB_USER_ENV_FILE"
+            ;;
+        *)
+            printf '%s\n' "$SB_STATE_ENV_FILE"
+            ;;
+    esac
+}
+
+persist_env_kv(){
+    local key="$1" value="$2" target=""
+    ensure_sbox_dir
+    target="$(env_file_for_key "$key")"
+    upsert_kv_file "$target" "$key" "$value" || return 1
+    if [[ "$target" != "$SB_USER_ENV_FILE" ]]; then
+        delete_kv_from_file "$SB_USER_ENV_FILE" "$key" >/dev/null 2>&1 || true
+    fi
+    if [[ "$target" != "$SB_STATE_ENV_FILE" ]]; then
+        delete_kv_from_file "$SB_STATE_ENV_FILE" "$key" >/dev/null 2>&1 || true
+    fi
+}
+
+read_persisted_kv(){
+    local key="$1" value="" file=""
+    local -a files=()
+    case "$(env_file_for_key "$key")" in
+        "$SB_USER_ENV_FILE") files=("$SB_USER_ENV_FILE" "$SB_STATE_ENV_FILE" "$SB_LEGACY_ENV_FILE") ;;
+        *) files=("$SB_STATE_ENV_FILE" "$SB_USER_ENV_FILE" "$SB_LEGACY_ENV_FILE") ;;
+    esac
+    for file in "${files[@]}"; do
+        if kv_exists_in_file "$file" "$key"; then
+            read_kv_from_file "$file" "$key"
+            return 0
+        fi
+    done
+    return 1
+}
+
 load_runtime_env(){
-    SB_TELEGRAM_ENABLED="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" 2>/dev/null || true)"
-    SB_TELEGRAM_BOT_TOKEN="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_BOT_TOKEN" 2>/dev/null || true)"
-    SB_TELEGRAM_CHAT_ID="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_CHAT_ID" 2>/dev/null || true)"
-    SB_TELEGRAM_THREAD_ID="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_THREAD_ID" 2>/dev/null || true)"
-    SB_HY2_OBFS_ENABLED="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_OBFS_ENABLED" 2>/dev/null || true)"
-    SB_HY2_OBFS_PASSWORD="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" 2>/dev/null || true)"
-    SB_HY2_MASQUERADE_URL="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_MASQUERADE_URL" 2>/dev/null || true)"
-    SB_HY2_HOP_ENABLED="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_ENABLED" 2>/dev/null || true)"
-    SB_HY2_HOP_START="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_START" 2>/dev/null || true)"
-    SB_HY2_HOP_END="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_END" 2>/dev/null || true)"
-    SB_HY2_HOP_INTERVAL="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_INTERVAL" 2>/dev/null || true)"
-    SB_HY2_HOP_TARGET_PORT="$(read_kv_from_file "$SB_ENV_FILE" "SB_HY2_HOP_TARGET_PORT" 2>/dev/null || true)"
-    SB_CLIENT_UTLS_ENABLED="$(read_kv_from_file "$SB_ENV_FILE" "SB_CLIENT_UTLS_ENABLED" 2>/dev/null || true)"
-    SB_CLIENT_HOST_MODE="$(read_kv_from_file "$SB_ENV_FILE" "SB_CLIENT_HOST_MODE" 2>/dev/null || true)"
-    SB_REALITY_UTLS_FINGERPRINT="$(read_kv_from_file "$SB_ENV_FILE" "SB_REALITY_UTLS_FINGERPRINT" 2>/dev/null || true)"
-    SB_VMESS_UTLS_FINGERPRINT="$(read_kv_from_file "$SB_ENV_FILE" "SB_VMESS_UTLS_FINGERPRINT" 2>/dev/null || true)"
-    SB_REALITY_SNI="$(read_kv_from_file "$SB_ENV_FILE" "SB_REALITY_SNI" 2>/dev/null || true)"
-    SB_REALITY_SNI_CANDIDATES="$(read_kv_from_file "$SB_ENV_FILE" "SB_REALITY_SNI_CANDIDATES" 2>/dev/null || true)"
-    SB_VM_WS_PATH="$(read_kv_from_file "$SB_ENV_FILE" "SB_VM_WS_PATH" 2>/dev/null || true)"
+    local key value file
+    SB_TELEGRAM_ENABLED=""; SB_TELEGRAM_BOT_TOKEN=""; SB_TELEGRAM_CHAT_ID=""; SB_TELEGRAM_THREAD_ID=""
+    SB_HY2_OBFS_ENABLED=""; SB_HY2_OBFS_PASSWORD=""; SB_HY2_MASQUERADE_URL=""
+    SB_HY2_HOP_ENABLED=""; SB_HY2_HOP_START=""; SB_HY2_HOP_END=""; SB_HY2_HOP_INTERVAL=""; SB_HY2_HOP_TARGET_PORT=""
+    SB_CLIENT_UTLS_ENABLED=""; SB_CLIENT_HOST_MODE=""
+    SB_REALITY_UTLS_FINGERPRINT=""; SB_VMESS_UTLS_FINGERPRINT=""
+    SB_NGINX_DEFAULT_BACKEND=""; SB_HTTP_FALLBACK_ROOT=""
+    SB_GEOSITE_GEOLOCATION_NONCN_URL=""; SB_GEOSITE_CN_URL=""; SB_GEOIP_CN_URL=""
+    SB_REALITY_SNI=""; SB_REALITY_SNI_CANDIDATES=""; SB_VM_WS_PATH=""
+    INT_PORT_REALITY=""; INT_PORT_VMWS=""; INT_PORT_HTTPS_BACKEND=""
+    for file in "$SB_LEGACY_ENV_FILE" "$SB_USER_ENV_FILE" "$SB_STATE_ENV_FILE"; do
+        [[ -f "$file" ]] || continue
+        while IFS='=' read -r key value; do
+            case "$key" in
+                SB_TELEGRAM_ENABLED|SB_TELEGRAM_BOT_TOKEN|SB_TELEGRAM_CHAT_ID|SB_TELEGRAM_THREAD_ID|SB_HY2_OBFS_ENABLED|SB_HY2_OBFS_PASSWORD|SB_HY2_MASQUERADE_URL|SB_HY2_HOP_ENABLED|SB_HY2_HOP_START|SB_HY2_HOP_END|SB_HY2_HOP_INTERVAL|SB_HY2_HOP_TARGET_PORT|SB_CLIENT_UTLS_ENABLED|SB_CLIENT_HOST_MODE|SB_REALITY_UTLS_FINGERPRINT|SB_VMESS_UTLS_FINGERPRINT|SB_NGINX_DEFAULT_BACKEND|SB_HTTP_FALLBACK_ROOT|SB_GEOSITE_GEOLOCATION_NONCN_URL|SB_GEOSITE_CN_URL|SB_GEOIP_CN_URL|SB_REALITY_SNI|SB_REALITY_SNI_CANDIDATES|SB_VM_WS_PATH|INT_PORT_REALITY|INT_PORT_VMWS|INT_PORT_HTTPS_BACKEND)
+                    printf -v "$key" '%s' "$value"
+                    ;;
+            esac
+        done < "$file"
+    done
     [[ -z "$SB_TELEGRAM_ENABLED" ]] && SB_TELEGRAM_ENABLED="0"
     [[ -z "$SB_HY2_OBFS_ENABLED" ]] && SB_HY2_OBFS_ENABLED="1"
     [[ -z "$SB_HY2_HOP_ENABLED" ]] && SB_HY2_HOP_ENABLED="1"
@@ -117,14 +184,17 @@ load_runtime_env(){
     [[ -z "$SB_CLIENT_HOST_MODE" ]] && SB_CLIENT_HOST_MODE="ip_prefer"
     [[ -z "$SB_REALITY_UTLS_FINGERPRINT" ]] && SB_REALITY_UTLS_FINGERPRINT="chrome"
     [[ -z "$SB_VMESS_UTLS_FINGERPRINT" ]] && SB_VMESS_UTLS_FINGERPRINT="chrome"
+    [[ -z "$SB_NGINX_DEFAULT_BACKEND" ]] && SB_NGINX_DEFAULT_BACKEND="reality"
     [[ -z "$SB_REALITY_SNI" ]] && SB_REALITY_SNI=""
     [[ -z "$SB_REALITY_SNI_CANDIDATES" ]] && SB_REALITY_SNI_CANDIDATES=""
     [[ -z "$SB_VM_WS_PATH" ]] && SB_VM_WS_PATH=""
     export SB_TELEGRAM_ENABLED SB_TELEGRAM_BOT_TOKEN SB_TELEGRAM_CHAT_ID SB_TELEGRAM_THREAD_ID
     export SB_HY2_OBFS_ENABLED SB_HY2_OBFS_PASSWORD SB_HY2_MASQUERADE_URL
     export SB_HY2_HOP_ENABLED SB_HY2_HOP_START SB_HY2_HOP_END SB_HY2_HOP_INTERVAL SB_HY2_HOP_TARGET_PORT SB_CLIENT_UTLS_ENABLED SB_CLIENT_HOST_MODE
-    export SB_REALITY_UTLS_FINGERPRINT SB_VMESS_UTLS_FINGERPRINT
+    export SB_REALITY_UTLS_FINGERPRINT SB_VMESS_UTLS_FINGERPRINT SB_NGINX_DEFAULT_BACKEND SB_HTTP_FALLBACK_ROOT
+    export SB_GEOSITE_GEOLOCATION_NONCN_URL SB_GEOSITE_CN_URL SB_GEOIP_CN_URL
     export SB_REALITY_SNI SB_REALITY_SNI_CANDIDATES SB_VM_WS_PATH
+    export INT_PORT_REALITY INT_PORT_VMWS INT_PORT_HTTPS_BACKEND
 }
 
 probe_latest_stable_release(){
@@ -187,6 +257,20 @@ stable_track_label(){
     else
         printf '%s.x\n' "$SB_SUPPORTED_STABLE_FAMILY"
     fi
+}
+
+build_server_private_ip_rule_json(){
+    case "${SB_SERVER_PRIVATE_IP_POLICY:-block}" in
+        direct)
+            printf '%s\n' '      { "ip_is_private": true, "outbound": "direct" }'
+            ;;
+        off|none|disabled)
+            return 0
+            ;;
+        reject|block|*)
+            printf '%s\n' '      { "ip_is_private": true, "outbound": "block" }'
+            ;;
+    esac
 }
 
 is_true(){
@@ -317,7 +401,19 @@ create_rollout_snapshot(){
         [[ -n "$current_uuid" ]] && echo "CURRENT_UUID=$current_uuid"
     } > "${dir}/meta.env"
     record_snapshot_absent_paths "$dir" \
-        /etc/s-box \
+        "$SB_LEGACY_ENV_FILE" \
+        "$SB_USER_ENV_FILE" \
+        "$SB_STATE_ENV_FILE" \
+        /etc/s-box/sb.json \
+        /etc/s-box/sub.txt \
+        /etc/s-box/domain.log \
+        /etc/s-box/public.key \
+        /etc/s-box/cert.crt \
+        /etc/s-box/private.key \
+        /etc/s-box/firewall_ports.log \
+        /etc/s-box/sing-box \
+        /etc/s-box/sing-box.tar.gz \
+        /etc/s-box/sbyg_update \
         /etc/systemd/system/sing-box.service \
         "/etc/systemd/system/${SB_HY2_HOP_SERVICE}" \
         "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" \
@@ -367,10 +463,6 @@ restore_rollout_snapshot(){
     if [[ -f "${dir}/absent_paths.txt" ]]; then
         while IFS= read -r path; do
             [[ -n "$path" ]] || continue
-            if [[ "$path" == "/etc/s-box" ]]; then
-                cleanup_managed_sbox_files
-                continue
-            fi
             if [[ -d "$path" ]]; then
                 rmdir "$path" >/dev/null 2>&1 || true
             else
@@ -378,6 +470,7 @@ restore_rollout_snapshot(){
             fi
         done < "${dir}/absent_paths.txt"
     fi
+    rmdir /etc/s-box >/dev/null 2>&1 || true
     systemctl daemon-reload >/dev/null 2>&1 || true
     [[ -f "${dir}/iptables.save" ]] && iptables-restore < "${dir}/iptables.save" >/dev/null 2>&1 || true
     [[ -f "${dir}/ip6tables.save" ]] && ip6tables-restore < "${dir}/ip6tables.save" >/dev/null 2>&1 || true
@@ -425,8 +518,8 @@ assert_latest_stable_supported(){
 
     green "GitHub 最新穩定版: ${SB_LATEST_STABLE_VERSION}${SB_LATEST_STABLE_PUBLISHED_AT:+ (${SB_LATEST_STABLE_PUBLISHED_AT})}"
     ensure_sbox_dir
-    upsert_kv_file "$SB_ENV_FILE" "SB_LAST_STABLE_VERSION" "$SB_LATEST_STABLE_VERSION"
-    upsert_kv_file "$SB_ENV_FILE" "SB_LAST_STABLE_PUBLISHED_AT" "$SB_LATEST_STABLE_PUBLISHED_AT"
+    persist_env_kv "SB_LAST_STABLE_VERSION" "$SB_LATEST_STABLE_VERSION"
+    persist_env_kv "SB_LAST_STABLE_PUBLISHED_AT" "$SB_LATEST_STABLE_PUBLISHED_AT"
 
     if [[ ! "$SB_LATEST_STABLE_VERSION" =~ ^${SB_SUPPORTED_STABLE_FAMILY//./\\.}\. ]]; then
         red "檢測到新的穩定大版本 ${SB_LATEST_STABLE_VERSION}。"
@@ -498,13 +591,16 @@ enable_bbr(){
 
 install_depend(){
     local dep_ver="6" missing=0
-    local required_cmds=(jq openssl ss curl wget tar python3 cron file nginx)
+    local required_cmds=(jq openssl ss curl wget tar python3 file nginx)
     for cmd in "${required_cmds[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing=1
             break
         fi
     done
+    if ! dpkg -s cron >/dev/null 2>&1; then
+        missing=1
+    fi
     if [[ "$(cat /etc/s-box/sbyg_update 2>/dev/null)" != "$dep_ver" || "$missing" == "1" ]]; then
         green "安裝必要依賴..."
         DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt update -y || {
@@ -524,8 +620,16 @@ install_depend(){
 setup_tun(){
     sed -i '\|^@reboot root bash /root/tun.sh >/dev/null 2>&1|d' /etc/crontab 2>/dev/null || true
     rm -f /root/tun.sh
-    if [[ ! -c /dev/net/tun ]]; then
-        cat > "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" <<EOF
+    if [[ -c /dev/net/tun ]]; then
+        if [[ -f "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" ]]; then
+            systemctl disable "${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
+            rm -f "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        chmod 0600 /dev/net/tun >/dev/null 2>&1 || true
+        return 0
+    fi
+    cat > "/etc/systemd/system/${SB_TUN_PREPARE_SERVICE}" <<EOF
 [Unit]
 Description=Prepare /dev/net/tun for sing-box
 DefaultDependencies=no
@@ -540,10 +644,9 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable "${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
-        systemctl start "${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
-    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable "${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
+    systemctl start "${SB_TUN_PREPARE_SERVICE}" >/dev/null 2>&1 || true
 }
 
 _v4_cache=""
@@ -577,7 +680,11 @@ is_valid_hop_interval(){
 
 gen_random_alnum(){
     local n="${1:-20}"
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$n"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 $(( n * 3 )) 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c "$n"
+    else
+        LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$n"
+    fi
 }
 
 select_client_host(){
@@ -643,7 +750,7 @@ resolve_reality_sni(){
     candidates_raw="${SB_REALITY_SNI_CANDIDATES:-}"
     if [[ -z "$candidates_raw" ]]; then
         candidates_raw="$(default_reality_sni_candidates | paste -sd, -)"
-        upsert_kv_file "$SB_ENV_FILE" "SB_REALITY_SNI_CANDIDATES" "$candidates_raw"
+        persist_env_kv "SB_REALITY_SNI_CANDIDATES" "$candidates_raw"
     fi
 
     local old_ifs="$IFS"
@@ -653,7 +760,7 @@ resolve_reality_sni(){
         [[ -n "$candidate" ]] || continue
         if probe_reality_sni_candidate "$candidate"; then
             reality_sni="$candidate"
-            upsert_kv_file "$SB_ENV_FILE" "SB_REALITY_SNI" "$reality_sni"
+            persist_env_kv "SB_REALITY_SNI" "$reality_sni"
             load_runtime_env
             green "Reality 默認 SNI 已自動選定: ${reality_sni}"
             IFS="$old_ifs"
@@ -664,7 +771,7 @@ resolve_reality_sni(){
 
     reality_sni="$(printf '%s\n' "$candidates_raw" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | head -1)"
     [[ -n "$reality_sni" ]] || reality_sni="download-installer.cdn.mozilla.net"
-    upsert_kv_file "$SB_ENV_FILE" "SB_REALITY_SNI" "$reality_sni"
+    persist_env_kv "SB_REALITY_SNI" "$reality_sni"
     load_runtime_env
     yellow "未探測到可驗證的默認 Reality SNI，暫回退為候選池首選 ${reality_sni}"
     return 0
@@ -965,11 +1072,56 @@ maybe_align_hy2_masquerade_with_site(){
     if printf '%s\n' "$SB_PUBLIC_HTTPS_SITES" | tr ',' '\n' | grep -Fxq "$domain_name"; then
         if [[ -z "${SB_HY2_MASQUERADE_URL:-}" || "${SB_HY2_MASQUERADE_URL:-}" == "https://www.cloudflare.com/" ]]; then
             SB_HY2_MASQUERADE_URL="https://${domain_name}/"
-            upsert_kv_file "$SB_ENV_FILE" "SB_HY2_MASQUERADE_URL" "$SB_HY2_MASQUERADE_URL"
+            persist_env_kv "SB_HY2_MASQUERADE_URL" "$SB_HY2_MASQUERADE_URL"
             load_runtime_env
             green "HY2 偽裝已自動對齊站點: ${SB_HY2_MASQUERADE_URL}"
         fi
     fi
+}
+
+detect_http_fallback_root(){
+    local dump="" root_path=""
+    if [[ -n "${SB_HTTP_FALLBACK_ROOT:-}" && -d "${SB_HTTP_FALLBACK_ROOT:-}" ]]; then
+        printf '%s\n' "$SB_HTTP_FALLBACK_ROOT"
+        return 0
+    fi
+    dump=$(nginx -T 2>/dev/null || true)
+    if [[ -n "$dump" ]]; then
+        root_path=$(printf '%s\n' "$dump" | awk '
+            /^[[:space:]]*server[[:space:]]*\{/ {in_server=1; next}
+            in_server && /^[[:space:]]*root[[:space:]]+\// {
+                root=$2
+                gsub(/;/, "", root)
+                print root
+                exit
+            }
+            in_server && /^[[:space:]]*}/ {in_server=0}
+        ')
+    fi
+    [[ -n "$root_path" && -d "$root_path" ]] || root_path="/var/www/html"
+    printf '%s\n' "$root_path"
+}
+
+select_default_sni_backend(){
+    case "${SB_NGINX_DEFAULT_BACKEND:-auto}" in
+        reality|reality_backend)
+            printf '%s\n' "reality_backend"
+            ;;
+        https|https_backend)
+            printf '%s\n' "https_backend"
+            ;;
+        auto|"")
+            detect_public_https_sites
+            if [[ -n "${SB_PUBLIC_HTTPS_SITES:-}" ]]; then
+                printf '%s\n' "https_backend"
+            else
+                printf '%s\n' "reality_backend"
+            fi
+            ;;
+        *)
+            printf '%s\n' "https_backend"
+            ;;
+    esac
 }
 
 detect_install_layout(){
@@ -1191,16 +1343,16 @@ init_hy2_transport_env(){
         SB_HY2_HOP_TARGET_PORT="$port_hy2"
         changed=1
     fi
-    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_ENABLED" "${SB_HY2_OBFS_ENABLED:-1}"
-    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" "${SB_HY2_OBFS_PASSWORD:-}"
-    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_MASQUERADE_URL" "${SB_HY2_MASQUERADE_URL:-https://www.cloudflare.com/}"
-    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_ENABLED" "${SB_HY2_HOP_ENABLED:-1}"
-    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_START" "${SB_HY2_HOP_START:-}"
-    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_END" "${SB_HY2_HOP_END:-}"
-    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_INTERVAL" "${SB_HY2_HOP_INTERVAL:-30s}"
-    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_HOP_TARGET_PORT" "${SB_HY2_HOP_TARGET_PORT:-$port_hy2}"
-    upsert_kv_file "$SB_ENV_FILE" "SB_CLIENT_UTLS_ENABLED" "${SB_CLIENT_UTLS_ENABLED:-0}"
-    upsert_kv_file "$SB_ENV_FILE" "SB_CLIENT_HOST_MODE" "${SB_CLIENT_HOST_MODE:-ip_prefer}"
+    persist_env_kv "SB_HY2_OBFS_ENABLED" "${SB_HY2_OBFS_ENABLED:-1}"
+    persist_env_kv "SB_HY2_OBFS_PASSWORD" "${SB_HY2_OBFS_PASSWORD:-}"
+    persist_env_kv "SB_HY2_MASQUERADE_URL" "${SB_HY2_MASQUERADE_URL:-https://www.cloudflare.com/}"
+    persist_env_kv "SB_HY2_HOP_ENABLED" "${SB_HY2_HOP_ENABLED:-1}"
+    persist_env_kv "SB_HY2_HOP_START" "${SB_HY2_HOP_START:-}"
+    persist_env_kv "SB_HY2_HOP_END" "${SB_HY2_HOP_END:-}"
+    persist_env_kv "SB_HY2_HOP_INTERVAL" "${SB_HY2_HOP_INTERVAL:-30s}"
+    persist_env_kv "SB_HY2_HOP_TARGET_PORT" "${SB_HY2_HOP_TARGET_PORT:-$port_hy2}"
+    persist_env_kv "SB_CLIENT_UTLS_ENABLED" "${SB_CLIENT_UTLS_ENABLED:-0}"
+    persist_env_kv "SB_CLIENT_HOST_MODE" "${SB_CLIENT_HOST_MODE:-ip_prefer}"
     load_runtime_env
     green "HY2 抗封鎖增強: obfs=salamander, masquerade=${SB_HY2_MASQUERADE_URL}"
     if [[ "${SB_HY2_HOP_ENABLED:-1}" == "1" ]]; then
@@ -1208,7 +1360,7 @@ init_hy2_transport_env(){
     else
         yellow "HY2 端口跳躍: 已停用"
     fi
-    [[ "$changed" == "1" ]] && green "HY2 增強參數已寫入 ${SB_ENV_FILE}"
+    [[ "$changed" == "1" ]] && green "HY2 增強參數已寫入 ${SB_USER_ENV_FILE} / ${SB_STATE_ENV_FILE}"
 }
 
 load_hy2_runtime_from_server_files(){
@@ -1253,7 +1405,7 @@ install_acme_sh_pinned(){
         return 1
     }
     rm -rf "$tmp_dir"
-    upsert_kv_file "$SB_ENV_FILE" "SB_ACME_SH_VERSION" "$acme_ref"
+    persist_env_kv "SB_ACME_SH_VERSION" "$acme_ref"
     green "acme.sh 已按固定版本安裝：${acme_ref}"
 }
 
@@ -1428,14 +1580,16 @@ create_cert_renew_script(){
     cat > "$SB_CERT_RENEW_SCRIPT" <<'CERTEOF'
 #!/bin/bash
 set -u
-ENV_FILE="/etc/s-box/sb.env"
+LEGACY_ENV_FILE="/etc/s-box/sb.env"
+USER_ENV_FILE="/etc/s-box/sb.user.env"
+STATE_ENV_FILE="/etc/s-box/sb.state.env"
 DOMAIN_FILE="/etc/s-box/domain.log"
 STATUS_FILE="/etc/s-box/cert_renew.status"
 LOG_FILE="/etc/s-box/cert_renew.log"
 ACME_BIN="/root/.acme.sh/acme.sh"
 mode="${1:-auto}"
 now_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-read_env_value(){ local key="$1"; [[ -f "$ENV_FILE" ]] || return 0; grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2-; }
+read_env_value(){ local key="$1" file=""; for file in "$STATE_ENV_FILE" "$USER_ENV_FILE" "$LEGACY_ENV_FILE"; do [[ -f "$file" ]] || continue; if grep -q -E "^${key}=" "$file" 2>/dev/null; then grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2-; return 0; fi; done; return 0; }
 record_status(){ local result="$1" detail="$2"; { echo "LAST_RUN_AT=$now_utc"; echo "LAST_MODE=$mode"; echo "LAST_RESULT=$result"; echo "LAST_DETAIL=$detail"; } > "$STATUS_FILE"; chmod 600 "$STATUS_FILE" 2>/dev/null || true; echo "$now_utc|$mode|$result|$detail" >> "$LOG_FILE"; }
 send_telegram_fail(){ local msg="$1"; [[ "${SB_TELEGRAM_ENABLED:-0}" == "1" ]] || return 0; [[ -n "${SB_TELEGRAM_BOT_TOKEN:-}" && -n "${SB_TELEGRAM_CHAT_ID:-}" ]] || return 0; local api="https://api.telegram.org/bot${SB_TELEGRAM_BOT_TOKEN}/sendMessage"; local text="[sb] 證書續期失敗\n主機: $(hostname)\n域名: ${domain}\n時間(UTC): ${now_utc}\n原因: ${msg}"; if [[ -n "${SB_TELEGRAM_THREAD_ID:-}" ]]; then curl -fsS -X POST "$api" --data-urlencode "chat_id=${SB_TELEGRAM_CHAT_ID}" --data-urlencode "message_thread_id=${SB_TELEGRAM_THREAD_ID}" --data-urlencode "text=${text}" >/dev/null 2>&1 || true; else curl -fsS -X POST "$api" --data-urlencode "chat_id=${SB_TELEGRAM_CHAT_ID}" --data-urlencode "text=${text}" >/dev/null 2>&1 || true; fi; }
 SB_TELEGRAM_ENABLED="$(read_env_value SB_TELEGRAM_ENABLED)"; SB_TELEGRAM_BOT_TOKEN="$(read_env_value SB_TELEGRAM_BOT_TOKEN)"; SB_TELEGRAM_CHAT_ID="$(read_env_value SB_TELEGRAM_CHAT_ID)"; SB_TELEGRAM_THREAD_ID="$(read_env_value SB_TELEGRAM_THREAD_ID)"
@@ -1518,7 +1672,8 @@ setup_nginx_sni(){
     resolve_reality_sni
     load_runtime_env
     rm -f "$SB_NGINX_MANIFEST"
-    local tmp_stream_conf="" tmp_http_conf="" candidate_file=""
+    local tmp_stream_conf="" tmp_http_conf="" candidate_file="" fallback_root="" default_sni_backend="" nginx_main_candidate=""
+    local -a staged_targets=() staged_candidates=()
 
     if ! command -v nginx >/dev/null 2>&1; then
         green "安裝 Nginx..."
@@ -1531,9 +1686,24 @@ setup_nginx_sni(){
 
     mkdir -p /etc/nginx/stream.d
 
+    detect_public_https_sites
+    if [[ -n "${SB_PUBLIC_HTTPS_SITES:-}" ]]; then
+        local site_count=0
+        site_count=$(printf '%s\n' "$SB_PUBLIC_HTTPS_SITES" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')
+        if [[ "${site_count:-0}" -gt 1 ]] && ! is_true "${SB_ALLOW_MULTI_HTTPS:-0}"; then
+            red "檢測到多個公開 HTTPS 站點: ${SB_PUBLIC_HTTPS_SITES}"
+            red "當前 v3 SNI 接管默認只支持單一 HTTPS backend。"
+            yellow "如確需接管多站點，請先顯式設置 SB_ALLOW_MULTI_HTTPS=1 並人工核對 nginx -T。"
+            exit 1
+        fi
+    fi
+
     if ! grep -q "include /etc/nginx/stream.d/\*.conf;" /etc/nginx/nginx.conf 2>/dev/null; then
-        backup_file_once /etc/nginx/nginx.conf || { red "備份 nginx.conf 失敗"; exit 1; }
-        ensure_nginx_stream_include /etc/nginx/nginx.conf
+        nginx_main_candidate=$(mktemp /tmp/sb_nginx_main.XXXXXX) || { red "建立 nginx.conf 候選文件失敗"; exit 1; }
+        cp -a /etc/nginx/nginx.conf "$nginx_main_candidate" || { rm -f "$nginx_main_candidate"; red "複製 nginx.conf 候選文件失敗"; exit 1; }
+        ensure_nginx_stream_include "$nginx_main_candidate"
+        staged_targets+=("/etc/nginx/nginx.conf")
+        staged_candidates+=("$nginx_main_candidate")
     fi
 
     local nginx_conf_dirs=("/etc/nginx/sites-enabled" "/etc/nginx/conf.d")
@@ -1556,19 +1726,19 @@ setup_nginx_sni(){
                         yellow "  $conf_file 未檢測到需要遷移的 TCP 443 行，保持原樣。"
                     else
                         red "  無法安全改寫 $conf_file 的 443 監聽行。"
-                        restore_recorded_backups
-                        rm -f "$SB_NGINX_STREAM_CONF" "$SB_NGINX_HTTP_CONF"
+                        rm -f "${staged_candidates[@]}" "$tmp_stream_conf" "$tmp_http_conf"
                         exit 1
                     fi
                 else
-                    backup_file_once "$conf_file" || { rm -f "$candidate_file"; red "備份 $conf_file 失敗"; exit 1; }
-                    mv "$candidate_file" "$conf_file" || { rm -f "$candidate_file"; red "覆蓋 $conf_file 失敗"; exit 1; }
+                    staged_targets+=("$conf_file")
+                    staged_candidates+=("$candidate_file")
                 fi
             fi
         done
     done
 
     green "生成 Nginx stream SNI 分流配置..."
+    default_sni_backend="$(select_default_sni_backend)"
     tmp_stream_conf=$(mktemp /tmp/sb_stream.XXXXXX) || { red "建立 Nginx stream 候選配置失敗"; exit 1; }
     cat > "$tmp_stream_conf" <<STREAMEOF
 # ========== Sing-box SNI 分流 — 由 sb2.sh 自動生成 ==========
@@ -1577,7 +1747,7 @@ setup_nginx_sni(){
 map \$ssl_preread_server_name \$sni_backend {
     ${reality_sni}    reality_backend;
     ${domain_name}    https_backend;
-    default           https_backend;
+    default           ${default_sni_backend};
 }
 
 upstream reality_backend {
@@ -1605,11 +1775,11 @@ STREAMEOF
     [[ -z "$vm_ws_path" ]] && vm_ws_path=$(jq -r '.inbounds[]? | select(.type=="vmess") | .transport.path // empty' /etc/s-box/sb.json 2>/dev/null)
     if [[ -z "$vm_ws_path" ]]; then
         red "未找到 VMess-WS 路徑，停止生成 Nginx 反代配置以避免路徑漂移。"
-        restore_recorded_backups
-        rm -f "$tmp_stream_conf"
+        rm -f "${staged_candidates[@]}" "$tmp_stream_conf"
         exit 1
     fi
-    tmp_http_conf=$(mktemp /tmp/sb_http.XXXXXX) || { red "建立 Nginx HTTP 候選配置失敗"; restore_recorded_backups; rm -f "$tmp_stream_conf"; exit 1; }
+    fallback_root="$(detect_http_fallback_root)"
+    tmp_http_conf=$(mktemp /tmp/sb_http.XXXXXX) || { red "建立 Nginx HTTP 候選配置失敗"; rm -f "${staged_candidates[@]}" "$tmp_stream_conf"; exit 1; }
     cat > "$tmp_http_conf" <<HTTPEOF
 # ========== Sing-box VMess-WS 反代 — 由 sb2.sh 自動生成 ==========
 
@@ -1639,12 +1809,27 @@ server {
     }
 
     location / {
-        root /var/www/html;
+        root ${fallback_root};
         index index.html;
         try_files \$uri \$uri/ =404;
     }
 }
 HTTPEOF
+    local i target candidate
+    for i in "${!staged_targets[@]}"; do
+        target="${staged_targets[$i]}"
+        backup_file_once "$target" || { rm -f "${staged_candidates[@]}" "$tmp_stream_conf" "$tmp_http_conf"; red "備份 $target 失敗"; exit 1; }
+    done
+    for i in "${!staged_targets[@]}"; do
+        target="${staged_targets[$i]}"
+        candidate="${staged_candidates[$i]}"
+        mv "$candidate" "$target" || {
+            red "覆蓋 $target 失敗"
+            restore_recorded_backups
+            rm -f "$tmp_stream_conf" "$tmp_http_conf" "$SB_NGINX_STREAM_CONF" "$SB_NGINX_HTTP_CONF"
+            exit 1
+        }
+    done
     mv "$tmp_stream_conf" "$SB_NGINX_STREAM_CONF" || { red "覆蓋 stream 分流配置失敗"; restore_recorded_backups; rm -f "$tmp_stream_conf" "$tmp_http_conf" "$SB_NGINX_STREAM_CONF" "$SB_NGINX_HTTP_CONF"; exit 1; }
     mv "$tmp_http_conf" "$SB_NGINX_HTTP_CONF" || { red "覆蓋 HTTP 反代配置失敗"; restore_recorded_backups; rm -f "$tmp_http_conf" "$SB_NGINX_STREAM_CONF" "$SB_NGINX_HTTP_CONF"; exit 1; }
 
@@ -1667,7 +1852,7 @@ HTTPEOF
 # ==================== sing-box 配置生成（新架構）====================
 
 gen_config(){
-    local tmp_json="" tmp_public_key="" key_pair="" vm_ws_path="" hy2_obfs_password="" hy2_masquerade_url=""
+    local tmp_json="" tmp_public_key="" key_pair="" vm_ws_path="" hy2_obfs_password="" hy2_masquerade_url="" server_private_ip_rule_json=""
     resolve_reality_sni
     uuid="${uuid:-$(/etc/s-box/sing-box generate uuid)}"
     if [[ -z "${private_key_reality:-}" || -z "${public_key_reality:-}" ]]; then
@@ -1688,6 +1873,7 @@ gen_config(){
 
     v4v6
     if [[ -n $v4 ]]; then ipv="prefer_ipv4"; else ipv="prefer_ipv6"; fi
+    server_private_ip_rule_json="$(build_server_private_ip_rule_json)"
 
     tmp_json=$(mktemp /etc/s-box/sb.json.tmp.XXXXXX) || { red "建立臨時配置文件失敗。"; return 1; }
     tmp_public_key=$(mktemp /etc/s-box/public.key.tmp.XXXXXX) || { rm -f "$tmp_json"; red "建立臨時公鑰文件失敗。"; return 1; }
@@ -1781,7 +1967,7 @@ cat > "$tmp_json" <<EOF
       "strategy": "${ipv}"
     },
     "rules": [
-      { "ip_is_private": true, "outbound": "block" }
+${server_private_ip_rule_json:+${server_private_ip_rule_json}}
     ]
   }
 }
@@ -1794,12 +1980,12 @@ EOF
     mv "$tmp_public_key" /etc/s-box/public.key || { rm -f "$tmp_json" "$tmp_public_key"; red "覆蓋 public.key 失敗。"; return 1; }
     mv "$tmp_json" /etc/s-box/sb.json || { rm -f "$tmp_json"; red "覆蓋 sb.json 失敗。"; return 1; }
     chmod 600 /etc/s-box/public.key /etc/s-box/sb.json 2>/dev/null || true
-    upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" "$hy2_obfs_password"
-    upsert_kv_file "$SB_ENV_FILE" "INT_PORT_REALITY" "$int_port_reality"
-    upsert_kv_file "$SB_ENV_FILE" "INT_PORT_VMWS" "$int_port_vmws"
-    upsert_kv_file "$SB_ENV_FILE" "INT_PORT_HTTPS_BACKEND" "$int_port_https_backend"
-    upsert_kv_file "$SB_ENV_FILE" "SB_VM_WS_PATH" "$vm_ws_path"
-    upsert_kv_file "$SB_ENV_FILE" "SB_REALITY_SNI" "$reality_sni"
+    persist_env_kv "SB_HY2_OBFS_PASSWORD" "$hy2_obfs_password"
+    persist_env_kv "INT_PORT_REALITY" "$int_port_reality"
+    persist_env_kv "INT_PORT_VMWS" "$int_port_vmws"
+    persist_env_kv "INT_PORT_HTTPS_BACKEND" "$int_port_https_backend"
+    persist_env_kv "SB_VM_WS_PATH" "$vm_ws_path"
+    persist_env_kv "SB_REALITY_SNI" "$reality_sni"
     load_runtime_env
 }
 
@@ -1875,7 +2061,7 @@ collect_v2_runtime_state(){
     is_valid_port_number "$port_hy2" || { red "舊版 Hysteria2 端口無效"; return 1; }
     is_valid_port_number "$port_tu" || { red "舊版 TUIC 端口無效"; return 1; }
 
-    upsert_kv_file "$SB_ENV_FILE" "SB_PREVIOUS_UUID" "$existing_uuid"
+    persist_env_kv "SB_PREVIOUS_UUID" "$existing_uuid"
     if is_true "$SB_ROTATE_UUID_ON_MIGRATE"; then
         uuid=""
         yellow "遷移策略：將輪換 UUID，不沿用舊 UUID。"
@@ -1884,33 +2070,33 @@ collect_v2_runtime_state(){
         yellow "遷移策略：沿用舊 UUID。"
     fi
 
-    [[ -n "$old_hy2_obfs_password" ]] && upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" "$old_hy2_obfs_password"
-    [[ -n "$old_hy2_masquerade_url" ]] && upsert_kv_file "$SB_ENV_FILE" "SB_HY2_MASQUERADE_URL" "$old_hy2_masquerade_url"
+    [[ -n "$old_hy2_obfs_password" ]] && persist_env_kv "SB_HY2_OBFS_PASSWORD" "$old_hy2_obfs_password"
+    [[ -n "$old_hy2_masquerade_url" ]] && persist_env_kv "SB_HY2_MASQUERADE_URL" "$old_hy2_masquerade_url"
     if [[ -n "$old_reality_sni" ]]; then
-        upsert_kv_file "$SB_ENV_FILE" "SB_PREVIOUS_REALITY_SNI" "$old_reality_sni"
+        persist_env_kv "SB_PREVIOUS_REALITY_SNI" "$old_reality_sni"
         if is_true "$SB_ROTATE_REALITY_SNI_ON_MIGRATE"; then
             reality_sni=""
-            upsert_kv_file "$SB_ENV_FILE" "SB_REALITY_SNI" ""
+            persist_env_kv "SB_REALITY_SNI" ""
             yellow "遷移策略：將輪換 Reality SNI，不沿用舊 SNI。"
         else
             reality_sni="$old_reality_sni"
-            upsert_kv_file "$SB_ENV_FILE" "SB_REALITY_SNI" "$old_reality_sni"
+            persist_env_kv "SB_REALITY_SNI" "$old_reality_sni"
             yellow "遷移策略：沿用舊 Reality SNI。"
         fi
     else
         reality_sni=""
     fi
     if [[ -n "$old_vm_ws_path" ]]; then
-        upsert_kv_file "$SB_ENV_FILE" "SB_PREVIOUS_VM_WS_PATH" "$old_vm_ws_path"
+        persist_env_kv "SB_PREVIOUS_VM_WS_PATH" "$old_vm_ws_path"
         if is_true "$SB_ROTATE_VM_WS_PATH_ON_MIGRATE"; then
-            upsert_kv_file "$SB_ENV_FILE" "SB_VM_WS_PATH" ""
+            persist_env_kv "SB_VM_WS_PATH" ""
             yellow "遷移策略：將輪換 VMess-WS 路徑，不沿用舊路徑。"
         else
-            upsert_kv_file "$SB_ENV_FILE" "SB_VM_WS_PATH" "$old_vm_ws_path"
+            persist_env_kv "SB_VM_WS_PATH" "$old_vm_ws_path"
             yellow "遷移策略：沿用舊 VMess-WS 路徑。"
         fi
     fi
-    upsert_kv_file "$SB_ENV_FILE" "SB_CLIENT_HOST_MODE" "${SB_CLIENT_HOST_MODE:-ip_prefer}"
+    persist_env_kv "SB_CLIENT_HOST_MODE" "${SB_CLIENT_HOST_MODE:-ip_prefer}"
     load_runtime_env
 }
 
@@ -1934,7 +2120,7 @@ collect_v3_runtime_state(){
     old_hy2_masquerade_url=$(jq -r '.inbounds[]? | select(.type=="hysteria2") | .masquerade // empty' "$cfg" 2>/dev/null)
     domain_name=$(head -n1 /etc/s-box/domain.log 2>/dev/null | tr -d '\r\n ')
 
-    https_backend_port="${INT_PORT_HTTPS_BACKEND:-}"
+    https_backend_port="$(read_persisted_kv "INT_PORT_HTTPS_BACKEND" 2>/dev/null || true)"
     if ! is_valid_port_number "$https_backend_port" && [[ -f "$SB_NGINX_STREAM_CONF" ]]; then
         https_backend_port=$(awk '/upstream https_backend/{flag=1; next} flag && /server 127\.0\.0\.1:/{gsub(/.*127\.0\.0\.1:/, "", $0); gsub(/;.*/, "", $0); print; exit}' "$SB_NGINX_STREAM_CONF" 2>/dev/null)
     fi
@@ -1954,17 +2140,17 @@ collect_v3_runtime_state(){
     is_valid_port_number "$port_tu" || { red "當前 TUIC 端口無效"; return 1; }
 
     uuid="$existing_uuid"
-    [[ -n "$old_hy2_obfs_password" ]] && upsert_kv_file "$SB_ENV_FILE" "SB_HY2_OBFS_PASSWORD" "$old_hy2_obfs_password"
-    [[ -n "$old_hy2_masquerade_url" ]] && upsert_kv_file "$SB_ENV_FILE" "SB_HY2_MASQUERADE_URL" "$old_hy2_masquerade_url"
+    [[ -n "$old_hy2_obfs_password" ]] && persist_env_kv "SB_HY2_OBFS_PASSWORD" "$old_hy2_obfs_password"
+    [[ -n "$old_hy2_masquerade_url" ]] && persist_env_kv "SB_HY2_MASQUERADE_URL" "$old_hy2_masquerade_url"
     if [[ -n "$old_reality_sni" ]]; then
-        upsert_kv_file "$SB_ENV_FILE" "SB_PREVIOUS_REALITY_SNI" "$old_reality_sni"
+        persist_env_kv "SB_PREVIOUS_REALITY_SNI" "$old_reality_sni"
     fi
     if [[ -n "$old_vm_ws_path" ]]; then
-        upsert_kv_file "$SB_ENV_FILE" "SB_PREVIOUS_VM_WS_PATH" "$old_vm_ws_path"
+        persist_env_kv "SB_PREVIOUS_VM_WS_PATH" "$old_vm_ws_path"
     fi
     reality_sni=""
-    upsert_kv_file "$SB_ENV_FILE" "SB_REALITY_SNI" ""
-    upsert_kv_file "$SB_ENV_FILE" "SB_VM_WS_PATH" ""
+    persist_env_kv "SB_REALITY_SNI" ""
+    persist_env_kv "SB_VM_WS_PATH" ""
     yellow "身份歸一化：將重新選定 Reality SNI 並輪換 VMess-WS 路徑。"
     load_runtime_env
 }
@@ -2075,8 +2261,10 @@ create_hy2_hop_script(){
     cat > "$SB_HY2_HOP_SCRIPT" <<'EOF'
 #!/bin/bash
 set -u
-ENV_FILE="/etc/s-box/sb.env"
-read_env(){ local key="$1"; [[ -f "$ENV_FILE" ]] || return 0; grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2-; }
+LEGACY_ENV_FILE="/etc/s-box/sb.env"
+USER_ENV_FILE="/etc/s-box/sb.user.env"
+STATE_ENV_FILE="/etc/s-box/sb.state.env"
+read_env(){ local key="$1" file=""; for file in "$STATE_ENV_FILE" "$USER_ENV_FILE" "$LEGACY_ENV_FILE"; do [[ -f "$file" ]] || continue; if grep -q -E "^${key}=" "$file" 2>/dev/null; then grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2-; return 0; fi; done; return 0; }
 is_valid_port(){ local p="$1"; [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); }
 clean_bin_chain(){ local bin="$1" chain="SB_HY2_HOP"; command -v "$bin" >/dev/null 2>&1 || return 0; "$bin" -t nat -F "$chain" >/dev/null 2>&1 || true; while "$bin" -t nat -C PREROUTING -j "$chain" >/dev/null 2>&1; do "$bin" -t nat -D PREROUTING -j "$chain" >/dev/null 2>&1 || break; done; while "$bin" -t nat -C OUTPUT -m addrtype --dst-type LOCAL -j "$chain" >/dev/null 2>&1; do "$bin" -t nat -D OUTPUT -m addrtype --dst-type LOCAL -j "$chain" >/dev/null 2>&1 || break; done; "$bin" -t nat -X "$chain" >/dev/null 2>&1 || true; }
 apply_bin_chain(){ local bin="$1" start="$2" end="$3" target="$4" chain="SB_HY2_HOP"; command -v "$bin" >/dev/null 2>&1 || return 0; "$bin" -t nat -N "$chain" >/dev/null 2>&1 || true; "$bin" -t nat -C PREROUTING -j "$chain" >/dev/null 2>&1 || "$bin" -t nat -A PREROUTING -j "$chain"; "$bin" -t nat -C OUTPUT -m addrtype --dst-type LOCAL -j "$chain" >/dev/null 2>&1 || "$bin" -t nat -A OUTPUT -m addrtype --dst-type LOCAL -j "$chain"; "$bin" -t nat -F "$chain" >/dev/null 2>&1 || true; "$bin" -t nat -A "$chain" -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target" >/dev/null 2>&1 || true; }
@@ -2219,7 +2407,7 @@ configure_telegram_notify(){
     echo; yellow "Telegram 通知用於：證書自動續期失敗時提醒。"
     readp "啟用 Telegram 失敗通知？[y/N]: " tele_enable_choice
     if [[ ! "${tele_enable_choice:-n}" =~ ^[Yy]$ ]]; then
-        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" "0"; load_runtime_env; green "已關閉 Telegram 通知。"; return 0
+        persist_env_kv "SB_TELEGRAM_ENABLED" "0"; load_runtime_env; green "已關閉 Telegram 通知。"; return 0
     fi
     local token_input chat_input thread_input
     readp "Bot Token [留空沿用]: " token_input; token_input=$(echo "$token_input" | tr -d '[:space:]'); [[ -z "$token_input" ]] && token_input="$SB_TELEGRAM_BOT_TOKEN"
@@ -2228,19 +2416,19 @@ configure_telegram_notify(){
     [[ -z "$chat_input" ]] && { red "Chat ID 不能為空。"; return 1; }
     readp "Thread ID (可選，none 清空): " thread_input; thread_input=$(echo "$thread_input" | tr -d '[:space:]')
     [[ "$thread_input" == "none" || "$thread_input" == "NONE" ]] && thread_input="" || { [[ -z "$thread_input" ]] && thread_input="$SB_TELEGRAM_THREAD_ID"; }
-    upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" "1"
-    upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_BOT_TOKEN" "$token_input"
-    upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_CHAT_ID" "$chat_input"
-    upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_THREAD_ID" "$thread_input"
+    persist_env_kv "SB_TELEGRAM_ENABLED" "1"
+    persist_env_kv "SB_TELEGRAM_BOT_TOKEN" "$token_input"
+    persist_env_kv "SB_TELEGRAM_CHAT_ID" "$chat_input"
+    persist_env_kv "SB_TELEGRAM_THREAD_ID" "$thread_input"
     load_runtime_env; green "Telegram 參數已寫入。"
 }
 
 maybe_prompt_telegram_on_install(){
     local tele_enabled_saved
-    tele_enabled_saved="$(read_kv_from_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" 2>/dev/null || true)"
+    tele_enabled_saved="$(read_persisted_kv "SB_TELEGRAM_ENABLED" 2>/dev/null || true)"
     if [[ -n "$tele_enabled_saved" ]]; then load_runtime_env; return 0; fi
     if is_true "$SB_BATCH_MODE"; then
-        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" "0"
+        persist_env_kv "SB_TELEGRAM_ENABLED" "0"
         load_runtime_env
         return 0
     fi
@@ -2248,7 +2436,7 @@ maybe_prompt_telegram_on_install(){
     readp "現在配置？[y/N]: " tele_init_choice
     if [[ "${tele_init_choice:-n}" =~ ^[Yy]$ ]]; then configure_telegram_notify
     else
-        upsert_kv_file "$SB_ENV_FILE" "SB_TELEGRAM_ENABLED" "0"; load_runtime_env; green "已跳過。"
+        persist_env_kv "SB_TELEGRAM_ENABLED" "0"; load_runtime_env; green "已跳過。"
     fi
 }
 
@@ -2302,12 +2490,21 @@ sbshare(){
     vm_path=$(jq -r '.inbounds[]? | select(.type=="vmess") | .transport.path' /etc/s-box/sb.json 2>/dev/null)
     reality_sni_share=$(jq -r '.inbounds[0].tls.reality.handshake.server // .inbounds[0].tls.server_name // empty' /etc/s-box/sb.json 2>/dev/null)
     [[ -z "$reality_sni_share" ]] && reality_sni_share="$reality_sni"
+    [[ -n "$domain" && -n "$uuid" && -n "$port_hy" && -n "$port_tu_share" && -n "$pk" && -n "$sid" && -n "$vm_path" && -n "$reality_sni_share" ]] || {
+        red "節點輸出所需字段不完整，請先檢查 /etc/s-box/sb.json、/etc/s-box/public.key 和 /etc/s-box/domain.log。"
+        return 1
+    }
 
     host="$(select_client_host "$domain" "$v4")" || { red "節點地址策略 ${SB_CLIENT_HOST_MODE:-ip_prefer} 無可用目標。"; return 1; }
     load_hy2_runtime_from_server_files
-    local domain_enc reality_sni_enc hy2_obfs_password_enc hy2_query="security=tls&alpn=h3&insecure=0" hy2_hop_range=""
+    local domain_enc reality_sni_enc hy2_obfs_password_enc pk_enc sid_enc hostname_enc tuic_user_enc tuic_pass_enc hy2_query="security=tls&alpn=h3&insecure=0" hy2_hop_range=""
     domain_enc="$(uri_encode "$domain")"
     reality_sni_enc="$(uri_encode "$reality_sni_share")"
+    pk_enc="$(uri_encode "$pk")"
+    sid_enc="$(uri_encode "$sid")"
+    hostname_enc="$(uri_encode "$hostname")"
+    tuic_user_enc="$(uri_encode "$uuid")"
+    tuic_pass_enc="$(uri_encode "$uuid")"
     hy2_query="${hy2_query}&sni=${domain_enc}"
     if [[ "${SB_HY2_OBFS_ENABLED:-1}" == "1" && -n "${SB_HY2_OBFS_PASSWORD:-}" ]]; then
         hy2_obfs_password_enc="$(uri_encode "${SB_HY2_OBFS_PASSWORD}")"
@@ -2318,7 +2515,7 @@ sbshare(){
     fi
 
     # 所有 TCP 協議端口統一為 443
-    vl_link="vless://$uuid@$host:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reality_sni_enc&fp=chrome&pbk=$pk&sid=$sid&type=tcp&headerType=none#VL-$hostname"
+    vl_link="vless://$uuid@$host:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reality_sni_enc&fp=chrome&pbk=$pk_enc&sid=$sid_enc&type=tcp&headerType=none#VL-$hostname_enc"
 
     vm_json=$(jq -n \
         --arg add "$host" --arg aid "0" --arg host "$domain" --arg id "$uuid" \
@@ -2328,10 +2525,10 @@ sbshare(){
         '{add:$add, aid:$aid, host:$host, id:$id, net:$net, path:$path, port:$port, ps:$ps, tls:$tls, sni:$sni, type:$type, v:$v}')
     vm_link="vmess://$(echo -n "$vm_json" | base64_no_wrap)"
 
-    hy_link="hysteria2://$uuid@$host:$port_hy?${hy2_query}#HY2-$hostname"
+    hy_link="hysteria2://$uuid@$host:$port_hy?${hy2_query}#HY2-$hostname_enc"
     hy_hop_link=""
-    [[ -n "$hy2_hop_range" ]] && hy_hop_link="hysteria2://$uuid@$host:$hy2_hop_range?${hy2_query}#HY2-Hop-$hostname"
-    tu_link="tuic://$uuid:$uuid@$host:$port_tu_share?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$domain_enc&allow_insecure=0#TU5-$hostname"
+    [[ -n "$hy2_hop_range" ]] && hy_hop_link="hysteria2://$uuid@$host:$hy2_hop_range?${hy2_query}#HY2-Hop-$hostname_enc"
+    tu_link="tuic://${tuic_user_enc}:${tuic_pass_enc}@$host:$port_tu_share?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$domain_enc&allow_insecure=0#TU5-$hostname_enc"
 
     echo "$vl_link" > /etc/s-box/sub.txt
     echo "$vm_link" >> /etc/s-box/sub.txt
@@ -2444,9 +2641,9 @@ show_client_conf_latest(){
   "route": {
     "default_domain_resolver": { "server": "proxydns" },
     "rule_set": [
-      { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs", "download_detour": "select", "update_interval": "1d" },
-      { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs", "download_detour": "select", "update_interval": "1d" },
-      { "tag": "geoip-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs", "download_detour": "select", "update_interval": "1d" }
+      { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "${SB_GEOSITE_GEOLOCATION_NONCN_URL}", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "${SB_GEOSITE_CN_URL}", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geoip-cn", "type": "remote", "format": "binary", "url": "${SB_GEOIP_CN_URL}", "download_detour": "select", "update_interval": "1d" }
     ],
     "auto_detect_interface": true,
     "final": "select",
@@ -2556,9 +2753,9 @@ show_client_conf_legacy(){
   ],
   "route": {
     "rule_set": [
-      { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs", "download_detour": "select", "update_interval": "1d" },
-      { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs", "download_detour": "select", "update_interval": "1d" },
-      { "tag": "geoip-cn", "type": "remote", "format": "binary", "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs", "download_detour": "select", "update_interval": "1d" }
+      { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "${SB_GEOSITE_GEOLOCATION_NONCN_URL}", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "${SB_GEOSITE_CN_URL}", "download_detour": "select", "update_interval": "1d" },
+      { "tag": "geoip-cn", "type": "remote", "format": "binary", "url": "${SB_GEOIP_CN_URL}", "download_detour": "select", "update_interval": "1d" }
     ],
     "auto_detect_interface": true,
     "final": "select",
@@ -2665,12 +2862,48 @@ restart_singbox(){
     systemctl is-active --quiet sing-box && green "sing-box 已成功重啟。" || red "sing-box 重啟後狀態異常。"
 }
 
+validate_core_runtime_health(){
+    local attempt
+    for attempt in {1..5}; do
+        /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1 || { sleep 2; continue; }
+        systemctl is-active --quiet sing-box >/dev/null 2>&1 || { sleep 2; continue; }
+        return 0
+    done
+    return 1
+}
+
 update_core(){
+    local snapshot_dir=""
     green "正在更新 Sing-box 內核..."
     assert_latest_stable_supported "Sing-box 內核更新" || return 1
-    systemctl stop sing-box 2>/dev/null || true; inssb
-    if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json; then red "內核已更新，但配置校驗失敗。"; return; fi
-    systemctl restart sing-box 2>/dev/null || { yellow "內核已更新，但重啟失敗。"; return; }
+    snapshot_dir=$(create_rollout_snapshot "update-core") || { red "建立內核更新回滾快照失敗。"; return 1; }
+    begin_rollback_guard "$snapshot_dir" "Sing-box 內核更新"
+    systemctl stop sing-box 2>/dev/null || true
+    inssb || {
+        red "Sing-box 內核下載或替換失敗。"
+        restore_rollout_snapshot "$snapshot_dir" || true
+        end_rollback_guard
+        return 1
+    }
+    if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then
+        red "內核已更新，但配置校驗失敗。"
+        restore_rollout_snapshot "$snapshot_dir" || true
+        end_rollback_guard
+        return 1
+    fi
+    systemctl restart sing-box 2>/dev/null || {
+        yellow "內核已更新，但重啟失敗。"
+        restore_rollout_snapshot "$snapshot_dir" || true
+        end_rollback_guard
+        return 1
+    }
+    if ! validate_core_runtime_health; then
+        red "內核更新後運行態校驗失敗。"
+        restore_rollout_snapshot "$snapshot_dir" || true
+        end_rollback_guard
+        return 1
+    fi
+    end_rollback_guard
     green "Sing-box 內核已更新並重啟。"
 }
 
@@ -2679,6 +2912,8 @@ cleanup_managed_sbox_files(){
     local managed_paths=(
         /etc/s-box/sb.json
         /etc/s-box/sb.env
+        /etc/s-box/sb.user.env
+        /etc/s-box/sb.state.env
         /etc/s-box/sub.txt
         /etc/s-box/domain.log
         /etc/s-box/public.key
@@ -2727,10 +2962,11 @@ lnsb(){
     local target="/usr/bin/sb"
     local backup="/usr/bin/sb.bak"
     local source_url="${UPDATE_URL:-}"
+    local script_path="${BASH_SOURCE[0]:-$0}"
     if [[ -z "$source_url" ]]; then
-        if [[ -f "$0" ]]; then
+        if [[ -f "$script_path" ]]; then
             [[ -f "$target" ]] && cp "$target" "$backup" 2>/dev/null || true
-            cp "$0" "$target" || { red "安裝快捷命令失敗。"; return 1; }
+            cp "$script_path" "$target" || { red "安裝快捷命令失敗。"; return 1; }
             chmod +x "$target"
             green "已從當前腳本安裝快捷命令 /usr/bin/sb。"
             return 0
@@ -2995,7 +3231,7 @@ show_banner
 show_status
 show_menu
 
-readp "   請選擇操作 [0-9]: " Input
+readp "   請選擇操作 [0-9/A]: " Input
 echo
 
 case "$Input" in
