@@ -260,7 +260,7 @@ stable_track_label(){
 }
 
 build_server_private_ip_rule_json(){
-    case "${SB_SERVER_PRIVATE_IP_POLICY:-block}" in
+    case "${SB_SERVER_PRIVATE_IP_POLICY:-direct}" in
         direct)
             printf '%s\n' '      { "ip_is_private": true, "outbound": "direct" }'
             ;;
@@ -1111,12 +1111,9 @@ select_default_sni_backend(){
             printf '%s\n' "https_backend"
             ;;
         auto|"")
-            detect_public_https_sites
-            if [[ -n "${SB_PUBLIC_HTTPS_SITES:-}" ]]; then
-                printf '%s\n' "https_backend"
-            else
-                printf '%s\n' "reality_backend"
-            fi
+            # Keep unknown SNI conservative by default. Even when a public site exists,
+            # auto should not implicitly funnel arbitrary SNI probes into the real site backend.
+            printf '%s\n' "reality_backend"
             ;;
         *)
             printf '%s\n' "https_backend"
