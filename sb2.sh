@@ -40,6 +40,7 @@ SB_LATEST_STABLE_PUBLISHED_AT=""
 SB_ROLLBACK_ACTIVE="0"
 SB_ROLLBACK_SNAPSHOT_DIR=""
 SB_ROLLBACK_CONTEXT=""
+SB_ROLLBACK_RUNNING="0"
 SB_MIGRATE_OLD_VLESS_PORT=""
 SB_MIGRATE_OLD_VMESS_PORT=""
 
@@ -48,10 +49,11 @@ green(){ echo -e "\\033[32m\\033[01m$1\\033[0m";}
 yellow(){ echo -e "\\033[33m\\033[01m$1\\033[0m";}
 blue(){ echo -e "\\033[36m\\033[01m$1\\033[0m";}
 white(){ echo -e "\\033[37m\\033[01m$1\\033[0m";}
-readp(){ read -p "$(yellow "$1")" $2;}
+readp(){ read -rp "$(yellow "$1")" "$2";}
 
 ensure_sbox_dir(){
     mkdir -p /etc/s-box
+    chmod 700 /etc/s-box 2>/dev/null || true
 }
 
 read_kv_from_file(){
@@ -200,6 +202,45 @@ calc_sha256(){
     fi
 }
 
+base64_no_wrap(){
+    if base64 -w 0 /dev/null >/dev/null 2>&1; then
+        base64 -w 0 "$@"
+    else
+        base64 "$@" | tr -d '\r\n'
+    fi
+}
+
+uri_encode(){
+    local value="${1:-}"
+    if command -v jq >/dev/null 2>&1; then
+        jq -nr --arg v "$value" '$v|@uri'
+    else
+        python3 - "$value" <<'PY'
+import sys
+from urllib.parse import quote
+print(quote(sys.argv[1], safe=''))
+PY
+    fi
+}
+
+fetch_public_ip(){
+    local family="$1" url ip=""
+    local -a urls=()
+    case "$family" in
+        4) urls=("https://icanhazip.com" "https://api.ipify.org") ;;
+        6) urls=("https://icanhazip.com" "https://api64.ipify.org") ;;
+        *) return 1 ;;
+    esac
+    for url in "${urls[@]}"; do
+        ip=$(curl -fsS -"$family" -m 5 "$url" 2>/dev/null | tr -d '\r\n ' || true)
+        case "$family" in
+            4) [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { printf '%s\n' "$ip"; return 0; } ;;
+            6) [[ "$ip" == *:* ]] && { printf '%s\n' "$ip"; return 0; } ;;
+        esac
+    done
+    return 1
+}
+
 extract_sha256_from_text(){
     sed -nE 's/.*([0-9a-fA-F]{64}).*/\1/p' | head -n1 | tr 'A-F' 'a-f'
 }
@@ -345,10 +386,12 @@ end_rollback_guard(){
 
 rollback_on_exit_if_needed(){
     local status="$?"
-    if [[ "$SB_ROLLBACK_ACTIVE" == "1" && "$status" -ne 0 && -n "$SB_ROLLBACK_SNAPSHOT_DIR" ]]; then
+    if [[ "$SB_ROLLBACK_ACTIVE" == "1" && "$status" -ne 0 && -n "$SB_ROLLBACK_SNAPSHOT_DIR" && "${SB_ROLLBACK_RUNNING:-0}" != "1" ]]; then
+        SB_ROLLBACK_RUNNING="1"
         red "${SB_ROLLBACK_CONTEXT:-本次操作} 異常退出，正在自動回滾..."
         restore_rollout_snapshot "$SB_ROLLBACK_SNAPSHOT_DIR" || true
         end_rollback_guard
+        SB_ROLLBACK_RUNNING="0"
     fi
     return "$status"
 }
@@ -375,7 +418,9 @@ assert_latest_stable_supported(){
 }
 
 sb(){
-    bash "$0"
+    local self="${BASH_SOURCE[0]:-$0}"
+    [[ -f "$self" ]] || { red "無法定位當前腳本文件。"; return 1; }
+    bash "$self"
     exit 0
 }
 
@@ -449,17 +494,22 @@ install_depend(){
     done
     if [[ "$(cat /etc/s-box/sbyg_update 2>/dev/null)" != "$dep_ver" || "$missing" == "1" ]]; then
         green "安裝必要依賴..."
-        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt update -y
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt update -y || {
+            red "apt update 失敗，無法繼續安裝依賴。"
+            return 1
+        }
         DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt install -y jq openssl iproute2 iputils-ping coreutils expect git socat grep \
-            util-linux curl wget tar python3 cron ufw iptables file nginx libnginx-mod-stream
+            util-linux curl wget tar python3 cron ufw iptables file nginx libnginx-mod-stream || {
+            red "apt install 失敗，無法繼續安裝依賴。"
+            return 1
+        }
         mkdir -p /etc/s-box
         echo "$dep_ver" > /etc/s-box/sbyg_update
     fi
 }
 
 setup_tun(){
-    TUN=$(cat /dev/net/tun 2>&1)
-    if [[ ! $TUN =~ 'in bad state' ]] && [[ ! $TUN =~ '處於錯誤狀態' ]]; then
+    if [[ ! -c /dev/net/tun ]]; then
         cat > /root/tun.sh <<'EOF'
 #!/bin/bash
 if [ ! -e /dev/net/tun ]; then
@@ -477,10 +527,10 @@ _v4_cache=""
 _v6_cache=""
 v4v6(){
     if [[ -z "$_v4_cache" ]]; then
-        _v4_cache=$(curl -s4m5 icanhazip.com -k 2>/dev/null || echo "")
+        _v4_cache=$(fetch_public_ip 4 2>/dev/null || echo "")
     fi
     if [[ -z "$_v6_cache" ]]; then
-        _v6_cache=$(curl -s6m5 icanhazip.com -k 2>/dev/null || echo "")
+        _v6_cache=$(fetch_public_ip 6 2>/dev/null || echo "")
     fi
     v4="$_v4_cache"
     v6="$_v6_cache"
@@ -604,6 +654,19 @@ port_in_use(){
     return 1
 }
 
+pick_unused_high_port(){
+    local attempts=0 port
+    while (( attempts < 240 )); do
+        port=$(shuf -i 10000-65535 -n 1)
+        if ! port_in_use "$port" && [[ ! " $* " =~ " $port " ]]; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+    done
+    return 1
+}
+
 detect_public_https_sites(){
     SB_PUBLIC_HTTPS_SITES=""
     command -v nginx >/dev/null 2>&1 || return 0
@@ -696,9 +759,9 @@ backup_file_once(){
 
 restore_recorded_backups(){
     local manifest="${1:-$SB_NGINX_MANIFEST}"
+    local file backup
     [[ -f "$manifest" ]] || return 0
     while IFS= read -r line; do
-        local file backup
         [[ -n "$line" ]] || continue
         file="${line%%$'\t'*}"
         backup="${line#*$'\t'}"
@@ -712,9 +775,9 @@ restore_recorded_backups(){
 
 cleanup_recorded_backups(){
     local manifest="${1:-$SB_NGINX_MANIFEST}"
+    local file backup
     [[ -f "$manifest" ]] || return 0
     while IFS= read -r line; do
-        local file backup
         [[ -n "$line" ]] || continue
         file="${line%%$'\t'*}"
         backup="${line#*$'\t'}"
@@ -774,7 +837,7 @@ text = path.read_text()
 lines = text.splitlines(True)
 out = []
 changed = False
-have_loopback = any(re.match(r'^\s*listen\s+(127\.0\.0\.1|\[::1\]):' + re.escape(port) + r'(\s|;)', line) for line in lines)
+have_ipv4_loopback = any(re.match(r'^\s*listen\s+127\.0\.0\.1:' + re.escape(port) + r'(\s|;)', line) for line in lines)
 unsupported = []
 
 for line in lines:
@@ -792,7 +855,7 @@ for line in lines:
         out.append(f"{m4.group(1)}listen 127.0.0.1:{port}{suffix}\n")
         if not out[-1].endswith(';\n'):
             out[-1] = out[-1][:-1] + ';\n'
-        have_loopback = True
+        have_ipv4_loopback = True
         changed = True
         continue
     if m6:
@@ -800,12 +863,12 @@ for line in lines:
         if 'quic' in suffix.split():
             out.append(line)
             continue
-        if not have_loopback:
+        if not have_ipv4_loopback:
             inserted = f"{m6.group(1)}listen 127.0.0.1:{port}{suffix}\n"
             if not inserted.endswith(';\n'):
                 inserted = inserted[:-1] + ';\n'
             out.append(inserted)
-            have_loopback = True
+            have_ipv4_loopback = True
         out.append(f"{m6.group(1)}# sb-managed disabled external IPv6 443: listen [::]:443{suffix};\n")
         changed = True
         continue
@@ -934,7 +997,7 @@ inssb(){
         sbcore="${SB_LATEST_STABLE_VERSION:-}"
         if [[ -z "$sbcore" ]]; then
             yellow "GitHub API 獲取失敗，嘗試 fallback..."
-            sbcore=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null | grep -oP 'releases/tag/v\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            sbcore=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null | grep -oE 'releases/tag/v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's#.*v##')
         fi
         if [[ -z "$sbcore" ]]; then
             red "無法獲取 sing-box 最新版本號。"
@@ -999,15 +1062,13 @@ inssb(){
 insport(){
     green "生成端口..."
     # 生成 5 個不衝突的高位隨機端口（3 個內部 + 2 個外部 UDP）
-    local all_ports=()
+    local all_ports=() port
     for i in {1..5}; do
-        while true; do
-            local port=$(shuf -i 10000-65535 -n 1)
-            if ! port_in_use "$port" && [[ ! " ${all_ports[*]} " =~ " $port " ]]; then
-                all_ports+=("$port")
-                break
-            fi
-        done
+        port=$(pick_unused_high_port "${all_ports[@]}") || {
+            red "高位端口生成失敗：未能在合理嘗試次數內找到空閒端口。"
+            return 1
+        }
+        all_ports+=("$port")
     done
     # 內部端口（只聽 127.0.0.1，不對外暴露）
     int_port_reality=${all_ports[0]}
@@ -1360,8 +1421,8 @@ CERTEOF
 
 install_cert_renew_jobs(){
     ensure_sbox_dir; create_cert_renew_script
-    /root/.acme.sh/acme.sh --install-cronjob >/dev/null 2>&1 || true
-    green "已為 acme.sh 安裝/更新自動續期任務 (cron)。"
+    /root/.acme.sh/acme.sh --uninstall-cronjob >/dev/null 2>&1 || true
+    green "已停用 acme.sh 自帶 cron，改由 sb 自管續期任務。"
     if [[ ! -f /etc/crontab ]]; then yellow "未找到 /etc/crontab，跳過 sb 證書續期任務寫入。"; return; fi
     if grep -Fq "$SB_CERT_RENEW_CRON_MARK" /etc/crontab 2>/dev/null; then sed -i "\|${SB_CERT_RENEW_CRON_MARK}|d" /etc/crontab; fi
     echo "17 3 * * * root ${SB_CERT_RENEW_SCRIPT} auto >/dev/null 2>&1 ${SB_CERT_RENEW_CRON_MARK}" >> /etc/crontab
@@ -1654,30 +1715,39 @@ cat > /etc/s-box/sb.json <<EOF
     }
   ],
   "outbounds": [
-    { "type": "direct", "tag": "direct" }
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" }
   ],
   "route": {
     "default_domain_resolver": {
       "server": "local",
       "strategy": "${ipv}"
-    }
+    },
+    "rules": [
+      { "ip_is_private": true, "outbound": "block" }
+    ]
   }
 }
 EOF
 }
 
 validate_v3_runtime_health(){
-    /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1 || return 1
-    systemctl is-active --quiet sing-box >/dev/null 2>&1 || return 1
-    systemctl is-active --quiet nginx >/dev/null 2>&1 || return 1
-    nginx -t >/dev/null 2>&1 || return 1
-    [[ -s /etc/s-box/cert.crt && -s /etc/s-box/private.key ]] || return 1
-    [[ -f "$SB_NGINX_STREAM_CONF" && -f "$SB_NGINX_HTTP_CONF" ]] || return 1
-    ss -tlnp 2>/dev/null | grep -q ":443 " || return 1
-    ss -tlnp 2>/dev/null | grep -q ":${int_port_reality} " || return 1
-    ss -tlnp 2>/dev/null | grep -q ":${int_port_vmws} " || return 1
-    ss -ulnp 2>/dev/null | grep -q ":${port_hy2} " || return 1
-    ss -ulnp 2>/dev/null | grep -q ":${port_tu} " || return 1
+    local attempt
+    for attempt in {1..5}; do
+        /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1 || { sleep 2; continue; }
+        systemctl is-active --quiet sing-box >/dev/null 2>&1 || { sleep 2; continue; }
+        systemctl is-active --quiet nginx >/dev/null 2>&1 || { sleep 2; continue; }
+        nginx -t >/dev/null 2>&1 || { sleep 2; continue; }
+        [[ -s /etc/s-box/cert.crt && -s /etc/s-box/private.key ]] || { sleep 2; continue; }
+        [[ -f "$SB_NGINX_STREAM_CONF" && -f "$SB_NGINX_HTTP_CONF" ]] || { sleep 2; continue; }
+        ss -tlnp 2>/dev/null | grep -q ":443 " || { sleep 2; continue; }
+        ss -tlnp 2>/dev/null | grep -q ":${int_port_reality} " || { sleep 2; continue; }
+        ss -tlnp 2>/dev/null | grep -q ":${int_port_vmws} " || { sleep 2; continue; }
+        ss -ulnp 2>/dev/null | grep -q ":${port_hy2} " || { sleep 2; continue; }
+        ss -ulnp 2>/dev/null | grep -q ":${port_tu} " || { sleep 2; continue; }
+        return 0
+    done
+    return 1
 }
 
 cleanup_legacy_split_firewall_rules(){
@@ -1690,13 +1760,11 @@ preserve_external_udp_ports_for_migration(){
     local keep_hy2="$1" keep_tu="$2"
     local all_ports=() port
     for i in {1..3}; do
-        while true; do
-            port=$(shuf -i 10000-65535 -n 1)
-            if ! port_in_use "$port" && [[ "$port" != "$keep_hy2" && "$port" != "$keep_tu" ]] && [[ ! " ${all_ports[*]} " =~ " $port " ]]; then
-                all_ports+=("$port")
-                break
-            fi
-        done
+        port=$(pick_unused_high_port "$keep_hy2" "$keep_tu" "${all_ports[@]}") || {
+            red "遷移端口生成失敗：未能在合理嘗試次數內找到空閒端口。"
+            return 1
+        }
+        all_ports+=("$port")
     done
     int_port_reality=${all_ports[0]}
     int_port_vmws=${all_ports[1]}
@@ -1840,10 +1908,10 @@ migrate_v2_to_v3(){
     snapshot_dir=$(create_rollout_snapshot "migrate-v2") || { red "建立遷移快照失敗。"; return 1; }
     green "已建立遷移快照: ${snapshot_dir}"
     begin_rollback_guard "$snapshot_dir" "v2 -> v3 遷移"
-    install_depend
+    install_depend || return 1
     assert_latest_stable_supported "Sing-box 遷移" || return 1
     collect_v2_runtime_state || return 1
-    preserve_external_udp_ports_for_migration "$port_hy2" "$port_tu"
+    preserve_external_udp_ports_for_migration "$port_hy2" "$port_tu" || return 1
     init_hy2_transport_env
     ensure_domain_and_cert
     maybe_align_hy2_masquerade_with_site
@@ -1852,7 +1920,7 @@ migrate_v2_to_v3(){
     gen_config
     setup_nginx_sni
     setup_firewall
-    sbservice
+    sbservice || return 1
     setup_hy2_port_hopping
     if ! validate_v3_runtime_health; then
         red "遷移後健康檢查失敗，正在自動回滾。"
@@ -1882,7 +1950,7 @@ normalize_v3_identity(){
     gen_config
     setup_nginx_sni
     setup_firewall
-    sbservice
+    sbservice || return 1
     setup_hy2_port_hopping
     if ! validate_v3_runtime_health; then
         red "身份歸一化後健康檢查失敗，正在自動回滾。"
@@ -1923,9 +1991,9 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable sing-box >/dev/null 2>&1
-    systemctl restart sing-box
+    systemctl daemon-reload || return 1
+    systemctl enable sing-box >/dev/null 2>&1 || return 1
+    systemctl restart sing-box || return 1
 }
 
 # ==================== HY2 端口跳躍服務 ====================
@@ -2153,14 +2221,20 @@ sbshare(){
 
     host="$(select_client_host "$domain" "$v4")" || { red "節點地址策略 ${SB_CLIENT_HOST_MODE:-ip_prefer} 無可用目標。"; return 1; }
     load_hy2_runtime_from_server_files
-    local hy2_query="security=tls&alpn=h3&insecure=0&sni=$domain" hy2_hop_range=""
-    [[ "${SB_HY2_OBFS_ENABLED:-1}" == "1" && -n "${SB_HY2_OBFS_PASSWORD:-}" ]] && hy2_query="${hy2_query}&obfs=salamander&obfs-password=${SB_HY2_OBFS_PASSWORD}"
+    local domain_enc reality_sni_enc hy2_obfs_password_enc hy2_query="security=tls&alpn=h3&insecure=0" hy2_hop_range=""
+    domain_enc="$(uri_encode "$domain")"
+    reality_sni_enc="$(uri_encode "$reality_sni_share")"
+    hy2_query="${hy2_query}&sni=${domain_enc}"
+    if [[ "${SB_HY2_OBFS_ENABLED:-1}" == "1" && -n "${SB_HY2_OBFS_PASSWORD:-}" ]]; then
+        hy2_obfs_password_enc="$(uri_encode "${SB_HY2_OBFS_PASSWORD}")"
+        hy2_query="${hy2_query}&obfs=salamander&obfs-password=${hy2_obfs_password_enc}"
+    fi
     if [[ "${SB_HY2_HOP_ENABLED:-0}" == "1" ]] && is_valid_port_number "${SB_HY2_HOP_START:-}" && is_valid_port_number "${SB_HY2_HOP_END:-}" && (( SB_HY2_HOP_START < SB_HY2_HOP_END )); then
         hy2_hop_range="${SB_HY2_HOP_START}-${SB_HY2_HOP_END}"
     fi
 
     # 所有 TCP 協議端口統一為 443
-    vl_link="vless://$uuid@$host:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reality_sni_share&fp=chrome&pbk=$pk&sid=$sid&type=tcp&headerType=none#VL-$hostname"
+    vl_link="vless://$uuid@$host:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reality_sni_enc&fp=chrome&pbk=$pk&sid=$sid&type=tcp&headerType=none#VL-$hostname"
 
     vm_json=$(jq -n \
         --arg add "$host" --arg aid "0" --arg host "$domain" --arg id "$uuid" \
@@ -2168,12 +2242,12 @@ sbshare(){
         --arg ps "VM-$hostname" --arg tls "tls" --arg sni "$domain" \
         --arg type "none" --arg v "2" \
         '{add:$add, aid:$aid, host:$host, id:$id, net:$net, path:$path, port:$port, ps:$ps, tls:$tls, sni:$sni, type:$type, v:$v}')
-    vm_link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
+    vm_link="vmess://$(echo -n "$vm_json" | base64_no_wrap)"
 
     hy_link="hysteria2://$uuid@$host:$port_hy?${hy2_query}#HY2-$hostname"
     hy_hop_link=""
     [[ -n "$hy2_hop_range" ]] && hy_hop_link="hysteria2://$uuid@$host:$hy2_hop_range?${hy2_query}#HY2-Hop-$hostname"
-    tu_link="tuic://$uuid:$uuid@$host:$port_tu_share?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$domain&allow_insecure=0#TU5-$hostname"
+    tu_link="tuic://$uuid:$uuid@$host:$port_tu_share?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$domain_enc&allow_insecure=0#TU5-$hostname"
 
     echo "$vl_link" > /etc/s-box/sub.txt
     echo "$vm_link" >> /etc/s-box/sub.txt
@@ -2182,7 +2256,7 @@ sbshare(){
     echo "$tu_link" >> /etc/s-box/sub.txt
     chmod 600 /etc/s-box/sub.txt
 
-    sub_base64=$(base64 -w 0 < /etc/s-box/sub.txt)
+    sub_base64=$(base64_no_wrap < /etc/s-box/sub.txt)
 
     echo
     white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -2516,6 +2590,35 @@ update_core(){
     green "Sing-box 內核已更新並重啟。"
 }
 
+cleanup_managed_sbox_files(){
+    local path
+    local managed_paths=(
+        /etc/s-box/sb.json
+        /etc/s-box/sb.env
+        /etc/s-box/sub.txt
+        /etc/s-box/domain.log
+        /etc/s-box/public.key
+        /etc/s-box/cert.crt
+        /etc/s-box/private.key
+        /etc/s-box/firewall_ports.log
+        /etc/s-box/sing-box
+        /etc/s-box/sing-box.tar.gz
+        /etc/s-box/sbyg_update
+        "$SB_NGINX_MANIFEST"
+        /root/geoip.db
+        /root/geosite.db
+        "$SB_CERT_RENEW_SCRIPT"
+        "$SB_CERT_RENEW_STATUS"
+        "$SB_CERT_RENEW_LOG"
+        "$SB_HY2_HOP_SCRIPT"
+    )
+    for path in "${managed_paths[@]}"; do
+        rm -f "$path"
+    done
+    rm -rf "$SB_NGINX_BACKUP_DIR"
+    rmdir /etc/s-box >/dev/null 2>&1 || true
+}
+
 repair_hy2_hop_defaults(){
     detect_install_layout
     require_v3_layout "HY2 hop 默認修復" || return 1
@@ -2629,7 +2732,8 @@ unins(){
     fi
 
     cleanup_hy2_port_hopping
-    rm -rf /etc/s-box /usr/bin/sb /etc/systemd/system/sing-box.service /root/geoip.db /root/geosite.db
+    cleanup_managed_sbox_files
+    rm -f /usr/bin/sb /etc/systemd/system/sing-box.service
     systemctl daemon-reload 2>/dev/null
     green "卸載完成 (BBR/Nginx 保留)。"
 }
@@ -2651,13 +2755,13 @@ install_singbox(){
     snapshot_dir=$(create_rollout_snapshot "install-v3") || { red "建立安裝快照失敗。"; return 1; }
     green "已建立安裝快照: ${snapshot_dir}"
     begin_rollback_guard "$snapshot_dir" "v3 安裝"
-    install_depend
+    install_depend || return 1
     assert_latest_stable_supported "Sing-box 安裝" || return 1
     show_install_context
     enable_bbr
     setup_tun
     inssb
-    insport
+    insport || return 1
     init_hy2_transport_env
     ensure_domain_and_cert
     maybe_align_hy2_masquerade_with_site
@@ -2665,7 +2769,7 @@ install_singbox(){
     gen_config
     setup_nginx_sni       # 核心：配置 Nginx SNI 分流
     setup_firewall
-    sbservice
+    sbservice || return 1
     setup_hy2_port_hopping
     if ! validate_v3_runtime_health; then
         red "安裝後健康檢查失敗，正在自動回滾。"
