@@ -45,7 +45,7 @@ SB_HTTP_FALLBACK_ROOT="${SB_HTTP_FALLBACK_ROOT:-}"
 SB_GEOSITE_GEOLOCATION_NONCN_URL="${SB_GEOSITE_GEOLOCATION_NONCN_URL:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs}"
 SB_GEOSITE_CN_URL="${SB_GEOSITE_CN_URL:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs}"
 SB_GEOIP_CN_URL="${SB_GEOIP_CN_URL:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs}"
-SB_SERVER_PRIVATE_IP_POLICY="${SB_SERVER_PRIVATE_IP_POLICY:-block}"
+SB_SERVER_PRIVATE_IP_POLICY="${SB_SERVER_PRIVATE_IP_POLICY:-direct}"
 SB_LATEST_STABLE_VERSION=""
 SB_LATEST_STABLE_PUBLISHED_AT=""
 SB_LATEST_STABLE_PROBED="0"
@@ -165,7 +165,7 @@ load_runtime_env(){
     SB_GEOSITE_GEOLOCATION_NONCN_URL=""; SB_GEOSITE_CN_URL=""; SB_GEOIP_CN_URL=""
     SB_REALITY_SNI=""; SB_REALITY_SNI_CANDIDATES=""; SB_VM_WS_PATH=""
     INT_PORT_REALITY=""; INT_PORT_VMWS=""; INT_PORT_HTTPS_BACKEND=""
-    for file in "$SB_LEGACY_ENV_FILE" "$SB_USER_ENV_FILE" "$SB_STATE_ENV_FILE"; do
+    for file in "$SB_LEGACY_ENV_FILE" "$SB_STATE_ENV_FILE" "$SB_USER_ENV_FILE"; do
         [[ -f "$file" ]] || continue
         while IFS='=' read -r key value; do
             case "$key" in
@@ -1695,6 +1695,9 @@ setup_nginx_sni(){
             red "當前 v3 SNI 接管默認只支持單一 HTTPS backend。"
             yellow "如確需接管多站點，請先顯式設置 SB_ALLOW_MULTI_HTTPS=1 並人工核對 nginx -T。"
             exit 1
+        elif [[ "${site_count:-0}" -gt 1 ]]; then
+            yellow "已顯式啟用 SB_ALLOW_MULTI_HTTPS=1，但當前實現仍只提供單一 https_backend。"
+            yellow "這只適用於人工確認後的風險操作，不代表腳本已原生支持多 HTTPS backend。"
         fi
     fi
 
