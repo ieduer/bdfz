@@ -1,7 +1,9 @@
 #!/bin/bash
-# Sing-Box 四協議一鍵安裝腳本 v3.0 — Nginx SNI 分流架構
+# Sing-Box 四協議一鍵安裝腳本 v3.2 — Nginx SNI 分流架構
 # VLESS-Reality · VMess-WS · Hysteria2 · TUIC V5
-# 所有 TCP 協議統一走 443 端口，由 Nginx stream 做 SNI 分流
+# 服務端: TCP 統一 443 · Nginx SNI 分流 · DoT 上游優先 + 本地兜底 DNS
+# 客戶端模板: 雙軌 1.11.4 + 1.13.x · FakeIP 雙棧 · DoT/DoH 分流 · DNS 防洩漏 · Mux
+# 注意: FakeIP、防洩漏、雙棧 DNS 為客戶端模板能力；服務端僅保留最小 DNS 依賴供自身路由解析
 export LANG=en_US.UTF-8
 red='\\033[0;31m'
 green='\\033[0;32m'
@@ -16,11 +18,28 @@ UPDATE_SHA256_URL="${UPDATE_SHA256_URL:-}"
 SB_ALLOW_UNVERIFIED_UPDATE="${SB_ALLOW_UNVERIFIED_UPDATE:-0}"
 SB_BATCH_MODE="${SB_BATCH_MODE:-0}"
 SB_ENABLE_UFW="${SB_ENABLE_UFW:-0}"
-SB_ROTATE_UUID_ON_MIGRATE="${SB_ROTATE_UUID_ON_MIGRATE:-1}"
-SB_ROTATE_REALITY_SNI_ON_MIGRATE="${SB_ROTATE_REALITY_SNI_ON_MIGRATE:-1}"
-SB_ROTATE_VM_WS_PATH_ON_MIGRATE="${SB_ROTATE_VM_WS_PATH_ON_MIGRATE:-1}"
+SB_ROTATE_UUID_ON_MIGRATE="${SB_ROTATE_UUID_ON_MIGRATE:-0}"
+SB_ROTATE_REALITY_SNI_ON_MIGRATE="${SB_ROTATE_REALITY_SNI_ON_MIGRATE:-0}"
+SB_ROTATE_VM_WS_PATH_ON_MIGRATE="${SB_ROTATE_VM_WS_PATH_ON_MIGRATE:-0}"
+# --- v3.2 可調參數 ---
+# DNS: 客戶端 port53 劫持 + DoT/DoQ/STUN 阻斷
 SB_DNS_PORT53_HIJACK="${SB_DNS_PORT53_HIJACK:-1}"
-SB_DNS_REJECT_BYPASS="${SB_DNS_REJECT_BYPASS:-0}"
+SB_DNS_REJECT_BYPASS="${SB_DNS_REJECT_BYPASS:-1}"
+# 服務端 DNS 上游 (DoT, IP only)
+SB_SERVER_DNS_UPSTREAM="${SB_SERVER_DNS_UPSTREAM:-1.1.1.1}"
+# 客戶端 VMess Mux
+SB_CLIENT_MUX="${SB_CLIENT_MUX:-0}"
+SB_CLIENT_INTERRUPT_ON_SWITCH="${SB_CLIENT_INTERRUPT_ON_SWITCH:-1}"
+# URLTest 探測參數
+SB_URLTEST_INTERVAL="${SB_URLTEST_INTERVAL:-1m}"
+SB_URLTEST_TOLERANCE="${SB_URLTEST_TOLERANCE:-100}"
+SB_URLTEST_URL="${SB_URLTEST_URL:-https://cp.cloudflare.com/generate_204}"
+SB_URLTEST_IDLE_TIMEOUT="${SB_URLTEST_IDLE_TIMEOUT:-10m}"
+# TCP buffer / sysctl 調優 (BBR 之外的額外參數)
+SB_SYSCTL_TUNE="${SB_SYSCTL_TUNE:-1}"
+# HY2 帶寬提示 (幫助服務端 BBR 估算)
+SB_HY2_UP_MBPS="${SB_HY2_UP_MBPS:-50}"
+SB_HY2_DOWN_MBPS="${SB_HY2_DOWN_MBPS:-200}"
 ACME_SH_VERSION="${ACME_SH_VERSION:-3.1.2}"
 SB_LEGACY_ENV_FILE="/etc/s-box/sb.env"
 SB_USER_ENV_FILE="/etc/s-box/sb.user.env"
@@ -181,7 +200,7 @@ load_runtime_env(){
     [[ -z "$SB_HY2_HOP_INTERVAL" ]] && SB_HY2_HOP_INTERVAL="30s"
     [[ -z "$SB_HY2_MASQUERADE_URL" ]] && SB_HY2_MASQUERADE_URL="https://www.cloudflare.com/"
     [[ -z "$SB_CLIENT_UTLS_ENABLED" ]] && SB_CLIENT_UTLS_ENABLED="0"
-    [[ -z "$SB_CLIENT_HOST_MODE" ]] && SB_CLIENT_HOST_MODE="ip_prefer"
+    [[ -z "$SB_CLIENT_HOST_MODE" ]] && SB_CLIENT_HOST_MODE="domain_prefer"
     [[ -z "$SB_REALITY_UTLS_FINGERPRINT" ]] && SB_REALITY_UTLS_FINGERPRINT="chrome"
     [[ -z "$SB_VMESS_UTLS_FINGERPRINT" ]] && SB_VMESS_UTLS_FINGERPRINT="chrome"
     [[ -z "$SB_NGINX_DEFAULT_BACKEND" ]] && SB_NGINX_DEFAULT_BACKEND="reality"
@@ -238,8 +257,38 @@ EOF
     fi
 }
 
+# 策略選擇: 嚴格保守模式。阻擋 DoT(853)/DoQ(UDP 443)/STUN 以防 DNS 洩漏。
+# UDP 443 在某些場景可能影響非 DoQ 業務，此為保守選擇而非普適最佳實踐。
+# 如需放寬，設置 SB_DNS_REJECT_BYPASS=0。
 build_dns_bypass_guard_rule_json(){
-    if ! is_true "${SB_DNS_REJECT_BYPASS:-0}"; then
+    if ! is_true "${SB_DNS_REJECT_BYPASS:-1}"; then
+        return 0
+    fi
+    cat <<'EOF'
+      { "type": "logical", "mode": "or", "rules": [
+          { "port": 853 },
+          { "network": "udp", "port": 443 },
+          { "protocol": "stun" }
+        ], "action": "reject" },
+EOF
+}
+
+# Legacy 1.11.4 軌仍支持 action 語法；直接遷移可避免 special outbounds deprecation warning。
+build_dns_hijack_rule_json_legacy(){
+    if is_true "${SB_DNS_PORT53_HIJACK:-1}"; then
+        cat <<'EOF'
+      { "type": "logical", "mode": "or", "rules": [
+          { "protocol": "dns" },
+          { "port": 53 }
+        ], "action": "hijack-dns" },
+EOF
+    else
+        printf '%s\n' '      { "protocol": "dns", "action": "hijack-dns" },'
+    fi
+}
+
+build_dns_bypass_guard_rule_json_legacy(){
+    if ! is_true "${SB_DNS_REJECT_BYPASS:-1}"; then
         return 0
     fi
     cat <<'EOF'
@@ -268,7 +317,7 @@ build_server_private_ip_rule_json(){
             return 0
             ;;
         reject|block|*)
-            printf '%s\n' '      { "ip_is_private": true, "outbound": "block" }'
+            printf '%s\n' '      { "ip_is_private": true, "action": "reject" }'
             ;;
     esac
 }
@@ -278,6 +327,48 @@ is_true(){
         1|true|TRUE|yes|YES|y|Y|on|ON) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+json_bool_value(){
+    if is_true "${1:-0}"; then
+        printf '%s\n' "true"
+    else
+        printf '%s\n' "false"
+    fi
+}
+
+ensure_sysctl_conf_value(){
+    local key="$1" value="$2" file="/etc/sysctl.conf" tmp
+    [[ -n "$key" ]] || return 2
+    [[ -f "$file" ]] || touch "$file" || return 2
+    tmp=$(mktemp /etc/sysctl.conf.tmp.XXXXXX) || return 2
+    if ! awk -v key="$key" -v value="$value" '
+        BEGIN { updated = 0 }
+        {
+            if ($0 ~ "^[[:space:]]*" key "[[:space:]]*=") {
+                if (!updated) {
+                    print key " = " value
+                    updated = 1
+                }
+                next
+            }
+            print
+        }
+        END {
+            if (!updated) {
+                print key " = " value
+            }
+        }
+    ' "$file" > "$tmp"; then
+        rm -f "$tmp"
+        return 2
+    fi
+    if cmp -s "$file" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$file" || { rm -f "$tmp"; return 2; }
+    return 0
 }
 
 timestamp_utc(){
@@ -384,6 +475,9 @@ record_snapshot_absent_paths(){
     done
 }
 
+# 建立回滾快照: 盡力備份 (best-effort)，非原子事務。
+# 備份範圍: sing-box 配置、Nginx 配置、防火牆規則、systemd 服務、證書等。
+# 已知限制: 快照只反映建立時刻的狀態；外部服務的並行變更不會被捕獲。
 create_rollout_snapshot(){
     local label="${1:-manual}" ts dir current_uuid=""
     ts=$(timestamp_utc)
@@ -444,6 +538,10 @@ create_rollout_snapshot(){
     printf '%s\n' "$dir"
 }
 
+# 從快照恢復: 盡力恢復 (best-effort)，非原子事務。
+# 恢復順序: stop services → restore files → restore firewall → reload → restart
+# 已知限制: iptables-restore 全量覆蓋可能與 UFW 管理衝突；
+# 如恢復中途某步失敗，系統可能處於部分恢復狀態。
 restore_rollout_snapshot(){
     local dir="$1"
     [[ -d "$dir" ]] || { red "回滾快照不存在: $dir"; return 1; }
@@ -497,6 +595,7 @@ end_rollback_guard(){
     SB_ROLLBACK_CONTEXT=""
 }
 
+# EXIT trap 自動回滾: 異常退出時盡力恢復，非保證成功。
 rollback_on_exit_if_needed(){
     local status="$?"
     if [[ "$SB_ROLLBACK_ACTIVE" == "1" && "$status" -ne 0 && -n "$SB_ROLLBACK_SNAPSHOT_DIR" && "${SB_ROLLBACK_RUNNING:-0}" != "1" ]]; then
@@ -575,17 +674,44 @@ trap rollback_on_exit_if_needed EXIT
 
 enable_bbr(){
     local needs_update=false
-    if ! grep -q "net.core.default_qdisc = fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+    if ensure_sysctl_conf_value "net.core.default_qdisc" "fq"; then
         needs_update=true
+    elif [[ "$?" -eq 2 ]]; then
+        yellow "寫入 /etc/sysctl.conf 失敗：net.core.default_qdisc"
     fi
-    if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+    if ensure_sysctl_conf_value "net.ipv4.tcp_congestion_control" "bbr"; then
         needs_update=true
+    elif [[ "$?" -eq 2 ]]; then
+        yellow "寫入 /etc/sysctl.conf 失敗：net.ipv4.tcp_congestion_control"
     fi
     if [[ "$needs_update" == "true" ]]; then
         green "正在自動開啟 BBR 加速..."
         sysctl -p >/dev/null 2>&1
+    fi
+
+    # TCP buffer + 網路調優 (gated by SB_SYSCTL_TUNE)
+    if is_true "${SB_SYSCTL_TUNE:-1}"; then
+        local tune_update=false
+        local -A tune_params=(
+            ["net.core.rmem_max"]="16777216"
+            ["net.core.wmem_max"]="16777216"
+            ["net.ipv4.tcp_rmem"]="4096 87380 16777216"
+            ["net.ipv4.tcp_wmem"]="4096 65536 16777216"
+            ["net.ipv4.tcp_fastopen"]="3"
+            ["net.ipv4.tcp_slow_start_after_idle"]="0"
+            ["net.ipv4.tcp_mtu_probing"]="1"
+        )
+        for key in "${!tune_params[@]}"; do
+            if ensure_sysctl_conf_value "$key" "${tune_params[$key]}"; then
+                tune_update=true
+            elif [[ "$?" -eq 2 ]]; then
+                yellow "寫入 /etc/sysctl.conf 失敗：${key}"
+            fi
+        done
+        if [[ "$tune_update" == "true" ]]; then
+            green "正在套用 TCP buffer 調優..."
+            sysctl -p >/dev/null 2>&1
+        fi
     fi
 }
 
@@ -602,7 +728,7 @@ install_depend(){
         missing=1
     fi
     if [[ "$(cat /etc/s-box/sbyg_update 2>/dev/null)" != "$dep_ver" || "$missing" == "1" ]]; then
-        green "安裝必要依賴..."
+        echo -e "\\033[1;36m   ⏳ 安裝必要依賴...\\033[0m"
         DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt update -y || {
             red "apt update 失敗，無法繼續安裝依賴。"
             return 1
@@ -688,36 +814,95 @@ gen_random_alnum(){
 }
 
 select_client_host(){
-    local domain="$1" ip="$2"
-    case "${SB_CLIENT_HOST_MODE:-ip_prefer}" in
+    local domain="$1" ipv4="$2" ipv6="${3:-}"
+    case "${SB_CLIENT_HOST_MODE:-domain_prefer}" in
         domain_only)
             [[ -n "$domain" ]] || return 1
             printf '%s\n' "$domain"
             ;;
         domain|domain_prefer)
-            [[ -n "$domain" ]] && printf '%s\n' "$domain" || printf '%s\n' "$ip"
+            if [[ -n "$domain" ]]; then
+                printf '%s\n' "$domain"
+            elif [[ -n "$ipv4" ]]; then
+                printf '%s\n' "$ipv4"
+            else
+                printf '%s\n' "$ipv6"
+            fi
             ;;
-        ip|ip_only|ip_prefer|*)
-            [[ -n "$ip" ]] && printf '%s\n' "$ip" || printf '%s\n' "$domain"
+        ip_only)
+            if [[ -n "$ipv4" ]]; then
+                printf '%s\n' "$ipv4"
+            elif [[ -n "$ipv6" ]]; then
+                printf '%s\n' "$ipv6"
+            else
+                printf '%s\n' "$domain"
+            fi
+            ;;
+        ip|ip_prefer|*)
+            if [[ -n "$ipv4" && -z "$ipv6" ]]; then
+                printf '%s\n' "$ipv4"
+            elif [[ -n "$domain" ]]; then
+                printf '%s\n' "$domain"
+            elif [[ -n "$ipv4" ]]; then
+                printf '%s\n' "$ipv4"
+            else
+                printf '%s\n' "$ipv6"
+            fi
             ;;
     esac
 }
 
+select_legacy_client_host(){
+    local domain="$1" ipv4="$2" ipv6="${3:-}"
+    case "${SB_CLIENT_HOST_MODE:-domain_prefer}" in
+        domain_only)
+            [[ -n "$domain" ]] || return 1
+            printf '%s\n' "$domain"
+            ;;
+        domain|domain_prefer)
+            if [[ -n "$ipv4" ]]; then
+                printf '%s\n' "$ipv4"
+            elif [[ -n "$domain" ]]; then
+                printf '%s\n' "$domain"
+            else
+                printf '%s\n' "$ipv6"
+            fi
+            ;;
+        ip_only|ip|ip_prefer|*)
+            if [[ -n "$ipv4" ]]; then
+                printf '%s\n' "$ipv4"
+            elif [[ -n "$ipv6" ]]; then
+                printf '%s\n' "$ipv6"
+            else
+                printf '%s\n' "$domain"
+            fi
+            ;;
+    esac
+}
+
+probe_server_dns_upstream(){
+    [[ -n "${SB_SERVER_DNS_UPSTREAM:-}" ]] || return 1
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 openssl s_client -connect "${SB_SERVER_DNS_UPSTREAM}:853" </dev/null >/dev/null 2>&1
+    else
+        openssl s_client -connect "${SB_SERVER_DNS_UPSTREAM}:853" </dev/null >/dev/null 2>&1
+    fi
+}
+
 default_reality_sni_candidates(){
     cat <<'EOF'
-download-installer.cdn.mozilla.net
 gateway.icloud.com
 swdist.apple.com
-addons.mozilla.org
+download-installer.cdn.mozilla.net
 www.microsoft.com
 www.speedtest.net
-www.lovelive-anime.jp
-dl.google.com
+www.cloudflare.com
+addons.mozilla.org
 EOF
 }
 
 probe_reality_sni_candidate(){
-    local candidate="$1" headers status_line handshake
+    local candidate="$1" headers status_line handshake total_ms
     [[ -n "$candidate" ]] || return 1
     if command -v timeout >/dev/null 2>&1; then
         handshake=$(timeout 6 openssl s_client -connect "${candidate}:443" -servername "$candidate" -tls1_3 -alpn h2 </dev/null 2>/dev/null || true)
@@ -725,18 +910,21 @@ probe_reality_sni_candidate(){
         handshake=$(openssl s_client -connect "${candidate}:443" -servername "$candidate" -tls1_3 -alpn h2 </dev/null 2>/dev/null || true)
     fi
     printf '%s\n' "$handshake" | grep -q "ALPN protocol: h2" || return 1
-    headers=$(curl -fsSI --http2 --connect-timeout 3 -m 6 "https://${candidate}/" 2>/dev/null || true)
+    headers=$(curl -fsSI --http2 --connect-timeout 3 -m 6 -w $'\nSB_TOTAL=%{time_total}\n' "https://${candidate}/" 2>/dev/null || true)
     [[ -n "$headers" ]] || return 1
     status_line=$(printf '%s\n' "$headers" | awk 'toupper($0) ~ /^HTTP\/[0-9.]+ [0-9][0-9][0-9]/ {print; exit}')
     [[ "$status_line" == HTTP/2* ]] || return 1
     if printf '%s\n' "$status_line" | grep -qE '^HTTP/2 30[1278]\b'; then
         return 1
     fi
+    total_ms=$(printf '%s\n' "$headers" | awk -F= '/^SB_TOTAL=/{printf "%d\n", ($2 * 1000) + 0.5; exit}')
+    [[ "$total_ms" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$total_ms"
     return 0
 }
 
 resolve_reality_sni(){
-    local candidates_raw="" candidate=""
+    local candidates_raw="" candidate="" candidate_score="" best_candidate="" best_score=""
     [[ -n "${REALITY_SNI:-}" ]] && reality_sni="$REALITY_SNI"
     if [[ -n "${reality_sni:-}" ]]; then
         return 0
@@ -758,16 +946,22 @@ resolve_reality_sni(){
     for candidate in $candidates_raw; do
         candidate=$(printf '%s' "$candidate" | tr -d '[:space:]')
         [[ -n "$candidate" ]] || continue
-        if probe_reality_sni_candidate "$candidate"; then
-            reality_sni="$candidate"
-            persist_env_kv "SB_REALITY_SNI" "$reality_sni"
-            load_runtime_env
-            green "Reality 默認 SNI 已自動選定: ${reality_sni}"
-            IFS="$old_ifs"
-            return 0
+        if candidate_score=$(probe_reality_sni_candidate "$candidate"); then
+            if [[ -z "$best_score" || "$candidate_score" -lt "$best_score" ]]; then
+                best_candidate="$candidate"
+                best_score="$candidate_score"
+            fi
         fi
     done
     IFS="$old_ifs"
+
+    if [[ -n "$best_candidate" ]]; then
+        reality_sni="$best_candidate"
+        persist_env_kv "SB_REALITY_SNI" "$reality_sni"
+        load_runtime_env
+        green "Reality 默認 SNI 已自動選定: ${reality_sni} (${best_score}ms)"
+        return 0
+    fi
 
     reality_sni="$(printf '%s\n' "$candidates_raw" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | head -1)"
     [[ -n "$reality_sni" ]] || reality_sni="download-installer.cdn.mozilla.net"
@@ -817,17 +1011,33 @@ find_tcp_listener_pid(){
 }
 
 detect_public_https_sites(){
+    # 保守策略：只計入同時滿足以下條件的 server_name：
+    #   1. 不是 _ / localhost / 內部名
+    #   2. 所在 server block 同時有 listen 443 和 ssl_certificate
+    #   3. 看起來像合法域名（含 dot）
+    # 注意：此函數仍可能誤判 include 進但未實際啟用的配置
     SB_PUBLIC_HTTPS_SITES=""
     command -v nginx >/dev/null 2>&1 || return 0
     local dump
     dump=$(nginx -T 2>/dev/null || true)
     [[ -n "$dump" ]] || return 0
     SB_PUBLIC_HTTPS_SITES=$(printf '%s\n' "$dump" | awk '
-        /^[[:space:]]*server_name[[:space:]]+/ {
+        /^[[:space:]]*server[[:space:]]*\{/ { in_server=1; has_443=0; has_cert=0; delete names; name_count=0; next }
+        in_server && /^[[:space:]]*listen[[:space:]]/ && /443/ { has_443=1 }
+        in_server && /^[[:space:]]*ssl_certificate[[:space:]]/ { has_cert=1 }
+        in_server && /^[[:space:]]*server_name[[:space:]]+/ {
             for (i = 2; i <= NF; i++) {
                 gsub(/;/, "", $i)
-                if ($i != "_" && $i != "localhost" && $i != "" && $i !~ /^\$/) print $i
+                if ($i != "_" && $i != "localhost" && $i != "" && $i !~ /^\$/ && $i ~ /\./) {
+                    names[name_count++] = $i
+                }
             }
+        }
+        in_server && /^[[:space:]]*\}/ {
+            if (has_443 && has_cert && name_count > 0) {
+                for (j = 0; j < name_count; j++) print names[j]
+            }
+            in_server=0
         }
     ' | sort -u | paste -sd, -)
 }
@@ -837,15 +1047,26 @@ show_install_context(){
     local tcp443="free" udp443="free"
     ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)443$' && tcp443="busy"
     ss -ulnH 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)443$' && udp443="busy"
-    green "安裝前環境預檢..."
+    v4v6
+    echo
+    echo -e "\\033[1;36m   ┌──────────────────────────────────────────────────────────────┐\\033[0m"
+    echo -e "\\033[1;36m   │              📋 安裝前環境預檢                               │\\033[0m"
+    echo -e "\\033[1;36m   ├──────────────────────────────────────────────────────────────┤\\033[0m"
+    printf  "\\033[1;36m   │\\033[0m  %-12s %-46s\\033[1;36m│\\033[0m\\n" "IPv4:" "${v4:-N/A}"
+    printf  "\\033[1;36m   │\\033[0m  %-12s %-46s\\033[1;36m│\\033[0m\\n" "IPv6:" "${v6:-N/A}"
+    printf  "\\033[1;36m   │\\033[0m  %-12s %-46s\\033[1;36m│\\033[0m\\n" "TCP 443:" "${tcp443}"
+    printf  "\\033[1;36m   │\\033[0m  %-12s %-46s\\033[1;36m│\\033[0m\\n" "UDP 443:" "${udp443}"
     if [[ -n "$SB_PUBLIC_HTTPS_SITES" ]]; then
-        yellow "檢測到現有公開站點: ${SB_PUBLIC_HTTPS_SITES}"
-        green "將以 with_site 模式協調 443/TCP，保留現有網站。"
+        printf  "\\033[1;36m   │\\033[0m  %-12s \\033[33m%-46s\\033[0m\\033[1;36m│\\033[0m\\n" "現有站點:" "${SB_PUBLIC_HTTPS_SITES}"
+        printf  "\\033[1;36m   │\\033[0m  %-12s %-46s\\033[1;36m│\\033[0m\\n" "模式:" "with_site (現有網站流量經 SNI 轉發)"
     else
-        yellow "未檢測到現有公開站點。"
-        green "仍採用四協議共存的 443/TCP 收斂架構；若後續做無站極簡模式，可再單獨收斂。"
+        printf  "\\033[1;36m   │\\033[0m  %-12s %-46s\\033[1;36m│\\033[0m\\n" "現有站點:" "無"
+        printf  "\\033[1;36m   │\\033[0m  %-12s %-46s\\033[1;36m│\\033[0m\\n" "模式:" "四協議 443/TCP 收斂"
     fi
-    yellow "端口現狀: TCP 443=${tcp443}, UDP 443=${udp443}"
+    printf  "\\033[1;36m   │\\033[0m  %-12s %-46s\\033[1;36m│\\033[0m\\n" "穩定版家族:" "${SB_SUPPORTED_STABLE_FAMILY}.x"
+    printf  "\\033[1;36m   │\\033[0m  %-12s %-46s\\033[1;36m│\\033[0m\\n" "客戶端模板:" "DNS 防洩漏 + FakeIP 雙棧 (見 client-conf)"
+    echo -e "\\033[1;36m   └──────────────────────────────────────────────────────────────┘\\033[0m"
+    echo
 }
 
 calc_cert_public_key_sha256(){
@@ -1080,22 +1301,31 @@ maybe_align_hy2_masquerade_with_site(){
 }
 
 detect_http_fallback_root(){
-    local dump="" root_path=""
+    # 策略：
+    #   1. 優先使用用戶顯式設定的 SB_HTTP_FALLBACK_ROOT
+    #   2. 嘗試匹配 domain_name 對應 server block 的 root（需 domain_name 已設定）
+    #   3. fallback 到 /var/www/html（不嘗試猜測其他站點的 root）
+    # 注意：此函數不保證能正確取到多站點環境下的目標 root
+    local dump="" root_path="" target_domain="${domain_name:-}"
     if [[ -n "${SB_HTTP_FALLBACK_ROOT:-}" && -d "${SB_HTTP_FALLBACK_ROOT:-}" ]]; then
         printf '%s\n' "$SB_HTTP_FALLBACK_ROOT"
         return 0
     fi
     dump=$(nginx -T 2>/dev/null || true)
-    if [[ -n "$dump" ]]; then
-        root_path=$(printf '%s\n' "$dump" | awk '
-            /^[[:space:]]*server[[:space:]]*\{/ {in_server=1; next}
-            in_server && /^[[:space:]]*root[[:space:]]+\// {
-                root=$2
-                gsub(/;/, "", root)
-                print root
-                exit
+    if [[ -n "$dump" && -n "$target_domain" ]]; then
+        # 只取包含我們域名的 server block 的 root
+        root_path=$(printf '%s\n' "$dump" | awk -v domain="$target_domain" '
+            /^[[:space:]]*server[[:space:]]*\{/ {in_server=1; has_domain=0; root=""; next}
+            in_server && /^[[:space:]]*server_name[[:space:]]/ {
+                for (i=2; i<=NF; i++) { gsub(/;/,"",$i); if ($i == domain) has_domain=1 }
             }
-            in_server && /^[[:space:]]*}/ {in_server=0}
+            in_server && /^[[:space:]]*root[[:space:]]+\// {
+                r=$2; gsub(/;/,"",r); root=r
+            }
+            in_server && /^[[:space:]]*\}/ {
+                if (has_domain && root != "") { print root; exit }
+                in_server=0
+            }
         ')
     fi
     [[ -n "$root_path" && -d "$root_path" ]] || root_path="/var/www/html"
@@ -1349,7 +1579,7 @@ init_hy2_transport_env(){
     persist_env_kv "SB_HY2_HOP_INTERVAL" "${SB_HY2_HOP_INTERVAL:-30s}"
     persist_env_kv "SB_HY2_HOP_TARGET_PORT" "${SB_HY2_HOP_TARGET_PORT:-$port_hy2}"
     persist_env_kv "SB_CLIENT_UTLS_ENABLED" "${SB_CLIENT_UTLS_ENABLED:-0}"
-    persist_env_kv "SB_CLIENT_HOST_MODE" "${SB_CLIENT_HOST_MODE:-ip_prefer}"
+    persist_env_kv "SB_CLIENT_HOST_MODE" "${SB_CLIENT_HOST_MODE:-domain_prefer}"
     load_runtime_env
     green "HY2 抗封鎖增強: obfs=salamander, masquerade=${SB_HY2_MASQUERADE_URL}"
     if [[ "${SB_HY2_HOP_ENABLED:-1}" == "1" ]]; then
@@ -1766,6 +1996,7 @@ server {
     proxy_protocol off;
     proxy_connect_timeout 10s;
     proxy_timeout 86400s;
+    proxy_buffer_size 64k;
 }
 STREAMEOF
 
@@ -1806,6 +2037,8 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_read_timeout 86400s;
         proxy_send_timeout 86400s;
+        proxy_buffering off;
+        proxy_request_buffering off;
     }
 
     location / {
@@ -1872,7 +2105,17 @@ gen_config(){
     fi
 
     v4v6
-    if [[ -n $v4 ]]; then ipv="prefer_ipv4"; else ipv="prefer_ipv6"; fi
+    if [[ -n "$v4" && -n "$v6" ]]; then
+        ipv=""  # 雙棧: 不指定策略，讓 sing-box 自然解析 A+AAAA
+    elif [[ -n "$v4" ]]; then
+        ipv="ipv4_only"
+    elif [[ -n "$v6" ]]; then
+        ipv="ipv6_only"
+    else
+        ipv=""
+    fi
+    local strategy_json=""
+    [[ -n "$ipv" ]] && strategy_json=", \"strategy\": \"${ipv}\""
     server_private_ip_rule_json="$(build_server_private_ip_rule_json)"
 
     tmp_json=$(mktemp /etc/s-box/sb.json.tmp.XXXXXX) || { red "建立臨時配置文件失敗。"; return 1; }
@@ -1889,8 +2132,10 @@ cat > "$tmp_json" <<EOF
   },
   "dns": {
     "servers": [
+      { "type": "tls", "tag": "dns_upstream", "server": "${SB_SERVER_DNS_UPSTREAM}", "server_port": 853 },
       { "type": "local", "tag": "local" }
-    ]
+    ],
+    "final": "local"
   },
   "inbounds": [
     {
@@ -1916,6 +2161,7 @@ cat > "$tmp_json" <<EOF
       "listen": "127.0.0.1",
       "listen_port": ${int_port_vmws},
       "users": [{"uuid": "${uuid}", "alterId": 0}],
+      "multiplex": { "enabled": true },
       "transport": {
         "type": "ws",
         "path": "${vm_ws_path}",
@@ -1958,14 +2204,10 @@ cat > "$tmp_json" <<EOF
     }
   ],
   "outbounds": [
-    { "type": "direct", "tag": "direct" },
-    { "type": "block", "tag": "block" }
+    { "type": "direct", "tag": "direct" }
   ],
   "route": {
-    "default_domain_resolver": {
-      "server": "local",
-      "strategy": "${ipv}"
-    },
+    "default_domain_resolver": { "server": "dns_upstream"${strategy_json} },
     "rules": [
 ${server_private_ip_rule_json:+${server_private_ip_rule_json}}
     ]
@@ -2003,6 +2245,9 @@ validate_v3_runtime_health(){
         tcp_port_listening "${int_port_vmws}" || { sleep 2; continue; }
         udp_port_listening "${port_hy2}" || { sleep 2; continue; }
         udp_port_listening "${port_tu}" || { sleep 2; continue; }
+        if ! probe_server_dns_upstream; then
+            yellow "警告：未驗證到 DoT 上游 ${SB_SERVER_DNS_UPSTREAM}:853 可達，服務端可能退化為本地 DNS 兜底。"
+        fi
         return 0
     done
     return 1
@@ -2096,7 +2341,7 @@ collect_v2_runtime_state(){
             yellow "遷移策略：沿用舊 VMess-WS 路徑。"
         fi
     fi
-    persist_env_kv "SB_CLIENT_HOST_MODE" "${SB_CLIENT_HOST_MODE:-ip_prefer}"
+    persist_env_kv "SB_CLIENT_HOST_MODE" "${SB_CLIENT_HOST_MODE:-domain_prefer}"
     load_runtime_env
 }
 
@@ -2364,7 +2609,7 @@ setup_firewall(){
 
     cat > /etc/s-box/firewall_ports.log <<EOF
 # 本腳本添加的防火牆端口（卸載時自動清理）
-# v3.0 Nginx SNI 架構 — TCP 只暴露 443
+# v3.2 Nginx SNI 架構 — TCP 只暴露 443
 SSH_PORT=$ssh_port
 HY2_PORT=$port_hy2
 HY2_HOP_RANGE=$hy2_hop_range
@@ -2443,37 +2688,51 @@ maybe_prompt_telegram_on_install(){
 # ==================== 安裝後自檢 ====================
 
 post_install_check(){
-    green "正在進行安裝後自檢..."
+    echo
+    echo -e "\\033[1;36m   ┌──────────────────────────────────────────────────────────────┐\\033[0m"
+    echo -e "\\033[1;36m   │              🔍 安裝後健康自檢                               │\\033[0m"
+    echo -e "\\033[1;36m   ├──────────────────────────────────────────────────────────────┤\\033[0m"
+    local all_ok=1
 
-    # Nginx 狀態
-    if systemctl is-active --quiet nginx; then green "✅ Nginx 服務已運行"
-    else red "❌ Nginx 服務未運行"; systemctl status nginx --no-pager -n 5; fi
+    if systemctl is-active --quiet nginx; then
+        echo -e "\\033[1;36m   │\\033[0m  \\033[32m✅\\033[0m Nginx 服務運行中                                        \\033[1;36m│\\033[0m"
+    else echo -e "\\033[1;36m   │\\033[0m  \\033[31m❌\\033[0m Nginx 服務未運行                                        \\033[1;36m│\\033[0m"; all_ok=0; fi
 
-    # sing-box 狀態
-    if systemctl is-active --quiet sing-box; then green "✅ sing-box 服務已運行"
-    else red "❌ sing-box 服務未運行"; systemctl status sing-box --no-pager -n 5; fi
+    if systemctl is-active --quiet sing-box; then
+        echo -e "\\033[1;36m   │\\033[0m  \\033[32m✅\\033[0m Sing-box 服務運行中                                      \\033[1;36m│\\033[0m"
+    else echo -e "\\033[1;36m   │\\033[0m  \\033[31m❌\\033[0m Sing-box 服務未運行                                      \\033[1;36m│\\033[0m"; all_ok=0; fi
 
-    # 443 端口由 Nginx 監聽
-    if tcp_port_listening 443; then green "✅ TCP 443 正在監聽 (Nginx)"
-    else yellow "⚠️ TCP 443 未監聽"; fi
+    if tcp_port_listening 443; then
+        echo -e "\\033[1;36m   │\\033[0m  \\033[32m✅\\033[0m TCP 443 監聽中 (Nginx SNI)                                \\033[1;36m│\\033[0m"
+    else echo -e "\\033[1;36m   │\\033[0m  \\033[33m⚠️\\033[0m  TCP 443 未監聽                                           \\033[1;36m│\\033[0m"; all_ok=0; fi
 
-    # 內部端口
-    if tcp_port_listening "${int_port_reality}"; then green "✅ Reality 內部端口 $int_port_reality 監聽中"
-    else yellow "⚠️ Reality 內部端口 $int_port_reality 未監聽"; fi
+    if tcp_port_listening "${int_port_reality}"; then
+        echo -e "\\033[1;36m   │\\033[0m  \\033[32m✅\\033[0m Reality 端口 ${int_port_reality} 監聽中                                 \\033[1;36m│\\033[0m"
+    else echo -e "\\033[1;36m   │\\033[0m  \\033[33m⚠️\\033[0m  Reality 端口 ${int_port_reality} 未監聽                                \\033[1;36m│\\033[0m"; all_ok=0; fi
 
-    if tcp_port_listening "${int_port_vmws}"; then green "✅ VMess-WS 內部端口 $int_port_vmws 監聽中"
-    else yellow "⚠️ VMess-WS 內部端口 $int_port_vmws 未監聽"; fi
+    if tcp_port_listening "${int_port_vmws}"; then
+        echo -e "\\033[1;36m   │\\033[0m  \\033[32m✅\\033[0m VMess-WS 端口 ${int_port_vmws} 監聽中                                \\033[1;36m│\\033[0m"
+    else echo -e "\\033[1;36m   │\\033[0m  \\033[33m⚠️\\033[0m  VMess-WS 端口 ${int_port_vmws} 未監聽                                \\033[1;36m│\\033[0m"; all_ok=0; fi
 
-    # UDP 端口
-    if udp_port_listening "${port_hy2}"; then green "✅ HY2 UDP $port_hy2 監聽中"
-    else yellow "⚠️ HY2 UDP $port_hy2 未監聽"; fi
+    if udp_port_listening "${port_hy2}"; then
+        echo -e "\\033[1;36m   │\\033[0m  \\033[32m✅\\033[0m Hysteria2 UDP ${port_hy2} 監聽中                                \\033[1;36m│\\033[0m"
+    else echo -e "\\033[1;36m   │\\033[0m  \\033[33m⚠️\\033[0m  HY2 UDP ${port_hy2} 未監聽                                    \\033[1;36m│\\033[0m"; all_ok=0; fi
 
-    if udp_port_listening "${port_tu}"; then green "✅ TUIC UDP $port_tu 監聽中"
-    else yellow "⚠️ TUIC UDP $port_tu 未監聽"; fi
+    if udp_port_listening "${port_tu}"; then
+        echo -e "\\033[1;36m   │\\033[0m  \\033[32m✅\\033[0m TUIC UDP ${port_tu} 監聽中                                     \\033[1;36m│\\033[0m"
+    else echo -e "\\033[1;36m   │\\033[0m  \\033[33m⚠️\\033[0m  TUIC UDP ${port_tu} 未監聽                                    \\033[1;36m│\\033[0m"; all_ok=0; fi
 
-    # 配置校驗
-    if /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then green "✅ 配置文件校驗通過"
-    else red "❌ 配置文件校驗失敗"; /etc/s-box/sing-box check -c /etc/s-box/sb.json; fi
+    if /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then
+        echo -e "\\033[1;36m   │\\033[0m  \\033[32m✅\\033[0m 配置文件校驗通過                                          \\033[1;36m│\\033[0m"
+    else echo -e "\\033[1;36m   │\\033[0m  \\033[31m❌\\033[0m 配置文件校驗失敗                                          \\033[1;36m│\\033[0m"; all_ok=0; fi
+
+    echo -e "\\033[1;36m   ├──────────────────────────────────────────────────────────────┤\\033[0m"
+    if [[ "$all_ok" == "1" ]]; then
+        echo -e "\\033[1;36m   │\\033[0m  \\033[1;32m🎉 所有檢查項通過！服務已就緒。\\033[0m                          \\033[1;36m│\\033[0m"
+    else
+        echo -e "\\033[1;36m   │\\033[0m  \\033[1;33m⚠️  部分項異常，請查看上方詳情。\\033[0m                         \\033[1;36m│\\033[0m"
+    fi
+    echo -e "\\033[1;36m   └──────────────────────────────────────────────────────────────┘\\033[0m"
 }
 
 # ==================== 訂閱鏈接（端口統一 443）====================
@@ -2495,7 +2754,7 @@ sbshare(){
         return 1
     }
 
-    host="$(select_client_host "$domain" "$v4")" || { red "節點地址策略 ${SB_CLIENT_HOST_MODE:-ip_prefer} 無可用目標。"; return 1; }
+    host="$(select_client_host "$domain" "$v4" "$v6")" || { red "節點地址策略 ${SB_CLIENT_HOST_MODE:-domain_prefer} 無可用目標。"; return 1; }
     load_hy2_runtime_from_server_files
     local domain_enc reality_sni_enc hy2_obfs_password_enc pk_enc sid_enc hostname_enc tuic_user_enc tuic_pass_enc hy2_query="security=tls&alpn=h3&insecure=0" hy2_hop_range=""
     domain_enc="$(uri_encode "$domain")"
@@ -2543,7 +2802,7 @@ sbshare(){
     white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     echo -e "域名: ${green}$domain${plain}"
     echo -e "UUID: ${green}$uuid${plain}"
-    echo -e "架構: ${green}Nginx SNI 分流 (v3.0)${plain}"
+    echo -e "架構: ${green}Nginx SNI 分流 (v3.2)${plain}"
     echo
     echo -e "VLESS-Reality: ${yellow}443/tcp${plain} (SNI: $reality_sni_share)"
     echo -e "VMess-WS-TLS:  ${yellow}443/tcp${plain} (Nginx 反代)"
@@ -2561,7 +2820,7 @@ sbshare(){
 show_client_conf_latest(){
     local host="$1" domain="$2" uuid="$3" pk="$4" sid="$5" reality_sni_client="$6" vm_path="$7" port_hy="$8" port_tu_client="$9" hy2_server_ports="${10}" hy2_hop_interval="${11}" hy2_obfs_password="${12}" cert_pin="${13}"
     local current_stable_label="${14}"
-    local standard_tls_pin_json="" vless_utls_json=', "utls": { "enabled": true, "fingerprint": "'"${SB_REALITY_UTLS_FINGERPRINT:-chrome}"'" }' vmess_utls_json="" hy2_hop_json="" dns_hijack_rule_json="" dns_bypass_guard_rule_json=""
+    local standard_tls_pin_json="" vless_utls_json=', "utls": { "enabled": true, "fingerprint": "'"${SB_REALITY_UTLS_FINGERPRINT:-chrome}"'" }' vmess_utls_json="" hy2_hop_json="" dns_hijack_rule_json="" dns_bypass_guard_rule_json="" interrupt_exist_connections_json=""
 
     [[ -n "$cert_pin" ]] && standard_tls_pin_json=', "certificate_public_key_sha256": ["'"$cert_pin"'"]'
     if [[ "${SB_CLIENT_UTLS_ENABLED:-0}" == "1" ]]; then
@@ -2572,43 +2831,54 @@ show_client_conf_latest(){
     fi
     dns_hijack_rule_json="$(build_dns_hijack_rule_json)"
     dns_bypass_guard_rule_json="$(build_dns_bypass_guard_rule_json)"
+    interrupt_exist_connections_json="$(json_bool_value "${SB_CLIENT_INTERRUPT_ON_SWITCH:-1}")"
+    local vmess_mux_json=""
+    if is_true "${SB_CLIENT_MUX:-0}"; then
+        vmess_mux_json=',
+      "multiplex": { "enabled": true, "protocol": "h2mux", "max_connections": 4, "min_streams": 4, "padding": true }'
+    fi
 
     green "══════════════════════════════════════════════════════════════"
-    green "  Sing-box ${current_stable_label} 客戶端配置 (最新穩定版軌)"
-    green "  ✅ 所有 TCP 協議統一走 443"
-    green "  🌐 節點地址策略: ${SB_CLIENT_HOST_MODE:-ip_prefer} (${host})"
-    yellow "  ⚠️ Reality 客戶端固定啟用 uTLS（內核要求）"
-    [[ "${SB_CLIENT_UTLS_ENABLED:-0}" == "1" ]] && yellow "  ⚠️ 已啟用 uTLS（默認不建議）"
+    green "  客戶端配置 — ${current_stable_label} 穩定版軌"
+    green "  TCP 統一 443 · TUN 模式"
+    green "  節點: ${SB_CLIENT_HOST_MODE:-domain_prefer} (${host})"
+    green "  DNS: proxydns=DoT(Google) localdns=DoH(Ali+Tencent)"
+    green "  FakeIP: v4+v6 · CN 直連 · 非 CN 走代理"
+    yellow "  Reality: uTLS 固定啟用 (${SB_REALITY_UTLS_FINGERPRINT:-chrome})"
+    [[ "${SB_CLIENT_UTLS_ENABLED:-0}" == "1" ]] && yellow "  VMess: uTLS 已啟用 (${SB_VMESS_UTLS_FINGERPRINT:-chrome})"
+    is_true "${SB_DNS_REJECT_BYPASS:-1}" && green "  防洩漏: DoT/DoQ/STUN 攔截已啟用"
     green "══════════════════════════════════════════════════════════════"
     echo
     cat <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
   "experimental": {
-    "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true },
+    "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true, "store_rdrc": true },
     "clash_api": { "external_controller": "127.0.0.1:9090", "external_ui": "ui", "secret": "", "default_mode": "rule" }
   },
   "dns": {
     "servers": [
       { "type": "tls", "tag": "proxydns", "server": "8.8.8.8", "server_port": 853, "detour": "select" },
       { "type": "https", "tag": "localdns", "server": "223.5.5.5", "path": "/dns-query" },
+      { "type": "https", "tag": "localdns2", "server": "119.29.29.29", "path": "/dns-query" },
       { "type": "fakeip", "tag": "dns_fakeip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" }
     ],
     "rules": [
       { "clash_mode": "Global", "server": "proxydns" },
       { "clash_mode": "Direct", "server": "localdns" },
       { "rule_set": "geosite-cn", "server": "localdns" },
-      { "rule_set": "geosite-geolocation-!cn", "server": "proxydns" },
-      { "rule_set": "geosite-geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" }
+      { "domain_suffix": [".cn"], "server": "localdns2" },
+      { "rule_set": "geosite-geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" },
+      { "rule_set": "geosite-geolocation-!cn", "server": "proxydns" }
     ],
     "independent_cache": true,
     "final": "proxydns"
   },
   "inbounds": [
-    { "type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30", "fd00::1/126"], "auto_route": true, "strict_route": true }
+    { "type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"], "auto_route": true, "strict_route": true }
   ],
   "outbounds": [
-    { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "vless-sb", "hy2-sb", "tuic5-sb", "vmess-sb"], "interrupt_exist_connections": false },
+    { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "vless-sb", "hy2-sb", "tuic5-sb", "vmess-sb"], "interrupt_exist_connections": ${interrupt_exist_connections_json} },
     {
       "type": "vless", "tag": "vless-sb", "server": "$host", "server_port": 443,
       "uuid": "$uuid", "flow": "xtls-rprx-vision", "network": "tcp", "packet_encoding": "xudp",
@@ -2621,11 +2891,12 @@ show_client_conf_latest(){
       "type": "vmess", "tag": "vmess-sb", "server": "$host", "server_port": 443,
       "uuid": "$uuid", "security": "auto", "alter_id": 0, "packet_encoding": "packetaddr", "network": "tcp",
       "tls": { "enabled": true, "server_name": "$domain", "insecure": false${standard_tls_pin_json}${vmess_utls_json} },
-      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": ["$domain"] } }
+      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": "$domain" } }${vmess_mux_json}
     },
     {
       "type": "hysteria2", "tag": "hy2-sb", "server": "$host", "server_port": $port_hy,
       "network": "udp"${hy2_hop_json},
+      "up_mbps": ${SB_HY2_UP_MBPS}, "down_mbps": ${SB_HY2_DOWN_MBPS},
       "password": "$uuid",
       "obfs": { "type": "salamander", "password": "$hy2_obfs_password" },
       "tls": { "enabled": true, "server_name": "$domain", "insecure": false${standard_tls_pin_json}, "alpn": ["h3"] }
@@ -2633,13 +2904,14 @@ show_client_conf_latest(){
     {
       "type": "tuic", "tag": "tuic5-sb", "server": "$host", "server_port": $port_tu_client,
       "uuid": "$uuid", "password": "$uuid", "congestion_control": "bbr", "udp_relay_mode": "native", "network": "udp",
+      "zero_rtt_handshake": true, "heartbeat": "10s",
       "tls": { "enabled": true, "server_name": "$domain", "insecure": false${standard_tls_pin_json}, "alpn": ["h3"] }
     },
     { "tag": "direct", "type": "direct" },
-    { "tag": "auto", "type": "urltest", "outbounds": ["vless-sb", "hy2-sb", "tuic5-sb", "vmess-sb"], "url": "https://www.gstatic.com/generate_204", "interval": "3m", "tolerance": 150, "interrupt_exist_connections": false }
+    { "tag": "auto", "type": "urltest", "outbounds": ["vless-sb", "hy2-sb", "tuic5-sb", "vmess-sb"], "url": "${SB_URLTEST_URL}", "interval": "${SB_URLTEST_INTERVAL}", "tolerance": ${SB_URLTEST_TOLERANCE}, "idle_timeout": "${SB_URLTEST_IDLE_TIMEOUT}", "interrupt_exist_connections": ${interrupt_exist_connections_json} }
   ],
   "route": {
-    "default_domain_resolver": { "server": "proxydns" },
+    "default_domain_resolver": { "server": "localdns" },
     "rule_set": [
       { "tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "${SB_GEOSITE_GEOLOCATION_NONCN_URL}", "download_detour": "select", "update_interval": "1d" },
       { "tag": "geosite-cn", "type": "remote", "format": "binary", "url": "${SB_GEOSITE_CN_URL}", "download_detour": "select", "update_interval": "1d" },
@@ -2668,36 +2940,47 @@ show_client_conf_legacy(){
     local host="$1" domain="$2" uuid="$3" pk="$4" sid="$5" reality_sni_client="$6" vm_path="$7" port_hy="$8" port_tu_client="$9" hy2_server_ports="${10}" hy2_hop_interval="${11}" hy2_obfs_password="${12}"
     local legacy_vless_utls_json=', "utls": { "enabled": true, "fingerprint": "'"${SB_REALITY_UTLS_FINGERPRINT:-chrome}"'" }'
     local legacy_vmess_utls_json=', "utls": { "enabled": true, "fingerprint": "'"${SB_VMESS_UTLS_FINGERPRINT:-chrome}"'" }'
-    local hy2_hop_json="" dns_hijack_rule_json="" dns_bypass_guard_rule_json=""
+    local hy2_hop_json="" dns_hijack_rule_json_legacy="" dns_bypass_guard_rule_json_legacy="" interrupt_exist_connections_json=""
     if [[ "$hy2_server_ports" =~ ^[0-9]+[:\-][0-9]+$ ]]; then
         hy2_hop_json=', "server_ports": ["'"$hy2_server_ports"'"], "hop_interval": "'"$hy2_hop_interval"'"'
     fi
-    dns_hijack_rule_json="$(build_dns_hijack_rule_json)"
-    dns_bypass_guard_rule_json="$(build_dns_bypass_guard_rule_json)"
+    dns_hijack_rule_json_legacy="$(build_dns_hijack_rule_json_legacy)"
+    dns_bypass_guard_rule_json_legacy="$(build_dns_bypass_guard_rule_json_legacy)"
+    interrupt_exist_connections_json="$(json_bool_value "${SB_CLIENT_INTERRUPT_ON_SWITCH:-1}")"
+    local legacy_vmess_mux_json=""
+    if is_true "${SB_CLIENT_MUX:-0}"; then
+        legacy_vmess_mux_json=',
+      "multiplex": { "enabled": true, "protocol": "h2mux", "max_connections": 4, "min_streams": 4, "padding": true }'
+    fi
 
     green "══════════════════════════════════════════════════════════════"
-    green "  Sing-box ${SB_LEGACY_CLIENT_VERSION} 客戶端配置 (legacy 軌)"
-    green "  📱 適用於 iOS SFI / 舊版 1.11.4"
-    green "  🌐 節點地址策略: ${SB_CLIENT_HOST_MODE:-ip_prefer} (${host})"
-    yellow "  ⚠️ legacy Reality 固定啟用 uTLS（1.11.4 必需）"
+    green "  客戶端配置 — ${SB_LEGACY_CLIENT_VERSION} legacy 軌"
+    green "  適用於 iOS SFI / 舊版 1.11.4"
+    green "  節點: ${SB_CLIENT_HOST_MODE:-domain_prefer} (${host})"
+    green "  DNS: proxydns=DoT(Google) localdns=DoH(Ali+Tencent)"
+    green "  FakeIP: v4+v6 · CN 直連 · 非 CN 走代理"
+    yellow "  Reality+VMess: uTLS 固定啟用 (1.11.4 必需)"
+    is_true "${SB_DNS_REJECT_BYPASS:-1}" && green "  防洩漏: DoT/DoQ/STUN 攔截已啟用"
     green "══════════════════════════════════════════════════════════════"
     echo
     cat <<EOF
 {
   "log": { "disabled": false, "level": "info", "timestamp": true },
   "experimental": {
-    "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true }
+    "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": true, "store_rdrc": true }
   },
   "dns": {
     "servers": [
-      { "tag": "proxydns", "address": "https://8.8.8.8/dns-query", "detour": "select" },
+      { "tag": "proxydns", "address": "tls://8.8.8.8", "detour": "select" },
       { "tag": "localdns", "address": "https://223.5.5.5/dns-query", "detour": "direct" },
+      { "tag": "localdns2", "address": "https://119.29.29.29/dns-query", "detour": "direct" },
       { "tag": "dns_fakeip", "address": "fakeip" }
     ],
     "rules": [
       { "clash_mode": "Global", "server": "proxydns" },
       { "clash_mode": "Direct", "server": "localdns" },
       { "rule_set": "geosite-cn", "server": "localdns" },
+      { "domain_suffix": [".cn"], "server": "localdns2" },
       { "rule_set": "geosite-geolocation-!cn", "query_type": ["A", "AAAA"], "server": "dns_fakeip" },
       { "rule_set": "geosite-geolocation-!cn", "server": "proxydns" }
     ],
@@ -2708,14 +2991,13 @@ show_client_conf_legacy(){
   "inbounds": [
     {
       "type": "tun", "tag": "tun-in",
-      "address": ["172.19.0.1/30", "fd00::1/126"],
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
       "auto_route": true, "strict_route": true,
-      "sniff": true, "sniff_override_destination": true,
-      "domain_strategy": "prefer_ipv4"
+      "sniff": true, "sniff_override_destination": true
     }
   ],
   "outbounds": [
-    { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "vless-sb", "hy2-sb", "tuic5-sb", "vmess-sb"], "interrupt_exist_connections": false },
+    { "tag": "select", "type": "selector", "default": "auto", "outbounds": ["auto", "vless-sb", "hy2-sb", "tuic5-sb", "vmess-sb"], "interrupt_exist_connections": ${interrupt_exist_connections_json} },
     {
       "type": "vless", "tag": "vless-sb", "server": "$host", "server_port": 443,
       "uuid": "$uuid", "flow": "xtls-rprx-vision", "network": "tcp",
@@ -2728,11 +3010,12 @@ show_client_conf_legacy(){
       "type": "vmess", "tag": "vmess-sb", "server": "$host", "server_port": 443,
       "uuid": "$uuid", "security": "auto", "packet_encoding": "packetaddr", "network": "tcp",
       "tls": { "enabled": true, "server_name": "$domain", "insecure": false${legacy_vmess_utls_json} },
-      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": "$domain" } }
+      "transport": { "type": "ws", "path": "$vm_path", "headers": { "Host": "$domain" } }${legacy_vmess_mux_json}
     },
     {
       "type": "hysteria2", "tag": "hy2-sb", "server": "$host", "server_port": $port_hy,
       "network": "udp"${hy2_hop_json},
+      "up_mbps": ${SB_HY2_UP_MBPS}, "down_mbps": ${SB_HY2_DOWN_MBPS},
       "password": "$uuid",
       "obfs": { "type": "salamander", "password": "$hy2_obfs_password" },
       "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "alpn": ["h3"] }
@@ -2740,15 +3023,15 @@ show_client_conf_legacy(){
     {
       "type": "tuic", "tag": "tuic5-sb", "server": "$host", "server_port": $port_tu_client,
       "uuid": "$uuid", "password": "$uuid", "congestion_control": "bbr", "udp_relay_mode": "native",
-      "udp_over_stream": false, "zero_rtt_handshake": false, "heartbeat": "10s",
+      "udp_over_stream": false, "zero_rtt_handshake": true, "heartbeat": "10s",
       "tls": { "enabled": true, "server_name": "$domain", "insecure": false, "alpn": ["h3"] }
     },
     { "tag": "direct", "type": "direct" },
     {
       "tag": "auto", "type": "urltest",
       "outbounds": ["vless-sb", "hy2-sb", "tuic5-sb", "vmess-sb"],
-      "url": "https://www.gstatic.com/generate_204", "interval": "3m", "tolerance": 150,
-      "interrupt_exist_connections": false
+      "url": "${SB_URLTEST_URL}", "interval": "${SB_URLTEST_INTERVAL}", "tolerance": ${SB_URLTEST_TOLERANCE},
+      "idle_timeout": "${SB_URLTEST_IDLE_TIMEOUT}", "interrupt_exist_connections": ${interrupt_exist_connections_json}
     }
   ],
   "route": {
@@ -2760,8 +3043,7 @@ show_client_conf_legacy(){
     "auto_detect_interface": true,
     "final": "select",
     "rules": [
-      { "inbound": "tun-in", "action": "sniff" },
-${dns_hijack_rule_json}${dns_bypass_guard_rule_json}
+${dns_hijack_rule_json_legacy}${dns_bypass_guard_rule_json_legacy}
       { "ip_is_private": true, "outbound": "direct" },
       { "clash_mode": "Direct", "outbound": "direct" },
       { "clash_mode": "Global", "outbound": "select" },
@@ -2773,12 +3055,12 @@ ${dns_hijack_rule_json}${dns_bypass_guard_rule_json}
 }
 EOF
     echo
-    yellow "📌 適用於: Sing-box ${SB_LEGACY_CLIENT_VERSION}"
+    yellow "📌 適用於: Sing-box ${SB_LEGACY_CLIENT_VERSION} (1.11.x schema)"
 }
 
 client_conf(){
     local requested_track="${1:-${SB_CLIENT_CONF_TRACK:-}}"
-    local current_stable_label="" cert_pin="" hy2_server_ports="" hy2_hop_interval="" hy2_obfs_password="" ver_choice=""
+    local current_stable_label="" cert_pin="" hy2_server_ports="" hy2_hop_interval="" hy2_obfs_password="" ver_choice="" latest_host="" legacy_host=""
     require_v3_layout "客戶端配置輸出" || return 1
     [[ ! -f /etc/s-box/sb.json ]] && { red "未找到 /etc/s-box/sb.json"; return; }
     command -v jq >/dev/null 2>&1 || { red "缺少 jq"; return; }
@@ -2796,7 +3078,8 @@ client_conf(){
 
     current_stable_label="$(stable_track_label)"
     v4v6
-    host="$(select_client_host "$domain" "$v4")" || { red "節點地址策略 ${SB_CLIENT_HOST_MODE:-ip_prefer} 無可用目標。"; return 1; }
+    latest_host="$(select_client_host "$domain" "$v4" "$v6")" || { red "節點地址策略 ${SB_CLIENT_HOST_MODE:-domain_prefer} 無可用目標。"; return 1; }
+    legacy_host="$(select_legacy_client_host "$domain" "$v4" "$v6")" || { red "legacy 節點地址策略 ${SB_CLIENT_HOST_MODE:-domain_prefer} 無可用目標。"; return 1; }
     load_hy2_runtime_from_server_files
     hy2_server_ports="$port_hy"
     hy2_hop_interval="${SB_HY2_HOP_INTERVAL:-30s}"
@@ -2836,12 +3119,12 @@ client_conf(){
     fi
 
     case "$ver_choice" in
-        1) show_client_conf_legacy "$host" "$domain" "$uuid" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$port_hy" "$port_tu_client" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password" ;;
-        2) show_client_conf_latest "$host" "$domain" "$uuid" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$port_hy" "$port_tu_client" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password" "$cert_pin" "$current_stable_label" ;;
+        1) show_client_conf_legacy "$legacy_host" "$domain" "$uuid" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$port_hy" "$port_tu_client" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password" ;;
+        2) show_client_conf_latest "$latest_host" "$domain" "$uuid" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$port_hy" "$port_tu_client" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password" "$cert_pin" "$current_stable_label" ;;
         3)
-            show_client_conf_legacy "$host" "$domain" "$uuid" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$port_hy" "$port_tu_client" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password"
+            show_client_conf_legacy "$legacy_host" "$domain" "$uuid" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$port_hy" "$port_tu_client" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password"
             echo
-            show_client_conf_latest "$host" "$domain" "$uuid" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$port_hy" "$port_tu_client" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password" "$cert_pin" "$current_stable_label"
+            show_client_conf_latest "$latest_host" "$domain" "$uuid" "$pk" "$sid" "$reality_sni_client" "$vm_path" "$port_hy" "$port_tu_client" "$hy2_server_ports" "$hy2_hop_interval" "$hy2_obfs_password" "$cert_pin" "$current_stable_label"
             ;;
         0|*) return ;;
     esac
@@ -3178,9 +3461,9 @@ show_banner(){
     echo -e "${C3}    ██████╔╝${C4}██████╔╝${C4}██║     ${C3}███████╗  ${C1}███████║${C2}╚██████╔╝${C3}███████╗${C4}██║ ╚████║${R}"
     echo -e "${C3}    ╚═════╝ ${C4}╚═════╝ ${C4}╚═╝     ${C3}╚══════╝  ${C1}╚══════╝${C2} ╚═════╝ ${C3}╚══════╝${C4}╚═╝  ╚═══╝${R}"
     echo
-    echo -e "${W}        Sing-Box Multi-Protocol Installer ${G}v3.0 (Nginx SNI)${R}"
+    echo -e "${W}        Sing-Box Multi-Protocol Installer ${G}v3.2 (Nginx SNI)${R}"
     echo -e "${D}       VLESS-Reality · VMess-WS · Hysteria2 · TUIC V5${R}"
-    echo -e "${D}            所有 TCP 統一走 443 · Nginx SNI 分流${R}"
+    echo -e "${D}       TCP 統一 443 · 穩定版家族 ${SB_SUPPORTED_STABLE_FAMILY}.x${R}"
     echo
 }
 
@@ -3197,9 +3480,11 @@ show_status(){
     detect_public_https_sites
     [[ -n "$SB_PUBLIC_HTTPS_SITES" ]] && sites="$SB_PUBLIC_HTTPS_SITES"
     if [[ ${#sites} -gt 56 ]]; then sites="${sites:0:56}..."; fi
+    local ip6_addr="${v6:-N/A}"
     echo -e "   ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}"
     echo -e "   ${C}Sing-box:${R} $sb_status${sb_ver}    ${C}Nginx:${R} $ng_status    ${C}快捷命令:${R} sb"
-    echo -e "   ${C}IP:${R} ${W}${ip_addr}${R}    ${C}架構:${R} ${layout}"
+    echo -e "   ${C}IPv4:${R} ${W}${ip_addr}${R}    ${C}IPv6:${R} ${ip6_addr}"
+    echo -e "   ${C}架構:${R} ${layout}    ${C}穩定版家族:${R} ${SB_SUPPORTED_STABLE_FAMILY}.x"
     echo -e "   ${C}站點:${R} ${sites}"
     echo -e "   ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}"
 }
