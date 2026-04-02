@@ -631,12 +631,40 @@ assert_latest_stable_supported(){
 
 [[ $EUID -ne 0 ]] && yellow "請以root模式運行脚本" && exit
 
-if [[ -f /etc/issue ]] && grep -q -E -i "ubuntu" /etc/issue; then
-    release="Ubuntu"
-elif [[ -f /proc/version ]] && grep -q -E -i "ubuntu" /proc/version; then
-    release="Ubuntu"
-else
-    red "脚本僅支持 Ubuntu 系統。" && exit
+detect_release_family(){
+    local os_id="" os_like=""
+    if [[ -r /etc/os-release ]]; then
+        os_id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+        os_like="$(. /etc/os-release && printf '%s' "${ID_LIKE:-}")"
+    fi
+    os_id="${os_id,,}"
+    os_like="${os_like,,}"
+
+    case "$os_id" in
+        ubuntu) release="Ubuntu"; return 0 ;;
+        debian) release="Debian"; return 0 ;;
+    esac
+    case " $os_like " in
+        *" ubuntu "*) release="Ubuntu"; return 0 ;;
+        *" debian "*) release="Debian"; return 0 ;;
+    esac
+    if [[ -f /etc/issue ]] && grep -q -E -i "ubuntu" /etc/issue; then
+        release="Ubuntu"; return 0
+    fi
+    if [[ -f /etc/issue ]] && grep -q -E -i "debian" /etc/issue; then
+        release="Debian"; return 0
+    fi
+    if [[ -f /proc/version ]] && grep -q -E -i "ubuntu" /proc/version; then
+        release="Ubuntu"; return 0
+    fi
+    if [[ -f /proc/version ]] && grep -q -E -i "debian" /proc/version; then
+        release="Debian"; return 0
+    fi
+    return 1
+}
+
+if ! detect_release_family; then
+    red "脚本僅支持 Debian / Ubuntu 系統。" && exit
 fi
 
 if ! command -v systemctl >/dev/null 2>&1; then
@@ -1588,6 +1616,7 @@ init_hy2_transport_env(){
         yellow "HY2 端口跳躍: 已停用"
     fi
     [[ "$changed" == "1" ]] && green "HY2 增強參數已寫入 ${SB_USER_ENV_FILE} / ${SB_STATE_ENV_FILE}"
+    return 0
 }
 
 load_hy2_runtime_from_server_files(){
@@ -1612,6 +1641,7 @@ load_hy2_runtime_from_server_files(){
     [[ -z "${SB_HY2_OBFS_ENABLED:-}" ]] && SB_HY2_OBFS_ENABLED="1"
     [[ -z "${SB_HY2_HOP_ENABLED:-}" ]] && SB_HY2_HOP_ENABLED="1"
     [[ -z "${SB_HY2_HOP_INTERVAL:-}" ]] && SB_HY2_HOP_INTERVAL="30s"
+    return 0
 }
 
 # ==================== ACME 證書申請 ====================
@@ -2015,7 +2045,7 @@ STREAMEOF
 # ========== Sing-box VMess-WS 反代 — 由 sb2.sh 自動生成 ==========
 
 server {
-    listen 127.0.0.1:${int_port_https_backend} ssl;
+    listen 127.0.0.1:${int_port_https_backend} ssl http2;
     server_name ${domain_name};
 
     ssl_certificate     /etc/s-box/cert.crt;
