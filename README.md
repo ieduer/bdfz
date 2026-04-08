@@ -147,6 +147,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/mentee.sh)
 
 偶爾救急。輕量下載/中轉小工具，適合臨時拉取大文件、轉存到指定 VPS 或雲端存儲，避免在本機/教學機器上折騰。
 
+`dl.sh` 目前對應 `xz.bdfz.net` 的 yt-dlp Web 安裝器；運維說明見 `dl.md`，關鍵運行記憶見 `dl.memory.md`。
+
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/ieduer/bdfz/main/dl.sh)
 ```

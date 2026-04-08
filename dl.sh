@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # dl.sh - ytweb with progress, HTTPS, 8h auto-clean, Telegram notify
-# version: v1.8-2026-02-13
-# changes from v1.5-2025-12-03:
+# version: v1.10-2026-04-08
+# changes from v1.9-2026-03-30:
 # - 全新 Geek 風格 Glassmorphism UI（暗色主題、漸變背景、動畫效果）
 # - 新增下載格式選項（偏好 MP4、最高解析度限制、僅音訊）
 # - 新增進階選項（嵌入字幕、嵌入縮略圖、提取 MP3、僅下載單個視頻）
+# - 新增 URL 預填、cookies.txt 上傳、yt-dlp 預解析
 # - Terminal 風格日誌顯示
 # - 使用 Inter + JetBrains Mono 字體
+# - 固定 curl-cffi 相容版本，恢復 X/Twitter impersonation
+# - 新增 ffmpeg / impersonation 健康檢查與 /healthz
 # domain: xz.bdfz.net
 
 set -euo pipefail
@@ -21,7 +24,7 @@ DOWNLOAD_DIR="/var/www/yt-downloads"
 SERVICE_NAME="ytweb.service"
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 
-echo "[ytweb] installing version v1.8-2026-02-13 ..."
+echo "[ytweb] installing version v1.10-2026-04-08 ..."
 
 # 必須 root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -117,14 +120,26 @@ fi
 
 V_PY="$VENV_DIR/bin/python"
 
-echo "[ytweb] upgrading pip and installing/refreshing dependencies (flask, dotenv, yt-dlp + curl_cffi, werkzeug, requests) ..."
+echo "[ytweb] upgrading pip and installing/refreshing dependencies (flask, dotenv, yt-dlp, werkzeug, requests, curl-cffi<0.15) ..."
 "$V_PY" -m pip install --upgrade pip
-"$V_PY" -m pip install --upgrade flask python-dotenv "yt-dlp[default,curl-cffi]" werkzeug requests
+"$V_PY" -m pip install --upgrade flask python-dotenv "yt-dlp[default]" werkzeug requests "curl-cffi>=0.14,<0.15"
 
 # 更新後的 yt-dlp 路徑 & 版本
 YTDLP_BIN="$VENV_DIR/bin/yt-dlp"
 YTDLP_VERSION="$("$YTDLP_BIN" --version 2>/dev/null || echo "unknown")"
 echo "[ytweb] yt-dlp version: $YTDLP_VERSION (path: $YTDLP_BIN)"
+if ! "$YTDLP_BIN" --list-impersonate-targets 2>/dev/null | grep -q '^Chrome'; then
+  echo "[ytweb] Chrome impersonation missing; forcing curl-cffi compatibility pin ..."
+  "$V_PY" -m pip install --force-reinstall "curl-cffi>=0.14,<0.15"
+fi
+if ! "$YTDLP_BIN" --list-impersonate-targets 2>/dev/null | grep -q '^Chrome'; then
+  echo "[ytweb] Chrome impersonation still unavailable after compatibility pin" >&2
+  exit 1
+fi
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "[ytweb] ffmpeg still missing after package installation" >&2
+  exit 1
+fi
 
 # 3.5) yt-dlp system config (enable deno runtime; mitigate YouTube SABR/403)
 if command -v deno >/dev/null 2>&1; then
@@ -154,7 +169,7 @@ cat > "$APP_DIR/app.py" <<'PY'
 # -*- coding: utf-8 -*-
 """
 ytweb - tiny web ui for yt-dlp
-version: v1.8-2026-02-13
+version: v1.10-2026-04-08
 
 - explicit yt-dlp path via env YTDLP_BIN
 - youtube url normalization (watch/shorts/live/youtu.be)
@@ -163,11 +178,17 @@ version: v1.8-2026-02-13
 - ProxyFix + PREFERRED_URL_SCHEME=https
 - auto 模式：不傳 -f，讓 yt-dlp 自行選擇 bestvideo+bestaudio
 - 限制檔名長度，避免 Errno 36
+- 支援 cookies.txt 上傳，提升登入站點 / 受限視頻下載成功率
+- 支援 yt-dlp JSON 預解析，顯示標題 / extractor / 部分格式
 - 下載完成後透過 Telegram 發送通知（由環境變量注入 TG_BOT_TOKEN / TG_CHAT_ID）
+- 啟動與健康檢查會驗證 ffmpeg 與 X/Twitter impersonation 可用性
 """
+import json
 import os
+import shutil
 import uuid
 import subprocess
+import tempfile
 import threading
 import time
 import re
@@ -209,7 +230,12 @@ app.config["PREFERRED_URL_SCHEME"] = "https"
 TASKS = {}
 LOCK = threading.Lock()
 EXPIRE_HOURS = 8
+INFO_TIMEOUT_SECONDS = 45
+MAX_COOKIE_FILE_BYTES = 2 * 1024 * 1024
 PROG_RE = re.compile(r"(\d+(?:\.\d+)?)%")
+HEALTH_CACHE_SECONDS = 300
+_RUNTIME_HEALTH = None
+_RUNTIME_HEALTH_TS = 0.0
 
 
 def now_utc():
@@ -256,6 +282,337 @@ def normalize_url(u: str) -> str:
   return u
 
 
+def is_http_url(u: str) -> bool:
+  try:
+    parsed = urlparse(u)
+  except Exception:
+    return False
+  return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def format_duration(seconds) -> str:
+  try:
+    total = int(seconds or 0)
+  except (TypeError, ValueError):
+    return ""
+  if total <= 0:
+    return ""
+  hours, remainder = divmod(total, 3600)
+  minutes, secs = divmod(remainder, 60)
+  if hours:
+    return f"{hours}:{minutes:02d}:{secs:02d}"
+  return f"{minutes}:{secs:02d}"
+
+
+def format_bytes(size) -> str:
+  try:
+    value = float(size or 0)
+  except (TypeError, ValueError):
+    return ""
+  if value <= 0:
+    return ""
+  for unit in ("B", "KB", "MB", "GB", "TB"):
+    if value < 1024 or unit == "TB":
+      if unit == "B":
+        return f"{int(value)} {unit}"
+      return f"{value:.1f} {unit}"
+    value /= 1024
+  return ""
+
+
+def detect_curl_cffi_version() -> str:
+  try:
+    import curl_cffi  # type: ignore
+  except Exception:
+    return ""
+  return str(getattr(curl_cffi, "__version__", "") or "")
+
+
+def detect_impersonate_targets() -> list[str]:
+  try:
+    proc = subprocess.run(
+      [YTDLP_BIN, "--list-impersonate-targets"],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      text=True,
+      timeout=15,
+    )
+  except Exception:
+    return []
+
+  targets = []
+  for raw_line in (proc.stdout or "").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("[info]") or line.startswith("Client") or line.startswith("-"):
+      continue
+    first = line.split()[0].strip()
+    if first:
+      targets.append(first.lower())
+  return targets
+
+
+def get_runtime_health(force: bool = False) -> dict:
+  global _RUNTIME_HEALTH, _RUNTIME_HEALTH_TS
+  now = time.time()
+  if not force and _RUNTIME_HEALTH and (now - _RUNTIME_HEALTH_TS) < HEALTH_CACHE_SECONDS:
+    return _RUNTIME_HEALTH
+
+  ytdlp_exists = os.path.isfile(YTDLP_BIN)
+  yt_dlp_version = ""
+  if ytdlp_exists:
+    try:
+      proc = subprocess.run(
+        [YTDLP_BIN, "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+      )
+      yt_dlp_version = (proc.stdout or "").strip()
+    except Exception:
+      yt_dlp_version = ""
+
+  ffmpeg_path = shutil.which("ffmpeg") or ""
+  targets = detect_impersonate_targets() if ytdlp_exists else []
+  chrome_targets = [target for target in targets if target.startswith("chrome")]
+
+  warnings = []
+  if not ytdlp_exists:
+    warnings.append(f"yt-dlp missing at {YTDLP_BIN}")
+  if not ffmpeg_path:
+    warnings.append("ffmpeg missing from PATH")
+  if not chrome_targets:
+    warnings.append("yt-dlp chrome impersonation unavailable for x.com/twitter.com")
+
+  health = {
+    "ok": bool(ytdlp_exists and ffmpeg_path and chrome_targets),
+    "ytdlp_bin": YTDLP_BIN,
+    "yt_dlp_version": yt_dlp_version,
+    "ffmpeg_path": ffmpeg_path,
+    "curl_cffi_version": detect_curl_cffi_version(),
+    "impersonate_targets": targets,
+    "x_impersonation_ok": bool(chrome_targets),
+    "checked_at": now_utc().isoformat(),
+    "warnings": warnings,
+  }
+  _RUNTIME_HEALTH = health
+  _RUNTIME_HEALTH_TS = now
+  return health
+
+
+def build_ytdlp_base_cmd(url: str, cookies_path=None):
+  cmd = [YTDLP_BIN]
+  try:
+    uhost = (urlparse(url).netloc or "").lower()
+  except Exception:
+    uhost = ""
+
+  if cookies_path and os.path.isfile(cookies_path):
+    cmd += ["--cookies", cookies_path]
+
+  # YouTube: prefer enabling JS runtime (deno) + mitigate SABR/403
+  if "youtube.com" in uhost or "youtu.be" in uhost:
+    if os.path.isfile("/usr/local/bin/deno"):
+      cmd += ["--js-runtimes", "deno:/usr/local/bin/deno"]
+    cmd += ["--extractor-args", "youtube:player_client=default,-android_sdkless"]
+    cmd += [
+      "--concurrent-fragments",
+      "1",
+      "--retries",
+      "10",
+      "--fragment-retries",
+      "10",
+      "--retry-sleep",
+      "1",
+    ]
+
+  # X/Twitter: often needs browser impersonation to pass GraphQL/guest-token checks
+  if any(h in uhost for h in ("x.com", "twitter.com")):
+    if get_runtime_health().get("x_impersonation_ok"):
+      cmd += ["--impersonate", "chrome"]
+
+  return cmd
+
+
+def parse_ytdlp_json(raw: str):
+  payload = raw.strip()
+  if not payload:
+    raise ValueError("empty yt-dlp response")
+  lines = [line.strip() for line in payload.splitlines() if line.strip()]
+  for line in reversed(lines):
+    if (line.startswith("{") and line.endswith("}")) or (
+      line.startswith("[") and line.endswith("]")
+    ):
+      return json.loads(line)
+  return json.loads(payload)
+
+
+def summarize_formats(info: dict, limit: int = 10):
+  summarized = []
+  seen = set()
+
+  for fmt in info.get("formats") or []:
+    format_id = str(fmt.get("format_id") or "").strip()
+    if not format_id or format_id in seen:
+      continue
+    seen.add(format_id)
+
+    vcodec = str(fmt.get("vcodec") or "none")
+    acodec = str(fmt.get("acodec") or "none")
+    if vcodec == "none" and acodec == "none":
+      continue
+
+    height = int(fmt.get("height") or 0)
+    width = int(fmt.get("width") or 0)
+    resolution = ""
+    if width and height:
+      resolution = f"{width}x{height}"
+    else:
+      resolution = str(fmt.get("resolution") or fmt.get("format_note") or "")
+
+    label_bits = []
+    if resolution:
+      label_bits.append(resolution)
+    elif fmt.get("ext"):
+      label_bits.append(str(fmt.get("ext")))
+
+    if vcodec == "none":
+      label_bits.append("audio only")
+    elif acodec == "none":
+      label_bits.append("video only")
+    else:
+      label_bits.append("muxed")
+
+    if fmt.get("fps"):
+      try:
+        label_bits.append(f"{int(float(fmt['fps']))}fps")
+      except (TypeError, ValueError):
+        pass
+
+    size_text = format_bytes(fmt.get("filesize") or fmt.get("filesize_approx"))
+    if size_text:
+      label_bits.append(size_text)
+
+    tbr = 0
+    try:
+      tbr = int(float(fmt.get("tbr") or 0))
+    except (TypeError, ValueError):
+      tbr = 0
+    if tbr > 0:
+      label_bits.append(f"{tbr}k")
+
+    summarized.append(
+      {
+        "format_id": format_id,
+        "label": f"{format_id} · {' · '.join(label_bits)}",
+        "selector": format_id,
+        "has_audio": acodec != "none",
+        "has_video": vcodec != "none",
+        "height": height,
+        "tbr": tbr,
+      }
+    )
+
+  summarized.sort(
+    key=lambda item: (
+      1 if item["has_audio"] and item["has_video"] else 0,
+      1 if item["has_video"] else 0,
+      item["height"],
+      item["tbr"],
+    ),
+    reverse=True,
+  )
+  return summarized[:limit]
+
+
+def build_info_payload(url: str, cookies_path=None):
+  cmd = build_ytdlp_base_cmd(url, cookies_path)
+  cmd += [
+    "--dump-single-json",
+    "--skip-download",
+    "--no-playlist",
+    "--no-warnings",
+    "--encoding",
+    "utf-8",
+    url,
+  ]
+
+  proc = subprocess.run(
+    cmd,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    timeout=INFO_TIMEOUT_SECONDS,
+  )
+  if proc.returncode != 0:
+    error_lines = [
+      line.strip()
+      for line in (proc.stderr or proc.stdout or "").splitlines()
+      if line.strip()
+    ]
+    raise RuntimeError(error_lines[-1] if error_lines else "yt-dlp metadata extraction failed")
+
+  info = parse_ytdlp_json(proc.stdout or proc.stderr or "")
+  if isinstance(info, dict) and info.get("_type") == "playlist":
+    entries = info.get("entries") or []
+    if entries:
+      info = entries[0]
+
+  if not isinstance(info, dict):
+    raise RuntimeError("unexpected metadata payload from yt-dlp")
+
+  return {
+    "title": info.get("title") or url,
+    "thumbnail": info.get("thumbnail") or "",
+    "extractor": info.get("extractor_key") or info.get("extractor") or "unknown",
+    "uploader": info.get("uploader") or info.get("channel") or "",
+    "duration": format_duration(info.get("duration")),
+    "webpage_url": info.get("webpage_url") or url,
+    "is_live": bool(info.get("is_live")),
+    "formats": summarize_formats(info),
+  }
+
+
+def save_cookie_upload(file_storage, destination_path: str):
+  filename = (getattr(file_storage, "filename", "") or "").strip()
+  if not filename:
+    return None, None
+
+  lower_name = filename.lower()
+  if not lower_name.endswith((".txt", ".cookies", ".cookie")):
+    return None, "cookies 文件請上傳 Netscape 格式的 cookies.txt / .cookies"
+
+  data = file_storage.stream.read(MAX_COOKIE_FILE_BYTES + 1)
+  if len(data) > MAX_COOKIE_FILE_BYTES:
+    return None, "cookies 文件過大，請控制在 2 MB 以內"
+  if not data.strip():
+    return None, "cookies 文件為空"
+
+  with open(destination_path, "wb") as fp:
+    fp.write(data)
+  return destination_path, None
+
+
+def save_preview_cookie_upload(file_storage):
+  filename = (getattr(file_storage, "filename", "") or "").strip()
+  if not filename:
+    return None, None
+
+  fd, temp_path = tempfile.mkstemp(
+    prefix="ytweb-preview-",
+    suffix=".cookies.txt",
+    dir=DOWNLOAD_DIR,
+  )
+  os.close(fd)
+  cookie_path, error = save_cookie_upload(file_storage, temp_path)
+  if error:
+    try:
+      os.remove(temp_path)
+    except OSError:
+      pass
+  return cookie_path, error
+
+
 def send_telegram_notification(task: dict, filename: str, download_path: str) -> None:
   """下載完成後的通知。
 
@@ -300,7 +657,7 @@ def send_telegram_notification(task: dict, filename: str, download_path: str) ->
     pass
 
 
-def run_ytdlp_task(task_id, url, fmt, options=None):
+def run_ytdlp_task(task_id, url, fmt, options=None, cookies_path=None):
   """執行 yt-dlp 下載任務。
 
   如果 fmt 為 None，則不傳 -f，讓 yt-dlp 使用預設策略（bestvideo+bestaudio）。
@@ -318,27 +675,12 @@ def run_ytdlp_task(task_id, url, fmt, options=None):
   # 限制 title 最長 60 字元，避免檔名過長；同時搭配 --trim-filenames
   output_tpl = os.path.join(task_dir, "%(title).60s-%(id)s.%(ext)s")
 
-  cmd = [
-    YTDLP_BIN,
+  cmd = build_ytdlp_base_cmd(url, cookies_path)
+  cmd += [
     "--newline",
     "--trim-filenames",
     "80",
   ]
-  # YouTube: prefer enabling JS runtime (deno) + mitigate SABR/403
-  try:
-    uhost = (urlparse(url).netloc or "").lower()
-  except Exception:
-    uhost = ""
-  if "youtube.com" in uhost or "youtu.be" in uhost:
-    if os.path.isfile("/usr/local/bin/deno"):
-      cmd += ["--js-runtimes", "deno:/usr/local/bin/deno"]
-    cmd += ["--extractor-args", "youtube:player_client=default,-android_sdkless"]
-    # a bit more robust for fragments
-    cmd += ["--concurrent-fragments", "1", "--retries", "10", "--fragment-retries", "10", "--retry-sleep", "1"]
-
-  # X/Twitter: often needs browser impersonation to pass GraphQL/guest-token checks
-  if any(h in uhost for h in ("x.com", "twitter.com")):
-    cmd += ["--impersonate", "chrome"]
 
   if fmt:
     cmd += ["-f", fmt]
@@ -359,6 +701,17 @@ def run_ytdlp_task(task_id, url, fmt, options=None):
     url,
   ]
   logs = [f"cmd: {' '.join(cmd)}"]
+  health = get_runtime_health()
+  if not health.get("ffmpeg_path"):
+    logs.append("WARNING: ffmpeg not found. The downloaded format may not be the best available.")
+  try:
+    uhost = (urlparse(url).netloc or "").lower()
+  except Exception:
+    uhost = ""
+  if any(h in uhost for h in ("x.com", "twitter.com")) and not health.get("x_impersonation_ok"):
+    logs.append(
+      "WARNING: chrome impersonation is unavailable in this runtime; x.com/twitter.com downloads may fail."
+    )
 
   try:
     proc = subprocess.Popen(
@@ -467,7 +820,42 @@ def cleanup_worker():
 
 @app.route("/", methods=["GET"])
 def index():
-  return render_template("index.html")
+  prefill_url = (request.args.get("u") or request.args.get("url") or "").strip()
+  return render_template("index.html", prefill_url=prefill_url)
+
+
+@app.route("/api/info", methods=["POST"])
+def api_info():
+  raw_url = request.form.get("url", "").strip()
+  if not raw_url:
+    raw_url = (request.args.get("u") or request.args.get("url") or "").strip()
+  url = normalize_url(raw_url)
+  if not url:
+    return jsonify({"error": "URL is required."}), 400
+  if not is_http_url(url):
+    return jsonify({"error": "Please provide a valid http(s) URL."}), 400
+
+  preview_cookie_path = None
+  try:
+    preview_cookie_path, cookie_error = save_preview_cookie_upload(
+      request.files.get("cookies_file")
+    )
+    if cookie_error:
+      return jsonify({"error": cookie_error}), 400
+
+    return jsonify(build_info_payload(url, preview_cookie_path))
+  except subprocess.TimeoutExpired:
+    return jsonify({"error": "預解析超時，請稍後再試。"}), 504
+  except RuntimeError as exc:
+    return jsonify({"error": str(exc)}), 400
+  except Exception as exc:
+    return jsonify({"error": f"metadata extraction failed: {exc}"}), 500
+  finally:
+    if preview_cookie_path and os.path.isfile(preview_cookie_path):
+      try:
+        os.remove(preview_cookie_path)
+      except OSError:
+        pass
 
 
 @app.route("/download", methods=["POST"])
@@ -481,7 +869,13 @@ def download():
     fmt = custom_fmt
   fmt_for_worker = fmt if fmt else None  # None => auto
   if not url:
-    return render_template("index.html", error="URL is required.")
+    return render_template("index.html", error="URL is required.", prefill_url=raw_url)
+  if not is_http_url(url):
+    return render_template(
+      "index.html",
+      error="Please provide a valid http(s) URL.",
+      prefill_url=raw_url,
+    )
 
   # 進階選項
   options = {
@@ -499,6 +893,16 @@ def download():
   task_dir = os.path.join(DOWNLOAD_DIR, task_id)
   os.makedirs(task_dir, exist_ok=True)
   expires_at = now_utc() + timedelta(hours=EXPIRE_HOURS)
+  cookies_path, cookie_error = save_cookie_upload(
+    request.files.get("cookies_file"),
+    os.path.join(task_dir, "cookies.txt"),
+  )
+  if cookie_error:
+    try:
+      os.rmdir(task_dir)
+    except OSError:
+      pass
+    return render_template("index.html", error=cookie_error, prefill_url=raw_url)
 
   with LOCK:
     TASKS[task_id] = {
@@ -514,11 +918,12 @@ def download():
       "created_at": now_utc(),
       "expires_at": expires_at,
       "client_ip": client_ip,
+      "cookies_path": cookies_path,
     }
 
   t = threading.Thread(
     target=run_ytdlp_task,
-    args=(task_id, url, fmt_for_worker, options),
+    args=(task_id, url, fmt_for_worker, options, cookies_path),
     daemon=True,
   )
   t.start()
@@ -529,6 +934,7 @@ def download():
     task_id=task_id,
     expires_at=expires_at.isoformat(),
     normalized_url=url,
+    prefill_url=raw_url,
   )
 
 
@@ -559,6 +965,13 @@ def progress(task_id):
   return jsonify(data)
 
 
+@app.route("/healthz", methods=["GET"])
+def healthz():
+  health = get_runtime_health(force=True)
+  status_code = 200 if health.get("ok") else 503
+  return jsonify(health), status_code
+
+
 @app.route("/files/<task_id>/<path:filename>", methods=["GET"])
 def get_file(task_id, filename):
   task_dir = os.path.join(DOWNLOAD_DIR, task_id)
@@ -568,6 +981,13 @@ def get_file(task_id, filename):
 
 
 if __name__ == "__main__":
+  print(
+    json.dumps(
+      {"event": "ytweb-startup-health", **get_runtime_health(force=True)},
+      ensure_ascii=False,
+    ),
+    flush=True,
+  )
   cleaner = threading.Thread(target=cleanup_worker, daemon=True)
   cleaner.start()
   app.run(host="127.0.0.1", port=5001, debug=False)
@@ -910,16 +1330,47 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
       animation: fadeIn 0.3s ease;
     }
 
+    input[type="file"] {
+      width: 100%;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.03);
+      border: 1px dashed rgba(255,255,255,0.16);
+      border-radius: var(--radius-sm);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    input[type="file"]::file-selector-button {
+      margin-right: 10px;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 8px;
+      background: rgba(88, 166, 255, 0.14);
+      color: var(--fg);
+      cursor: pointer;
+    }
+
+    .prefill-note {
+      margin-top: 10px;
+    }
+
+    .actions-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 8px;
+    }
+
     @keyframes fadeIn {
       from { opacity: 0; transform: translateY(-8px); }
       to { opacity: 1; transform: translateY(0); }
     }
 
-    /* Submit Button */
-    button[type="submit"] {
+    /* Action Buttons */
+    .primary-btn,
+    .secondary-btn {
       width: 100%;
       padding: 14px 20px;
-      background: linear-gradient(135deg, var(--accent), #3b82f6);
       border: none;
       border-radius: var(--radius-sm);
       color: #fff;
@@ -934,13 +1385,39 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
       gap: 8px;
     }
 
-    button[type="submit"]:hover {
+    .primary-btn {
+      background: linear-gradient(135deg, var(--accent), #3b82f6);
+    }
+
+    .secondary-btn {
+      background: linear-gradient(135deg, rgba(255,255,255,0.08), rgba(88, 166, 255, 0.16));
+      border: 1px solid rgba(255,255,255,0.08);
+      color: var(--fg);
+    }
+
+    .primary-btn:hover,
+    .secondary-btn:hover {
       transform: translateY(-2px);
+    }
+
+    .primary-btn:hover {
       box-shadow: 0 8px 24px var(--accent-glow);
     }
 
-    button[type="submit"]:active {
+    .secondary-btn:hover {
+      box-shadow: 0 8px 24px rgba(88, 166, 255, 0.16);
+    }
+
+    .primary-btn:active,
+    .secondary-btn:active {
       transform: translateY(0);
+    }
+
+    .secondary-btn:disabled {
+      opacity: 0.6;
+      cursor: wait;
+      transform: none;
+      box-shadow: none;
     }
 
     /* Status Messages */
@@ -954,6 +1431,11 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
     .status-box.running {
       background: linear-gradient(135deg, rgba(88, 166, 255, 0.1), rgba(88, 166, 255, 0.05));
       border: 1px solid rgba(88, 166, 255, 0.3);
+    }
+
+    .status-box.preview {
+      background: linear-gradient(135deg, rgba(167, 139, 250, 0.12), rgba(88, 166, 255, 0.05));
+      border: 1px solid rgba(167, 139, 250, 0.28);
     }
 
     .status-box.done {
@@ -992,6 +1474,75 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
       padding: 2px 6px;
       border-radius: 4px;
       color: var(--fg);
+      overflow-wrap: anywhere;
+    }
+
+    .preview-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .preview-thumb {
+      width: 100%;
+      max-width: 220px;
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      border-radius: var(--radius-sm);
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.03);
+    }
+
+    .preview-meta h4 {
+      font-size: 16px;
+      margin-bottom: 10px;
+    }
+
+    .preview-meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .preview-meta-item {
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .preview-meta-item strong {
+      display: block;
+      color: var(--fg);
+      margin-bottom: 4px;
+      font-size: 12px;
+    }
+
+    .format-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .format-chip {
+      border: 1px solid rgba(88, 166, 255, 0.22);
+      background: rgba(88, 166, 255, 0.08);
+      color: var(--fg);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .format-chip:hover {
+      background: rgba(88, 166, 255, 0.16);
+      transform: translateY(-1px);
     }
 
     /* Progress Bar */
@@ -1159,6 +1710,15 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
       .options-grid {
         grid-template-columns: 1fr;
       }
+      .actions-grid {
+        grid-template-columns: 1fr;
+      }
+      .preview-layout {
+        grid-template-columns: 1fr;
+      }
+      .preview-thumb {
+        max-width: none;
+      }
     }
   </style>
 </head>
@@ -1167,7 +1727,7 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
     <div class="header-content">
       <div class="brand">
         <img src="https://img.bdfz.net/20250503004.webp" alt="BDFZ" class="brand-icon">
-        <h1>yt-dlp web<span class="version">v1.8</span></h1>
+        <h1>yt-dlp web<span class="version">v1.10</span></h1>
       </div>
       <div class="stats-badge">
         <span class="dot"></span>
@@ -1188,12 +1748,19 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
         <span>下載視頻</span>
       </div>
 
-      <form method="post" action="/download">
+      <form id="download-form" method="post" action="/download" enctype="multipart/form-data">
         <div class="form-group">
           <label for="url">視頻 URL <span class="hint">(必填)</span></label>
           <input type="url" id="url" name="url" required 
-                 placeholder="YouTube / Bilibili / Twitter / TikTok / 其他支援的網站...">
+                 value="{{ prefill_url or '' }}"
+                 placeholder="YouTube / Bilibili / Douyin / X / TikTok / Instagram / 微信文章視頻 / 其他支援站點...">
         </div>
+
+        {% if prefill_url %}
+        <div class="form-help prefill-note">
+          ↗ 已帶入外部鏈接。可以直接開始下載，也可以先用「預解析」確認 extractor 和可用格式。
+        </div>
+        {% endif %}
 
         <div class="form-group">
           <label for="format">下載格式</label>
@@ -1219,6 +1786,14 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
             <label for="custom_format">自定義格式 <span class="hint">(覆蓋上方選擇)</span></label>
             <input type="text" id="custom_format" name="custom_format" 
                    placeholder="例如: bv*[height<=720][ext=mp4]+ba/best">
+          </div>
+
+          <div class="form-group">
+            <label for="cookies_file">cookies.txt <span class="hint">(登入站點 / 受限視頻時建議上傳)</span></label>
+            <input type="file" id="cookies_file" name="cookies_file" accept=".txt,.cookies,.cookie,text/plain">
+            <div class="form-help">
+              🔐 上傳 Netscape 格式 cookies 文件後，會僅用於本次預解析 / 下載任務，並隨任務目錄一起在 8 小時內清理。
+            </div>
           </div>
 
           <div class="options-grid">
@@ -1248,11 +1823,25 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
           </div>
         </div>
 
-        <button type="submit">
-          <span>⬇️</span>
-          <span>開始下載</span>
-        </button>
+        <div class="actions-grid">
+          <button type="button" id="preview-btn" class="secondary-btn">
+            <span>🔎</span>
+            <span>預解析</span>
+          </button>
+          <button type="submit" class="primary-btn">
+            <span>⬇️</span>
+            <span>開始下載</span>
+          </button>
+        </div>
       </form>
+    </div>
+
+    <div id="preview-box" class="status-box preview" hidden>
+      <div class="status-header">
+        <span class="icon">🧭</span>
+        <h3>預解析結果</h3>
+      </div>
+      <div id="preview-body" class="status-info"></div>
     </div>
 
     {% if error %}
@@ -1306,14 +1895,146 @@ cat > "$APP_DIR/templates/index.html" <<'HTML'
   </footer>
 
   <script>
-  function toggleAdvanced() {
+  function toggleAdvanced(forceState) {
     const btn = document.querySelector('.advanced-toggle');
     const section = document.getElementById('advancedSection');
-    btn.classList.toggle('open');
-    section.classList.toggle('show');
+    if (!btn || !section) return;
+    const shouldOpen = typeof forceState === 'boolean'
+      ? forceState
+      : !btn.classList.contains('open');
+    btn.classList.toggle('open', shouldOpen);
+    section.classList.toggle('show', shouldOpen);
   }
 
   (function() {
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function setPreviewState(kind, bodyHtml) {
+      const previewBox = document.getElementById('preview-box');
+      const previewBody = document.getElementById('preview-body');
+      if (!previewBox || !previewBody) return;
+      previewBox.hidden = false;
+      previewBox.className = `status-box ${kind}`;
+      previewBody.innerHTML = bodyHtml;
+    }
+
+    function renderPreview(data) {
+      const formats = Array.isArray(data.formats) ? data.formats : [];
+      const thumbHtml = data.thumbnail
+        ? `<img class="preview-thumb" src="${escapeHtml(data.thumbnail)}" alt="thumbnail">`
+        : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);">No thumbnail</div>';
+      const metaItems = [
+        { label: 'Extractor', value: data.extractor || 'unknown' },
+        { label: '時長', value: data.duration || '未知' },
+        { label: '發布者', value: data.uploader || '未知' },
+        { label: '狀態', value: data.is_live ? '直播 / 回放' : '普通媒體' },
+      ];
+      const formatsHtml = formats.length
+        ? `
+          <div class="format-list">
+            ${formats.map((item) => `
+              <button type="button" class="format-chip" data-format="${escapeHtml(item.selector || item.format_id || '')}">
+                ${escapeHtml(item.label || item.format_id || '')}
+              </button>
+            `).join('')}
+          </div>
+          <p class="status-info" style="margin-top:12px;">
+            點任一 format id 可自動填入「自定義格式」。若該格式只有視頻或音訊，建議仍使用「自動最佳」。
+          </p>
+        `
+        : '<p class="status-info" style="margin-top:12px;">此站點未返回可展示的格式列表，可直接使用「自動最佳」。</p>';
+
+      return `
+        <div class="preview-layout">
+          ${thumbHtml}
+          <div class="preview-meta">
+            <h4>${escapeHtml(data.title || 'Untitled')}</h4>
+            <p class="status-info">原頁面: <code>${escapeHtml(data.webpage_url || '')}</code></p>
+            <div class="preview-meta-grid">
+              ${metaItems.map((item) => `
+                <div class="preview-meta-item">
+                  <strong>${escapeHtml(item.label)}</strong>
+                  ${escapeHtml(item.value)}
+                </div>
+              `).join('')}
+            </div>
+            ${formatsHtml}
+          </div>
+        </div>
+      `;
+    }
+
+    async function previewInfo() {
+      const urlInput = document.getElementById('url');
+      const previewBtn = document.getElementById('preview-btn');
+      const cookiesInput = document.getElementById('cookies_file');
+      if (!urlInput) return;
+
+      const rawUrl = urlInput.value.trim();
+      if (!rawUrl) {
+        setPreviewState('error', '<p class="status-info">請先輸入 URL。</p>');
+        return;
+      }
+
+      if (previewBtn) previewBtn.disabled = true;
+      setPreviewState(
+        'running',
+        '<p class="status-info">正在用 yt-dlp 預解析 extractor、標題、封面與可用格式，通常幾秒內返回。</p>'
+      );
+
+      const formData = new FormData();
+      formData.append('url', rawUrl);
+      if (cookiesInput && cookiesInput.files && cookiesInput.files[0]) {
+        formData.append('cookies_file', cookiesInput.files[0]);
+      }
+
+      try {
+        const response = await fetch('/api/info', {
+          method: 'POST',
+          body: formData,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.error || '預解析失敗');
+        }
+        setPreviewState('preview', renderPreview(data));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '預解析失敗';
+        setPreviewState('error', `<p class="status-info">${escapeHtml(message)}</p>`);
+      } finally {
+        if (previewBtn) previewBtn.disabled = false;
+      }
+    }
+
+    const previewBtn = document.getElementById('preview-btn');
+    if (previewBtn) {
+      previewBtn.addEventListener('click', previewInfo);
+    }
+
+    document.addEventListener('click', (event) => {
+      const chip = event.target.closest('.format-chip');
+      if (!chip) return;
+      const selector = chip.getAttribute('data-format') || '';
+      const customFormatInput = document.getElementById('custom_format');
+      if (!selector || !customFormatInput) return;
+      customFormatInput.value = selector;
+      toggleAdvanced(true);
+      customFormatInput.focus();
+      customFormatInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+
+    const params = new URLSearchParams(window.location.search);
+    if ((params.get('u') || params.get('url')) && previewBtn && !document.getElementById('task-id')) {
+      previewInfo();
+    }
+
     const taskIdEl = document.getElementById('task-id');
     if (!taskIdEl) return;
     const taskId = taskIdEl.textContent.trim();
@@ -1449,12 +2170,37 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
-# 7) nginx (force https)
+# 7) nginx
+write_nginx_http_only() {
 cat > /etc/nginx/sites-available/ytweb.conf <<NG
 server {
     listen 80;
     listen [::]:80;
     server_name $DOMAIN;
+    client_max_body_size 4m;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:5001;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NG
+}
+
+write_nginx_https() {
+cat > /etc/nginx/sites-available/ytweb.conf <<NG
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+    client_max_body_size 4m;
 
     location /.well-known/acme-challenge/ {
         root /var/www/html;
@@ -1469,6 +2215,7 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     server_name $DOMAIN;
+    client_max_body_size 4m;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
@@ -1488,6 +2235,9 @@ server {
     }
 }
 NG
+}
+
+write_nginx_http_only
 
 echo "[ytweb] enabling nginx site ytweb.conf ..."
 ln -sf /etc/nginx/sites-available/ytweb.conf /etc/nginx/sites-enabled/ytweb.conf
@@ -1498,6 +2248,9 @@ systemctl reload nginx
 if command -v certbot >/dev/null 2>&1; then
   echo "[ytweb] running certbot --nginx for $DOMAIN (errors ignored if already configured) ..."
   certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email || true
+  if [ -s "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] && [ -s "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]; then
+    write_nginx_https
+  fi
   nginx -t && systemctl reload nginx
 else
   echo "[ytweb] certbot not found; please configure TLS certificate for $DOMAIN manually." >&2
@@ -1505,18 +2258,31 @@ fi
 
 # 9) healthcheck script + cron
 cat >/usr/local/sbin/check-ytweb.sh <<'SH'
-#!/bin/bash
-# simple health check for ytweb on 127.0.0.1:5001
-if ! curl -s --max-time 3 http://127.0.0.1:5001/ >/dev/null; then
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! curl -fsS --max-time 5 http://127.0.0.1:5001/healthz >/dev/null; then
   systemctl restart ytweb.service
 fi
 SH
 chmod +x /usr/local/sbin/check-ytweb.sh
 
-# add to root cron (idempotent)
-if ! crontab -l 2>/dev/null | grep -q 'check-ytweb.sh'; then
-  ( crontab -l 2>/dev/null ; echo "* * * * * /usr/local/sbin/check-ytweb.sh" ) | crontab -
-fi
+# install cron.d entry (idempotent, avoids mutating root user crontab)
+cat >/etc/cron.d/ytweb-healthcheck <<'CRON'
+* * * * * root /usr/local/sbin/check-ytweb.sh
+CRON
+chmod 0644 /etc/cron.d/ytweb-healthcheck
 
 echo "[ytweb] install done. open: https://$DOMAIN/"
 echo "[ytweb] yt-dlp version in use: $YTDLP_VERSION"
+echo "[ytweb] curl_cffi version: $("$V_PY" - <<'PY'
+try:
+    import curl_cffi
+    print(curl_cffi.__version__)
+except Exception:
+    print("missing")
+PY
+)"
+echo "[ytweb] ffmpeg path: $(command -v ffmpeg)"
+sleep 2
+curl -fsS http://127.0.0.1:5001/healthz >/dev/null
