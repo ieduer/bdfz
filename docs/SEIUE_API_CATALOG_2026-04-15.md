@@ -1,19 +1,11 @@
-# Seiue 网站 API 清单(字段级版本,基于本机 + GitHub 代码实扫)
-
-> 补充说明(2026-04-15 晚间真实抓取增补)
->
-> - 本文是"代码实扫 + 历史验证链路"主表。
-> - 当晚基于 `~/.secrets.env` 中真实凭据、门户 SSO、真实页面交互、真实 URL 回放得到的新增接口,另见:
->   - `docs/SEIUE_API_REAL_CAPTURE_2026-04-15.md`
->   - `docs/SEIUE_API_CAPTURE_RUNBOOK_2026-04-15.md`
+# Seiue / Portal API 文档（统一版，2026-04-15）
 
 > 说明
 >
-> - 这不是 Seiue 官方开放平台文档,而是**基于本机代码仓与相关脚本实扫**整理出的字段级文档。
-> - 每个 API 尽量补齐:**方法 / 参数 / 返回字段 / 鉴权要求**。
-> - **返回字段只写代码中已实际使用、或能从现有实现确认的字段**;不伪造完整 schema。
-> - 同一路径若在多个项目重复出现,统一合并说明。
-> - 文中 `Bearer` / `x-school-id` / `x-role` / `x-reflection-id` 默认为 Seiue 教师侧常见头。
+> - 本文只保留 API 资料：接口、方法、关键参数、返回字段、鉴权要求、错误/约束、链路关系。
+> - 已移除本机路径、凭据来源、抓包脚本、产物目录、运行步骤等环境相关信息。
+> - 文中证据边界仅用于区分：代码/历史链路可确认，或 2026-04-15 已做真实请求验证。
+> - `passport.seiue.com` / `api.seiue.com` 属于 Seiue 侧；`api.pkuschool.edu.cn` 属于 growp / 门户 / BI 侧。
 
 ---
 
@@ -1498,56 +1490,31 @@ curl 'https://api.seiue.com/chalk/chat/instances/7/chats' \
   - 最后查 `forms[].id`
 
 ---
-
-# 十七、接口覆盖边界说明
-
-这份文档当前已经补到:
-- 代码里直接出现的接口
-- 运行链路里已被长期验证过的核心接口
-- 通知侧顺藤摸瓜拉到的关联接口
-- 自建中间层接口
-
-但**仍不等于**:
-- Seiue 官方全站完整 OpenAPI
-- 所有角色(教师/学生/家长/管理员)全量接口面
-- 所有 query/body 字段的严格 schema
-
-准确说,它现在是:
-
-> **你现有代码生态下,足够支撑考勤、作业、评分、通知、约谈、学生画像、请假流这些自动化任务的"最大实用版 API 文档"。**
-
 ---
 
-# 十八、来源仓库 / 文件
+# 十七、Portal / growp / BI 侧 API（真实入口命中）
 
-主要来源:
+> 下列接口来自门户 SSO / growp / 导师看板侧真实页面命中；此处仅保留 API 路径与 query 形态，不保留本地抓取过程信息。
 
-- `~/Desktop/CF/kseiue-worker/src/index.js`
-- `~/Desktop/CF/my-seiue-app/backend/index.py`
-- `~/Desktop/CF/bdfz/agrader.sh`
-- `~/Desktop/CF/bdfz/seiue-notify.sh`
-- `~/Desktop/CF/bdfz/seiuestu.sh`
-- `~/Desktop/CF/bdfz/mentee.sh`
-- `~/Desktop/CF/seiue-frontend/index.html`
-- 历史已验证的 Seiue 自动化链路
+## growp / 门户基础接口
+- `POST https://api.pkuschool.edu.cn/growp/login/formal`
+- `GET https://api.pkuschool.edu.cn/growp/school/schools/3`
+- `GET https://api.pkuschool.edu.cn/growp/perm/perms/me`
+- `GET https://api.pkuschool.edu.cn/growp/load/reflection`
+- `GET https://api.pkuschool.edu.cn/growp/plugin/school-plugins/enabled?expand=plugins.plugin,plugins.tag`
+- `GET https://api.pkuschool.edu.cn/growp/plugin/school-plugin-tags`
+- `GET https://api.pkuschool.edu.cn/growp/notification/frontend-notices`
+- `GET https://api.pkuschool.edu.cn/growp/notification/frontend-informations?expand=current_recever,sender_name&is_received=true&page=1&per_page=5`
 
----
+## BI / 导师看板接口
+- `GET https://api.pkuschool.edu.cn/bi/query_semester_data?advisor_usin={advisor_usin}&date={date}`
+- `GET https://api.pkuschool.edu.cn/bi/advisor/query_advisor_daily_student_attendance_stats?advisor_usin={advisor_usin}&date={date}&advisor_role={role}`
+- `GET https://api.pkuschool.edu.cn/bi/advisor/query_advisor_student_lift_assessment_stats?advisor_usin={advisor_usin}&semester_id={semester_id}&advisor_role={role}&week_number={week_number}&var=1`
+- `GET https://api.pkuschool.edu.cn/bi/advisor/query_advisor_student_silent_assessment_stats?advisor_usin={advisor_usin}&semester_id={semester_id}&advisor_role={role}&week_number={week_number}&var=1`
+- `GET https://api.pkuschool.edu.cn/bi/advisor/query_advisor_student_tablet_violation_stats?semester_id={semester_id}&week_number={week_number}&advisor_usin={advisor_usin}&advisor_role={role}`
+- `GET https://api.pkuschool.edu.cn/bi/advisor/query_advisor_student_takeout_assessment_stats?advisor_usin={advisor_usin}&semester_id={semester_id}&advisor_role={role}&week_number={week_number}&var=1`
+- `GET https://api.pkuschool.edu.cn/bi/advisor/query_student_absence_stats?advisor_usin={advisor_usin}&semester_id={semester_id}&advisor_role={role}&week_number={week_number}&var=1`
+- `GET https://api.pkuschool.edu.cn/bi/advisor/query_student_attendance_stats?advisor_usin={advisor_usin}&semester_id={semester_id}&advisor_role={role}&week_number={week_number}&var=1`
+- `GET https://api.pkuschool.edu.cn/bi/advisor/query_student_certification_stats?advisor_usin={advisor_usin}&semester_id={semester_id}&advisor_role={role}&week_number={week_number}&var=1`
+- `GET https://api.pkuschool.edu.cn/bi/advisor/query_student_moral_assessment_stats?advisor_usin={advisor_usin}&semester_id={semester_id}&advisor_role={role}&week_number={week_number}&var=1`
 
-# 十九、结论
-
-现在这份已经不是"接口名罗列版",而是接近 runbook 的版本:
-
-- **方法**:有了
-- **关键参数**:有了
-- **代码确认过的返回字段**:有了
-- **鉴权要求**:有了
-- **业务链路**:有了
-- **示例请求**:有了
-- **响应骨架**:有了
-- **失败码/重试经验**:有了
-
-如果还要继续往死里补,下一层应该是:
-1. 每个接口补真实抓包样例
-2. 每个链路单独拆成 runbook
-3. 生成 task→item→assessment、message→chat/form、leave_flow→absence 的关系图
-4. 最后再抽一份真正适合程序消费的 machine-readable schema
