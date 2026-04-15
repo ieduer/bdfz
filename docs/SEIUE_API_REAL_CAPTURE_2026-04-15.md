@@ -1,0 +1,509 @@
+# Seiue / Portal 真实 API 抓取增补（2026-04-15）
+
+> 说明
+>
+> - 本文只收录 **2026-04-15 这轮真实登录、真实浏览器、真实请求、真实回放** 得到的 API。
+> - `api.seiue.com` 大部分 URL 已用 `~/.secrets.env` 中的 Seiue 凭据重新登录并回放。
+> - `api.pkuschool.edu.cn` 为门户 SSO / 导师看板侧真实命中；当前未做独立 cookie 回放，只保留真实前端命中记录。
+
+## 执行路径（真实）
+1. 使用 `~/.secrets.env` 中的 `SEIUE_USERNAME / SEIUE_PASSWORD` 直登 Seiue，确认 `login` + `authorize` 成功。
+2. 使用 `~/.secrets.env` 中的 `BDFZ_PORTAL_USERNAME / BDFZ_PORTAL_PASSWORD` 走门户 SSO。
+3. 进入 `chalk-c3.seiue.com` 后，对首页、通知、档案、导师组、课表动作（修改考勤 / 录入成绩 / 查看回放 / 发送通知）做真实页面交互。
+4. 从浏览器实际请求和资源时序中提取真实 URL。
+5. 对 `api.seiue.com` URL 用 Bearer 重新回放并记录状态码。
+
+## 回放统计
+- reflection_id: `30961`
+- 总 URL 数: `158`
+- 状态统计: `{'skip': 18, '200': 96, '204': 1, '302': 42, '403': 1}`
+
+## Portal / 北大附中 API（18）
+- `https://api.pkuschool.edu.cn/bi/advisor/query_advisor_daily_student_attendance_stats?advisor_usin=F006180224&date=2026-04-15&advisor_role=mentor`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/bi/advisor/query_advisor_student_lift_assessment_stats?advisor_usin=F006180224&semester_id=61670&advisor_role=mentor&week_number=7&var=1`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/bi/advisor/query_advisor_student_silent_assessment_stats?advisor_usin=F006180224&semester_id=61670&advisor_role=mentor&week_number=7&var=1`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/bi/advisor/query_advisor_student_tablet_violation_stats?semester_id=61670&week_number=7&advisor_usin=F006180224&advisor_role=mentor`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/bi/advisor/query_advisor_student_takeout_assessment_stats?advisor_usin=F006180224&semester_id=61670&advisor_role=mentor&week_number=7&var=1`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/bi/advisor/query_student_absence_stats?advisor_usin=F006180224&semester_id=61670&advisor_role=mentor&week_number=7&var=1`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/bi/advisor/query_student_attendance_stats?advisor_usin=F006180224&semester_id=61670&advisor_role=mentor&week_number=7&var=1`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/bi/advisor/query_student_certification_stats?advisor_usin=F006180224&semester_id=61670&advisor_role=mentor&week_number=7&var=1`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/bi/advisor/query_student_moral_assessment_stats?advisor_usin=F006180224&semester_id=61670&advisor_role=mentor&week_number=7&var=1`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/bi/query_semester_data?advisor_usin=F006180224&date=2026-04-15`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/growp/load/reflection`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/growp/login/formal`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/growp/notification/frontend-informations?expand=current_recever%2Csender_name&is_received=true&page=1&per_page=5`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/growp/notification/frontend-notices`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/growp/perm/perms/me`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/growp/plugin/school-plugin-tags`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/growp/plugin/school-plugins/enabled?expand=plugins.plugin%2Cplugins.tag`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+- `https://api.pkuschool.edu.cn/growp/school/schools/3`
+  - status: `SKIP`
+  - note: `portal-api skipped in bearer replay`
+
+## Passport / 会话（1）
+- `https://passport.seiue.com/session/hooks?host=https%3A%2F%2Fchalk-c3.seiue.com`
+  - status: `200`
+  - note: `text/html; charset=UTF-8`
+
+## Chalk（109）
+- `https://api.seiue.com/chalk/acm/scopes/school.3/seiue.apollo/biz.settings/items`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/acm/scopes/school.3/seiue.chalk/items?group_in=homework_task%2Ctask.settings`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/acm/scopes/school.3/seiue.chalk/items?group_in=reflection.student.setting%2Creflection.teacher.setting`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/acm/scopes/school.3/seiue.chalk/items?group_in=system.theme%2Csystem.global`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/acm/scopes/school.3/seiue.chalk/system.security/items`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/acm/scopes/school.3/seiue.scms/items?group_in=election.settings`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/acm/scopes/school.3/seiue.vnas/class_assessment/items`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/calendar/personals/30961/events?end_time=2026-04-19%2023%3A59%3A59&expand=address%2Cinitiators&start_time=2026-04-13%2000%3A00%3A00`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/classin/personal/account`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/counter/my-counters`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/custom_group/group_types?id_in=2710%2C1999%2C1490%2C1352%2C1351`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/custom_group/group_types?id_in=2710%2C1999%2C1490%2C1352%2C1351&paginated=0`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/custom_group/reflection/30961/custom_groups?expand=type_entity%2Cmanagers%2Cmembers%2Cmanagers.reflection%2Cmembers.reflection&group_type_sys_template=mentor&owner_is_admin=true&status=normal`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/dict/reflections/30961/dict`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/event/instances`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/groups/1382704/reflections/30961/permissions`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/groups/2367132/members?class_id=1937527&expand=reflection%2Cteam&paginated=0`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/groups/2367132/members?class_id=1937527&expand=reflection&paginated=0`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/groups/2367132/members?class_id=1937527&expand=teams%2Cgroup%2Creflection%2Cteam&paginated=0&sort=member_type_id%2C-top%2Creflection.usin`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/groups/2367132/teams?expand=members&paginated=0&sort=weight`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/reflections/30961/groups?enhancer=seiue.adminclass_group&expand=members%2Cmembers.reflection%2Cmembers.reflection.guardians&status=normal`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/reflections/30961/groups?enhancer=seiue.class_group&expand=members%2Cmembers.reflection%2Cmembers.reflection.guardians&semester_id=61670`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/reflections/30961/groups?enhancer=seiue.dorm_group&expand=members%2Cmembers.reflection%2Cmembers.reflection.guardians`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/reflections/30961/groups?expand=members&paginated=0&scope_in=adminclass%2Ccustom_group.655467fb3d88a%2Ccustom_group.63195d8f472ca%2Ccustom_group.6263934a66a69%2Ccustom_group.616f6cd22fce8%2Ccustom_group.616f6cc0716a5`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/reflections/30961/groups?paginated=0&scope=relation`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/reflections/30961/groups?paginated=0&scope_in=adminclass%2Ccourse%2Cdorm%2Cclass.semester-61670%2Ccustom_group.655467fb3d88a%2Ccustom_group.63195d8f472ca%2Ccustom_group.6263934a66a69%2Ccustom_group.616f6cd22fce8%2Ccustom_group.616f6cc0716a5&status=normal`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/seiue.class_group/groups/1929922?cal_leave_status_by_rid=30961`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/seiue.class_group/groups/1929922?expand=members`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/seiue.class_group/groups/1937527?cal_leave_status_by_rid=30961`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/seiue.class_group/groups/1937527?expand=members`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/seiue.relation_group/groups/30961`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/group/seiue.relation_group/permissions`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/i18n/dynamic-translations?paginated=0&sort=-id`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/i18n/school-locale-text-overrides?lang=zh-CN&paginated=0&service=c3-chalk&translation_type=static`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/i18n/school-locale-text-overrides?lang=zh-CN&paginated=0&service=c3-packages&translation_type=static`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/layout/layouts/teacher_profile/tabs`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/layout/me/layouts/current?page_identity=home&platform=web&role_ids=3511%2C257`
+  - status: `204`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/me/permissions`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/me/received-messages-counts?count_fields=readed%2Cis_important%2Cis_cc&owner.id=30961&type=message`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/me/received-messages?expand=aggregated_messages&notice=true&owner.id=30961&per_page=999&readed=false&type=exam.schedule_result_for_examinee%2Cexam.schedule_result_for_examiner%2Cexam.stats_received%2Cexam.published_for_adminclass_teacher%2Cexam.published_for_examinee%2Cexam.published_scoring_for_examinee%2Cexam.published_for_teacher%2Cexam.published_for_mentor%2Cschcal.holiday_created%2Cschcal.holiday_deleted%2Cschcal.holiday_updated%2Cschcal.makeup_created%2Cschcal.makeup_deleted%2Cschcal.makeup_updated%2Cevaluation.completed_notice_for_subject%2Creporting.warning_received%2Creport_report.report_publish_published%2Cclass_adjustment.stage_approved%2Cclass_adjustment.stage_invalid%2Cintl_goal.goal_submitted%2Cintl_goal.goal_changed%2Cclass_review.un_completed%2Celection.lotting_result`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/me/received-messages?expand=sender_reflection&owner.id=30961&per_page=5&sort=-published_at%2C-created_at&type=message`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/me/received-messages?expand=sender_reflection&owner.id=30961&sort=-published_at%2C-created_at&type=message`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/me/roles?as_manager=false&expand=assignments&paginated=0`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/me/roles?as_manager=true&expand=assignments%2Crole_group&paginated=0`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/001fb6138664e1f1779e22416e1de4f7.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/012769b1ef79a477866253a7088fc92f.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/101200571fd048e3b25cc02dbc57efed/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/151f03f773e73928f63e910414316dfe.jpg/url?processor=quality-Q-75_zoom-fill-h-96-w-96`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/1c77087c3a41912871e8521faae72d17.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/1dcbefdfb1e4b945850e62069170c6fa.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/24b74837bc9acb03b28b5ae16bf1b12d/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/2d9ba015db65e9bcb16343a1a4cedc59.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/317fe36ca7da7102bed56a373debd495.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/33f68dae6b3d933e9aecb3d8975b33f6.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/37ee2a93c24b94736a2e433c3fff9b98.jpg/url?processor=quality-Q-75_zoom-fill-h-96-w-96`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/3ebce227771f794829cc1af1053d8da2.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/453a74ba0f4d97f401845d7af475d060.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/45a64c9430c33656e993dfbba906f762.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/4c811f4605106af3f92eee7be6b84039/url`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/62c95c410e0fa01268f7c1bc73876359/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/6795181d13812a13a6a4b5ac29fde196.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/6d246fa6d9ceeece9de19e2900ac0f38.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/7471c3be9a09c817d5172ea88dcdd316.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/82fd04251224275b3602dbe5a13e4a71.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/8fdbbec81086ac83170c07b33f13e10e.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/964aa7ca72eb6240e97a036cd091bf12.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/98624278b9cac61f3009287c8ef4283f.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/9d383de5f99cda8b5770574d5916d0a7.jpg/url?processor=quality-Q-75_zoom-fill-h-96-w-96`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/a2b21e8b5b7739ef439ef728836b3fc8.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/ab32b32cd9aba77e9c3373cb3e2c2329.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/aeaec04f2bcb11134ee54d5b69e53d01.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/b40b1f37e9e469107147459fb48ae68e/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/bd71843a1cde0921b2b65316d2acc770/url?processor=quality-Q-75_zoom-fill-h-160-w-160`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/bd71843a1cde0921b2b65316d2acc770/url?processor=quality-Q-75_zoom-fill-h-64-w-64`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/bd89fdaf78303980ea0f5847a6cbbded.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/bdfb13f5fcd480b0fb07e3d0742c05ee.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/c8ad9118c18b4952079307f86b78160f.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/d607308451e9192765f032b440095024.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/ddd30048789376935253fa89b2d78e61.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/e012242848f0d5ed62ffc51d705cff40.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/e34b5a1fbd69e8f07802cb9e186a04e7.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/e35d5026f90d1c45e0718956b6cb402e.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/e5520d7d7b91441c053b5b510bd50d94.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/e88b786911b7f3101d950dba0da6403f.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/ec73f47c7e43b5c98a8da52914c216f6.jpg/url?processor=quality-Q-75_zoom-fill-h-48-w-48`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/netdisk/files/ee2d0774e1e2a07acaa57237d0df7f8d.jpg/url?processor=quality-Q-75_zoom-fill-h-96-w-96`
+  - status: `302`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/notification/received-notifications?expand=receiver&id_in=69ddf8072f4f70dad505f59d%2C69d5f05da90e2718750a0696%2C69d899223cc2eed9c4046584%2C69d5b37a948c964e74018b11%2C69cf622987f569256e0e8e65%2C69c9ddf983094032000e15ae%2C69ce2a7a631b55cd2c06c44e%2C69ce34c8310aefc10c07dcd9%2C69ccb6f2098515161c075c49%2C69ca19f0f2d2c4aa3b03d032`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/notification/sent-notifications?per_page=1`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/oauth/info?expand=reflections%2Creflections.archived_type%2Creflections.grade_structure%2Creflections.school_level_structure`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/plugin/enabled/school-plugins?enabled=true&entrypoints_overlaps=application_center&expand=plugin&is_app=true&paginated=0&status=installed`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/plugin/enabled/school-plugins?expand=plugin`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/reflection/security-groups?role=student`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/role/manager/30961/scopes?domain=class&enhancer=seiue.class_scope&permission=seiue.core.class.read`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/role/manager/30961/scopes?domain=class&enhancer=seiue.class_scope&permission=seiue.core.class.write`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/role/manager/30961/scopes?domain=class_attendance&enhancer=seiue.class_scope&permission=seiue.core.class_attendance.read`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/role/manager/30961/scopes?domain=grade&enhancer=seiue.class_scope&permission=seiue.core.grade.read`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/role/manager/30961/scopes?domain=grade&enhancer=seiue.class_scope&permission=seiue.core.grade.write`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/role/manager/30961/scopes?domain=reflection&enhancer=seiue.student_scope&permission=seiue.core.user.read`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/role/manager/30961/scopes?domain=reflection&enhancer=seiue.teacher_scope&permission=seiue.core.user.read`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/smart_card/cards?expand=creator&page=1&paginated=1&per_page=20&sort=-weight%2C-modify_at&top_or_unread=true`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/smart_card/cards?page=1&per_page=1`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/system/schools/3?expand=custom_constraints`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/system/semesters?expand=is_current&paginated=0&sort=-start_at`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/term/application.group/terms?sort=weight%2Cid`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/term/class.tag/terms?archived_at_is_empty=true&sort=weight%2Cid`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/term/score.invalid_type/terms?sort=weight%2Cid`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/term/system.semester_category/terms?sort=weight%2Cid`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/todo/executors/30961/todos?expand=related&page=1&paginated=1&per_page=20&status=pending`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/chalk/todo/executors/30961/todos?lifecycle=long-term&page=1&paginated=1&per_page=3&sort=-created_at&status_in=pending%2Ccompleted&with_expired_days=7`
+  - status: `200`
+  - note: `application/json`
+
+## SAMS（6）
+- `https://api.seiue.com/sams/absence/absence-types-with-role?only_active=true`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/sams/attendance/attendances-info?attendance_time_id_in=53502302%2C53502303%2C55432344%2C53503382%2C53503383%2C53503384%2C53502304%2C53502305%2C53503385%2C53503386%2C53708600%2C53503387%2C53502306%2C53502307&biz_id_in=1929913%2C1929913%2C1962520%2C1929922%2C1929922%2C1929922%2C1929913%2C1929913%2C1929922%2C1929922%2C1937527%2C1929922%2C1929913%2C1929913&biz_type_in=class%2Cdorm%2Ccustom_group&expand=checked_attendance_time_ids&paginated=0`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/sams/attendance/class-attendances/1929922`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/sams/attendance/class-attendances/1937527`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/sams/attendance/class/1929922/attendance-records?attendance_time_id_in=53503385%2C53503386&expand=absence_info&paginated=0`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/sams/attendance/semesters/61670/class-groups?expand=abnormal_notice_teachers`
+  - status: `200`
+  - note: `application/json`
+
+## SCMS（14）
+- `https://api.seiue.com/scms/admin-class/personal/classes?expand=grade&owner_id=30961&owner_is_teacher=true&paginated=0`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/class/classes/1929922/group-members?expand=reflection&member_type=student`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/class/classes/1929922/group-members?expand=reflection&member_type=student&sort=reflection.pinyin`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/class/classes/1929922/groups`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/class/classes/1929922?expand=class_lessons%2Cclass_times%2Cgrades%2Cclass_lessons.teachers`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/class/classes/1929922?expand=class_lessons%2Cplaces%2Cgrades%2Cclass_times%2Cteachers.reflection%2Cshared_class_id%2Csubject&with_member_trashed=false`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/class/classes/1929922?expand=class_lessons%2Ctag`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/class/classes/1937527?expand=class_lessons%2Cplaces%2Cgrades%2Cclass_times%2Cteachers.reflection%2Cshared_class_id%2Csubject&with_member_trashed=false`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/election/related-elections?paginated=0&relation.relation_id=1937527`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/online-class/classes/1937527?expand=online_class%2Cshare`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/schcal/events?expand=class_scope%2Cadmin_class_scope&paginated=0&schcal_id_in=0&semester_id=61670`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/schcal/schcals?policy=scope&semester_id=61670`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/timetable/structure?date=2026-04-15&reflection_id=30961&resolve_most_used_timetable_id_by_week=false`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/scms/timetable/structure?date=2026-04-15&reflection_id=30961&resolve_most_used_timetable_id_by_week=true`
+  - status: `200`
+  - note: `application/json`
+
+## VNAS（7）
+- `https://api.seiue.com/vnas/common/settings/current?category=class&semester_id=61670`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/vnas/common/stages?paginated=0&semester_id=61670&type=class`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/vnas/exam-stats/settings/current`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/vnas/exam_scoring/papers/managed_subjects?paginated=1&per_page=1&semester_id=61670`
+  - status: `403`
+  - note: `application/json`
+- `https://api.seiue.com/vnas/klass/assessments/1679613/grades?paginated=0`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/vnas/klass/assessments/1679613/scopes?paginated=0&sort=usin&with_archived_for=grade`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/vnas/klass/assessments?expand=items%2Crelated_data%2Cassessment_stages%2Citems.task_relations%2Citems.handout_outline_relations%2Ccompute_rule%2Cplan%2Cgrade%2Cklass%2Cklass.teachers%2Cklass.tag%2Citems.score_count%2Citems.attached_exam_info%2Citems.stage_id%2Citems.stage%2Citems.task_relations.task%2Citems.attached_exam_info%2Citems.handout_outline_relations.outline&scope_id_in=1929922&scope_type=class&semester_id=61670`
+  - status: `200`
+  - note: `application/json`
+
+## SGMS（1）
+- `https://api.seiue.com/sgms/certification/certifications?per_page=1&policy=teacher&school_plugin_id=0`
+  - status: `200`
+  - note: `application/json`
+
+## AIS（2）
+- `https://api.seiue.com/ais/chat/bots?type=semester_review_generator`
+  - status: `200`
+  - note: `application/json`
+- `https://api.seiue.com/ais/teacher-bot/teacher-bots/groups/2367132/bots`
+  - status: `200`
+  - note: `application/json`
