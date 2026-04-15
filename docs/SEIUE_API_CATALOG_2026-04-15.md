@@ -258,11 +258,35 @@
 - **请求体**：
   - 任务数组
   - 代码记忆中已确认 `role_id` 常为必填
+- **2026-04-15 真实抓包已确认的最小创建字段**：
+  - `allow_overdue_submit=false`
+  - `domain="group"`
+  - `domain_biz_id=2367132`
+  - `outline_id=0`
+  - `submit_enabled=true`
+  - `outlines=[]`
+  - `enhancer="seiue.class_homework_task"`
+  - `role_id=0`
+  - `title`
+  - `content`（DraftJS JSON）
+  - `is_team_work=false`
+  - `attachments=[]`
+  - `published_at`
+  - `expired_at=null`
+  - `general_status="published"`
+  - `assignments=[{"assignee_id":...}]`
+  - `custom_fields.website_url=""`
+  - `custom_fields.is_all_joined=false`
+  - `prev_id=0`
 - **返回字段**：
   - 创建后的任务数组 / 各 task id
+  - 真实抓包确认可直接返回 `id`、`labels.type`、`general_status`、`created_at`、`updated_at`
 - **鉴权要求**：
   - Bearer + Seiue 业务头
-- **来源依据**：历史作业自动化链路（已验证）
+- **证据边界**：
+  - 代码/历史链路已知
+  - 2026-04-15 已通过真实前端发包确认（201）
+- **来源依据**：历史作业自动化链路（已验证）+ 2026-04-15 真实抓包
 
 ## 13. `DELETE /chalk/task/v2/tasks/{task_id}`
 - **作用**：删除任务。
@@ -273,7 +297,46 @@
   - 通常仅凭 `204`/`2xx` 判断成功
 - **鉴权要求**：
   - Bearer + Seiue 业务头
-- **来源依据**：历史作业自动化链路（已验证）
+- **证据边界**：
+  - 历史链路已验证
+  - 2026-04-15 已用真实测试任务 `662680` 再次确认 `204`
+- **来源依据**：历史作业自动化链路（已验证）+ 2026-04-15 真实抓包回滚
+
+---
+
+## 13A. `POST /chalk/discussion/discussions/{discussion_id}/topics`
+- **作用**：在课程班讨论区发布新 topic。
+- **方法**：`POST`
+- **路径参数**：
+  - `discussion_id`
+- **2026-04-15 真实抓包请求体**：
+  - `{"content":"<讨论正文>","attachments":[]}`
+- **返回字段**（真实抓包已确认）:
+  - `id`（topic_id）
+  - `discussion_id`
+  - `creator_id`
+  - `content`
+  - `attachments`
+  - `created_at`
+  - `updated_at`
+- **鉴权要求**：
+  - Bearer + Seiue 业务头
+- **证据边界**：
+  - 2026-04-15 已通过真实前端发包确认（201）
+
+## 13B. `DELETE /chalk/discussion/discussions/{discussion_id}/topics/{topic_id}`
+- **作用**：删除讨论 topic。
+- **方法**：`DELETE`
+- **路径参数**：
+  - `discussion_id`
+  - `topic_id`
+- **返回字段**：
+  - 通常仅凭 `204`/`2xx` 判断成功
+- **鉴权要求**：
+  - Bearer + Seiue 业务头
+- **证据边界**：
+  - 2026-04-15 已通过真实测试 topic `707737` 确认 `204`
+  - 同时确认 `/chalk/discussion/topics/{topic_id}` 为错误路径（404）
 
 ---
 

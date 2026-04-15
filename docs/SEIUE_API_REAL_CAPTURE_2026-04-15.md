@@ -18,6 +18,77 @@
 - 总 URL 数: `158`
 - 状态统计: `{'skip': 18, '200': 96, '204': 1, '302': 42, '403': 1}`
 
+## 后续真实 mutation 抓包增补（2026-04-15 深夜）
+
+### A. 课程班作业创建（真实发包已拿到）
+- 页面路径：`/classes/1937527/tasks?modal=ClassTasksNewModal&modalQuery=...`
+- 任务类型：`seiue.class_homework_task`
+- 真实前置请求：
+  - `PUT https://api.seiue.com/chalk/task/v2/domains/group/bizs/2367132/task-outlines`
+    - request body: `[]`
+    - status: `200`
+  - `GET https://api.seiue.com/chalk/task/v2/task-outlines?domain=group&domain_biz_id=2367132`
+    - status: `200`
+- 真实创建请求：
+  - `POST https://api.seiue.com/chalk/task/v2/tasks/$batch`
+  - status: `201`
+- 真实最小请求体关键字段：
+  - `allow_overdue_submit=false`
+  - `domain="group"`
+  - `domain_biz_id=2367132`
+  - `outline_id=0`
+  - `submit_enabled=true`
+  - `outlines=[]`
+  - `enhancer="seiue.class_homework_task"`
+  - `role_id=0`
+  - `title`
+  - `content`（DraftJS JSON）
+  - `is_team_work=false`
+  - `attachments=[]`
+  - `published_at`
+  - `expired_at=null`
+  - `general_status="published"`
+  - `assignments=[{"assignee_id":...}]`
+  - `custom_fields.website_url=""`
+  - `custom_fields.is_all_joined=false`
+  - `prev_id=0`
+- 真实返回关键字段：
+  - `id=662680`（抓包专用测试任务）
+  - `labels.type="seiue.class_homework_task"`
+  - `general_status="published"`
+  - `created_at`
+  - `updated_at`
+- 对应清理：
+  - `DELETE https://api.seiue.com/chalk/task/v2/tasks/662680`
+  - status: `204`
+- 另有用户指定真实保留任务：
+  - title: `请注册 my.bdfz.net`
+  - `task_id=662679`
+  - `discussion_id=2011948`
+
+### B. 课程班讨论发布（真实发包已拿到）
+- 页面路径：`/classes/1937527/discussions`
+- 真实发布请求：
+  - `POST https://api.seiue.com/chalk/discussion/discussions/1887301/topics`
+  - request body: `{"content":"抓包专用讨论，请忽略。","attachments":[]}`
+  - status: `201`
+- 真实返回关键字段：
+  - `id=707737`
+  - `discussion_id=1887301`
+  - `creator_id=30961`
+  - `content`
+  - `created_at`
+- 发布后读取刷新：
+  - `GET https://api.seiue.com/chalk/discussion/discussions/1887301/collector/30961/topics?per_page=1`
+  - `GET https://api.seiue.com/chalk/discussion/discussions/1887301/topics?creator_id=30961&per_page=1`
+  - `GET https://api.seiue.com/chalk/discussion/discussions/1887301/topics?expand=top,collect,excellent,creator,message_count,comment_count,attachments,histories,two_comments,two_comments.reply_count,collected_at,excellented_at,two_comments.sender&page=1&per_page=20&sort=-is_topped,-topped_at,-created_at`
+- 对应清理：
+  - `DELETE https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707737`
+  - status: `204`
+- 错误路径排除：
+  - `DELETE https://api.seiue.com/chalk/discussion/topics/707737`
+  - status: `404`
+
 ## Portal / 北大附中 API（18）
 - `https://api.pkuschool.edu.cn/bi/advisor/query_advisor_daily_student_attendance_stats?advisor_usin=F006180224&date=2026-04-15&advisor_role=mentor`
   - status: `SKIP`
