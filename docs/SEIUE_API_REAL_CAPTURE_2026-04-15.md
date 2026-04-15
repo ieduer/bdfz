@@ -89,6 +89,58 @@
   - `DELETE https://api.seiue.com/chalk/discussion/topics/707737`
   - status: `404`
 
+### C. 成绩页保存 / 提交审核（真实发包已拿到）
+- 页面路径：`/classes/1937527/grades/entry`
+- assessment_id：`1684238`
+- 真实保存请求：
+  - `PUT https://api.seiue.com/vnas/klass/assessments/1684238/grades`
+  - status: `200`
+- 真实保存请求体结构（数组元素）至少包含：
+  - `id`
+  - `score`
+  - `level`
+  - `level_customized`
+  - `edit_reason`
+  - `review`
+  - `self_review`
+  - `attachments`
+  - `status`
+  - `delayed_reason`
+  - `special_level`
+  - `special_score`
+  - `invalid_type_id`
+- 真实保存返回字段可确认包含：
+  - `id`
+  - `owner_id`
+  - `source_id=1684238`
+  - `status`
+  - `review`
+  - `self_review`
+  - `attachments`
+  - `updated_at`
+  - `full_score`
+- 真实提交审核请求：
+  - `PUT https://api.seiue.com/vnas/klass/assessments/1684238/submit?enable_afterthought=true`
+  - request body: `null`
+  - status: `422`
+- 真实业务拒绝返回：
+  - `[{"field":"grades","message":"有 18 个学生没有总成绩，无法提交审核","context":{"type":"has_empty_score"}}]`
+- 关键结论：
+  - `submit` 接口已真实命中；当前未成功不是未抓到，而是业务条件不满足（空成绩被服务端拒绝）。
+  - 点击提交审核前，前端还会先调用一次 `PUT /vnas/klass/assessments/1684238/grades` 做保存/对齐。
+
+### D. 任务更新（真实 API 更新已拿到）
+- 真实更新请求：
+  - `PUT https://api.seiue.com/chalk/task/v2/tasks/{task_id}`
+  - 本次验证 task：`662689`
+  - status: `200`
+- 真实复核：
+  - `GET https://api.seiue.com/chalk/task/v2/tasks?id_in=662689&expand=group`
+  - 更新后标题确认为：`API更新后-20260415-061237`
+- 对应清理：
+  - `DELETE https://api.seiue.com/chalk/task/v2/tasks/662689`
+  - status: `204`
+
 ## Portal / 北大附中 API（18）
 - `https://api.pkuschool.edu.cn/bi/advisor/query_advisor_daily_student_attendance_stats?advisor_usin=F006180224&date=2026-04-15&advisor_role=mentor`
   - status: `SKIP`
