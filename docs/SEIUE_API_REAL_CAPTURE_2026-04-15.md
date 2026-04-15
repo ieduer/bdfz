@@ -141,8 +141,8 @@
   - `DELETE https://api.seiue.com/chalk/task/v2/tasks/662689`
   - status: `204`
 
-### E. 讨论收藏（真实发包已拿到）
-- 目标 topic：`707771`（测试 topic，随后已删）
+### E. 讨论收藏 / 取消收藏（真实发包 + API 闭环）
+- 收藏目标 topic：`707771`（测试 topic，随后已删）
 - 真实收藏请求：
   - `PUT https://api.seiue.com/chalk/top/tops`
   - request body: `{"key":"discussion.1887301:reflection.30961","resource_id":707771,"enhancer":"seiue.discussion_topic_collect","top":true}`
@@ -150,13 +150,54 @@
 - 收藏后读取确认：
   - `GET https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707771?expand=top,collect,excellent,creator,message_count,comment_count,attachments,histories,two_comments,two_comments.reply_count,collected_at,excellented_at,two_comments.sender`
   - 返回中已确认：`is_collected=true`、`collected_at=...`
-- 关键结论：
-  - 讨论“收藏”底层不是专门 discussion 独立路径，而是复用 `chalk/top/tops`，通过 `enhancer=seiue.discussion_topic_collect` 标识资源类型。
-- 对应清理：
-  - `DELETE https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707771`
+- 取消收藏目标 topic：`707776`（测试 topic，随后已删）
+- 真实取消收藏请求：
+  - `PUT https://api.seiue.com/chalk/top/tops`
+  - request body: `{"key":"discussion.1887301:reflection.30961","resource_id":707776,"enhancer":"seiue.discussion_topic_collect","top":false}`
   - status: `204`
-- 补充说明：
-  - 评论输入框与“输入你的评论”区域已在真实页面中确认存在，但本轮尚未命中独立 comment mutation；需后续继续针对发送动作/按键条件补抓。
+- 取消收藏后读取确认：
+  - 同一路径 readback 返回：`is_collected=false`、`collected_at=null`
+- 错误方法 / 路径排除：
+  - `DELETE https://api.seiue.com/chalk/top/tops` → `405`
+  - `DELETE https://api.seiue.com/chalk/top/tops/707776` → `404`
+- 关键结论：
+  - 讨论“收藏/取消收藏”底层不是专门 discussion 独立路径，而是统一复用 `chalk/top/tops`，通过 `enhancer=seiue.discussion_topic_collect` 标识资源类型，用 `top=true/false` 切换状态。
+- 对应清理：
+  - `DELETE https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707771` → `204`
+  - `DELETE https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707776` → `204`
+
+### F. discussion topic 评论 / message 发送（真实 API 闭环）
+- 目标 topic：`707778`（测试 topic，随后已删）
+- 首轮候选路由探测：
+  - `POST /chalk/discussion/topics/{topic_id}/messages` → `404`
+  - `POST /chalk/discussion/topics/{topic_id}/comments` → `404`
+  - `POST /chalk/discussion/topics/{topic_id}/replies` → `404`
+  - `POST /chalk/discussion/discussions/1887301/topics/707778/messages` → 命中真实路由，但首次返回 `400`：`type is required`
+- 第二轮参数探测结论：
+  - `type` 不是 `comment/reply`
+  - 服务端明确枚举：`["private","public","team"]`
+  - `receiver_id` 为必填
+- 已确认真实评论/消息发送请求：
+  - `POST https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707778/messages`
+  - request body: `{"content":"receiver评论探测","attachments":[],"type":"public","receiver_id":30961}`
+  - status: `201`
+- 真实返回关键字段：
+  - `id=270253`
+  - `discussion_id=1887301`
+  - `topic_id=707778`
+  - `key="public"`
+  - `content="receiver评论探测"`
+  - `sender_id=30961`
+  - `receiver_id=30961`
+  - `base_parent_id=0`
+  - `parent_id=0`
+- 后续读取确认：
+  - `GET https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707778?expand=top,collect,excellent,creator,message_count,comment_count,attachments,histories,two_comments,two_comments.reply_count,collected_at,excellented_at,two_comments.sender`
+  - 返回：`message_count=1`、`comment_count=1`
+  - `two_comments[0].id=270253`
+  - `two_comments[0].content="receiver评论探测"`
+- 对应清理：
+  - `DELETE https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707778` → `204`
 
 ## Portal / 北大附中 API（18）
 - `https://api.pkuschool.edu.cn/bi/advisor/query_advisor_daily_student_attendance_stats?advisor_usin=F006180224&date=2026-04-15&advisor_role=mentor`

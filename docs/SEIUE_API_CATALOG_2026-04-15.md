@@ -339,22 +339,62 @@
   - 同时确认 `/chalk/discussion/topics/{topic_id}` 为错误路径（404）
 
 ## 13C. `PUT /chalk/top/tops`
-- **作用**：为 discussion topic 执行“收藏”等 top/collect 类动作。
+- **作用**：为 discussion topic 执行“收藏/取消收藏”等 top/collect 类动作。
 - **方法**：`PUT`
-- **2026-04-15 真实抓包请求体**：
+- **2026-04-15 真实抓包请求体（收藏）**：
   - `{"key":"discussion.1887301:reflection.30961","resource_id":707771,"enhancer":"seiue.discussion_topic_collect","top":true}`
+- **2026-04-15 真实 API 验证请求体（取消收藏）**：
+  - `{"key":"discussion.1887301:reflection.30961","resource_id":707776,"enhancer":"seiue.discussion_topic_collect","top":false}`
 - **返回字段**：
   - 本次真实命中返回 `204` 空体
 - **后续确认方式**：
   - 读取 `GET /chalk/discussion/discussions/{discussion_id}/topics/{topic_id}?expand=...collect...`
-  - 本次真实确认字段：`is_collected=true`、`collected_at=...`
+  - 本次真实确认字段：`is_collected=true/false`、`collected_at=.../null`
 - **关键结论**：
-  - discussion topic 的“收藏”底层复用 `chalk/top/tops`
+  - discussion topic 的“收藏/取消收藏”底层统一复用 `chalk/top/tops`
   - 具体资源类型由 `enhancer=seiue.discussion_topic_collect` 区分
+  - `DELETE /chalk/top/tops` 为错误方法（405），`DELETE /chalk/top/tops/{id}` 为错误路径（404）
 - **鉴权要求**：
   - Bearer + Seiue 业务头
 - **证据边界**：
-  - 2026-04-15 已通过真实前端点击确认（204）
+  - 2026-04-15 已通过真实前端点击确认收藏（204）
+  - 2026-04-15 已通过真实 API 验证取消收藏（204 + readback）
+
+## 13D. `POST /chalk/discussion/discussions/{discussion_id}/topics/{topic_id}/messages`
+- **作用**：为指定 discussion topic 发送评论/消息。
+- **方法**：`POST`
+- **路径参数**：
+  - `discussion_id`
+  - `topic_id`
+- **2026-04-15 真实 API 验证请求体**：
+  - `{"content":"receiver评论探测","attachments":[],"type":"public","receiver_id":30961}`
+- **真实返回**：
+  - `201`
+  - 返回对象字段包括：
+    - `id`
+    - `discussion_id`
+    - `topic_id`
+    - `key`（本次为 `public`）
+    - `content`
+    - `attachments`
+    - `sender_id`
+    - `receiver_id`
+    - `base_parent_id`
+    - `parent_id`
+    - `created_at`
+    - `updated_at`
+- **后续确认方式**：
+  - 读取 `GET /chalk/discussion/discussions/{discussion_id}/topics/{topic_id}?expand=...two_comments...`
+  - 本次真实确认字段：`message_count=1`、`comment_count=1`、`two_comments[0].id=270253`
+- **参数探测结论**：
+  - 未带 `type` 时返回 `400`：`type is required`
+  - `type` 可枚举值不是 `comment/reply`，服务端明确要求枚举 `["private","public","team"]`
+  - 当 `type` 合法后，`receiver_id` 仍为必填
+  - `/chalk/discussion/topics/{topic_id}/messages` 为错误路径（404）
+- **鉴权要求**：
+  - Bearer + Seiue 业务头
+- **证据边界**：
+  - 2026-04-15 已通过真实 API 创建测试 topic → 发送 message/comment → readback 验证 → 删除 topic 完整闭环确认
 
 ---
 
