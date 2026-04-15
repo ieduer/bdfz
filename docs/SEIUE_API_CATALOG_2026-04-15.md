@@ -892,7 +892,48 @@
 
 ---
 
-# 十、最关键的返回字段索引
+# 十、补充发现的流程 / 请假类接口
+
+## 55. `GET https://api.seiue.com/form/workflow/flows/{flow_id}?expand=initiator,nodes,nodes.stages,nodes.stages.reflection,field_values`
+- **作用**：读取请假/流程审批流详情。
+- **方法**：`GET`
+- **路径参数**：
+  - `flow_id`
+- **查询参数**：
+  - `expand=initiator,nodes,nodes.stages,nodes.stages.reflection,field_values`
+- **返回字段**（通知脚本已实际使用/可确认）：
+  - `initiator`
+  - `nodes`
+  - `nodes[].stages`
+  - `nodes[].stages[].reflection`
+  - `field_values`
+- **典型用途**：
+  - 在请假通知里补审批流节点、发起人、表单字段、附件。
+- **鉴权要求**：
+  - Bearer + Seiue 业务头
+- **来源**：`bdfz/seiue-notify.sh`
+
+## 56. `GET https://api.seiue.com/sams/absence/absences/{absence_id}?expand=reflections,reflections.guardians,reflections.grade`
+- **作用**：读取请假详情。
+- **方法**：`GET`
+- **路径参数**：
+  - `absence_id`
+- **查询参数**：
+  - `expand=reflections,reflections.guardians,reflections.grade`
+- **返回字段**（通知脚本已实际使用/可确认）：
+  - `reflections`
+  - `reflections[].guardians`
+  - `reflections[].grade`
+  - 请假对象、时间、原因等 absence 主体字段
+- **典型用途**：
+  - 在请假通知里补学生、家长、年级、请假主体信息。
+- **鉴权要求**：
+  - Bearer + Seiue 业务头
+- **来源**：`bdfz/seiue-notify.sh`
+
+---
+
+# 十一、最关键的返回字段索引
 
 如果只看当前代码里**真正被消费**的返回字段，优先记这些：
 
@@ -946,7 +987,356 @@
 
 ---
 
-# 十一、来源仓库 / 文件
+# 十二、常见参数约定 / 字段语义
+
+## 1. 头部参数
+- `Authorization`: Bearer token
+- `x-school-id`: 学校 id，现有代码固定使用 `3`
+- `x-role`: 当前角色，现有代码固定使用 `teacher`
+- `x-reflection-id`: 当前登录教师 reflection id
+
+## 2. 常见 ID 语义
+- `reflection_id`: 反射到 Seiue 人物身份的一层 id，教师/学生都会有
+- `owner_id`: 在成绩、方向、评价等场景里常对应学生 owner
+- `student_id`: 学生对象 id
+- `class_id`: 班级/课程业务 id
+- `task_id`: 作业任务 id
+- `item_id`: 成绩结构项 id
+- `assessment_id`: 评价/成绩结构容器 id
+- `flow_id`: 流程审批 id
+- `absence_id`: 请假记录 id
+- `chat_id`: 约谈/聊天 id
+- `instance_id`: chat 实例容器 id
+
+## 3. 常见 expand 语义
+- `expand=...` 基本就是要求后端一次性展开关联对象，减少二次请求。
+- 当前代码最依赖的 expand：
+  - `guardians,grade,user`
+  - `items,items.task_relations,items.task_relations.task,klass`
+  - `members,owner,discussion,members.reflection,members.reflection.pupil`
+  - `form_template_fields`
+  - `initiator,nodes,nodes.stages,nodes.stages.reflection,field_values`
+
+---
+
+# 十三、按业务链路整理
+
+## A. 登录 / 换 token 链路
+1. `POST /login?school_id=3`
+2. `POST /authorize`
+3. 提取：
+   - `access_token`
+   - `active_reflection_id`
+4. 后续接口统一附带 Bearer 与业务头
+
+## B. 考勤链路
+1. `GET /chalk/calendar/personals/{reflection_id}/events`
+2. `GET /sams/attendance/attendances-info`
+3. `GET /scms/class/classes/{class_id}/group-members?...`
+4. `PUT /sams/attendance/class/{class_id}/records/sync`
+5. 再次 `GET /sams/attendance/attendances-info` 回查
+
+## C. 作业 → 批阅 → 写分链路
+1. `GET /chalk/task/v2/tasks/{task_id}`
+2. `GET /chalk/task/v2/tasks/{task_id}/assignments?...`
+3. `GET /vnas/klass/assessments?...` 或多种 `/items?task_id=...` 反查 item
+4. `POST /chalk/task/v2/assignees/{receiver_id}/tasks/{task_id}/reviews`
+5. `POST /vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true`
+6. `GET /vnas/common/items/{item_id}/scores?...` 回查是否写入
+
+## D. 约谈 / 聊天补录链路
+1. `GET /chalk/group/groups/{group_id}/members?...`
+2. `POST /chalk/chat/instances/{instance_id}/chats`
+3. `GET /chalk/chat/instances/{instance_id}/chats/{chat_id}?expand=chat_form,form,forms`
+4. `POST /chalk/chat/chats/{chat_id}/chat-form/{template_id}/answers`
+5. `PATCH /chalk/chat/instances/{instance_id}/chats/{chat_id}`
+
+## E. 通知 → 详情补全链路
+1. `GET /chalk/me/received-messages`
+2. 根据通知 domain/type 分流：
+   - chat → `/chalk/chat/...`
+   - assessment → `/vnas/common/...`
+   - leave_flow → `/form/workflow/...` + `/sams/absence/...`
+3. 需要头像/附件时，再打学生详情/网盘签名接口
+
+## F. 学生画像链路
+1. `GET /chalk/reflection/students?usin=...`
+2. `GET /chalk/search/items?...`
+3. `GET /chalk/reflection/students/{id}/rid/{reflection_id}?expand=...`
+4. `GET /chalk/chat/students/{student_id}/chats?...`
+5. `GET /scms/direction/...`
+6. `GET /sgms/certification/...`
+7. `GET /vnas/klass/owners/{owner_id}/transcript`
+
+---
+
+# 十四、示例请求（按当前代码风格整理）
+
+## 1. 登录
+```bash
+curl 'https://passport.seiue.com/login?school_id=3' \
+  -X POST \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -H 'Origin: https://passport.seiue.com' \
+  -H 'Referer: https://passport.seiue.com/login?school_id=3' \
+  --data-urlencode 'email=YOUR_USERNAME' \
+  --data-urlencode 'password=YOUR_PASSWORD' \
+  -c /tmp/seiue.cookies -b /tmp/seiue.cookies
+```
+
+## 2. 换 token
+```bash
+curl 'https://passport.seiue.com/authorize' \
+  -X POST \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -H 'Origin: https://chalk-c3.seiue.com' \
+  -H 'Referer: https://chalk-c3.seiue.com/' \
+  --data-urlencode 'client_id=GpxvnjhVKt56qTmnPWH1sA' \
+  --data-urlencode 'response_type=token' \
+  -c /tmp/seiue.cookies -b /tmp/seiue.cookies
+```
+
+## 3. 查当天课程
+```bash
+curl 'https://api.seiue.com/chalk/calendar/personals/REFLECTION_ID/events?start_time=2026-04-15%2000:00:00&end_time=2026-04-15%2023:59:59&expand=address,initiators' \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
+  -H 'x-school-id: 3' \
+  -H 'x-role: teacher' \
+  -H 'x-reflection-id: REFLECTION_ID'
+```
+
+## 4. 提交考勤
+```bash
+curl 'https://api.seiue.com/sams/attendance/class/CLASS_ID/records/sync' \
+  -X PUT \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
+  -H 'x-school-id: 3' \
+  -H 'x-role: teacher' \
+  -H 'x-reflection-id: REFLECTION_ID' \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "abnormal_notice_roles": [],
+    "attendance_records": [
+      {
+        "tag": "正常",
+        "attendance_time_id": 123456,
+        "owner_id": 789012,
+        "source": "web"
+      }
+    ]
+  }'
+```
+
+## 5. 发 review
+```bash
+curl 'https://api.seiue.com/chalk/task/v2/assignees/RECEIVER_ID/tasks/TASK_ID/reviews' \
+  -X POST \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
+  -H 'x-school-id: 3' \
+  -H 'x-role: teacher' \
+  -H 'x-reflection-id: REFLECTION_ID' \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "result": "approved",
+    "content": "已阅。",
+    "reason": "",
+    "attachments": [],
+    "do_evaluation": false,
+    "is_excellent_submission": false,
+    "is_submission_changed": true
+  }'
+```
+
+## 6. 写分
+```bash
+curl 'https://api.seiue.com/vnas/klass/items/ITEM_ID/scores/sync?async=true&from_task=true' \
+  -X POST \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
+  -H 'x-school-id: 3' \
+  -H 'x-role: teacher' \
+  -H 'x-reflection-id: REFLECTION_ID' \
+  -H 'Content-Type: application/json' \
+  --data '[
+    {
+      "owner_id": 789012,
+      "valid": true,
+      "score": "5",
+      "review": "完成。",
+      "attachments": [],
+      "related_data": {"task_id": 636545},
+      "type": "item_score",
+      "status": "published"
+    }
+  ]'
+```
+
+## 7. 创建约谈
+```bash
+curl 'https://api.seiue.com/chalk/chat/instances/7/chats' \
+  -X POST \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
+  -H 'x-school-id: 3' \
+  -H 'x-role: teacher' \
+  -H 'x-reflection-id: REFLECTION_ID' \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "title": "約談補錄",
+    "content": "系統自動補錄的約談記錄。",
+    "attachments": [],
+    "member_ids": [REFLECTION_ID, STUDENT_REFLECTION_ID],
+    "place_name": "辦公室",
+    "start_time": "2026-04-15 09:00:00",
+    "end_time": "2026-04-15 09:10:00",
+    "custom_fields": {
+      "chat_method": "offline",
+      "is_classin": false,
+      "chat_type": "chat"
+    }
+  }'
+```
+
+---
+
+# 十五、示例响应骨架（只保留代码真正关心的字段）
+
+## 1. `/authorize`
+```json
+{
+  "access_token": "...",
+  "active_reflection_id": 123456
+}
+```
+
+## 2. `/chalk/calendar/personals/{reflection_id}/events`
+```json
+[
+  {
+    "type": "lesson",
+    "title": "语文",
+    "custom": {"id": 123456},
+    "subject": {"id": 1815547}
+  }
+]
+```
+
+## 3. `/scms/class/classes/{class_id}/group-members?...`
+```json
+[
+  {
+    "reflection": {"id": 789012}
+  }
+]
+```
+
+## 4. `/sams/attendance/attendances-info`
+```json
+[
+  {
+    "checked_attendance_time_ids": [123456, 123457]
+  }
+]
+```
+
+## 5. `/chalk/task/v2/tasks/{task_id}/assignments?...`
+```json
+[
+  {
+    "assignee": {},
+    "submission": {},
+    "review": {},
+    "team": {},
+    "is_excellent": false
+  }
+]
+```
+
+## 6. `/vnas/klass/items/{item_id}?expand=...`
+```json
+{
+  "id": 1679605,
+  "related_data": {"task_id": 636545},
+  "assessment": {},
+  "assessment_stage": {},
+  "stage": {}
+}
+```
+
+## 7. `/chalk/reflection/students/{student_id}/rid/{reflection_id}?expand=...`
+```json
+{
+  "id": 10001,
+  "name": "某学生",
+  "usin": "20260101",
+  "grade": {},
+  "guardians": [],
+  "user": {}
+}
+```
+
+---
+
+# 十六、常见失败码 / 重试经验
+
+## 认证类
+- `401/403`
+  - token 过期或 reflection/header 不匹配
+  - 现有脚本普遍策略：**重新登录一次再重试**
+
+## 考勤类
+- `409/422`
+  - 常见表示时间窗口关闭、状态冲突、业务规则不允许
+- 处理建议：
+  - 先查 `attendances-info`
+  - 再确认 lesson 的 `custom.id` 与 `subject.id`
+
+## 作业 / 写分类
+- `404`
+  - 常见是 `item_id` 不存在 / 已删 / 不匹配
+- `422`
+  - 常见是：
+    - 分数超上限
+    - item/task 不匹配
+    - 记录已存在
+- 处理建议：
+  1. 重新解析 `task_id -> item_id`
+  2. 必要时先 `get_item_detail()` 验证 `related_data.task_id`
+  3. 写分后用 `/vnas/common/items/{item_id}/scores?...` 回查
+
+## 网盘签名类
+- `401/403`
+  - token 失效，重登即可
+- `302`
+  - 正常，不是错误；关键看 `Location`
+
+## 约谈 / 表单类
+- 创建 chat 成功但找不到 form_id
+  - 先查 `custom_fields.form_id`
+  - 再查 `chat_form.id`
+  - 再查 `form.id`
+  - 最后查 `forms[].id`
+
+---
+
+# 十七、接口覆盖边界说明
+
+这份文档当前已经补到：
+- 代码里直接出现的接口
+- 运行链路里已被长期验证过的核心接口
+- 通知侧顺藤摸瓜拉到的关联接口
+- 自建中间层接口
+
+但**仍不等于**：
+- Seiue 官方全站完整 OpenAPI
+- 所有角色（教师/学生/家长/管理员）全量接口面
+- 所有 query/body 字段的严格 schema
+
+准确说，它现在是：
+
+> **你现有代码生态下，足够支撑考勤、作业、评分、通知、约谈、学生画像、请假流这些自动化任务的“最大实用版 API 文档”。**
+
+---
+
+# 十八、来源仓库 / 文件
 
 主要来源：
 
@@ -961,21 +1351,21 @@
 
 ---
 
-# 十二、结论
+# 十九、结论
 
-现在这份已经不是“接口名罗列版”，而是能直接拿来做自动化的字段级文档：
+现在这份已经不是“接口名罗列版”，而是接近 runbook 的版本：
 
 - **方法**：有了
 - **关键参数**：有了
 - **代码确认过的返回字段**：有了
 - **鉴权要求**：有了
+- **业务链路**：有了
+- **示例请求**：有了
+- **响应骨架**：有了
+- **失败码/重试经验**：有了
 
-但要说死一点：
-
-> 这仍然是**实扫版工程文档**，不是官方 OpenAPI。
->
-> 真要继续往下做，下一步应该是把每个接口再补成：
-> 1. 示例请求
-> 2. 示例响应
-> 3. 失败码/重试策略
-> 4. 调用关系图（登录 → 查课 → 查成员 → 提交考勤 / 查 task → 查 item → review → score）
+如果还要继续往死里补，下一层应该是：
+1. 每个接口补真实抓包样例
+2. 每个链路单独拆成 runbook
+3. 生成 task→item→assessment、message→chat/form、leave_flow→absence 的关系图
+4. 最后再抽一份真正适合程序消费的 machine-readable schema
