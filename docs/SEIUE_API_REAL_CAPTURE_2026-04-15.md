@@ -141,6 +141,23 @@
   - `DELETE https://api.seiue.com/chalk/task/v2/tasks/662689`
   - status: `204`
 
+### E. 讨论收藏（真实发包已拿到）
+- 目标 topic：`707771`（测试 topic，随后已删）
+- 真实收藏请求：
+  - `PUT https://api.seiue.com/chalk/top/tops`
+  - request body: `{"key":"discussion.1887301:reflection.30961","resource_id":707771,"enhancer":"seiue.discussion_topic_collect","top":true}`
+  - status: `204`
+- 收藏后读取确认：
+  - `GET https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707771?expand=top,collect,excellent,creator,message_count,comment_count,attachments,histories,two_comments,two_comments.reply_count,collected_at,excellented_at,two_comments.sender`
+  - 返回中已确认：`is_collected=true`、`collected_at=...`
+- 关键结论：
+  - 讨论“收藏”底层不是专门 discussion 独立路径，而是复用 `chalk/top/tops`，通过 `enhancer=seiue.discussion_topic_collect` 标识资源类型。
+- 对应清理：
+  - `DELETE https://api.seiue.com/chalk/discussion/discussions/1887301/topics/707771`
+  - status: `204`
+- 补充说明：
+  - 评论输入框与“输入你的评论”区域已在真实页面中确认存在，但本轮尚未命中独立 comment mutation；需后续继续针对发送动作/按键条件补抓。
+
 ## Portal / 北大附中 API（18）
 - `https://api.pkuschool.edu.cn/bi/advisor/query_advisor_daily_student_attendance_stats?advisor_usin=F006180224&date=2026-04-15&advisor_role=mentor`
   - status: `SKIP`

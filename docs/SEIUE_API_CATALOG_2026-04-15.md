@@ -325,18 +325,36 @@
   - 2026-04-15 已通过真实前端发包确认(201)
 
 ## 13B. `DELETE /chalk/discussion/discussions/{discussion_id}/topics/{topic_id}`
-- **作用**:删除讨论 topic。
-- **方法**:`DELETE`
-- **路径参数**:
+- **作用**：删除讨论 topic。
+- **方法**：`DELETE`
+- **路径参数**：
   - `discussion_id`
   - `topic_id`
-- **返回字段**:
+- **返回字段**：
   - 通常仅凭 `204`/`2xx` 判断成功
-- **鉴权要求**:
+- **鉴权要求**：
   - Bearer + Seiue 业务头
-- **证据边界**:
+- **证据边界**：
   - 2026-04-15 已通过真实测试 topic `707737` 确认 `204`
-  - 同时确认 `/chalk/discussion/topics/{topic_id}` 为错误路径(404)
+  - 同时确认 `/chalk/discussion/topics/{topic_id}` 为错误路径（404）
+
+## 13C. `PUT /chalk/top/tops`
+- **作用**：为 discussion topic 执行“收藏”等 top/collect 类动作。
+- **方法**：`PUT`
+- **2026-04-15 真实抓包请求体**：
+  - `{"key":"discussion.1887301:reflection.30961","resource_id":707771,"enhancer":"seiue.discussion_topic_collect","top":true}`
+- **返回字段**：
+  - 本次真实命中返回 `204` 空体
+- **后续确认方式**：
+  - 读取 `GET /chalk/discussion/discussions/{discussion_id}/topics/{topic_id}?expand=...collect...`
+  - 本次真实确认字段：`is_collected=true`、`collected_at=...`
+- **关键结论**：
+  - discussion topic 的“收藏”底层复用 `chalk/top/tops`
+  - 具体资源类型由 `enhancer=seiue.discussion_topic_collect` 区分
+- **鉴权要求**：
+  - Bearer + Seiue 业务头
+- **证据边界**：
+  - 2026-04-15 已通过真实前端点击确认（204）
 
 ---
 
@@ -361,29 +379,29 @@
 - **来源**:`bdfz/agrader.sh`
 
 ## 15. `GET /vnas/common/items/{item_id}/scores?paginated=0&type=item_score`
-- **作用**：查看某 item 已有分数。
-- **方法**：`GET`
-- **路径参数**：
+- **作用**:查看某 item 已有分数。
+- **方法**:`GET`
+- **路径参数**:
   - `item_id`
-- **查询参数**：
+- **查询参数**:
   - `paginated=0`
   - `type=item_score`
-- **返回字段**（用途可确认）:
-  - 分数记录数组，通常含：
+- **返回字段**(用途可确认):
+  - 分数记录数组,通常含:
     - `owner_id`
     - `score`
     - `type`
     - `related_data`
-- **鉴权要求**：
+- **鉴权要求**:
   - Bearer + Seiue 业务头
-- **来源**：`bdfz/agrader.sh`
+- **来源**:`bdfz/agrader.sh`
 
 ## 15A. `PUT /vnas/klass/assessments/{assessment_id}/grades`
-- **作用**：成绩录入页批量保存 grade 记录。
-- **方法**：`PUT`
-- **路径参数**：
+- **作用**:成绩录入页批量保存 grade 记录。
+- **方法**:`PUT`
+- **路径参数**:
   - `assessment_id`
-- **2026-04-15 真实抓包请求体结构**：数组元素至少包含：
+- **2026-04-15 真实抓包请求体结构**:数组元素至少包含:
   - `id`
   - `score`
   - `level`
@@ -397,7 +415,7 @@
   - `special_level`
   - `special_score`
   - `invalid_type_id`
-- **返回字段**（真实抓包已确认）:
+- **返回字段**(真实抓包已确认):
   - `id`
   - `owner_id`
   - `source_id`
@@ -407,50 +425,50 @@
   - `attachments`
   - `updated_at`
   - `full_score`
-- **鉴权要求**：
+- **鉴权要求**:
   - Bearer + Seiue 业务头
-- **证据边界**：
-  - 2026-04-15 已通过成绩录入页真实前端发包确认（200）
+- **证据边界**:
+  - 2026-04-15 已通过成绩录入页真实前端发包确认(200)
 
 ## 15B. `PUT /vnas/klass/assessments/{assessment_id}/submit?enable_afterthought=true`
-- **作用**：提交总成绩进入审核。
-- **方法**：`PUT`
-- **路径参数**：
+- **作用**:提交总成绩进入审核。
+- **方法**:`PUT`
+- **路径参数**:
   - `assessment_id`
-- **查询参数**：
+- **查询参数**:
   - `enable_afterthought=true`
-- **请求体**：
+- **请求体**:
   - 2026-04-15 真实抓包为 `null`
-- **返回字段 / 失败特征**：
+- **返回字段 / 失败特征**:
   - 当前真实命中返回 `422`
-  - 真实错误体：`[{"field":"grades","message":"有 18 个学生没有总成绩，无法提交审核","context":{"type":"has_empty_score"}}]`
-- **关键结论**：
-  - 接口已真实命中；当前失败原因是业务条件不满足，不是路径猜测。
-  - 点击提交审核前，前端还会先调用一次 `PUT /vnas/klass/assessments/{assessment_id}/grades` 做保存/对齐。
-- **鉴权要求**：
+  - 真实错误体:`[{"field":"grades","message":"有 18 个学生没有总成绩,无法提交审核","context":{"type":"has_empty_score"}}]`
+- **关键结论**:
+  - 接口已真实命中;当前失败原因是业务条件不满足,不是路径猜测。
+  - 点击提交审核前,前端还会先调用一次 `PUT /vnas/klass/assessments/{assessment_id}/grades` 做保存/对齐。
+- **鉴权要求**:
   - Bearer + Seiue 业务头
-- **证据边界**：
-  - 2026-04-15 已通过成绩录入页真实前端发包确认（422 业务拒绝）
+- **证据边界**:
+  - 2026-04-15 已通过成绩录入页真实前端发包确认(422 业务拒绝)
 
 ## 16. `POST /vnas/klass/items/{item_id}/scores/sync?async=true&from_task=true`
-- **作用**：向成绩项写分。
-- **方法**：`POST`
-- **路径参数**：
+- **作用**:向成绩项写分。
+- **方法**:`POST`
+- **路径参数**:
   - `item_id`
-- **查询参数**：
+- **查询参数**:
   - `async=true`
   - `from_task=true`
-- **请求体**（代码已确认）:
+- **请求体**(代码已确认):
   - `owner_id`
   - `score`
   - `review`
   - `type=item_score`
   - `related_data.task_id`
-- **返回字段**：
+- **返回字段**:
   - 代码主要按 HTTP 状态 + 后续回查判断成功
-- **鉴权要求**：
+- **鉴权要求**:
   - Bearer + Seiue 业务头
-- **来源**：
+- **来源**:
   - `bdfz/agrader.sh`
   - 历史作业自动化链路
 
